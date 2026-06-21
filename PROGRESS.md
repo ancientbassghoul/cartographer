@@ -31,6 +31,18 @@ D:\EXTEND\C2_SIM\XLAB\
   (the int64_t kernel patch in `third_party/MASt3R-SLAM/mast3r_slam/backend/src/*.cu` must be present
   — see `mast3r-slam-windows-build` memory).
 
+## Status: Milestone 2 DONE ✅ (io_bridge + frame_bus) — verified on hardware 2026-06-21
+- `frame_bus.py`, `io_bridge.py`, `test_frame_subscriber.py` written and verified.
+- **Hardware verification PASSED** (user ran Xlab.exe + io_bridge + test_frame_subscriber): live frames
+  flowing to a 2nd process with no control lag. Earlier synthetic loopback confirmed ~10 fps 512×288 BGR,
+  per-frame control/sim_time metadata, ~0 ms localhost latency, 'g' detect event on the state bus.
+- Design choices made: frame bus uses ZMQ **CONFLATE** (newest-wins, true drop-old) with a single
+  length-prefixed `[hdr_len][hdr_json][raw bytes]` blob (CONFLATE forbids multipart). State bus is
+  non-conflated multipart `[topic][json]`. Per-frame meta carries `frame_id`, `mono_ts`, `sim_time`,
+  and a `controls` snapshot (trigger/reverse/joy/yaw/pitch) so the glass detector later knows
+  "forward-commanded". Dropped the sample's YOLO 'o'-autopilot + `detect_target` try-except (GPU work
+  + silent fallback — both forbidden); manual flight mapping is otherwise byte-for-byte unchanged.
+
 ## Status: Milestone 1 DONE ✅ (env + all models verified on GPU)
 - Depth Anything V2 (`depth-anything/Depth-Anything-V2-Base-hf`): 0.49 s/frame, 0.40 GB.
 - Qwen2.5-VL-3B 4-bit (`Qwen/Qwen2.5-VL-3B-Instruct`): 2.6 GB, reads scenes correctly. Helper:
@@ -45,8 +57,11 @@ D:\EXTEND\C2_SIM\XLAB\
 - `build_mast3r_slam.bat` (steps 0-1), `build_mast3r_slam_step23.bat` (steps 2-4) — Windows build.
 - `test_assets/` — sample_frame.png, frame_a/b.png (512-ready XLAB frames), smoke_depth.png.
 - `third_party/MASt3R-SLAM/` — built editable + checkpoints/ (2.6 GB metric + retrieval).
-- NOT yet created: io_bridge.py, frame_bus.py, perception_worker.py, object_worker.py, map_store.py,
-  visualizer.py, report.py, run.py.
+- `frame_bus.py` — DropOldRing + ZMQ Frame/State Pub/Sub + encode/decode. Self-test: `python frame_bus.py`.
+- `io_bridge.py` — P1: NDI capture + 60 Hz TCP control server + keyboard, fail-fast init, publishes
+  downscaled frames + status/detect events. Flags: `--debug-keys`, `--no-display`, `--config`.
+- `test_frame_subscriber.py` — M2 verification stand-in for perception_worker (prints fps/shape/latency).
+- NOT yet created: perception_worker.py, object_worker.py, map_store.py, visualizer.py, report.py, run.py.
 
 ## Key technical facts already learned (don't re-derive)
 - **Sim protocol** (`../XLAB/Sample_Drone_Interface.py`): Python is the TCP **SERVER** (127.0.0.1:65432);
@@ -66,16 +81,22 @@ D:\EXTEND\C2_SIM\XLAB\
 - **Resolution:** transport 512×288 (16:9). MASt3R's own resize already produces 512×288 from
   1280×720 — do NOT anamorphically squash; letterbox if a model needs square.
 
-## NEXT: Milestone 2 — io_bridge + frame_bus
-Goal: refactor sim IO out of `../XLAB/Sample_Drone_Interface.py` into our process, fail-fast.
-1. `io_bridge.py` (P1, no GPU): lift NDI receive + 60 Hz TCP server + keyboard from the sample.
-   Keep manual flight working unchanged. Convert the sample's silent try-excepts (detect_target,
-   NDI/keyboard init) to fail-fast or visible state. Publish frames into the bus.
-2. `frame_bus.py`: drop-old ring — every frame to the 60 Hz UI path; sub-sample to ~10 fps,
-   downscale to 512×288 (16:9 preserved, monotonic-clock gate), publish to perception over ZeroMQ
-   (PUB/SUB, ports in config: frame 5601, state 5602). Resize before IPC.
-3. Verification (NEEDS THE USER — requires running Xlab.exe): launch sim, run io_bridge, arm & fly
-   manually, confirm a second subscriber process receives live downscaled frames with no control lag.
+## NEXT: verify M2 on hardware, then start Milestone 3 — depth overlay
+M2 verification checklist (do this FIRST, with Xlab.exe running):
+  1. Start Xlab.exe (Unity).
+  2. `cd cartographer && venv\Scripts\python.exe io_bridge.py` — should print "Unity connected",
+     "Keyboard hook active", "Found NDI source", then "=== READY ===". Arm (1) and fly (WASD/arrows).
+  3. 2nd terminal: `venv\Scripts\python.exe test_frame_subscriber.py` — expect ~10 fps, 512×288,
+     low latency, and controls echoed live (trigger/yaw change as you fly). Press 'g' → DETECT REQUEST.
+  4. Confirm manual flight has NO lag while the subscriber runs. If keyboard does nothing, retry the
+     terminal as Administrator (the `keyboard` hook often needs it). If "No NDI sources", Unity isn't
+     streaming yet. Then M2 is signed off.
+
+Then **Milestone 3 — depth overlay** (first GPU worker): create `perception_worker.py` that
+subscribes to the frame bus, runs Depth Anything V2 (`depth-anything/Depth-Anything-V2-Base-hf`,
+already verified in M1) at ~2–3 Hz, and publishes a depth map + a forward-obstacle bar on the state
+bus; extend the visualizer/overlay to show it. *Verify:* fly toward a wall → depth collapses; fly at
+the glass → depth stays "far" (sets up the M5 glass detector's corroborating evidence).
 
 ## Remaining milestones (see plan file for detail)
 - M3: Depth overlay (DA-V2) + forward-obstacle bar; verify depth collapses at walls, stays "far" at glass.
