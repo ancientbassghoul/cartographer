@@ -30,6 +30,36 @@ D:\EXTEND\C2_SIM\XLAB\
 - To rebuild MASt3R-SLAM from scratch: `build_mast3r_slam.bat` then `build_mast3r_slam_step23.bat`
   (the int64_t kernel patch in `third_party/MASt3R-SLAM/mast3r_slam/backend/src/*.cu` must be present
   — see `mast3r-slam-windows-build` memory).
+- **lietorch is a PATCHED LOCAL build** at `third_party/lietorch` (NOT the pip/git version, which
+  segfaults — see M4 below). To rebuild it: `build_lietorch.bat`. NEVER `pip install` upstream lietorch.
+  Re-validate group ops: `venv\Scripts\python.exe lietorch_probe.py` (expects "ALL LIETORCH CASES PASSED").
+
+## Status: Milestone 4 UNBLOCKED ✅ (SLAM runs) — lietorch Windows patch applied 2026-06-21
+- Built `slam_offline.py` to drive the FULL MASt3R-SLAM loop (tracker + FactorGraph + retrieval)
+  over a recorded flight (`../XLAB/OUTPUT/flight_20260621_120829.mp4`), single-process, no viz.
+  Diagnostics: `slam_match_probe.py`, `lietorch_probe.py`. Map export → `.ply` + `.npz` + top-down PNG.
+- **Fixed: `mp.Manager()` deadlock** on Windows (spawn re-imports this module) → replaced with an
+  in-process `InProcessManager` shim (we run tracker + backend in ONE process, no separate viz).
+- **Fixed: lietorch CUDA group-op segfault (the real blocker).** A bare
+  `lietorch.Sim3.Identity(1,device='cuda').inv()*...` access-violated (0xC0000005); the two-view smoke
+  test missed it because it never called a group op. **Root cause:** in
+  `third_party/lietorch/lietorch/src/lietorch_gpu.cu`, the `__global__` kernels declared input pointers
+  `const scalar_t*`; with Eigen, `const` vs non-const selects different `Eigen::Map` template
+  instantiations, and the const path is **miscompiled by nvcc 12.1 + MSVC 14.36** → illegal access.
+  **Fix (user-authorized quarantine bypass, community-vetted):** changed input-pointer params from
+  `const scalar_t*` → `scalar_t*` in ALL forward kernels (exp/log/inv/mul/adj/adjT/act/act4/as_matrix/
+  orthogonal_projector/jleft). Rebuilt from a LOCAL clone via `build_lietorch.bat` (MSVC 14.36 + CUDA
+  12.1, `TORCH_CUDA_ARCH_LIST=8.6`). `lietorch_probe.py` now passes inv/mul/act/retr (fresh +
+  shared-memory). `slam_offline.py` runs the full tracker+backend end-to-end (~3 fps, peak 6.75 GB).
+  **NOTE:** lietorch is now a LOCAL source build at `third_party/lietorch` — to rebuild, run
+  `build_lietorch.bat` (do NOT `pip install` the upstream git version, which reintroduces the crash).
+- **Full-video run VERIFIED:** 587 frames (stride 3) → **23 keyframes**, tracking never lost (0 reloc),
+  retrieval backend found loop-closure candidates, 2.08M world points, ~2 fps, peak 7.2 GB. Map artifacts
+  in `OUTPUT/`: `*_cloud.ply`, `*_map.npz`, `*_topdown.png`. Top-down shows a globally-consistent
+  room/corridor with coherent walls + a clean forward trajectory. **Offline SLAM milestone done.**
+- **NEXT (rest of M4):** integrate SLAM into the live `perception_worker` (share its CUDA context with
+  DA-V2, depth at the slower cadence) + build `map_store.py` (voxel/occupancy + trajectory) + a live
+  view. Then the live verification fly-through.
 
 ## Status: Milestone 3 DONE ✅ (depth overlay) — offline-verified + user-approved 2026-06-21
 _(Live wall-vs-glass flight is the M3 sign-off ritual; confirm it opportunistically during the M4
@@ -85,6 +115,14 @@ flights — see the checklist at the bottom. User reviewed the offline overlay o
 - `test_frame_subscriber.py` — M2 verification stand-in for perception_worker (prints fps/shape/latency).
 - `perception_worker.py` — P2 GPU worker. M3: DA-V2 depth → obstacle bar + clearance + coarse grid on
   state bus :5603 + live overlay window. Flags: `--self-test`, `--no-display`, `--config`.
+- `slam_offline.py` — M4 de-risk: drives the FULL MASt3R-SLAM loop over a recorded mp4 (single-process,
+  no viz; in-process `InProcessManager` shim), exports `.ply`/`.npz`/top-down PNG. Flags: `--video`,
+  `--stride`, `--max-frames`, `--conf-thresh`, `--out`. Run unbuffered (`$env:PYTHONUNBUFFERED=1`).
+- `build_lietorch.bat` — rebuilds the patched local lietorch (`third_party/lietorch`).
+- `lietorch_windows_const_fix.patch` — the tracked const→non-const kernel fix (third_party is
+  gitignored, so this patch is the version-controlled copy; `git apply` it onto a fresh lietorch clone).
+- `lietorch_probe.py`, `slam_match_probe.py` — M4 diagnostics (lietorch group ops; matching kernels).
+- `third_party/lietorch/` — patched local clone (`lietorch_gpu.cu` const→non-const kernel fix).
 - NOT yet created: object_worker.py, map_store.py, visualizer.py, report.py, run.py.
 
 ## Key technical facts already learned (don't re-derive)
@@ -104,6 +142,14 @@ flights — see the checklist at the bottom. User reviewed the offline overlay o
   loading. Full driving loop reference: `third_party/MASt3R-SLAM/main.py`.
 - **Resolution:** transport 512×288 (16:9). MASt3R's own resize already produces 512×288 from
   1280×720 — do NOT anamorphically squash; letterbox if a model needs square.
+- **lietorch CUDA group ops (inv/mul/act/retr) crash on the stock Windows build** — bug is `const
+  scalar_t*` kernel params in `lietorch_gpu.cu` (Eigen picks a miscompiled `Eigen::Map` instantiation
+  under nvcc 12.1 + MSVC 14.36). FIXED in the local patched build (`third_party/lietorch`, const→non-
+  const on all forward kernels). Don't re-debug; just ensure `lietorch_probe.py` passes after any rebuild.
+- **Driving the SLAM loop single-process:** mirror `main.py` (INIT mono → TRACKING `tracker.track` →
+  `run_backend`), but skip the viz process and feed `SharedKeyframes`/`SharedStates` an `InProcessManager`
+  shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
+  `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
 
 ## NEXT: live M3 verification on hardware (do this FIRST), then M4 — SLAM
 M3 live verification checklist (with Xlab.exe running):
@@ -121,14 +167,17 @@ M3 live verification checklist (with Xlab.exe running):
   - If the obstacle bar feels floor-dominated or mis-aimed, tune `BAND_TOP/BAND_BOTTOM` (currently
     0.25/0.70) and `COL_NEAR_PCTL` at the top of `perception_worker.py`.
 
-Then **Milestone 4 — SLAM + map**: add MASt3R-SLAM to `perception_worker` (same CUDA context, ~5–10 Hz
-tracking loop, depth stays the slower cadence), publish poses + pointmaps, and build `map_store.py`
-(voxel/occupancy + trajectory) with a Rerun / top-down view. *Verify:* fly a loop → globally
-consistent map. (See the plan file for M4–M6 detail.)
+**Milestone 4 — SLAM + map (offline done; live integration is the resume point):** offline SLAM is
+proven (`slam_offline.py` → consistent map, see status above). REMAINING: add MASt3R-SLAM to the live
+`perception_worker` (same CUDA context as DA-V2, depth stays the slower cadence), publish poses +
+pointmaps on the state bus, and build `map_store.py` (voxel/occupancy + trajectory) with a top-down /
+Rerun view. *Verify:* fly a loop → globally consistent live map. (See the plan file for M4–M6 detail.)
+Reuse the driving loop + map-export logic already in `slam_offline.py`.
 
 ## Remaining milestones (see plan file for detail)
-- M3: Depth overlay (DA-V2) + forward-obstacle bar; verify depth collapses at walls, stays "far" at glass.
-- M4: MASt3R-SLAM in perception_worker → map_store voxel/trajectory, Rerun view.
+- M3: Depth overlay (DA-V2) ✅ offline; live wall/glass fly-through still to be signed off on hardware.
+- M4: SLAM engine ✅ runs on Windows + offline map verified; REMAINING = live perception_worker
+  integration + `map_store.py` voxel/trajectory + top-down/Rerun view.
 - M5: glass detector (SLAM translation≈0 while forward-commanded = authoritative) + opening detector
   (RANSAC wall planes, gaps vs drone clearance).
 - M6: object_worker (Qwen multi-image: reference crop + live frame, hotkey 'g'); DINOv2 fallback is
