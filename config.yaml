@@ -12,7 +12,9 @@ network:
   ndi_source_name: "Unity"              # substring filter; dynamic discovery stays primary
   # localhost message bus between our own processes (io_bridge -> perception/object workers)
   frame_bus_port: 5601                  # ZeroMQ PUB/SUB for downscaled ML frames
-  state_bus_port: 5602                  # ZeroMQ for poses/depth/detections back to UI/map
+  state_bus_port: 5602                  # io_bridge -> UI: status heartbeat + detect requests
+  # Each PUB binds its own port (frame_bus convention); subscribers connect to all they need.
+  perception_state_port: 5603           # perception_worker -> UI/map: depth, obstacle bar, poses
 
 perception:
   target_processing_fps: 10             # sub-sample 30 -> 10 into the GPU workers

@@ -31,6 +31,28 @@ D:\EXTEND\C2_SIM\XLAB\
   (the int64_t kernel patch in `third_party/MASt3R-SLAM/mast3r_slam/backend/src/*.cu` must be present
   — see `mast3r-slam-windows-build` memory).
 
+## Status: Milestone 3 DONE ✅ (depth overlay) — offline-verified + user-approved 2026-06-21
+_(Live wall-vs-glass flight is the M3 sign-off ritual; confirm it opportunistically during the M4
+flights — see the checklist at the bottom. User reviewed the offline overlay output and approved.)_
+- `perception_worker.py` written (P2, first GPU worker). Subscribes to the frame bus, runs **Depth
+  Anything V2** (`depth-anything/Depth-Anything-V2-Base-hf`) capped at `perception.depth_cadence_hz`
+  (3 Hz), derives a **forward-obstacle bar** (16 columns) + `forward_clearance` scalar + a coarse
+  18×32 proximity grid, publishes them as JSON on the state bus topic `depth`, and renders a live
+  `[ input | depth-colormap + obstacle-bar ]` window with telemetry.
+- **Offline self-test PASSED** (`perception_worker.py --self-test` on `test_assets/frame_a.png`):
+  DA-V2 loads 1.6 s / **0.39 GB VRAM**, infer ~340–470 ms, depth (288,512). On the recon frame the
+  wall reads mid-distance → obstacle bar ~0.20 (green/clear), `fwd_clearance` 0.80. Overlay saved to
+  `test_assets/perception_selftest.png`.
+- **Design choices made:** new **`perception_state_port: 5603`** in config — each PUB binds its own
+  port (frame_bus convention; io_bridge keeps 5602 for status/detect, perception owns 5603 for depth),
+  subscribers connect to both. **Depth semantics:** DA-V2 `-hf` relative model emits inverse depth
+  (larger = nearer); we robustly normalize (2nd/98th pctl) to `proximity ∈ [0,1]` (1=nearest, bright
+  in the INFERNO colormap). Glass reads as open air → low proximity = the corroborating signal M5
+  wants. Raw stats published too. **Obstacle band = 0.25–0.70 of frame height** (forward view; excludes
+  the floor directly beneath, which always reads "near" but is not a forward hazard) — a TUNABLE to
+  revisit during live flight. Uses `torch.autocast` fp16; no CPU fallback (fail-fast if no CUDA).
+- **NEXT (do FIRST on hardware):** live M3 verification — see checklist at the bottom.
+
 ## Status: Milestone 2 DONE ✅ (io_bridge + frame_bus) — verified on hardware 2026-06-21
 - `frame_bus.py`, `io_bridge.py`, `test_frame_subscriber.py` written and verified.
 - **Hardware verification PASSED** (user ran Xlab.exe + io_bridge + test_frame_subscriber): live frames
@@ -61,7 +83,9 @@ D:\EXTEND\C2_SIM\XLAB\
 - `io_bridge.py` — P1: NDI capture + 60 Hz TCP control server + keyboard, fail-fast init, publishes
   downscaled frames + status/detect events. Flags: `--debug-keys`, `--no-display`, `--config`.
 - `test_frame_subscriber.py` — M2 verification stand-in for perception_worker (prints fps/shape/latency).
-- NOT yet created: perception_worker.py, object_worker.py, map_store.py, visualizer.py, report.py, run.py.
+- `perception_worker.py` — P2 GPU worker. M3: DA-V2 depth → obstacle bar + clearance + coarse grid on
+  state bus :5603 + live overlay window. Flags: `--self-test`, `--no-display`, `--config`.
+- NOT yet created: object_worker.py, map_store.py, visualizer.py, report.py, run.py.
 
 ## Key technical facts already learned (don't re-derive)
 - **Sim protocol** (`../XLAB/Sample_Drone_Interface.py`): Python is the TCP **SERVER** (127.0.0.1:65432);
@@ -81,22 +105,26 @@ D:\EXTEND\C2_SIM\XLAB\
 - **Resolution:** transport 512×288 (16:9). MASt3R's own resize already produces 512×288 from
   1280×720 — do NOT anamorphically squash; letterbox if a model needs square.
 
-## NEXT: verify M2 on hardware, then start Milestone 3 — depth overlay
-M2 verification checklist (do this FIRST, with Xlab.exe running):
+## NEXT: live M3 verification on hardware (do this FIRST), then M4 — SLAM
+M3 live verification checklist (with Xlab.exe running):
   1. Start Xlab.exe (Unity).
-  2. `cd cartographer && venv\Scripts\python.exe io_bridge.py` — should print "Unity connected",
-     "Keyboard hook active", "Found NDI source", then "=== READY ===". Arm (1) and fly (WASD/arrows).
-  3. 2nd terminal: `venv\Scripts\python.exe test_frame_subscriber.py` — expect ~10 fps, 512×288,
-     low latency, and controls echoed live (trigger/yaw change as you fly). Press 'g' → DETECT REQUEST.
-  4. Confirm manual flight has NO lag while the subscriber runs. If keyboard does nothing, retry the
-     terminal as Administrator (the `keyboard` hook often needs it). If "No NDI sources", Unity isn't
-     streaming yet. Then M2 is signed off.
+  2. Terminal 1: `cd cartographer && venv\Scripts\python.exe io_bridge.py` → "=== READY ===".
+     Arm (1) and fly. (As Administrator if the keyboard hook is dead.)
+  3. Terminal 2: `venv\Scripts\python.exe perception_worker.py` → DA-V2 loads, "=== READY ===",
+     then a depth window appears `[ input | depth-colormap + obstacle-bar ]`. Expect ~3 Hz depth.
+  4. **Fly toward an opaque wall** → the wall region of the colormap brightens (proximity↑), the
+     central obstacle bars turn red, `fwd_clearance` drops toward 0. **Fly at the glass window** →
+     depth stays dark/"far" there, obstacle bars stay green even though you're driving forward (this
+     is exactly the corroborating signal the M5 glass detector relies on — SLAM stall = authoritative,
+     depth-open = corroboration).
+  5. Confirm io_bridge's 60 Hz manual flight has NO lag while perception runs. Then M3 is signed off.
+  - If the obstacle bar feels floor-dominated or mis-aimed, tune `BAND_TOP/BAND_BOTTOM` (currently
+    0.25/0.70) and `COL_NEAR_PCTL` at the top of `perception_worker.py`.
 
-Then **Milestone 3 — depth overlay** (first GPU worker): create `perception_worker.py` that
-subscribes to the frame bus, runs Depth Anything V2 (`depth-anything/Depth-Anything-V2-Base-hf`,
-already verified in M1) at ~2–3 Hz, and publishes a depth map + a forward-obstacle bar on the state
-bus; extend the visualizer/overlay to show it. *Verify:* fly toward a wall → depth collapses; fly at
-the glass → depth stays "far" (sets up the M5 glass detector's corroborating evidence).
+Then **Milestone 4 — SLAM + map**: add MASt3R-SLAM to `perception_worker` (same CUDA context, ~5–10 Hz
+tracking loop, depth stays the slower cadence), publish poses + pointmaps, and build `map_store.py`
+(voxel/occupancy + trajectory) with a Rerun / top-down view. *Verify:* fly a loop → globally
+consistent map. (See the plan file for M4–M6 detail.)
 
 ## Remaining milestones (see plan file for detail)
 - M3: Depth overlay (DA-V2) + forward-obstacle bar; verify depth collapses at walls, stays "far" at glass.
