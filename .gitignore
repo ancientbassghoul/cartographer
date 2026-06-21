@@ -1,0 +1,21 @@
+# Environments / builds — do not commit
+venv/
+third_party/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Model weights / caches / large assets
+*.pth
+*.pkl
+*.safetensors
+checkpoints/
+
+# Outputs / scratch
+test_assets/*.png
+OUTPUT/
+*.mp4
+*.log

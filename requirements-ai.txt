@@ -1,0 +1,22 @@
+# Unified cartographer env (Python 3.11, torch 2.5.1+cu121 installed separately via cu121 index).
+#
+# torch / torchvision are NOT listed here on purpose — they must come from the cu121 index:
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+
+# --- Base runtime (io_bridge, visualizer, map_store) ---
+opencv-python
+ndi-python
+keyboard
+PyYAML
+pyzmq                 # localhost message bus between processes
+rerun-sdk             # optional live 3D map viewer
+scipy                 # RANSAC plane fits, transforms in map_store
+
+# --- "Smart reader" models (Stream A) ---
+transformers>=4.49    # Qwen2.5-VL + Depth Anything V2 (AutoModelForDepthEstimation)
+accelerate            # device_map / offload
+bitsandbytes          # 4-bit quantization for Qwen2.5-VL
+qwen-vl-utils         # Qwen2.5-VL vision preprocessing (process_vision_info)
+huggingface_hub       # weight downloads
+einops                # required by several VLM code paths
+sentencepiece         # tokenizer backend
