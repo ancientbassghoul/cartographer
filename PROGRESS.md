@@ -1,7 +1,8 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated: 2026-06-21. Read this first when resuming with fresh context, alongside the
-design plan at `C:\Users\owner\.claude\plans\hey-read-this-file-breezy-otter.md`._
+_Last updated: 2026-06-22. Read this first when resuming with fresh context, alongside the
+design plan at `C:\Users\owner\.claude\plans\hey-read-this-file-breezy-otter.md`. **The single
+actionable resume pointer is the "## NEXT" section near the bottom.**_
 
 ## What this project is (1 paragraph)
 Assessment task: from the black-box **XLAB** Unity sim's single monocular drone feed, autonomously
@@ -34,7 +35,8 @@ D:\EXTEND\C2_SIM\XLAB\
   segfaults — see M4 below). To rebuild it: `build_lietorch.bat`. NEVER `pip install` upstream lietorch.
   Re-validate group ops: `venv\Scripts\python.exe lietorch_probe.py` (expects "ALL LIETORCH CASES PASSED").
 
-## Status: Milestone 4 UNBLOCKED ✅ (SLAM runs) — lietorch Windows patch applied 2026-06-21
+## Status: Milestone 4 — SLAM ✅ runs + ✅ offline map + ✅ map_store + ✅ live integration (offline-verified)
+_Remaining for M4: Task 3 = live top-down view, then on-hardware fly-a-loop sign-off. See "## NEXT" at bottom._
 - Built `slam_offline.py` to drive the FULL MASt3R-SLAM loop (tracker + FactorGraph + retrieval)
   over a recorded flight (`../XLAB/OUTPUT/flight_20260621_120829.mp4`), single-process, no viz.
   Diagnostics: `slam_match_probe.py`, `lietorch_probe.py`. Map export → `.ply` + `.npz` + top-down PNG.
@@ -57,9 +59,17 @@ D:\EXTEND\C2_SIM\XLAB\
   retrieval backend found loop-closure candidates, 2.08M world points, ~2 fps, peak 7.2 GB. Map artifacts
   in `OUTPUT/`: `*_cloud.ply`, `*_map.npz`, `*_topdown.png`. Top-down shows a globally-consistent
   room/corridor with coherent walls + a clean forward trajectory. **Offline SLAM milestone done.**
-- **NEXT (rest of M4):** integrate SLAM into the live `perception_worker` (share its CUDA context with
-  DA-V2, depth at the slower cadence) + build `map_store.py` (voxel/occupancy + trajectory) + a live
-  view. Then the live verification fly-through.
+- **Live integration DONE + offline-verified 2026-06-22.** `slam_engine.py` wraps the proven loop as a
+  streaming `SlamEngine.process(rgb)->SlamResult` (lazy/side-effect-free import; chdir's into the SLAM
+  repo only on init). `perception_worker.py` now runs **SLAM every frame + DA-V2 throttled in ONE CUDA
+  context**, fuses each new keyframe's pointmap into an in-process `MapStore`, and publishes TOPIC_POSE
+  (+TOPIC_DEPTH) — never raw pointmaps. New offline mode `perception_worker.py --video <mp4>` drives the
+  whole pipeline from a recording and exports the map. **Verified vs the slam_offline reference:** full
+  587-frame pass → **22 keyframes, 0 reloc** (tracking never lost), 2.37M pts → 58K voxels, **peak 7.57 GB**
+  (DA-V2+SLAM together), ~2 fps; `*_livemap_topdown.png` is structurally identical to the offline map.
+- **NEXT (rest of M4):** Task 3 = live top-down view subscribing to the bus (OpenCV first; Rerun optional),
+  then the on-hardware fly-a-loop sign-off (globally consistent LIVE map). Note: a `perception_worker`
+  from the M3 test was still holding state port :5603 — kill stray workers before a live run.
 
 ## Status: Milestone 3 DONE ✅ (depth overlay) — LIVE wall-vs-glass SIGNED OFF 2026-06-22
 _(Live hardware fly-through complete. Opaque surfaces read near/red, clearance collapses on approach
@@ -121,8 +131,14 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
 - `io_bridge.py` — P1: NDI capture + 60 Hz TCP control server + keyboard, fail-fast init, publishes
   downscaled frames + status/detect events. Flags: `--debug-keys`, `--no-display`, `--config`.
 - `test_frame_subscriber.py` — M2 verification stand-in for perception_worker (prints fps/shape/latency).
-- `perception_worker.py` — P2 GPU worker. M3: DA-V2 depth → obstacle bar + clearance + coarse grid on
-  state bus :5603 + live overlay window. Flags: `--self-test`, `--no-display`, `--config`.
+- `perception_worker.py` — P2 GPU worker. M3: DA-V2 depth → obstacle bar/clearance/grid. M4: + SLAM
+  every frame (via `slam_engine`) fused into an in-process `MapStore`; publishes TOPIC_POSE + TOPIC_DEPTH
+  on :5603; depth/map windows. `Pipeline.step()` is the shared per-frame body. Flags: `--self-test`,
+  `--video <mp4>` (offline: full pipeline from a recording + map export), `--stride`, `--max-frames`,
+  `--conf-thresh`, `--out`, `--no-display`, `--config`.
+- `slam_engine.py` — M4: `SlamEngine` streaming wrapper around the MASt3R-SLAM loop (INIT/TRACKING/RELOC
+  + backend + retrieval) extracted from `slam_offline.py`; `process(rgb)->SlamResult` (mode, pose,
+  new-keyframe world points+colors). Lazy import + chdir-on-init so importing it is side-effect-free.
 - `slam_offline.py` — M4 de-risk: drives the FULL MASt3R-SLAM loop over a recorded mp4 (single-process,
   no viz; in-process `InProcessManager` shim), exports `.ply`/`.npz`/top-down PNG. Flags: `--video`,
   `--stride`, `--max-frames`, `--conf-thresh`, `--out`. Run unbuffered (`$env:PYTHONUNBUFFERED=1`).
@@ -164,24 +180,34 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
   shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
   `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
 
-## NEXT: M4 — live SLAM integration (M3 live sign-off DONE 2026-06-22, see M3 status block)
-The M3 live wall/glass fly-through is complete (results recorded in the M3 status block above). To
-re-run perception on hardware later: Xlab.exe → `venv\Scripts\python.exe io_bridge.py` (Terminal 1,
-arm with 1; Administrator if the keyboard hook is dead) → `venv\Scripts\python.exe perception_worker.py`
-(Terminal 2). Tunables if the obstacle bar feels floor-dominated/mis-aimed: `BAND_TOP/BAND_BOTTOM`
-(0.25/0.70) and `COL_NEAR_PCTL` at the top of `perception_worker.py`.
+## NEXT: M4 Task 3 — live top-down map view (the resume point)
+Everything upstream is DONE and offline-verified (see the M4 status block up top). The remaining M4
+work is **Task 3: a live map view + the on-hardware fly-a-loop sign-off.**
 
-**Milestone 4 — SLAM + map (offline done; live integration is the resume point):** offline SLAM is
-proven (`slam_offline.py` → consistent map, see status above). REMAINING: add MASt3R-SLAM to the live
-`perception_worker` (same CUDA context as DA-V2, depth stays the slower cadence), publish poses +
-pointmaps on the state bus, and build `map_store.py` (voxel/occupancy + trajectory) with a top-down /
-Rerun view. *Verify:* fly a loop → globally consistent live map. (See the plan file for M4–M6 detail.)
-Reuse the driving loop + map-export logic already in `slam_offline.py`.
+**Task 3 — build the live top-down view.** A small subscriber process (e.g. `visualizer.py`, or extend
+the existing map window) that connects to the perception state bus on :5603, reads **TOPIC_POSE**
+(`tracking_mode`, `mode`, `n_keyframes`, `n_voxels`, `camera_center`, `reloc_event`) and **TOPIC_DEPTH**,
+and renders the growing map + trajectory live. OpenCV first per the plan (Rerun optional). Decisions
+already settled (don't re-litigate): pointmaps stay in-process inside `perception_worker` (too big for
+the JSON bus) — so the live map is rendered *inside* perception_worker (it already opens a MAP_WINDOW
+via `MapStore.render_topdown`) OR the viewer renders only the compact pose/voxel summary. Simplest path:
+have perception_worker also publish a small downsampled occupancy summary on a new topic, and let
+`visualizer.py` compose depth + map + flags. Confirm the exact split with the user (checkpoint culture).
+
+**Then the on-hardware fly-a-loop sign-off (needs the user flying):**
+1. Kill any stray `perception_worker` first (one from the M3 test was holding :5603).
+2. Xlab.exe → Terminal 1 `venv\Scripts\python.exe io_bridge.py` (arm with 1; Admin if keyboard hook dead).
+3. Terminal 2 `venv\Scripts\python.exe perception_worker.py` → SLAM+depth+map windows.
+4. Fly a loop → confirm the LIVE map is globally consistent (matches the offline map's room/corridor).
+- Offline re-verify anytime (no hardware): `perception_worker.py --video ../XLAB/OUTPUT/flight_20260621_120829.mp4`
+  → exports `OUTPUT/*_livemap_topdown.png` (22 kf, 0 reloc, peak ~7.6 GB is the known-good baseline).
+- Depth obstacle-bar tunables if needed: `BAND_TOP/BAND_BOTTOM` (0.25/0.70) + `COL_NEAR_PCTL` in `perception_worker.py`.
 
 ## Remaining milestones (see plan file for detail)
 - M3: Depth overlay (DA-V2) ✅ offline AND ✅ live wall/glass fly-through signed off on hardware 2026-06-22.
-- M4: SLAM engine ✅ runs on Windows + offline map verified; REMAINING = live perception_worker
-  integration + `map_store.py` voxel/trajectory + top-down/Rerun view.
+- M4: SLAM engine ✅ Windows + ✅ offline map + ✅ `map_store.py` voxel/trajectory + ✅ live
+  perception_worker integration (offline-verified 2026-06-22); REMAINING = live top-down view (Task 3)
+  + on-hardware fly-a-loop sign-off.
 - M5: glass detector (SLAM translation≈0 while forward-commanded = authoritative) + opening detector
   (RANSAC wall planes, gaps vs drone clearance).
 - M6: object_worker (Qwen multi-image: reference crop + live frame, hotkey 'g'); DINOv2 fallback is
