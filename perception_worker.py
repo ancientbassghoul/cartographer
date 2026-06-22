@@ -54,6 +54,8 @@ BAND_BOTTOM = 0.70          # excluding the floor directly beneath (always "near
 COL_NEAR_PCTL = 75          # per-column near-ness = this percentile of proximity (emphasize near)
 GRID_ROWS, GRID_COLS = 18, 32   # coarse proximity grid shipped on the bus for the map/UI
 
+MAP_GRID = 200              # resolution of the compact top-down occupancy summary on TOPIC_MAP
+
 
 def load_config(path=None):
     path = path or os.path.join(REPO, "config.yaml")
@@ -246,6 +248,12 @@ class Pipeline:
                 "new_keyframe": res.new_keyframe, "reloc_event": res.reloc_event,
                 "slam_ms": round(slam_ms, 1),
             })
+            # Compact top-down occupancy snapshot — only when the map actually grew (a new
+            # keyframe), i.e. ~once/keyframe, so the bus stays light. Each message is a full
+            # self-contained snapshot, so a late-joining visualizer catches up on the next one.
+            if map_updated:
+                state_pub.publish(frame_bus.TOPIC_MAP,
+                                  self._map_payload(res, meta))
 
         # --- DA-V2 depth, throttled to the slower cadence ---
         now = time.monotonic()
@@ -284,6 +292,24 @@ class Pipeline:
             ]
             panel = render(frame_bgr, proximity, bars, telem)
         return res, payload, panel, map_updated
+
+    def _map_payload(self, res, meta):
+        """Serialize MapStore.topdown_summary() to a JSON-able TOPIC_MAP payload.
+
+        Colors are packed to one 0xRRGGBB int per cell to keep the snapshot compact.
+        """
+        s = self.mapstore.topdown_summary(grid=MAP_GRID)
+        rgb = s["cells_rgb"].astype(np.int32)
+        packed = (rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2]
+        return {
+            "tracking_mode": s["tracking_mode"], "grid": s["grid"],
+            "bounds": s["bounds"], "span_world": round(s["span_world"], 3),
+            "n_voxels": s["n_voxels_kept"], "n_keyframes": res.n_keyframes,
+            "cells_u": s["cells_u"].tolist(), "cells_v": s["cells_v"].tolist(),
+            "cells_rgb": packed.tolist(),
+            "traj_u": s["traj_u"].tolist(), "traj_v": s["traj_v"].tolist(),
+            "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
+        }
 
 
 # ==============================================================================
@@ -359,8 +385,13 @@ def _video_frames(path, stride, max_frames, proc_w, proc_h):
 
 
 def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
-                      out_dir=None, conf_thresh=1.5):
-    """M4 offline verification: drive the full pipeline from a recorded mp4, export the map."""
+                      out_dir=None, conf_thresh=1.5, publish=False):
+    """M4 offline verification: drive the full pipeline from a recorded mp4, export the map.
+
+    With `publish=True` it ALSO publishes TOPIC_POSE/DEPTH/MAP on the perception state bus,
+    so `visualizer.py` can be exercised against a recording with no hardware/NDI. Default
+    off so a plain export run stays self-contained and never collides with a live worker.
+    """
     from pathlib import Path
     # Resolve to absolute BEFORE Pipeline()/SlamEngine chdir's into the SLAM repo.
     video = Path(video).resolve()
@@ -371,9 +402,13 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     proc_h = cfg["perception"]["processing_height"]
 
     pipe = Pipeline(cfg, conf_thresh=conf_thresh)
-    # Offline mode is self-contained: it builds + exports the map and does NOT touch the
-    # state bus (no subscribers, and avoids colliding with a live worker on the same port).
+    # Offline mode is self-contained by default: it builds + exports the map and does NOT
+    # touch the state bus. --publish opts into the live bus to drive the visualizer offline.
     state_pub = None
+    if publish:
+        state_pub = frame_bus.StatePublisher(cfg["network"]["perception_state_port"])
+        print(f"[perception] OFFLINE --publish: state bus PUB "
+              f":{state_pub.port} (TOPIC_POSE+DEPTH+MAP) for visualizer.py")
     print(f"[perception] OFFLINE video={video.name} stride={stride} "
           f"max_frames={max_frames or 'all'} | exporting to {out_dir}")
     print("[perception] === READY === processing recording (SLAM + depth + map).\n")
@@ -459,6 +494,9 @@ def main():
     parser.add_argument("--conf-thresh", type=float, default=1.5,
                         help="per-point confidence cutoff for pointmaps fed into the map")
     parser.add_argument("--out", default=None, help="offline: output dir (default: OUTPUT/)")
+    parser.add_argument("--publish", action="store_true",
+                        help="offline: also publish TOPIC_POSE/DEPTH/MAP on the state bus "
+                             "(drives visualizer.py from a recording, no hardware)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -466,7 +504,8 @@ def main():
         run_self_test(cfg)
     elif args.video:
         run_offline_video(cfg, args.video, show=not args.no_display, stride=args.stride,
-                          max_frames=args.max_frames, out_dir=args.out, conf_thresh=args.conf_thresh)
+                          max_frames=args.max_frames, out_dir=args.out,
+                          conf_thresh=args.conf_thresh, publish=args.publish)
     else:
         run_live(cfg, show=not args.no_display, conf_thresh=args.conf_thresh)
 

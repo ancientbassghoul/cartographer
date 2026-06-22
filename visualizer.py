@@ -1,0 +1,260 @@
+"""visualizer.py — Process P3: the live dashboard (M4 Task 3).
+
+A read-only consumer that subscribes to the perception state bus (`perception_state_port`,
+default :5603) and composes a single OpenCV window from three topics published by
+`perception_worker`:
+
+  * TOPIC_MAP   -> the growing top-down (X-Z) occupancy map + camera trajectory. The worker
+                   keeps the dense per-keyframe pointmaps in-process (far too big for the JSON
+                   bus) and ships only a compact, downsampled occupancy *summary* — a sparse
+                   list of occupied grid cells + colors + the trajectory, already in pixel
+                   coords (see MapStore.topdown_summary). Each message is a full snapshot, so
+                   joining late just means catching up on the next keyframe.
+  * TOPIC_DEPTH -> the coarse proximity grid + forward-obstacle bar + forward_clearance.
+  * TOPIC_POSE  -> SLAM mode, tracking_mode, keyframe/voxel counts, reloc events.
+
+It also (optionally) subscribes to the frame bus (`frame_bus_port`, default :5601) to show the
+live input frame next to the depth view — the frame bus is conflated PUB/SUB, so an extra
+subscriber is free and never steals frames from the perception worker.
+
+This process owns no GPU and no SLAM; it is pure display. NO SILENT FALLBACKS (per CLAUDE.md):
+`tracking_mode` and reloc events are surfaced prominently in the status strip — a degraded or
+non-default SLAM state is always visible, never hidden. If nothing has been received yet the
+panels say so rather than faking content.
+
+Layout:  [ status strip                         ]
+         [ input frame ] [                        ]
+         [ depth+bar   ] [   top-down map + traj  ]
+"""
+
+import argparse
+import os
+import time
+
+import cv2
+import numpy as np
+import yaml
+
+import frame_bus
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+WINDOW = "Cartographer — live dashboard"
+
+PANEL_W, PANEL_H = 416, 234   # the two 16:9 left-column panels (input + depth)
+GAP = 12
+MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left column
+STATUS_H = 30
+RELOC_FLASH_S = 2.0           # keep the RELOC banner up this long after the event
+
+
+def load_config(path=None):
+    path = path or os.path.join(REPO, "config.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# Panel renderers
+# ---------------------------------------------------------------------------
+def _placeholder(w, h, text):
+    p = np.full((h, w, 3), 30, np.uint8)
+    cv2.putText(p, text, (10, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+    return p
+
+
+def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
+    if frame is None:
+        return _placeholder(w, h, "input: no frame bus")
+    p = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+    cv2.putText(p, "input", (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    return p
+
+
+def render_depth_panel(depth, w=PANEL_W, h=PANEL_H):
+    if not depth:
+        return _placeholder(w, h, "depth: waiting...")
+    grid = np.asarray(depth.get("depth_grid", []), np.float32)
+    if grid.size == 0:
+        return _placeholder(w, h, "depth: empty grid")
+    u8 = np.clip(grid * 255.0, 0, 255).astype(np.uint8)
+    color = cv2.applyColorMap(u8, cv2.COLORMAP_INFERNO)         # bright = near
+    color = cv2.resize(color, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    # Forward-obstacle bar across the bottom (green=clear -> red=near), mirroring the worker.
+    bars = depth.get("obstacle_bar") or []
+    bar_h = max(22, h // 5)
+    cv2.rectangle(color, (0, h - bar_h), (w, h), (0, 0, 0), -1)
+    if bars:
+        edges = np.linspace(0, w, len(bars) + 1, dtype=int)
+        for i, near in enumerate(bars):
+            bh = int(near * (bar_h - 4))
+            c = (0, int(255 * (1 - near)), int(255 * near))
+            cv2.rectangle(color, (edges[i] + 1, h - 2 - bh), (edges[i + 1] - 1, h - 2), c, -1)
+    cv2.putText(color, f"depth (bright=near)  fwd_clear={depth.get('forward_clearance')}",
+                (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+    return color
+
+
+def render_map_panel(m, size=MAP_SIZE):
+    img = np.full((size, size, 3), 18, np.uint8)
+    if not m or not m.get("cells_u"):
+        cv2.putText(img, "map: waiting for keyframes...", (12, size // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1)
+        return img
+
+    grid = int(m["grid"])
+    scale = size / grid
+    u = np.asarray(m["cells_u"], np.int64)
+    v = np.asarray(m["cells_v"], np.int64)
+    packed = np.asarray(m["cells_rgb"], np.int64)
+    bgr = np.stack([packed & 255, (packed >> 8) & 255, (packed >> 16) & 255], axis=1).astype(np.uint8)
+    uu = np.clip((u * scale).astype(int), 0, size - 1)
+    vv = np.clip((v * scale).astype(int), 0, size - 1)
+    ps = max(1, int(round(scale)))  # thicken each cell so the occupancy reads clearly
+    if ps <= 1:
+        img[vv, uu] = bgr
+    else:
+        for du in range(ps):
+            for dv in range(ps):
+                img[np.clip(vv + dv, 0, size - 1), np.clip(uu + du, 0, size - 1)] = bgr
+
+    tu = np.asarray(m.get("traj_u") or [], np.int64)
+    tv = np.asarray(m.get("traj_v") or [], np.int64)
+    if len(tu) > 1:
+        pts = np.stack([np.clip((tu * scale).astype(int), 0, size - 1),
+                        np.clip((tv * scale).astype(int), 0, size - 1)], axis=1).astype(np.int32)
+        cv2.polylines(img, [pts], False, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.circle(img, tuple(pts[0]), 6, (0, 255, 0), -1)    # start
+        cv2.circle(img, tuple(pts[-1]), 6, (0, 255, 255), -1)  # end (drone now)
+
+    cv2.putText(img, f"top-down X-Z  {m.get('n_voxels')} vox  {m.get('n_keyframes')} kf  "
+                f"~{m.get('span_world')}u  mode={m.get('tracking_mode')}",
+                (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    cv2.putText(img, "traj: green=start  yellow=now  (red path)", (8, size - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1)
+    return img
+
+
+def render_status(pose, depth, width, reloc_active):
+    strip = np.full((STATUS_H, width, 3), 45, np.uint8)
+    if pose is None:
+        cv2.putText(strip, "waiting for perception_worker on the state bus ...", (8, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        return strip
+    tm = pose.get("tracking_mode")
+    txt = (f"tracking={tm}  SLAM={pose.get('mode')}  kf={pose.get('n_keyframes')}  "
+           f"vox={pose.get('n_voxels')}  slam={pose.get('slam_ms')}ms")
+    if depth:
+        txt += f"  fwd_clear={depth.get('forward_clearance')}  depth={depth.get('infer_ms')}ms"
+    # Default tracking mode = green; anything else = orange (a fallback must never be silent).
+    col = (0, 255, 0) if tm == "MASt3R" else (0, 165, 255)
+    cv2.putText(strip, txt, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+    if reloc_active:
+        cv2.putText(strip, "RELOC!", (width - 95, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    return strip
+
+
+# ---------------------------------------------------------------------------
+# Dashboard state
+# ---------------------------------------------------------------------------
+class Dashboard:
+    """Holds the latest payload per topic + the latest frame, and composes the window.
+
+    The map panel is cached and only re-rendered when a new TOPIC_MAP snapshot arrives
+    (~once per keyframe); the cheap depth/frame panels redraw every tick.
+    """
+
+    def __init__(self):
+        self.frame = None
+        self.pose = None
+        self.depth = None
+        self.map = None
+        self._map_img = None
+        self._map_sig = None
+        self._last_reloc = 0.0
+
+    def update(self, topic, payload):
+        if topic == "pose":
+            self.pose = payload
+            if payload.get("reloc_event"):
+                self._last_reloc = time.monotonic()
+        elif topic == "depth":
+            self.depth = payload
+        elif topic == "map":
+            self.map = payload
+            self._map_img = None  # invalidate cache
+
+    def _map_image(self):
+        sig = None if self.map is None else (self.map.get("n_keyframes"), self.map.get("frame_id"))
+        if self._map_img is None or sig != self._map_sig:
+            self._map_img = render_map_panel(self.map)
+            self._map_sig = sig
+        return self._map_img
+
+    def render(self):
+        frame_p = render_frame_panel(self.frame)
+        depth_p = render_depth_panel(self.depth)
+        map_p = self._map_image()
+
+        col_gap = np.zeros((GAP, PANEL_W, 3), np.uint8)
+        left = np.vstack([frame_p, col_gap, depth_p])          # (MAP_SIZE, PANEL_W)
+        row_gap = np.zeros((left.shape[0], GAP, 3), np.uint8)
+        body = np.hstack([left, row_gap, map_p])               # (MAP_SIZE, width)
+
+        reloc_active = (time.monotonic() - self._last_reloc) < RELOC_FLASH_S
+        status = render_status(self.pose, self.depth, body.shape[1], reloc_active)
+        return np.vstack([status, body])
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def run(cfg, show_frame=True):
+    pstate_port = cfg["network"]["perception_state_port"]
+    frame_port = cfg["network"]["frame_bus_port"]
+    state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/depth/map)
+    frame_sub = frame_bus.FrameSubscriber(frame_port) if show_frame else None
+
+    print(f"[visualizer] state bus SUB :{pstate_port} (pose+depth+map)"
+          + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF"))
+    print("[visualizer] === READY === waiting for perception_worker ('q' to quit).\n")
+
+    dash = Dashboard()
+    try:
+        while True:
+            # Drain the (non-conflated) state bus so we always render the freshest of each topic.
+            got = state_sub.recv(timeout_ms=30)
+            while got is not None:
+                dash.update(*got)
+                got = state_sub.recv(timeout_ms=0)
+            if frame_sub is not None:
+                fr = frame_sub.recv(timeout_ms=0)
+                if fr is not None:
+                    dash.frame = fr[0]
+            cv2.imshow(WINDOW, dash.render())
+            if (cv2.waitKey(15) & 0xFF) == ord("q"):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("[visualizer] shutting down ...")
+        state_sub.close()
+        if frame_sub is not None:
+            frame_sub.close()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cartographer visualizer (P3): live map + depth dashboard")
+    ap.add_argument("--config", default=None)
+    ap.add_argument("--no-frame", action="store_true",
+                    help="don't subscribe to the frame bus (skip the live input panel)")
+    args = ap.parse_args()
+    run(load_config(args.config), show_frame=not args.no_frame)
+
+
+if __name__ == "__main__":
+    main()

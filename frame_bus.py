@@ -31,6 +31,7 @@ import zmq
 # Topic strings for the (non-conflated) state bus.
 TOPIC_POSE = b"pose"
 TOPIC_DEPTH = b"depth"
+TOPIC_MAP = b"map"          # perception_worker -> visualizer: compact top-down occupancy summary
 TOPIC_DETECTION = b"detection"
 TOPIC_STATUS = b"status"
 

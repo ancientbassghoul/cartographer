@@ -35,8 +35,21 @@ D:\EXTEND\C2_SIM\XLAB\
   segfaults — see M4 below). To rebuild it: `build_lietorch.bat`. NEVER `pip install` upstream lietorch.
   Re-validate group ops: `venv\Scripts\python.exe lietorch_probe.py` (expects "ALL LIETORCH CASES PASSED").
 
-## Status: Milestone 4 — SLAM ✅ runs + ✅ offline map + ✅ map_store + ✅ live integration (offline-verified)
-_Remaining for M4: Task 3 = live top-down view, then on-hardware fly-a-loop sign-off. See "## NEXT" at bottom._
+## Status: Milestone 4 DONE ✅ — SLAM + offline map + map_store + live perception_worker + live
+## dashboard (visualizer.py) + ON-HARDWARE FLY-A-LOOP SIGNED OFF 2026-06-22
+_M4 fully complete. `visualizer.py` (Task 3) built + verified; the live dashboard was watched during a
+real fly-a-loop and the live map was globally consistent (user sign-off 2026-06-22). Next milestone =
+M5 (glass + opening detector). See "## NEXT" for the M5 resume pointer._
+
+### PARKED (raised 2026-06-22, defer to autonomy): live point-cloud save + 3D flight replay
+Live flights currently do NOT auto-save the map — only the offline `--video` path exports
+(`*_livemap.npz` = voxel centers+colors+**trajectory**; `slam_offline.py` dumps a dense `.ply`). The
+user wants the *live* run to also persist the cloud so the flight can be replayed/recreated in 3D.
+Small change: add a save-on-exit (and/or a snapshot hotkey) to `run_live` calling
+`MapStore.save_npz` + `render_topdown`, optionally streaming the dense per-keyframe pointmaps. This is
+flagged as important for **Phase-2 autonomy**: the planner needs the voxel occupancy + pointmaps to
+reason about free space and gap-vs-drone-clearance ("which holes can I fly through"). Do when we start
+autonomy, not before.
 - Built `slam_offline.py` to drive the FULL MASt3R-SLAM loop (tracker + FactorGraph + retrieval)
   over a recorded flight (`../XLAB/OUTPUT/flight_20260621_120829.mp4`), single-process, no viz.
   Diagnostics: `slam_match_probe.py`, `lietorch_probe.py`. Map export → `.ply` + `.npz` + top-down PNG.
@@ -152,7 +165,12 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
   numpy, no ZMQ/torch) so it runs in-process inside perception_worker AND is offline-testable. Offline
   build vs the 2.08M-pt npz: 52.6K voxels (39.5x), coherent top-down. Flags: `--npz`, `--voxel-size`,
   `--min-count`, `--chunks`, `--out`.
-- NOT yet created: object_worker.py, visualizer.py, report.py, run.py.
+- `visualizer.py` — M4 Task 3: P3 live dashboard. Read-only SUB on the perception state bus
+  (:5603) for TOPIC_POSE+TOPIC_DEPTH+**TOPIC_MAP** (+ optional frame-bus :5601 for the input
+  panel). Composes [status strip | input | depth+bar | top-down map+traj]. Caches the map
+  render (redraws only on a new keyframe snapshot). Surfaces tracking_mode/reloc visibly
+  (NO SILENT FALLBACKS). Flags: `--no-frame`, `--config`. No GPU/SLAM — pure display.
+- NOT yet created: object_worker.py, report.py, run.py.
 
 ## Key technical facts already learned (don't re-derive)
 - **Sim protocol** (`../XLAB/Sample_Drone_Interface.py`): Python is the TCP **SERVER** (127.0.0.1:65432);
@@ -180,34 +198,33 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
   shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
   `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
 
-## NEXT: M4 Task 3 — live top-down map view (the resume point)
-Everything upstream is DONE and offline-verified (see the M4 status block up top). The remaining M4
-work is **Task 3: a live map view + the on-hardware fly-a-loop sign-off.**
+## NEXT: M5 — glass detector + opening detector (the resume point)
+**M4 is DONE** (live dashboard + on-hardware fly-a-loop signed off 2026-06-22). Start M5:
+- **Glass detector:** when the drone is **forward-commanded** (controls.trigger>0) but SLAM camera
+  translation ≈ 0 over `map.glass_stall_seconds` (1.5 s), declare a **virtual wall** there. This is
+  AUTHORITATIVE; depth reading "open air" is only corroborating (M3 confirmed DA-V2 can't see glass —
+  it'd fly you into it). Surface as a visible state flag (no silent fallbacks) + draw it on the map.
+- **Opening detector:** fit wall planes (RANSAC) to the voxel map, find gaps in the walls, compare gap
+  width to `map.drone_clearance_m` (0.30) → passable vs not. Feeds the Phase-2 planner.
+- The frame bus already carries `controls` per frame (trigger/yaw/etc.) — the glass detector needs
+  "forward-commanded", which is in `meta["controls"]`. Camera translation = delta of `res.camera_center`.
 
-**Task 3 — build the live top-down view.** A small subscriber process (e.g. `visualizer.py`, or extend
-the existing map window) that connects to the perception state bus on :5603, reads **TOPIC_POSE**
-(`tracking_mode`, `mode`, `n_keyframes`, `n_voxels`, `camera_center`, `reloc_event`) and **TOPIC_DEPTH**,
-and renders the growing map + trajectory live. OpenCV first per the plan (Rerun optional). Decisions
-already settled (don't re-litigate): pointmaps stay in-process inside `perception_worker` (too big for
-the JSON bus) — so the live map is rendered *inside* perception_worker (it already opens a MAP_WINDOW
-via `MapStore.render_topdown`) OR the viewer renders only the compact pose/voxel summary. Simplest path:
-have perception_worker also publish a small downsampled occupancy summary on a new topic, and let
-`visualizer.py` compose depth + map + flags. Confirm the exact split with the user (checkpoint culture).
-
-**Then the on-hardware fly-a-loop sign-off (needs the user flying):**
-1. Kill any stray `perception_worker` first (one from the M3 test was holding :5603).
+### Live-run launch procedure (reference — used for the M4 fly-a-loop, reuse for M5):
+1. Kill any stray `perception_worker`/`visualizer` first (a stray PUB on :5603 makes the worker fail-fast on bind).
 2. Xlab.exe → Terminal 1 `venv\Scripts\python.exe io_bridge.py` (arm with 1; Admin if keyboard hook dead).
-3. Terminal 2 `venv\Scripts\python.exe perception_worker.py` → SLAM+depth+map windows.
-4. Fly a loop → confirm the LIVE map is globally consistent (matches the offline map's room/corridor).
-- Offline re-verify anytime (no hardware): `perception_worker.py --video ../XLAB/OUTPUT/flight_20260621_120829.mp4`
-  → exports `OUTPUT/*_livemap_topdown.png` (22 kf, 0 reloc, peak ~7.6 GB is the known-good baseline).
+3. Terminal 2 `venv\Scripts\python.exe perception_worker.py --no-display` (SLAM+depth; PUBs TOPIC_MAP on :5603 every keyframe).
+4. Terminal 3 `venv\Scripts\python.exe visualizer.py` → live dashboard (input+depth+top-down map).
+- Offline re-verify anytime (no hardware, drives the dashboard too with `--publish`):
+  `perception_worker.py --video ../XLAB/OUTPUT/flight_20260621_120829.mp4 [--publish --no-display]`
+  → exports `OUTPUT/*_livemap_topdown.png` (known-good baseline: 22 kf, 0 reloc, peak ~7.6 GB, 58044 voxels).
+  Pair with `visualizer.py --no-frame` to watch it grow.
 - Depth obstacle-bar tunables if needed: `BAND_TOP/BAND_BOTTOM` (0.25/0.70) + `COL_NEAR_PCTL` in `perception_worker.py`.
 
 ## Remaining milestones (see plan file for detail)
 - M3: Depth overlay (DA-V2) ✅ offline AND ✅ live wall/glass fly-through signed off on hardware 2026-06-22.
 - M4: SLAM engine ✅ Windows + ✅ offline map + ✅ `map_store.py` voxel/trajectory + ✅ live
-  perception_worker integration (offline-verified 2026-06-22); REMAINING = live top-down view (Task 3)
-  + on-hardware fly-a-loop sign-off.
+  perception_worker integration + ✅ live dashboard (`visualizer.py`, Task 3) + ✅ on-hardware
+  fly-a-loop signed off 2026-06-22. **DONE.**
 - M5: glass detector (SLAM translation≈0 while forward-commanded = authoritative) + opening detector
   (RANSAC wall planes, gaps vs drone clearance).
 - M6: object_worker (Qwen multi-image: reference crop + live frame, hotkey 'g'); DINOv2 fallback is

@@ -159,6 +159,79 @@ class MapStore:
             "compression_x": round(self.n_points_seen / max(n, 1), 1),
         }
 
+    # ------------------------------------------------------------------ live summary
+    def topdown_summary(self, grid: int = 200, pad: float = 0.06, min_count: int = 1):
+        """Compact top-down (X-Z) occupancy summary for the live state bus.
+
+        Rasterizes the occupied voxels onto a `grid`x`grid` ground plane using the SAME
+        robust 1st/99th-pct bounds + axis convention as `render_topdown` (X right, +Z up),
+        and returns ONLY the occupied cells (sparse) plus the trajectory, already in
+        pixel row/col space (v=0 at the top, +Z up) so a viewer can plot them directly with
+        no knowledge of world coords. Per cell we keep the count-weighted mean color.
+
+        Transport-agnostic: numpy out; the caller serializes for the bus. Each summary is a
+        self-contained snapshot of the whole map, so a late-joining subscriber catches up
+        fully on the next publish (no incremental state to miss).
+        """
+        grid = int(grid)
+        out = {
+            "grid": grid, "tracking_mode": self.tracking_mode,
+            "voxel_size": self.voxel_size, "n_voxels_kept": 0,
+            "bounds": None, "span_world": 0.0,
+            "cells_u": np.zeros(0, np.int32), "cells_v": np.zeros(0, np.int32),
+            "cells_rgb": np.zeros((0, 3), np.uint8),
+            "traj_u": np.zeros(0, np.int32), "traj_v": np.zeros(0, np.int32),
+        }
+        n = len(self._keys)
+        if n == 0:
+            return out
+        keys = np.asarray(self._keys, dtype=np.int64)
+        count = self._count[:n]
+        keep = count >= min_count
+        if not keep.any():
+            return out
+        keys, count = keys[keep], count[keep]
+        csum = self._color_sum[:n][keep]
+        centers = (keys + 0.5) * self.voxel_size
+        color = (csum / count[:, None]).clip(0, 255)  # count-weighted mean RGB (float)
+
+        X, Z = centers[:, 0], centers[:, 2]
+        xlo, xhi = np.percentile(X, 1), np.percentile(X, 99)
+        zlo, zhi = np.percentile(Z, 1), np.percentile(Z, 99)
+        span = max(xhi - xlo, zhi - zlo, 1e-6)
+        cx, cz = (xlo + xhi) / 2, (zlo + zhi) / 2
+        half = span * (0.5 + pad)
+        x0, z0 = cx - half, cz - half
+        scale = (grid - 1) / (2 * half)
+
+        def to_cell(x, z):
+            u = np.clip((x - x0) * scale, 0, grid - 1).astype(np.int64)
+            vraw = np.clip((z - z0) * scale, 0, grid - 1).astype(np.int64)
+            return u, (grid - 1) - vraw  # flip so +Z reads "up", matching render_topdown
+
+        u, v = to_cell(X, Z)
+        lin = v * grid + u
+        uniq, invix = np.unique(lin, return_inverse=True)
+        cell_cnt = np.bincount(invix, weights=count, minlength=len(uniq))
+        cell_rgb = np.stack(
+            [np.bincount(invix, weights=color[:, c] * count, minlength=len(uniq))
+             for c in range(3)],
+            axis=1,
+        ) / cell_cnt[:, None]
+
+        out["cells_v"] = (uniq // grid).astype(np.int32)
+        out["cells_u"] = (uniq % grid).astype(np.int32)
+        out["cells_rgb"] = cell_rgb.clip(0, 255).astype(np.uint8)
+        out["n_voxels_kept"] = int(len(centers))
+        out["bounds"] = [float(x0), float(x0 + 2 * half), float(z0), float(z0 + 2 * half)]
+        out["span_world"] = float(2 * half)
+
+        traj = self.trajectory_array()
+        if len(traj):
+            tu, tv = to_cell(traj[:, 0], traj[:, 2])
+            out["traj_u"], out["traj_v"] = tu.astype(np.int32), tv.astype(np.int32)
+        return out
+
     # ------------------------------------------------------------------ export
     def save_npz(self, path, min_count: int = 1):
         centers, colors = self.occupied(min_count)
