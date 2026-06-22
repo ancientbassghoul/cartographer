@@ -1,7 +1,6 @@
 # Cartographer — Progress & Resume Handoff
 
 _Last updated: 2026-06-21. Read this first when resuming with fresh context, alongside the
-auto-loaded memory files (`cartographer-project-overview`, `mast3r-slam-windows-build`) and the
 design plan at `C:\Users\owner\.claude\plans\hey-read-this-file-breezy-otter.md`._
 
 ## What this project is (1 paragraph)
@@ -28,8 +27,9 @@ D:\EXTEND\C2_SIM\XLAB\
 - Re-validate the env anytime: `venv\Scripts\python.exe smoke_test_models.py` (DA-V2 + Qwen) and
   `venv\Scripts\python.exe smoke_test_slam.py` (MASt3R two-view).
 - To rebuild MASt3R-SLAM from scratch: `build_mast3r_slam.bat` then `build_mast3r_slam_step23.bat`
-  (the int64_t kernel patch in `third_party/MASt3R-SLAM/mast3r_slam/backend/src/*.cu` must be present
-  — see `mast3r-slam-windows-build` memory).
+  (the int64_t kernel patch in `third_party/MASt3R-SLAM/mast3r_slam/backend/src/*.cu` must already be
+  present in the source before building — it is a manual edit baked into the third_party checkout, NOT
+  re-applied by the .bats; on a fresh clone you must re-apply it by hand).
 - **lietorch is a PATCHED LOCAL build** at `third_party/lietorch` (NOT the pip/git version, which
   segfaults — see M4 below). To rebuild it: `build_lietorch.bat`. NEVER `pip install` upstream lietorch.
   Re-validate group ops: `venv\Scripts\python.exe lietorch_probe.py` (expects "ALL LIETORCH CASES PASSED").
@@ -61,9 +61,17 @@ D:\EXTEND\C2_SIM\XLAB\
   DA-V2, depth at the slower cadence) + build `map_store.py` (voxel/occupancy + trajectory) + a live
   view. Then the live verification fly-through.
 
-## Status: Milestone 3 DONE ✅ (depth overlay) — offline-verified + user-approved 2026-06-21
-_(Live wall-vs-glass flight is the M3 sign-off ritual; confirm it opportunistically during the M4
-flights — see the checklist at the bottom. User reviewed the offline overlay output and approved.)_
+## Status: Milestone 3 DONE ✅ (depth overlay) — LIVE wall-vs-glass SIGNED OFF 2026-06-22
+_(Live hardware fly-through complete. Opaque surfaces read near/red, clearance collapses on approach
+and recovers on retreat (`raw med` tracks distance correctly); ~2.5 Hz depth @ ~64 ms infer, no
+crash; 60 Hz manual flight had NO lag while perception ran.)_
+- **GLASS BEHAVIOR CONFIRMED (key M3→M5 finding):** when approaching the glass *pane* with a gap, DA-V2
+  reads it as **far / open air** — the forward obstacle bars stay GREEN even though a barrier is there
+  (`DEBUG_IMAGES/one_more.png`, `looking at glass window from afar.png`). i.e. **depth cannot see the
+  glass, so depth alone would fly you straight into it** — this validates the plan's premise that the
+  M5 glass detector must make the **SLAM-stall authoritative** and treat depth-open as only
+  *corroborating*. Caveat: pressed right against the glass, the opaque **window frame/mullions** fill
+  the forward band and read near (`fwd_clear`→0.09 in `bumping into glass window.png`) — frame ≠ pane.
 - `perception_worker.py` written (P2, first GPU worker). Subscribes to the frame bus, runs **Depth
   Anything V2** (`depth-anything/Depth-Anything-V2-Base-hf`) capped at `perception.depth_cadence_hz`
   (3 Hz), derives a **forward-obstacle bar** (16 columns) + `forward_clearance` scalar + a coarse
@@ -81,7 +89,7 @@ flights — see the checklist at the bottom. User reviewed the offline overlay o
   wants. Raw stats published too. **Obstacle band = 0.25–0.70 of frame height** (forward view; excludes
   the floor directly beneath, which always reads "near" but is not a forward hazard) — a TUNABLE to
   revisit during live flight. Uses `torch.autocast` fp16; no CPU fallback (fail-fast if no CUDA).
-- **NEXT (do FIRST on hardware):** live M3 verification — see checklist at the bottom.
+- **Live M3 verification: DONE 2026-06-22** (see the M3 status block above for the wall/glass result).
 
 ## Status: Milestone 2 DONE ✅ (io_bridge + frame_bus) — verified on hardware 2026-06-21
 - `frame_bus.py`, `io_bridge.py`, `test_frame_subscriber.py` written and verified.
@@ -123,7 +131,12 @@ flights — see the checklist at the bottom. User reviewed the offline overlay o
   gitignored, so this patch is the version-controlled copy; `git apply` it onto a fresh lietorch clone).
 - `lietorch_probe.py`, `slam_match_probe.py` — M4 diagnostics (lietorch group ops; matching kernels).
 - `third_party/lietorch/` — patched local clone (`lietorch_gpu.cu` const→non-const kernel fix).
-- NOT yet created: object_worker.py, map_store.py, visualizer.py, report.py, run.py.
+- `map_store.py` — M4: `MapStore` fuses per-keyframe world pointmaps+poses into a sparse voxel/occupancy
+  grid (`map.voxel_size`=0.05) + trajectory; top-down render + `.npz` export. Transport-agnostic (pure
+  numpy, no ZMQ/torch) so it runs in-process inside perception_worker AND is offline-testable. Offline
+  build vs the 2.08M-pt npz: 52.6K voxels (39.5x), coherent top-down. Flags: `--npz`, `--voxel-size`,
+  `--min-count`, `--chunks`, `--out`.
+- NOT yet created: object_worker.py, visualizer.py, report.py, run.py.
 
 ## Key technical facts already learned (don't re-derive)
 - **Sim protocol** (`../XLAB/Sample_Drone_Interface.py`): Python is the TCP **SERVER** (127.0.0.1:65432);
@@ -151,21 +164,12 @@ flights — see the checklist at the bottom. User reviewed the offline overlay o
   shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
   `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
 
-## NEXT: live M3 verification on hardware (do this FIRST), then M4 — SLAM
-M3 live verification checklist (with Xlab.exe running):
-  1. Start Xlab.exe (Unity).
-  2. Terminal 1: `cd cartographer && venv\Scripts\python.exe io_bridge.py` → "=== READY ===".
-     Arm (1) and fly. (As Administrator if the keyboard hook is dead.)
-  3. Terminal 2: `venv\Scripts\python.exe perception_worker.py` → DA-V2 loads, "=== READY ===",
-     then a depth window appears `[ input | depth-colormap + obstacle-bar ]`. Expect ~3 Hz depth.
-  4. **Fly toward an opaque wall** → the wall region of the colormap brightens (proximity↑), the
-     central obstacle bars turn red, `fwd_clearance` drops toward 0. **Fly at the glass window** →
-     depth stays dark/"far" there, obstacle bars stay green even though you're driving forward (this
-     is exactly the corroborating signal the M5 glass detector relies on — SLAM stall = authoritative,
-     depth-open = corroboration).
-  5. Confirm io_bridge's 60 Hz manual flight has NO lag while perception runs. Then M3 is signed off.
-  - If the obstacle bar feels floor-dominated or mis-aimed, tune `BAND_TOP/BAND_BOTTOM` (currently
-    0.25/0.70) and `COL_NEAR_PCTL` at the top of `perception_worker.py`.
+## NEXT: M4 — live SLAM integration (M3 live sign-off DONE 2026-06-22, see M3 status block)
+The M3 live wall/glass fly-through is complete (results recorded in the M3 status block above). To
+re-run perception on hardware later: Xlab.exe → `venv\Scripts\python.exe io_bridge.py` (Terminal 1,
+arm with 1; Administrator if the keyboard hook is dead) → `venv\Scripts\python.exe perception_worker.py`
+(Terminal 2). Tunables if the obstacle bar feels floor-dominated/mis-aimed: `BAND_TOP/BAND_BOTTOM`
+(0.25/0.70) and `COL_NEAR_PCTL` at the top of `perception_worker.py`.
 
 **Milestone 4 — SLAM + map (offline done; live integration is the resume point):** offline SLAM is
 proven (`slam_offline.py` → consistent map, see status above). REMAINING: add MASt3R-SLAM to the live
@@ -175,7 +179,7 @@ Rerun view. *Verify:* fly a loop → globally consistent live map. (See the plan
 Reuse the driving loop + map-export logic already in `slam_offline.py`.
 
 ## Remaining milestones (see plan file for detail)
-- M3: Depth overlay (DA-V2) ✅ offline; live wall/glass fly-through still to be signed off on hardware.
+- M3: Depth overlay (DA-V2) ✅ offline AND ✅ live wall/glass fly-through signed off on hardware 2026-06-22.
 - M4: SLAM engine ✅ runs on Windows + offline map verified; REMAINING = live perception_worker
   integration + `map_store.py` voxel/trajectory + top-down/Rerun view.
 - M5: glass detector (SLAM translation≈0 while forward-commanded = authoritative) + opening detector

@@ -17,5 +17,6 @@ checkpoints/
 # Outputs / scratch
 test_assets/*.png
 OUTPUT/
+DEBUG_IMAGES/
 *.mp4
 *.log
