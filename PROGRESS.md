@@ -35,21 +35,12 @@ D:\EXTEND\C2_SIM\XLAB\
   segfaults — see M4 below). To rebuild it: `build_lietorch.bat`. NEVER `pip install` upstream lietorch.
   Re-validate group ops: `venv\Scripts\python.exe lietorch_probe.py` (expects "ALL LIETORCH CASES PASSED").
 
-## Status: Milestone 4 DONE ✅ — SLAM + offline map + map_store + live perception_worker + live
-## dashboard (visualizer.py) + ON-HARDWARE FLY-A-LOOP SIGNED OFF 2026-06-22
-_M4 fully complete. `visualizer.py` (Task 3) built + verified; the live dashboard was watched during a
-real fly-a-loop and the live map was globally consistent (user sign-off 2026-06-22). Next milestone =
-M5 (glass + opening detector). See "## NEXT" for the M5 resume pointer._
-
-### PARKED (raised 2026-06-22, defer to autonomy): live point-cloud save + 3D flight replay
-Live flights currently do NOT auto-save the map — only the offline `--video` path exports
-(`*_livemap.npz` = voxel centers+colors+**trajectory**; `slam_offline.py` dumps a dense `.ply`). The
-user wants the *live* run to also persist the cloud so the flight can be replayed/recreated in 3D.
-Small change: add a save-on-exit (and/or a snapshot hotkey) to `run_live` calling
-`MapStore.save_npz` + `render_topdown`, optionally streaming the dense per-keyframe pointmaps. This is
-flagged as important for **Phase-2 autonomy**: the planner needs the voxel occupancy + pointmaps to
-reason about free space and gap-vs-drone-clearance ("which holes can I fly through"). Do when we start
-autonomy, not before.
+## Status: Milestone 4 DONE ✅ — SLAM + offline map + map_store + live perception_worker + live dashboard
+_M4 fully complete: `slam_engine` + `perception_worker` SLAM/depth fusion + `map_store` voxel map +
+`visualizer.py` (Task 3) live dashboard, with the **on-hardware fly-a-loop SIGNED OFF 2026-06-22**
+(live map globally consistent during a real flight). Next = **object detection (Qwen) + 3D
+localize/report** — M5 (glass + opening) was deferred to Phase-2 on 2026-06-22; see "## NEXT". M4
+history is below; a PARKED follow-up sits at the end of this section._
 - Built `slam_offline.py` to drive the FULL MASt3R-SLAM loop (tracker + FactorGraph + retrieval)
   over a recorded flight (`../XLAB/OUTPUT/flight_20260621_120829.mp4`), single-process, no viz.
   Diagnostics: `slam_match_probe.py`, `lietorch_probe.py`. Map export → `.ply` + `.npz` + top-down PNG.
@@ -80,9 +71,23 @@ autonomy, not before.
   whole pipeline from a recording and exports the map. **Verified vs the slam_offline reference:** full
   587-frame pass → **22 keyframes, 0 reloc** (tracking never lost), 2.37M pts → 58K voxels, **peak 7.57 GB**
   (DA-V2+SLAM together), ~2 fps; `*_livemap_topdown.png` is structurally identical to the offline map.
-- **NEXT (rest of M4):** Task 3 = live top-down view subscribing to the bus (OpenCV first; Rerun optional),
-  then the on-hardware fly-a-loop sign-off (globally consistent LIVE map). Note: a `perception_worker`
-  from the M3 test was still holding state port :5603 — kill stray workers before a live run.
+- **Task 3 (live dashboard) DONE 2026-06-22.** Added `frame_bus.TOPIC_MAP` + `MapStore.topdown_summary`
+  (compact sparse occupancy snapshot: occupied cells + count-weighted colors + trajectory, already in
+  pixel coords, ~220 KB, one per keyframe — each a full self-contained snapshot). `perception_worker`
+  PUBs it per keyframe (and `--publish` replays pose/depth/map from a recording to drive the dashboard
+  offline); `visualizer.py` composes [status | input | depth+bar | top-down map+traj]. Verified offline
+  (render path + live bus on real GPU: pose/depth/map all flow) AND on hardware (fly-a-loop, live map
+  globally consistent). Shipped in commit `ed92e1a`. Note: kill stray `perception_worker` (holds :5603)
+  before the next live run.
+
+### PARKED (raised 2026-06-22, defer to Phase-2 autonomy): live point-cloud save + 3D flight replay
+Live flights do NOT auto-save the map yet — only the offline `--video` path exports (`*_livemap.npz` =
+voxel centers+colors+**trajectory**; `slam_offline.py` dumps a dense `.ply`). The user wants the *live*
+run to also persist the cloud so a flight can be replayed/recreated in 3D. Small change: save-on-exit
+(and/or a snapshot hotkey) in `run_live` calling `MapStore.save_npz` + `render_topdown`, optionally
+streaming the dense per-keyframe pointmaps too. Flagged as important for autonomy: the planner needs the
+voxel occupancy + pointmaps to reason about free space and gap-vs-drone-clearance ("which holes can I
+fly through"). Do when we start autonomy, not before.
 
 ## Status: Milestone 3 DONE ✅ (depth overlay) — LIVE wall-vs-glass SIGNED OFF 2026-06-22
 _(Live hardware fly-through complete. Opaque surfaces read near/red, clearance collapses on approach
@@ -198,18 +203,34 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
   shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
   `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
 
-## NEXT: M5 — glass detector + opening detector (the resume point)
-**M4 is DONE** (live dashboard + on-hardware fly-a-loop signed off 2026-06-22). Start M5:
-- **Glass detector:** when the drone is **forward-commanded** (controls.trigger>0) but SLAM camera
-  translation ≈ 0 over `map.glass_stall_seconds` (1.5 s), declare a **virtual wall** there. This is
-  AUTHORITATIVE; depth reading "open air" is only corroborating (M3 confirmed DA-V2 can't see glass —
-  it'd fly you into it). Surface as a visible state flag (no silent fallbacks) + draw it on the map.
-- **Opening detector:** fit wall planes (RANSAC) to the voxel map, find gaps in the walls, compare gap
-  width to `map.drone_clearance_m` (0.30) → passable vs not. Feeds the Phase-2 planner.
-- The frame bus already carries `controls` per frame (trigger/yaw/etc.) — the glass detector needs
-  "forward-commanded", which is in `meta["controls"]`. Camera translation = delta of `res.camera_center`.
+## NEXT: object detection (Qwen) + 3D localize/report — the resume point
+**M4 is DONE.** **Re-prioritization 2026-06-22 (user-approved): M5 (glass + opening detectors) is
+DEFERRED to Phase-2 autonomy.** Rationale: both are navigation-safety features only an *autonomous*
+drone needs — a human pilot already avoids glass / picks gaps during recon, and neither feeds the
+grader. The gradable deliverable is **map the room + report the target object's 3D location (with
+uncertainty)**, so jump straight to the object chain. It depends on NOTHING in M5 — it reuses the SLAM
+pose + per-keyframe pointmaps we already produce, and the hotkey-`g` trigger fits the current
+human-flying recon mode.
 
-### Live-run launch procedure (reference — used for the M4 fly-a-loop, reuse for M5):
+Build a thin END-TO-END vertical (human flies recon → reported 3D target):
+1. **Detect — `object_worker.py`** (new GPU worker, was "M6"): Qwen2.5-VL-3B 4-bit, hotkey **`g`**
+   (1=arm; 'o'/'f' are taken — see sim protocol). Multi-image prompt = a **reference crop** of the
+   target + the live frame → bounding box / point of the target in the current frame. `object_mode=
+   "QWEN"` is the visible state flag; DINOv2 fallback is **approval-gated only** (NO SILENT FALLBACKS).
+   Shares the CUDA budget with SLAM+DA-V2 — watch VRAM (live peak already ~7.6 GB of 16; Qwen 4-bit ≈
+   2.6 GB, may need to gate it behind the hotkey rather than run every frame).
+2. **Lift to 3D:** back-project the detected pixels through that frame's SLAM pose + pointmap/depth
+   (world points = `kf.T_WC.act(kf.X_canon)`; or DA-V2 depth + intrinsics) into a world coordinate;
+   aggregate over the voxel map → a single 3D target position.
+3. **Report (Phase-3 core):** target 3D position + an **uncertainty** estimate (e.g. spread of the
+   back-projected points / agreement across multiple detections). This is the actual assessment output.
+
+**Settle with the user BEFORE coding (checkpoint culture):** where does the target **reference crop**
+come from — a provided asset, or picked from a recon frame? That choice shapes the Qwen prompt and the
+worker's inputs. Also confirm: run object detection only on the `g` hotkey (recommended, VRAM) vs.
+continuously.
+
+### Live-run launch procedure (reference — M4 fly-a-loop; reuse for object-detection live runs):
 1. Kill any stray `perception_worker`/`visualizer` first (a stray PUB on :5603 makes the worker fail-fast on bind).
 2. Xlab.exe → Terminal 1 `venv\Scripts\python.exe io_bridge.py` (arm with 1; Admin if keyboard hook dead).
 3. Terminal 2 `venv\Scripts\python.exe perception_worker.py --no-display` (SLAM+depth; PUBs TOPIC_MAP on :5603 every keyframe).
@@ -225,8 +246,14 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
 - M4: SLAM engine ✅ Windows + ✅ offline map + ✅ `map_store.py` voxel/trajectory + ✅ live
   perception_worker integration + ✅ live dashboard (`visualizer.py`, Task 3) + ✅ on-hardware
   fly-a-loop signed off 2026-06-22. **DONE.**
-- M5: glass detector (SLAM translation≈0 while forward-commanded = authoritative) + opening detector
-  (RANSAC wall planes, gaps vs drone clearance).
-- M6: object_worker (Qwen multi-image: reference crop + live frame, hotkey 'g'); DINOv2 fallback is
-  approval-gated only.
-- Later: Phase-2 autonomy (planner, bump-and-recover, frontier explore) + Phase-3 report + GUI.
+- **NEXT — object detection + 3D localize/report (the gradable core):** `object_worker.py` (Qwen
+  multi-image: reference crop + live frame, hotkey 'g') → back-project the detection through the SLAM
+  pose + pointmap into a 3D world position → report position + uncertainty. DINOv2 fallback approval-
+  gated only. _(Formerly "M6"; promoted ahead of M5 on 2026-06-22.)_
+- **DEFERRED to Phase-2 — glass + opening detectors** _(formerly M5)_: glass = SLAM translation≈0 while
+  forward-commanded (authoritative; depth can't see glass); opening = RANSAC wall planes, gaps vs
+  `map.drone_clearance_m`. Navigation safety only an autonomous drone needs — NOT on the grading path.
+  Build alongside autonomy. (Config keys `map.glass_stall_seconds`=1.5, `map.drone_clearance_m`=0.30
+  already exist; M3 confirmed DA-V2 reads glass as open air, so SLAM-stall must be authoritative.)
+- Later: Phase-2 autonomy (planner, bump-and-recover, frontier explore, + the deferred glass/opening
+  detectors) + Phase-3 report polish + GUI.
