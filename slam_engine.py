@@ -61,6 +61,7 @@ class SlamResult:
     camera_center: np.ndarray | None  # (3,) world coords of the current frame's camera
     new_keyframe: bool
     reloc_event: bool             # tracking was lost this frame -> entered RELOC
+    pose: np.ndarray | None = None        # (4,4) world<-camera Sim3 matrix [[sR,t],[0,1]] this frame
     kf_points: np.ndarray | None = None   # (N,3) world points of the NEW keyframe only
     kf_colors: np.ndarray | None = None   # (N,3) uint8, paired with kf_points
 
@@ -107,6 +108,16 @@ class SlamEngine:
         self.n_keyframes = 0
         self.n_reloc = 0
         self._origin = torch.zeros(1, 3, device=device)
+        # Origin + 3 unit axes, acted on by T_WC to recover the full pose via Act3 only.
+        # (T_WC.matrix() routes through Act4 on a view of the pose data, which corrupts the
+        # frame pose under the patched lietorch and freezes keyframe motion — Act3 is safe.)
+        self._pose_basis = torch.tensor(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=torch.float32, device=device)
+        # Per-pixel camera viewing rays (unit dirs in the camera frame), refreshed from each
+        # keyframe's canonical pointmap. Intrinsics are fixed (one sim camera), so this field is
+        # ~view-independent and can be reused to back-project a detection on any frame.
+        self.ray_field = None         # (h, w, 3) float32, or None until the first keyframe
+        self.ray_hw = None            # (h, w) of ray_field
 
     # ------------------------------------------------------------------ setup
     def _lazy_state(self, first_rgb):
@@ -250,23 +261,34 @@ class SlamEngine:
         if not ran_init:
             self._run_backend()
 
-        center = (self.states.get_frame().T_WC.act(self._origin)
-                  .detach().cpu().numpy().reshape(3).astype(np.float32))
+        # Recover the full pose using Act3 on origin + unit axes (act is safe; matrix()/Act4
+        # is not — see _pose_basis). w[0]=center=t; w[i]-w[0]=sR·e_i = i-th column of sR.
+        cur_frame = self.states.get_frame()
+        w = cur_frame.T_WC.act(self._pose_basis).detach().cpu().numpy().reshape(4, 3)
+        pose_mat = np.eye(4, dtype=np.float32)
+        pose_mat[:3, :3] = (w[1:] - w[0]).T
+        pose_mat[:3, 3] = w[0]
+        center = w[0].astype(np.float32).copy()
 
         kf_points = kf_colors = None
         if new_kf:
             self.n_keyframes += 1
             kf = self.keyframes[len(self.keyframes) - 1]
-            pW = kf.T_WC.act(kf.X_canon).detach().cpu().numpy().reshape(-1, 3)
+            X_canon = kf.X_canon.detach().cpu().numpy().reshape(self.h, self.w, 3)
+            pW = (kf.T_WC.act(kf.X_canon).detach().cpu().numpy().reshape(-1, 3))
             conf = kf.get_average_conf().detach().cpu().numpy().reshape(-1)
             valid = conf > self.conf_thresh
             kf_points = pW[valid]
             kf_colors = (kf.uimg.detach().cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)[valid]
+            # Refresh the camera ray field from this keyframe's canonical pointmap (unit dirs).
+            norm = np.linalg.norm(X_canon, axis=2, keepdims=True)
+            self.ray_field = (X_canon / np.clip(norm, 1e-9, None)).astype(np.float32)
+            self.ray_hw = (self.h, self.w)
 
         self._i += 1
         cur_mode = Mode(self.states.get_mode()).name
         return SlamResult(
             tracking_mode=self.tracking_mode, mode=cur_mode,
             n_keyframes=len(self.keyframes), frame_idx=i, camera_center=center,
-            new_keyframe=new_kf, reloc_event=reloc_event,
+            new_keyframe=new_kf, reloc_event=reloc_event, pose=pose_mat,
             kf_points=kf_points, kf_colors=kf_colors)

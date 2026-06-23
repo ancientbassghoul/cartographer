@@ -334,8 +334,10 @@ def main():
     ndi_filter = cfg["network"].get("ndi_source_name", "Unity")
     frame_port = cfg["network"]["frame_bus_port"]
     state_port = cfg["network"]["state_bus_port"]
+    hires_port = cfg["network"].get("frame_bus_hires_port")
     proc_w = cfg["perception"]["processing_width"]
     proc_h = cfg["perception"]["processing_height"]
+    object_frame_h = int(cfg["perception"].get("object_frame_height", 720))
     target_fps = cfg["perception"]["target_processing_fps"]
     detect_key = cfg["models"]["qwen_vl"].get("object_trigger_key", "g")
     publish_interval = 1.0 / float(target_fps)
@@ -343,8 +345,13 @@ def main():
     # --- bring up the bus (publishers bind; fail-fast if a port is taken) ---
     frame_pub = frame_bus.FramePublisher(frame_port)
     state_pub = frame_bus.StatePublisher(state_port)
+    # Second, higher-res frame stream for the object worker (Qwen grounds a ~60px target far more
+    # reliably with full pixel fidelity; detection runs ~0.5 Hz so loopback bandwidth is a non-issue).
+    hires_pub = frame_bus.FramePublisher(hires_port) if hires_port else None
     print(f"[io_bridge] frame bus PUB on :{frame_port}  | state bus PUB on :{state_port}")
     print(f"[io_bridge] perception stream: {proc_w}x{proc_h} @ ~{target_fps} fps (mono-clock gated)")
+    if hires_pub:
+        print(f"[io_bridge] hi-res object stream: ~{object_frame_h}p PUB on :{hires_port}")
 
     # --- control server + NDI (both fail-fast) ---
     control = DroneControl(host, port, detect_key=detect_key, debug_keys=args.debug_keys)
@@ -394,6 +401,17 @@ def main():
                         "controls": control.control_snapshot(),
                     }
                     frame_pub.publish(small, meta)
+                    # Same frame, same meta/frame_id, at higher resolution for the object worker
+                    # (so its detection frame_id still matches perception's pose history). Downscale
+                    # only if the source is taller than the target; never upscale.
+                    if hires_pub is not None:
+                        sh, sw = bgr.shape[:2]
+                        if sh > object_frame_h:
+                            ow = int(round(sw * object_frame_h / sh))
+                            hires = cv2.resize(bgr, (ow, object_frame_h), interpolation=cv2.INTER_AREA)
+                        else:
+                            hires = bgr
+                        hires_pub.publish(hires, meta)
                     published += 1
                     last_pub_mono = now
 
@@ -461,6 +479,8 @@ def main():
             video_writer.release()
         control.stop()
         frame_pub.close()
+        if hires_pub is not None:
+            hires_pub.close()
         state_pub.close()
         if recv:
             ndi.recv_destroy(recv)

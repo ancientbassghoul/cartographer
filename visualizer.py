@@ -12,6 +12,8 @@ default :5603) and composes a single OpenCV window from three topics published b
                    joining late just means catching up on the next keyframe.
   * TOPIC_DEPTH -> the coarse proximity grid + forward-obstacle bar + forward_clearance.
   * TOPIC_POSE  -> SLAM mode, tracking_mode, keyframe/voxel counts, reloc events.
+  * TOPIC_TARGET-> the lifted 3D target position + uncertainty (drawn as a marker on the map
+                   and summarized in the status strip).
 
 It also (optionally) subscribes to the frame bus (`frame_bus_port`, default :5601) to show the
 live input frame next to the depth view — the frame bus is conflated PUB/SUB, so an extra
@@ -30,6 +32,7 @@ Layout:  [ status strip                         ]
 import argparse
 import os
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -43,7 +46,7 @@ WINDOW = "Cartographer — live dashboard"
 PANEL_W, PANEL_H = 416, 234   # the two 16:9 left-column panels (input + depth)
 GAP = 12
 MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left column
-STATUS_H = 30
+STATUS_H = 48                 # two lines: SLAM/depth state + target estimate
 RELOC_FLASH_S = 2.0           # keep the RELOC banner up this long after the event
 
 
@@ -95,7 +98,49 @@ def render_depth_panel(depth, w=PANEL_W, h=PANEL_H):
     return color
 
 
-def render_map_panel(m, size=MAP_SIZE):
+def _world_to_px(x, z, m, size):
+    """Project a world (X,Z) point into map-panel pixels using the map summary's bounds.
+
+    Mirrors MapStore.topdown_summary's to_cell (u from X, v flipped from Z) then scales the
+    grid cell to panel pixels. Returns (px, py) or None if bounds are unavailable.
+    """
+    if not m or not m.get("bounds"):
+        return None
+    x0, x1, z0, _z1 = m["bounds"]
+    grid = int(m["grid"])
+    span = max(x1 - x0, 1e-6)
+    sc = (grid - 1) / span
+    u = (x - x0) * sc
+    v = (grid - 1) - (z - z0) * sc
+    return int(np.clip(u * size / grid, 0, size - 1)), int(np.clip(v * size / grid, 0, size - 1))
+
+
+def _target_to_px(target, m, size):
+    """Project the estimated target's world (X,Z) into map-panel pixels (or None)."""
+    if not target or not target.get("position"):
+        return None
+    tx, _ty, tz = target["position"]
+    return _world_to_px(tx, tz, m, size)
+
+
+def overlay_live_camera(img, m, cam_track, size):
+    """Draw the live camera track (recent poses) + current position on a map copy.
+
+    Updated every render tick from the per-frame TOPIC_POSE camera_center, so the drone's
+    position/path feel live instead of lagging at keyframe rate (the cached voxel/keyframe
+    trajectory only refreshes per keyframe). Yellow = live track + 'now' dot.
+    """
+    if not m or not cam_track:
+        return
+    pts = [p for p in (_world_to_px(c[0], c[2], m, size) for c in cam_track) if p is not None]
+    if len(pts) >= 2:
+        cv2.polylines(img, [np.asarray(pts, np.int32)], False, (0, 255, 255), 1, cv2.LINE_AA)
+    if pts:
+        cv2.circle(img, pts[-1], 5, (0, 255, 255), -1)
+        cv2.circle(img, pts[-1], 7, (0, 0, 0), 1)
+
+
+def render_map_panel(m, size=MAP_SIZE, target=None):
     img = np.full((size, size, 3), 18, np.uint8)
     if not m or not m.get("cells_u"):
         cv2.putText(img, "map: waiting for keyframes...", (12, size // 2),
@@ -127,6 +172,14 @@ def render_map_panel(m, size=MAP_SIZE):
         cv2.circle(img, tuple(pts[0]), 6, (0, 255, 0), -1)    # start
         cv2.circle(img, tuple(pts[-1]), 6, (0, 255, 255), -1)  # end (drone now)
 
+    # Estimated target marker (magenta), projected into the same top-down frame.
+    tpx = _target_to_px(target, m, size)
+    if tpx is not None:
+        cv2.drawMarker(img, tpx, (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
+        cv2.circle(img, tpx, 10, (255, 0, 255), 2)
+        cv2.putText(img, "TARGET", (tpx[0] + 12, tpx[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 2)
+
     cv2.putText(img, f"top-down X-Z  {m.get('n_voxels')} vox  {m.get('n_keyframes')} kf  "
                 f"~{m.get('span_world')}u  mode={m.get('tracking_mode')}",
                 (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
@@ -135,7 +188,8 @@ def render_map_panel(m, size=MAP_SIZE):
     return img
 
 
-def render_status(pose, depth, width, reloc_active):
+def render_status(pose, depth, width, reloc_active, target=None):
+    # Two-line strip: SLAM/depth state on top, the target estimate below.
     strip = np.full((STATUS_H, width, 3), 45, np.uint8)
     if pose is None:
         cv2.putText(strip, "waiting for perception_worker on the state bus ...", (8, 20),
@@ -148,9 +202,20 @@ def render_status(pose, depth, width, reloc_active):
         txt += f"  fwd_clear={depth.get('forward_clearance')}  depth={depth.get('infer_ms')}ms"
     # Default tracking mode = green; anything else = orange (a fallback must never be silent).
     col = (0, 255, 0) if tm == "MASt3R" else (0, 165, 255)
-    cv2.putText(strip, txt, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+    cv2.putText(strip, txt, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
     if reloc_active:
-        cv2.putText(strip, "RELOC!", (width - 95, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.putText(strip, "RELOC!", (width - 95, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+    if target and target.get("position"):
+        p = target["position"]
+        ttxt = (f"TARGET [{target.get('label','?')}] pos=({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})  "
+                f"+/-{target.get('radial_rms','?')}u  hits={target.get('n_hits')}/"
+                f"{target.get('n_found')}  {'CONFIDENT' if target.get('confident') else 'tentative'}")
+        tcol = (255, 0, 255) if target.get("confident") else (200, 120, 255)
+        cv2.putText(strip, ttxt, (8, STATUS_H - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, tcol, 1)
+    else:
+        cv2.putText(strip, "TARGET: not yet localized", (8, STATUS_H - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
     return strip
 
 
@@ -169,6 +234,8 @@ class Dashboard:
         self.pose = None
         self.depth = None
         self.map = None
+        self.target = None
+        self.cam_track = deque(maxlen=600)   # recent world camera centers (live, per-frame)
         self._map_img = None
         self._map_sig = None
         self._last_reloc = 0.0
@@ -176,6 +243,9 @@ class Dashboard:
     def update(self, topic, payload):
         if topic == "pose":
             self.pose = payload
+            cc = payload.get("camera_center")
+            if cc is not None:
+                self.cam_track.append(cc)
             if payload.get("reloc_event"):
                 self._last_reloc = time.monotonic()
         elif topic == "depth":
@@ -183,18 +253,24 @@ class Dashboard:
         elif topic == "map":
             self.map = payload
             self._map_img = None  # invalidate cache
+        elif topic == "target":
+            self.target = payload
+            self._map_img = None  # redraw map with the updated target marker
 
     def _map_image(self):
-        sig = None if self.map is None else (self.map.get("n_keyframes"), self.map.get("frame_id"))
+        tpos = tuple(self.target["position"]) if self.target and self.target.get("position") else None
+        sig = None if self.map is None else (self.map.get("n_keyframes"), self.map.get("frame_id"), tpos)
         if self._map_img is None or sig != self._map_sig:
-            self._map_img = render_map_panel(self.map)
+            self._map_img = render_map_panel(self.map, target=self.target)
             self._map_sig = sig
         return self._map_img
 
     def render(self):
         frame_p = render_frame_panel(self.frame)
         depth_p = render_depth_panel(self.depth)
-        map_p = self._map_image()
+        # Cached voxel/keyframe base + live camera overlay (per-frame, so position feels live).
+        map_p = self._map_image().copy()
+        overlay_live_camera(map_p, self.map, self.cam_track, map_p.shape[0])
 
         col_gap = np.zeros((GAP, PANEL_W, 3), np.uint8)
         left = np.vstack([frame_p, col_gap, depth_p])          # (MAP_SIZE, PANEL_W)
@@ -202,7 +278,7 @@ class Dashboard:
         body = np.hstack([left, row_gap, map_p])               # (MAP_SIZE, width)
 
         reloc_active = (time.monotonic() - self._last_reloc) < RELOC_FLASH_S
-        status = render_status(self.pose, self.depth, body.shape[1], reloc_active)
+        status = render_status(self.pose, self.depth, body.shape[1], reloc_active, self.target)
         return np.vstack([status, body])
 
 

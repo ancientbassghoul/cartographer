@@ -139,6 +139,41 @@ class MapStore:
             colors = (self._color_sum[:n][keep] / count[:, None]).clip(0, 255).astype(np.uint8)
         return centers, colors
 
+    def raycast(self, origin, direction, max_range: float = 15.0, step_frac: float = 0.5,
+                min_count: int = 1, skip: float = 0.0):
+        """March a world-space ray through the occupancy grid.
+
+        Returns (hit_center (3,) float32, distance float) for the first voxel seen
+        >= `min_count` along the ray, or None if nothing is hit within `max_range`.
+
+        `step_frac` is the march step as a fraction of voxel_size (<= 0.5 avoids tunneling
+        through a one-voxel-thick wall); `skip` skips the first `skip` world units (e.g. to
+        ignore voxels right at the camera). Uses the occupancy hash for O(1) per-step lookup;
+        a ray only does max_range/step lookups so it is cheap at detection cadence.
+        """
+        origin = np.asarray(origin, np.float64).reshape(3)
+        d = np.asarray(direction, np.float64).reshape(3)
+        dn = np.linalg.norm(d)
+        if dn < 1e-9 or not self._row_of:
+            return None
+        d = d / dn
+        step = self.voxel_size * float(step_frac)
+        t = float(skip)
+        last_key = None
+        while t <= max_range:
+            p = origin + d * t
+            key = (int(np.floor(p[0] / self.voxel_size)),
+                   int(np.floor(p[1] / self.voxel_size)),
+                   int(np.floor(p[2] / self.voxel_size)))
+            if key != last_key:
+                row = self._row_of.get(key)
+                if row is not None and self._count[row] >= min_count:
+                    center = ((np.asarray(key, np.float64) + 0.5) * self.voxel_size).astype(np.float32)
+                    return center, float(t)
+                last_key = key
+            t += step
+        return None
+
     def trajectory_array(self):
         return (np.asarray(self.trajectory, dtype=np.float32)
                 if self.trajectory else np.zeros((0, 3), np.float32))
@@ -240,12 +275,13 @@ class MapStore:
                  voxel_size=self.voxel_size, tracking_mode=self.tracking_mode)
 
     def render_topdown(self, out_path=None, size=900, pad=0.06, min_count: int = 1,
-                       point_px: int = 1):
+                       point_px: int = 1, targets=None):
         """Render an X-Z (ground-plane) top-down occupancy map with the trajectory.
 
         Camera convention: X right, Y down, Z forward => X-Z is the horizontal plane.
         Robust 1st/99th-percentile bounds keep outliers from squashing the view. Returns
-        the rendered BGR image (and writes it if `out_path` is given).
+        the rendered BGR image (and writes it if `out_path` is given). `targets` is an optional
+        list of world (3,) points (e.g. the estimated target) drawn as labeled markers.
         """
         centers, colors = self.occupied(min_count)
         traj = self.trajectory_array()
@@ -286,6 +322,16 @@ class MapStore:
             cv2.polylines(img, [path], False, (0, 0, 255), 2, cv2.LINE_AA)
             cv2.circle(img, tuple(path[0]), 6, (0, 255, 0), -1)    # start
             cv2.circle(img, tuple(path[-1]), 6, (0, 255, 255), -1)  # end
+
+        if targets:
+            for tw in targets:
+                tw = np.asarray(tw, np.float64).reshape(3)
+                tu, tv = to_px(np.array([tw[0]]), np.array([tw[2]]))
+                px, py = int(tu[0]), int(size - 1 - int(tv[0]))
+                cv2.drawMarker(img, (px, py), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
+                cv2.circle(img, (px, py), 11, (255, 0, 255), 2)
+                cv2.putText(img, "TARGET", (px + 14, py - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (255, 0, 255), 2)
 
         cv2.putText(img, f"top-down X-Z  {len(centers)} voxels @ {self.voxel_size:g}u  "
                     f"{len(traj)} kf  mode={self.tracking_mode}  ~{2*half:.2f}u across",
