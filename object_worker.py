@@ -1,8 +1,19 @@
-"""object_worker.py — Process P4: Qwen2.5-VL target detection.
+"""object_worker.py — Process P4: target detection (OWLv2 image-guided | Qwen2.5-VL).
 
-The gradable-core detector. Subscribes to the io_bridge frame bus (downscaled 512x288 BGR
-frames, CONFLATE newest-wins) and, in its **own process / CUDA context**, runs
-**Qwen2.5-VL-3B (4-bit)** to ground a designated target object in the live frame.
+The gradable-core detector. Subscribes to the io_bridge frame bus (CONFLATE newest-wins)
+and, in its **own process / CUDA context**, grounds a designated target object in the live
+frame. Two visible, mutually-exclusive detector paths selected by `runtime.object_mode`:
+
+  * **OWLV2** (default): **OWLv2 image-guided (one-shot) detection** — query = the reference
+    crop, find visually-matching regions in each frame, take the single highest-score box.
+    Keys off the actual target *image*, so it discriminates a printed poster from painted
+    murals where a text label cannot. Replaced Qwen after Qwen-3B-4bit proved unreliable for
+    this small-object, mural-competing grounding task (5 finds but all on murals / a framed
+    photo, slow ~5-6 s/found, degenerate `!!!` at full-res).
+  * **QWEN**: **Qwen2.5-VL-3B (4-bit)** label-driven grounding (kept intact, not removed).
+
+NO SILENT FALLBACKS: the active mode is the visible `object_mode` flag in every payload + log;
+switching detectors is a config edit (`runtime.object_mode`), never an automatic runtime swap.
 
 Why a separate process (not folded into perception_worker): Qwen-VL generation is
 autoregressive and slow (≈1-3 s/detection). Running it inside the SLAM loop would stall
@@ -43,8 +54,24 @@ import frame_bus
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
-# Visible NO-FALLBACK state flag (mirrors runtime.object_mode in config.yaml).
-OBJECT_MODE = "QWEN"
+# Visible NO-FALLBACK state flag (mirrors runtime.object_mode in config.yaml). Set once at
+# startup from config by set_object_mode(); every payload + log line reflects the active path.
+# {"QWEN_OWLV2" (default cascade), "OWLV2", "QWEN"}.
+OBJECT_MODE = "QWEN_OWLV2"
+VALID_OBJECT_MODES = ("QWEN_OWLV2", "OWLV2", "QWEN")
+
+
+def set_object_mode(cfg) -> str:
+    """Read the visible detector flag from config (runtime.object_mode) and pin the module
+    global so build_payload/render/logs all report the active path. Fail-fast on an unknown
+    mode (NO SILENT FALLBACKS — a typo must crash, not silently pick a default)."""
+    global OBJECT_MODE
+    mode = str(cfg.get("runtime", {}).get("object_mode", "QWEN_OWLV2")).strip().upper()
+    if mode not in VALID_OBJECT_MODES:
+        raise ValueError(f"unknown runtime.object_mode {mode!r} (expected one of "
+                         f"{VALID_OBJECT_MODES}; NO SILENT FALLBACKS — fix config).")
+    OBJECT_MODE = mode
+    return mode
 
 # Qwen2.5-VL vision patch size: smart_resize rounds each side to a multiple of patch*merge
 # (14*2=28); grounding coords are in the resized-image pixel space = grid_patches * PATCH_PX.
@@ -210,6 +237,153 @@ class QwenDetector:
 
 
 # ==============================================================================
+# OWLv2 image-guided detector (default path)
+# ==============================================================================
+class Owlv2Detector:
+    """Wraps OWLv2 image-guided (one-shot) detection. Fail-fast load; box in frame pixels.
+
+    `detect(ref_rgb, frame_rgb, label=None)` queries with the reference crop and returns the
+    single highest-score box in `frame_rgb` pixels. `label` is accepted for interface parity
+    with QwenDetector but unused (OWLv2 keys off the crop image, not a text label).
+
+    NOTE: image-guided scores are NOT 0-1 calibrated and can cluster near 1.0 across many
+    boxes; we keep only the top-scoring one above `score_thresh` (de-risk spike confirmed the
+    top box lands on the poster, not the murals). Tune `score_thresh` if it false-positives.
+    """
+
+    def __init__(self, hf_id: str, score_thresh: float = 0.9, nms_thresh: float = 0.3,
+                 device: str = "cuda"):
+        assert torch.cuda.is_available(), (
+            "CUDA not available — object_worker requires the GPU. "
+            "No CPU fallback (NO SILENT FALLBACKS)."
+        )
+        from transformers import Owlv2Processor, Owlv2ForObjectDetection
+
+        self.device = device
+        self.hf_id = hf_id
+        self.score_thresh = float(score_thresh)
+        self.nms_thresh = float(nms_thresh)
+        self.object_mode = OBJECT_MODE
+
+        t0 = time.time()
+        self.processor = Owlv2Processor.from_pretrained(hf_id)
+        self.model = Owlv2ForObjectDetection.from_pretrained(hf_id).to(device).eval()
+        torch.cuda.synchronize()
+        print(f"[object] OWLv2 '{hf_id}' loaded in {time.time()-t0:.1f}s "
+              f"| score_thresh {self.score_thresh} nms {self.nms_thresh} "
+              f"| VRAM {torch.cuda.memory_allocated()/1e9:.2f} GB", flush=True)
+
+    def derive_label(self, ref_rgb: np.ndarray) -> str:
+        """OWLv2 needs no text label (image-guided). Returns a fixed tag for display/logging."""
+        return "(owlv2 image-guided)"
+
+    def detect(self, ref_rgb: np.ndarray, frame_rgb: np.ndarray, label=None) -> dict:
+        H, W = frame_rgb.shape[:2]
+        inp = self.processor(images=frame_rgb, query_images=ref_rgb,
+                             return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            out = self.model.image_guided_detection(**inp)
+        res = self.processor.post_process_image_guided_detection(
+            out, target_sizes=torch.tensor([[H, W]], device=self.device),
+            threshold=self.score_thresh, nms_threshold=self.nms_thresh)[0]
+
+        boxes = res["boxes"].detach().cpu().numpy()
+        scores = res["scores"].detach().cpu().numpy()
+        if len(boxes) == 0:
+            return {"found": False, "bbox": None, "center": None,
+                    "raw": f"owlv2: no box >= {self.score_thresh}"}
+
+        i = int(np.argmax(scores))
+        x1, y1, x2, y2 = boxes[i]
+        x1, x2 = sorted((float(x1), float(x2)))
+        y1, y2 = sorted((float(y1), float(y2)))
+        x1 = float(np.clip(x1, 0, W - 1)); x2 = float(np.clip(x2, 0, W - 1))
+        y1 = float(np.clip(y1, 0, H - 1)); y2 = float(np.clip(y2, 0, H - 1))
+        center = [round((x1 + x2) / 2, 1), round((y1 + y2) / 2, 1)]
+        return {
+            "found": True,
+            "bbox": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+            "center": center,
+            "raw": f"owlv2 top score={scores[i]:.3f} of {len(boxes)} boxes",
+        }
+
+    def verify_logit(self, crop_rgb: np.ndarray, ref_rgb: np.ndarray) -> float:
+        """Image-guided similarity of a candidate crop to the reference, as the **absolute**
+        max logit (NOT the post-processed score, which self-normalizes to ~1.0 on every image
+        and so can't separate a true match from a distractor). On the dev poster: a real-poster
+        crop scores ≈7, a mural/sign crop ≈3.7 — so a fixed threshold (~5.0) is the precision
+        gate in the cascade. Returns -inf for an empty crop (cannot verify → reject)."""
+        if crop_rgb is None or crop_rgb.size == 0:
+            return float("-inf")
+        inp = self.processor(images=crop_rgb, query_images=ref_rgb,
+                             return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            out = self.model.image_guided_detection(**inp)
+        return float(out.logits[0, :, 0].max())
+
+
+# ==============================================================================
+# Cascade detector (default path): Qwen proposes @512, OWLv2 verifies the crop
+# ==============================================================================
+class CascadeDetector:
+    """Two-stage "both-positive" detector — the user-approved fix for the false-positive problem.
+
+    Stage 1 (recall): **4-bit Qwen @ 512** grounds the target label and proposes a box. Qwen is
+    only numerically stable at 512 (it degenerates to `!!!` at 720p, *worst on the target frame*),
+    so we always run it at 512 regardless of the resolution we are fed.
+    Stage 2 (precision): **OWLv2** verifies the proposed crop against the reference image via the
+    absolute image-guided logit; a candidate is accepted only if logit >= `verify_thresh`. This
+    rejects Qwen's mural / framed-photo false positives, which a text label can't distinguish.
+
+    A detection is forwarded only when BOTH agree. This is an ensemble (both models always run,
+    both required) — NOT a fallback. `detect(ref, frame, label)` returns the box in the **input
+    frame's** pixel space, so the pipeline's `_to_transport` scales it correctly whether fed a
+    512 or a hi-res frame.
+    """
+
+    def __init__(self, qwen: "QwenDetector", owlv2: "Owlv2Detector", verify_thresh: float = 5.0):
+        self.qwen = qwen
+        self.owlv2 = owlv2
+        self.verify_thresh = float(verify_thresh)
+        self.object_mode = OBJECT_MODE
+
+    def derive_label(self, ref_rgb: np.ndarray) -> str:
+        """Cascade still grounds via Qwen, so the label comes from the Qwen proposer."""
+        return self.qwen.derive_label(ref_rgb)
+
+    def detect(self, ref_rgb: np.ndarray, frame_rgb: np.ndarray, label: str) -> dict:
+        H, W = frame_rgb.shape[:2]
+        # Stage 1 — Qwen proposes at its stable resolution (512x288).
+        if (W, H) != (512, 288):
+            small = cv2.resize(frame_rgb, (512, 288), interpolation=cv2.INTER_AREA)
+        else:
+            small = frame_rgb
+        qdet = self.qwen.detect(ref_rgb, small, label)  # box in 512 px
+        if not qdet["found"] or qdet["bbox"] is None:
+            return {"found": False, "bbox": None, "center": None,
+                    "raw": f"cascade: qwen no proposal ({qdet['raw'][:60]})"}
+
+        # Map the 512-space box up to the input frame's native pixels, crop at full fidelity.
+        sx, sy = W / 512.0, H / 288.0
+        x1, y1, x2, y2 = qdet["bbox"]
+        bx1 = int(np.clip(round(x1 * sx), 0, W - 1)); bx2 = int(np.clip(round(x2 * sx), 0, W))
+        by1 = int(np.clip(round(y1 * sy), 0, H - 1)); by2 = int(np.clip(round(y2 * sy), 0, H))
+        crop = frame_rgb[by1:by2, bx1:bx2]
+
+        # Stage 2 — OWLv2 verifies the crop against the reference image.
+        logit = self.owlv2.verify_logit(crop, ref_rgb)
+        if logit < self.verify_thresh:
+            return {"found": False, "bbox": None, "center": None,
+                    "raw": f"cascade: owlv2 reject logit={logit:.2f} < {self.verify_thresh} "
+                           f"(qwen box {qdet['bbox']})"}
+
+        bbox = [round(float(bx1), 1), round(float(by1), 1), round(float(bx2), 1), round(float(by2), 1)]
+        center = [round((bbox[0] + bbox[2]) / 2, 1), round((bbox[1] + bbox[3]) / 2, 1)]
+        return {"found": True, "bbox": bbox, "center": center,
+                "raw": f"cascade qwen+owlv2 logit={logit:.2f} >= {self.verify_thresh}"}
+
+
+# ==============================================================================
 # Reference crop + payload + render
 # ==============================================================================
 def load_reference(cfg) -> np.ndarray:
@@ -269,31 +443,68 @@ def render(frame_bgr, ref_rgb, det, infer_ms, label=""):
 
 
 # ==============================================================================
+# Detector construction (shared by the cascade + the standalone diagnostic modes)
+# ==============================================================================
+def _build_qwen(cfg, q) -> "QwenDetector":
+    return QwenDetector(
+        q["hf_id"], quantization=q.get("quantization", "4bit"),
+        max_new_tokens=int(q.get("max_new_tokens", 256)))
+
+
+def _build_owlv2(cfg) -> "Owlv2Detector":
+    o = cfg["models"]["owlv2"]
+    return Owlv2Detector(
+        o["hf_id"], score_thresh=float(o.get("score_thresh", 0.9)),
+        nms_thresh=float(o.get("nms_thresh", 0.3)))
+
+
+def _qwen_label(detector, q, ref_rgb) -> str:
+    """The provided crop is the source of truth; the grounding label is taken from config if set,
+    else derived from the crop once (Qwen grounds a described object far more reliably than it
+    matches a raw reference image). Logged for transparency."""
+    cfg_label = q.get("target_label")
+    if cfg_label:
+        label = str(cfg_label).strip()
+        print(f"[object] target label (from config): {label!r}", flush=True)
+    else:
+        label = detector.derive_label(ref_rgb)
+        print(f"[object] target label (derived from crop): {label!r}", flush=True)
+    return label
+
+
+# ==============================================================================
 # Pipeline
 # ==============================================================================
 class Pipeline:
     def __init__(self, cfg):
+        mode = set_object_mode(cfg)  # pins the module OBJECT_MODE flag from config
         q = cfg["models"]["qwen_vl"]
         self.cadence_hz = float(cfg["perception"]["object_cadence_hz"])
         self.min_interval = 1.0 / self.cadence_hz if self.cadence_hz > 0 else 0.0
         # The lift (perception_worker) works in the 512x288 transport space, so detections are
-        # scaled back to it regardless of what (higher) resolution Qwen actually grounded on.
+        # scaled back to it regardless of what (higher) resolution the detector grounded on.
         self.proc_w = int(cfg["perception"]["processing_width"])
         self.proc_h = int(cfg["perception"]["processing_height"])
         self.ref_rgb = load_reference(cfg)
-        self.detector = QwenDetector(
-            q["hf_id"], quantization=q.get("quantization", "4bit"),
-            max_new_tokens=int(q.get("max_new_tokens", 256)))
-        # The provided crop is the source of truth; the grounding label is taken from config if
-        # set, else derived from the crop once (Qwen grounds a described object far more reliably
-        # than it matches a raw reference image). Logged for transparency.
-        cfg_label = q.get("target_label")
-        if cfg_label:
-            self.label = str(cfg_label).strip()
-            print(f"[object] target label (from config): {self.label!r}", flush=True)
-        else:
+        print(f"[object] === object_mode = {mode} ===", flush=True)
+
+        if mode == "QWEN_OWLV2":
+            # The cascade: Qwen (4-bit @512) proposes, OWLv2 verifies the crop. Both load.
+            qwen = _build_qwen(cfg, q)
+            owlv2 = _build_owlv2(cfg)
+            self.detector = CascadeDetector(
+                qwen, owlv2, verify_thresh=float(cfg["models"]["owlv2"].get("verify_thresh", 5.0)))
+            self.label = _qwen_label(qwen, q, self.ref_rgb)  # Qwen still grounds, so it needs a label
+            print(f"[object] cascade ready: Qwen proposer + OWLv2 verify "
+                  f"(thresh {self.detector.verify_thresh})", flush=True)
+        elif mode == "OWLV2":
+            self.detector = _build_owlv2(cfg)
+            # OWLv2 is image-guided (the crop IS the query) — no text label to derive.
             self.label = self.detector.derive_label(self.ref_rgb)
-            print(f"[object] target label (derived from crop): {self.label!r}", flush=True)
+            print(f"[object] OWLv2 image-guided (no text label needed)", flush=True)
+        else:  # QWEN
+            self.detector = _build_qwen(cfg, q)
+            self.label = _qwen_label(self.detector, q, self.ref_rgb)
         self.last_infer_mono = 0.0
         self.n_det = 0
         self.n_found = 0

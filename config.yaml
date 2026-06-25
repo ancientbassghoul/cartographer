@@ -25,10 +25,18 @@ perception:
   depth_cadence_hz: 3                    # Depth Anything V2 runs slower than SLAM tracking
   object_cadence_hz: 0.5                 # Qwen target detection (separate process); slow, start conservative
   object_frame_height: 720               # hi-res frame height for Qwen grounding (width keeps aspect; no upscale beyond source)
+  capture_key: "space"                   # io_bridge: grab the current FULL-RES drone frame -> capture_dir (benchmark frames)
+  capture_dir: "test_assets/captures"    # where 'space' snapshots are written (full-res PNG; sort into Nasrallah/Rifle/None)
 
 models:
   depth_anything:
     hf_id: "depth-anything/Depth-Anything-V2-Base-hf"   # via transformers AutoModelForDepthEstimation
+  owlv2:                                # OWLv2 image-guided (cascade verifier + standalone OWLV2 mode)
+    hf_id: "google/owlv2-base-patch16-ensemble"  # image-guided one-shot detection
+    score_thresh: 0.9                   # standalone OWLV2 mode: top box >= this (scores NOT calibrated)
+    nms_thresh: 0.3                     # NMS IoU for post_process_image_guided_detection
+    verify_thresh: 5.0                  # CASCADE gate: accept Qwen's crop iff abs image-guided logit >= this
+                                        #   (dev poster ~7, murals/sign ~3.7; tune on the offline run)
   qwen_vl:
     hf_id: "Qwen/Qwen2.5-VL-3B-Instruct"
     quantization: "4bit"                # bitsandbytes nf4
@@ -48,4 +56,4 @@ map:
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.
   tracking_mode: "MASt3R"               # {"MASt3R"} only unless an alternate is approved
-  object_mode: "QWEN"                   # {"QWEN"} only unless DINOv2 fallback is approved
+  object_mode: "QWEN_OWLV2"             # {"QWEN_OWLV2" (default cascade), "OWLV2", "QWEN"} — set in config, never auto-swapped

@@ -15,7 +15,7 @@ __pycache__/
 checkpoints/
 
 # Outputs / scratch
-test_assets/*.png
+test_assets/
 OUTPUT/
 DEBUG_IMAGES/
 *.mp4

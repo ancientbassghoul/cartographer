@@ -19,6 +19,13 @@ Apply the following rules to all design planning and code generation:
 3. Visible Alerts: When a fallback pathway is triggered at runtime, it must emit a critical log warning and modify a telemetry field that can be rendered in the visualizer overlay, so the operator immediately knows the system is running in a degraded or alternative state.
 4. Fail-Fast Assertions: If an unapproved error or OOM condition occurs, prefer raising an explicit exception over gracefully absorbing the failure with a generic catch-all.
 
+### IMAGE INTEGRITY AND RESOLUTION GUARDRAIL
+
+Whenever any script or process processes an image as an input (whether it is a static reference template or a live video frame):
+1. **No Silent Code Downscaling:** You are strictly forbidden from introducing arbitrary downscaling, cropping, or resolution caps in the script code (e.g., shrinking a 1280x720 frame to 700x392 to save compute) without explicitly proposing the change and validating it with the user first.
+2. **Mandatory Model Preprocessing Disclosure:** If a model's native architecture strictly requires a specific input tensor size (like OWLv2's 960x960 grid or DINOv2's 14-pixel patch alignments), you must explicitly state this resolution transformation in the code documentation and logs. You must maximize the source asset's data fidelity before it enters the model processor.
+3. If you are ever in doubt about whether a resolution change degrades the data, **STOP** and validate the execution parameters with the user.
+
 ## Overview
 The user is a candidate for an AI Assisted App Developer. This is the task he was given:
 

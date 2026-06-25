@@ -59,10 +59,11 @@ class DroneControl:
     request, and a `debug_keys` toggle (the sample's per-key print, off by default).
     """
 
-    def __init__(self, host, port, detect_key="g", debug_keys=False):
+    def __init__(self, host, port, detect_key="g", capture_key="space", debug_keys=False):
         self.host = host
         self.port = port
         self.detect_key = detect_key
+        self.capture_key = capture_key
         self.debug_keys = debug_keys
 
         self.control_state = {
@@ -92,6 +93,8 @@ class DroneControl:
         self._running.set()
         self._detect_held = False          # rising-edge tracker for the 'g' key
         self._detect_requests = 0          # incremented on each 'g' press; main loop drains it
+        self._capture_held = False         # rising-edge tracker for the capture key (space)
+        self._capture_requests = 0         # incremented on each capture press; main loop drains it
 
     # -- TCP server -----------------------------------------------------------
     def start(self):
@@ -121,6 +124,7 @@ class DroneControl:
         keyboard.hook(self._on_key_event)
         print("[io_bridge] Keyboard hook active. Manual flight: WASD/EF/arrows, 1=arm, b=land, c=reset cam.")
         print(f"[io_bridge] '{self.detect_key}' = request object detection (forwarded to object_worker).")
+        print(f"[io_bridge] '{self.capture_key}' = save the current FULL-RES frame to the capture dir.")
 
     def _listen_to_unity(self):
         conn = self._conn
@@ -237,10 +241,23 @@ class DroneControl:
                 print(f"[io_bridge] object-detect requested (#{self._detect_requests})")
             self._detect_held = is_down
 
+        # Frame-capture hotkey: rising edge only. The main loop saves the current
+        # full-res NDI frame (drone camera) so the press grabs exactly what's on screen.
+        if key == self.capture_key:
+            if is_down and not self._capture_held:
+                self._capture_requests += 1
+            self._capture_held = is_down
+
     def drain_detect_requests(self):
         """Return how many new 'g' presses occurred since the last call (and reset)."""
         n = self._detect_requests
         self._detect_requests = 0
+        return n
+
+    def drain_capture_requests(self):
+        """Return how many new capture-key presses occurred since the last call (and reset)."""
+        n = self._capture_requests
+        self._capture_requests = 0
         return n
 
     def control_snapshot(self):
@@ -340,6 +357,8 @@ def main():
     object_frame_h = int(cfg["perception"].get("object_frame_height", 720))
     target_fps = cfg["perception"]["target_processing_fps"]
     detect_key = cfg["models"]["qwen_vl"].get("object_trigger_key", "g")
+    capture_key = cfg["perception"].get("capture_key", "space")
+    capture_dir = os.path.join(REPO, cfg["perception"].get("capture_dir", "test_assets/captures"))
     publish_interval = 1.0 / float(target_fps)
 
     # --- bring up the bus (publishers bind; fail-fast if a port is taken) ---
@@ -354,15 +373,20 @@ def main():
         print(f"[io_bridge] hi-res object stream: ~{object_frame_h}p PUB on :{hires_port}")
 
     # --- control server + NDI (both fail-fast) ---
-    control = DroneControl(host, port, detect_key=detect_key, debug_keys=args.debug_keys)
+    control = DroneControl(host, port, detect_key=detect_key, capture_key=capture_key,
+                           debug_keys=args.debug_keys)
     control.start()
     recv = open_ndi(ndi_filter)
 
     window_name = "Cartographer — io_bridge (NDI)"
     output_dir = os.path.join(REPO, "OUTPUT")
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(capture_dir, exist_ok=True)
+    print(f"[io_bridge] full-res captures -> {capture_dir}")
     recording = False
     video_writer = None
+    captures_saved = 0           # session count, shown on the HUD
+    last_capture_mono = 0.0      # drives a brief on-screen "SAVED" flash
 
     frame_id = 0
     published = 0
@@ -373,7 +397,8 @@ def main():
     cap_window_start = time.monotonic()
     cap_fps = 0.0
 
-    print("\n[io_bridge] === READY === fly manually. Video keys (window focused): r=record, q=quit.\n")
+    print(f"\n[io_bridge] === READY === fly manually. '{capture_key}'=capture full-res frame (global). "
+          f"Video keys (window focused): r=record, q=quit.\n")
     try:
         while control._running.is_set():
             t, v, a, _ = ndi.recv_capture_v2(recv, 1000)
@@ -424,6 +449,21 @@ def main():
                          "frame_id": frame_id, "mono_ts": now},
                     )
 
+                # --- frame-capture requests -> save the CURRENT full-res NDI frame ---
+                # `bgr` is the native NDI frame (no downscale), so a press grabs full resolution.
+                # One save per loop iteration even if the key was hit multiple times (same frame).
+                if control.drain_capture_requests():
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    fname = os.path.join(capture_dir, f"capture_{ts}_f{frame_id}.png")
+                    if cv2.imwrite(fname, bgr):
+                        captures_saved += 1
+                        last_capture_mono = now
+                        h, w = bgr.shape[:2]
+                        print(f"[io_bridge] captured frame -> {fname}  ({w}x{h}, #{captures_saved})")
+                    else:
+                        # NO SILENT FALLBACKS: a failed write is surfaced, not swallowed.
+                        print(f"[io_bridge] WARNING: cv2.imwrite failed for {fname}")
+
                 # --- periodic status heartbeat (~2 Hz) ---
                 if now - last_status_mono >= 0.5:
                     window = now - last_status_mono
@@ -455,10 +495,13 @@ def main():
                 # --- live display ---
                 if not args.no_display:
                     disp = cv2.resize(bgr, (0, 0), fx=0.5, fy=0.5)
-                    cv2.putText(disp, f"cap {cap_fps:4.1f}fps  sim_t {self_time(control):.1f}",
+                    cv2.putText(disp, f"cap {cap_fps:4.1f}fps  sim_t {self_time(control):.1f}  shots {captures_saved}",
                                 (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
                     if recording:
                         cv2.circle(disp, (disp.shape[1] - 20, 20), 8, (0, 0, 255), -1)
+                    if now - last_capture_mono < 0.6:   # brief confirmation flash
+                        cv2.putText(disp, "SAVED", (disp.shape[1] // 2 - 40, disp.shape[0] // 2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
                     cv2.imshow(window_name, disp)
 
             elif t == ndi.FRAME_TYPE_AUDIO:

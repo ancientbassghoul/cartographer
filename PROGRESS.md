@@ -1,8 +1,185 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated: 2026-06-22. Read this first when resuming with fresh context, alongside the
+_Last updated: 2026-06-25. Read this first when resuming with fresh context, alongside the
 design plan at `C:\Users\owner\.claude\plans\hey-read-this-file-breezy-otter.md`. **The single
 actionable resume pointer is the "## NEXT" section near the bottom.**_
+
+## ✅✅ BREAKTHROUGH (2026-06-25): cascade detector WORKS — rifle 0.77 good / 0.00 FP, poster 0.33 / 0.00 FP
+_Built `cascade_detector.py` (+ `cascade_report.py` HTML). A 3-stage cascade — propose wide → verify
+appearance → verify geometry — is the FIRST approach that localizes the 3D rifle with ZERO false
+positives. This SUPERSEDES the "no detection solution" VERDICT block below._
+
+**Architecture (the detector we were waiting for):**
+- **Stage 1 — propose (recall ceiling):** GroundingDINO (text: "a rifle" / "a printed portrait
+  poster") + OWLv2 image-guided (top-K anchors), pooled, low thresholds, per-source NMS.
+- **Stage 2 — verify appearance:** DINOv2 ViT-S/14 GLOBAL crop embedding (CLS + mean-pool); each
+  candidate crop AND the ref are **letterboxed** (aspect-preserving, NEVER squashed — the rifle ref
+  is 168×447) to 224². Survivor gate = CLS cosine ≥ `DINO_THRESH` (=0.50).
+- **Stage 3 — verify geometry (asymmetric, user-decided):** planar poster = SIFT+RANSAC homography
+  **HARD gate** (≥12 inliers); 3D rifle = LightGlue inliers **SOFT bonus** that never vetoes
+  (LightGlue rifle recall is too low to gate, but scores 66–188 inliers on the localized CROP — a
+  strong tiebreak). Models load ONE STAGE AT A TIME and free (peak VRAM tiny: GD 0.69, OWLv2 0.63,
+  DINOv2 0.10 GB).
+- **Decision:** among accepted survivors rank by **DINOv2 cosine FIRST**, geometry as tiebreak.
+  (Fixed a poster mis-rank where a loose off-target box with marginally more SIFT inliers beat the
+  near-exact poster box — f2307/f3967 now land at IoU 0.93/0.96.)
+
+**Results (9 poster + 13 rifle positives, 15 negatives; `OUTPUT/cascade/{summary,per_frame}.json`):**
+| target | Stage-1 recall ceiling (gd / owlv2) | final good (on-target) | final FP | DINO sep pos/neg |
+|---|---|---|---|---|
+| Rifle (3D) | **1.00** (1.00 / 1.00) | **0.77** (10/13) | **0.00** | 0.75 / 0.15 |
+| Nasrallah (poster) | **1.00** (1.00 / 1.00) | 0.33 (3/9) | **0.00** | 0.42 / 0.29 |
+
+- **The 3D rifle was UNSOLVED by every prior engine** (best OWLv2 0.23 good / 0.93 FP). Cascade =
+  0.77 good / **0.00 FP**, IoU up to 0.94, boxes visually on the rifle.
+- **Both proposers cover GT on every positive frame** — GroundingDINO DOES find the rifle (the big
+  unknown is resolved), and **0 false positives across all 30 negative evaluations**.
+- **`DINO_THRESH=0.50` is the throttle:** every remaining miss is just under it (rifle 0.41–0.43,
+  poster 0.27–0.42). Rifle separation is huge (0.75 vs 0.15) → safe to lower; poster separation is
+  weak (0.42 vs 0.29, small flat crop) → wants a lower, **per-target** threshold. ← NEXT (user
+  instruction pending). Reproduce: `venv\Scripts\python.exe cascade_detector.py` then `cascade_report.py`.
+
+**Still a DIAGNOSTIC** (same status as `benchmark_*.py`): `object_worker.py` is NOT yet wired to the
+cascade. The detector-agnostic 3D lift/consensus/stream/viz (KEEP list below) is untouched and ready
+to consume whatever the cascade outputs.
+
+## ⛔⛔ (SUPERSEDED 2026-06-25 by the CASCADE BREAKTHROUGH above) detector benchmark DONE → NO proper detection solution
+_The 5-engine benchmark below is complete and reproducible (`benchmark_detectors.py` +
+`benchmark_report.py`, artifacts in `OUTPUT/benchmark/`). **Bottom line: we still do NOT have an
+adequate target detector — especially for the 3D rifle.** Do NOT pick/rewrite a detector yet. The
+**user is going to propose a NEW detection plan**; wait for it. The detector-agnostic 3D pipeline
+(lift / consensus / hi-res stream / viz — see the KEEP list further down) is untouched and reusable
+by whatever detector comes next._
+
+**What was built (benchmark harness — keep, reusable):**
+- `io_bridge.py` `space` hotkey → full-res 1280×720 frame capture (`perception.capture_key/_dir`).
+- `annotate_targets.py` → GT bbox annotator; writes `test_assets/<target>/labels.json` (`[x1,y1,x2,y2]`,
+  top-left origin).
+- Dataset: `test_assets/{Nasrallah(9), Rifle(13), None(15 neg)}/` + `*_ref.png` canonical templates.
+- `benchmark_detectors.py` — 5 engines × 2 targets + negatives; metrics **recall, good (=found AND
+  pred-center∈GT), loc/found, FP_neg, IoU**; flags `--mask-refs`, `--debug-shapes`, `--max-frames`.
+- `benchmark_report.py` — single portable `OUTPUT/benchmark/benchmark_report.html` (embedded overlays
+  GT=green / pred=cyan-correct,red-wrong + per-frame sidebar). `per_frame.json` has gt_bbox/pred_bbox
+  (+ Qwen raw replies) for machine-readable verification.
+- Deps added (clean, no torch/MASt3R/lietorch disturbance): `lightglue`(cvg)+`kornia`, `timm`,
+  `torchvision`(was present); `transformers` GroundingDINO+SAM used for `--mask-refs`.
+
+**Final numbers (canonical refs, un-throttled res). good = on-target hit rate; FP_neg = fires on empty room:**
+| engine | POSTER good / FP | RIFLE good / FP | note |
+|---|---|---|---|
+| SIFT (cv2) | **0.44 / 0.00** | 0.00 / 0.00 | clean+deterministic on poster; 0 recall on 3D rifle |
+| DINOv2 (vits14) | **0.78** / 0.60 | 0.00 / 1.00 | best poster localization but over-fires; rifle = noise |
+| OWLv2 image-guided | 0.11 / 0.13 | **0.23** / 0.93 | best rifle *good* but fires on ~all negatives |
+| Qwen2.5-VL-3B 4bit@512 | 0.22 / 0.13 | 0.08 / 0.27 | best rifle *recall* 0.77 but localizes wrong; mural mis-fires |
+| LightGlue (SuperPoint) | 0.11 / 0.00 | 0.08 / 0.00 | weak (small ref starves SuperPoint) |
+
+**Conclusions (don't re-derive):**
+- **Planar poster = solvable**: SIFT is the clean pick (0 false positives, exact homography box, but
+  recall threshold-limited — lower `SIFT_MIN_INLIERS`); DINOv2 localizes more (0.78) but needs a
+  precision gate (FP 0.60).
+- **3D rifle = UNSOLVED by every engine.** Best on-target rate is OWLv2 0.23 (with FP 0.93). A
+  low-texture, self-similar object defeats keypoints (no texture), patch-NN (DINOv2 matches dark
+  clutter everywhere), and both VLMs localize it poorly (OWLv2 loose boxes; Qwen confident-but-wrong).
+- **Experiments that did NOT rescue it (don't repeat):** (1) un-throttling resolution
+  (DINOv2 frame 700→1288, aspect-preserving zero-pad ref) — *helped the poster* (good 0.11→0.78) but
+  rifle stayed 0.00; (2) OWLv2 raw-logit gate (`verify_thresh` 5.0 vs the self-normalizing post-proc
+  score) — fixes the strawman FP but the logit scale is **query-dependent** (rifle neg-median ~6.4 >
+  gate); (3) **Grounded-SAM background masking** of refs (clean silhouettes, verified by eye) — fixed
+  OWLv2-rifle FP **0.93→0.13** (logit-cooling) but NOT its localization, did NOT restore DINOv2 rifle,
+  and *hurt* SIFT/OWLv2 on the poster. DINOv2 coord math was explicitly verified correct (not a bug).
+
+**➡️ NEXT: wait for the user's new detection plan.** Do not select/integrate a detector or edit
+`object_worker.py` until then. Everything above is the evidence base for that conversation.
+
+## ⛔ Status: ALL learned-detector attempts FAILED → benchmarking matching tools — 2026-06-25
+_Resume plan: `~/.claude/plans/parallel-weaving-orbit.md`. **Every detection engine we tried so
+far is inadequate for this target.** Decision: benchmark better-suited image-matching tools and
+pick the detection engine(s) for the pipeline._
+
+**What failed and why (don't re-try these):**
+- **Qwen2.5-VL (4-bit)** — *non-deterministic recall*: in a fixed pose it flickers `no target` ↔
+  `TARGET` (`DEBUG_IMAGES/wrong_3d_position_and_sensitive_qwen.png`). @512 finds the poster on
+  ~2 frames/flight; @720p **degenerates to `!!!` on the target frame** (inherent 4-bit fragility
+  at high vision-token counts — NOT a transformers/preprocessing bug, both ruled out). 8-bit @720p
+  is stable but **~18–20 s per *found* frame** (int8 decode); fp16 @720p also degenerates.
+- **OWLv2 image-guided** — *not discriminative*: as a verifier, its absolute crop logit
+  (`logits[0,:,0].max()`) scores window/brick/sign crops ~8, **same as the real poster** — it
+  answers "is this a framed textured rectangle," not "is this THE target." As a proposer it
+  over-proposes. (NOTE: some early "false positives" at src 150/400/700 were later found to be the
+  REAL poster seen *through a window* — but OWLv2 still can't be trusted to gate.)
+- **Qwen→OWLv2 cascade** (Qwen@512 proposes, OWLv2 verifies the crop, gate 5.0) — the current
+  uncommitted code. Self-test passes + offline E2E ran (587f, 22kf, peak 10.8 GB, geometry OK),
+  but recall is still ~2 hits → `confident:false`; the verify gate only "passed" by luck (Qwen
+  didn't propose the window/sign that run). **Inadequate.**
+
+**➡️ NEXT: benchmark image-matching tools, then rewrite ONLY the detector.**
+- Tools to benchmark: **SuperPoint + LightGlue** (learned local features + matcher; SIFT-but-better,
+  gives correspondences→homography+inlier confidence), **DINOv2** (semantic dense correspondence;
+  best for 3D / distant / through-glass), with **SIFT** (cv2, already works) and **OWLv2** as
+  baselines. SIFT already validated on the poster: 40–67 RANSAC inliers on clear views, **0 on the
+  window/sign** that fooled both VLMs — clean, deterministic, but loses recall on distant/oblique.
+- Benchmark on **TWO targets**: the **planar Nasrallah poster** (homography/SIFT/LightGlue ideal)
+  AND a **3D rifle** seen from different angles (non-planar → should favor semantic DINOv2). Likely
+  **no single winner** → the engine may end up target-type-dependent.
+- **Assets the user will provide** in `cartographer/test_assets/bench/`: `rifle_ref.png` (target
+  render/crop), `rifle_pos_*.png` (≥5, different angles), `rifle_neg_*.png` (≥3); optional extra
+  `poster_pos_*`/`poster_neg_*` (else auto-extract poster frames from
+  `../XLAB/OUTPUT/flight_20260621_120829.mp4`, poster in view src ~1260–1300).
+- **Deps likely needed:** `lightglue` (or via `kornia`) + **DINOv2** (`torch.hub`) — confirm before pip.
+- **PENDING USER DECISIONS (ask on resume):** (1) revert scope — recommended **discard detectors
+  only**, KEEP the detector-agnostic 3D pipeline; (2) which deps to install; (3) rifle assets +
+  poster-frame source.
+
+**KEEP (detector-agnostic, correct, reusable by ANY detector — do NOT delete in any revert):**
+the **3D lift** in `perception_worker.py` (`ingest_detection`, pose ring, ray-cast into the voxel
+map, `TOPIC_TARGET`; geometry verified center ray ≈[0,0,1]), **`target_estimator.py`** (cluster
+consensus + uncertainty), the **hi-res `:5605` stream** (io_bridge; full-res frames help SIFT/
+LightGlue/DINOv2), **`make_target.py`**, the **`TOPIC_DETECTION` bus contract**, the visualizer
+**target marker**, and **`--debug-lift`**. The detector is isolated in `object_worker.py`; only
+that file's detector classes get rewritten around the benchmark winner.
+
+**Working-tree state (UNCOMMITTED):** `object_worker.py` (+Owlv2Detector/CascadeDetector/modes),
+`config.yaml` (+models.owlv2, object_mode QWEN_OWLV2), `PROGRESS.md`. Last commit = `dc28876`
+(object chain + post-live fixes). Nothing committed since. `DEBUG_IMAGES/_diag_*` are throwaway.
+
+## Status: Detector swap → **Qwen+OWLv2 cascade** ("both-positive") — SUPERSEDED (see top, 2026-06-24)
+_Plan: `~/.claude/plans/parallel-weaving-orbit.md`. Replaced the single-model detector with a
+two-stage cascade after extensive empirical de-risking. **The detector is the only thing that
+changed** (lift/SLAM/map/consensus/viz all untouched)._
+- **Design:** Stage 1 (recall) = **4-bit Qwen @ 512** grounds the label + proposes a box;
+  Stage 2 (precision) = **OWLv2** verifies the proposed crop against the reference image via the
+  **absolute** image-guided logit (`out.logits[0,:,0].max()`, NOT the post-processed score which
+  self-normalizes to ~1.0 on every frame). Accept iff `logit >= models.owlv2.verify_thresh`
+  (=5.0; dev poster ≈7, murals/sign ≈3.7). Both models always run, both must agree — an
+  **ensemble, not a fallback**. New `object_worker.CascadeDetector` (resolution-adaptive: always
+  downscales to 512 for Qwen, crops at the input frame's native res for OWLv2).
+- **Visible mode flag:** `runtime.object_mode` now ∈ `{"QWEN_OWLV2" (default), "OWLV2", "QWEN"}`,
+  validated fail-fast in `set_object_mode`; standalone OWLV2/QWEN kept as diagnostics. `OBJECT_MODE`
+  in every payload + log reads the active path; per-detection `raw` carries the verify logit.
+- **Key empirical findings (this is WHY 512, not hi-res):**
+  - 4-bit Qwen **degenerates to `!!!` at 720p — worst on the target frame** (src 1290 → `!!!`
+    3/3, single- AND two-image), while only boxing *murals* on other frames. So the committed
+    hi-res path (`:5605`/720p, from commit dc28876) was MISSING the real poster and only firing
+    false positives — it was **never successfully flown live** (only offline-"verified"). The
+    live run the user remembers working was the *earlier* working-tree **4-bit @ 512** path.
+  - NOT a transformers regression (5.12.1 since 06-21) and NOT input corruption (sanity-dumped
+    `process_vision_info` output — pristine RGB). It's inherent 4-bit fragility at high token counts.
+  - 8-bit @ 720p is stable + boxes the poster but **~18–20 s per *found* frame** (int8 decode
+    ~2 tok/s) — unusable. fp16 @ 720p also degenerates. **512 is faster AND more reliable on the
+    target.** OWLv2 verify works on the 512 crop as well as a hi-res crop (logit ~7 either way).
+- **Timing (profiled, 4-bit @ 512):** empty frames ~0.5 s (fits the 2 s cadence — the ">90%"
+  case the user saw "firing every 2 s"); found frames ~4.5 s Qwen + ~0.8 s OWLv2 (autoregressive
+  bbox-JSON decode). Found-overrun accepted (drone dwells; "compute efficiency NOT graded").
+- **Verify (DONE):** `object_worker --self-test` PASS (POSITIVE boxed on the poster, logit 7.59;
+  NEGATIVE correctly empty; mode `QWEN_OWLV2`). Offline E2E `perception_worker --video <flight>
+  --detect --debug-lift` → **587 frames, 22 kf, reloc 0, 58044 voxels (== M4 baseline), peak VRAM
+  10.80 GB**, geometry intact (center ray ≈[0,0,1]). **Precision FIXED: 0 false positives lifted**
+  (at 512 Qwen didn't even propose murals; verify gate is insurance). **Recall still low (2 finds
+  → `confident:false`)** — the SAME pre-existing 3D-quality gap (2 hits ~2u apart, one near-camera
+  @0.48u), reproduced NOT introduced; it's the out-of-scope Task-3 lift tuning, best done on the
+  user's real Phase-1 target with more dwell/cadence. Live 4-process run still user-pending.
+- **Config:** `models.owlv2.verify_thresh: 5.0`, `runtime.object_mode: "QWEN_OWLV2"`,
+  `models.qwen_vl.quantization` stays `4bit`. NOT committed (awaiting user).
 
 ## What this project is (1 paragraph)
 Assessment task: from the black-box **XLAB** Unity sim's single monocular drone feed, autonomously
@@ -367,10 +544,14 @@ crash; 60 Hz manual flight had NO lag while perception ran.)_
   shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
   `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
 
-## NEXT (2026-06-23): ➡️ see the "⏭️ RESUME POINTER: swap Qwen → OWLv2" block in the TOP status
-section ("Post-live-run fixes"). The object chain is built + verified E2E but Qwen is unreliable for
-this target; the immediate next task is the OWLv2 image-guided detector swap (detector ONLY; all
-infra/lift/consensus/viz stays). The history below is the prior resume context (now superseded).
+## NEXT (2026-06-25): ➡️ see the TOP block "⛔⛔ VERDICT: detector benchmark DONE → NO proper
+detection solution". The 5-engine benchmark (SIFT, LightGlue, DINOv2, OWLv2, Qwen-4bit) is complete:
+the **planar poster is solvable (SIFT clean / DINOv2 high-recall), but the 3D rifle is unsolved for
+precise localization by every engine** (best on-target rate 0.23 w/ 93% false positives). **We do NOT
+have an adequate detector.** **The user will propose a NEW detection plan — wait for it.** Do not pick
+or integrate an engine, and do not touch `object_worker.py`, until the user's new plan lands. The
+detector-agnostic 3D lift/consensus/stream/viz (KEEP list above) stays as-is for whatever comes next.
+Older resume pointers below are superseded.
 
 ## (history) object detection (Qwen) + 3D localize/report — prior resume point
 **M4 is DONE.** **Re-prioritization 2026-06-22 (user-approved): M5 (glass + opening detectors) is
