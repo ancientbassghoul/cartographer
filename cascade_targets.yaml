@@ -1,0 +1,24 @@
+# cascade_detector.py batch config — example targets.
+# This is editable DATA you own (no target-specific logic lives in cascade_detector.py).
+# Run: venv\Scripts\python.exe cascade_detector.py --targets cascade_targets.yaml
+#
+# asset_class drives the DINOv2 threshold + Stage-3 geometric gate (see ASSET_CLASS_PARAMS):
+#   2D_PLANAR    flat/printed (poster, sign)  -> DINOv2 >= 0.33, SIFT homography HARD gate
+#   3D_GEOMETRY  3D object (rifle, tool)      -> DINOv2 >= 0.40, LightGlue SOFT bonus (no veto)
+# Paths are relative to the cartographer/ repo root.
+
+negatives: test_assets/None        # optional shared target-absent frames (FP metric); per-target overrides allowed
+
+targets:
+  - name: Nasrallah
+    text: "a printed portrait poster"
+    ref: test_assets/Nasrallah_ref.png
+    frames: test_assets/Nasrallah
+    asset_class: 2D_PLANAR
+    # labels: test_assets/Nasrallah/labels.json   # optional; auto-detected if omitted
+
+  - name: Rifle
+    text: "a rifle"
+    ref: test_assets/Rifle_ref.png
+    frames: test_assets/Rifle
+    asset_class: 3D_GEOMETRY

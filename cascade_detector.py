@@ -1,60 +1,100 @@
-"""cascade_detector.py — verified two/three-stage cascade to find the poster + rifle.
+"""cascade_detector.py — generalized verified cascade detector (any target, any asset class).
 
 Per PROGRESS.md, every single-shot engine (SIFT/LightGlue/DINOv2-dense/OWLv2/Qwen) over-fired
-because it conflated "where is a candidate" with "is this THE target". This script keeps the
-cascade paradigm (propose wide -> verify ruthlessly) but is driven by our own benchmark numbers:
+because it conflated "where is a candidate" with "is this THE target". This keeps the cascade
+paradigm (propose wide -> verify ruthlessly) and is driven entirely by an AssetClass, NOT by any
+hardcoded target name:
 
   STAGE 1  Propose (recall ceiling)
-      GroundingDINO (text-guided) + OWLv2 image-guided (image-guided), POOLED, low thresholds.
-      The cascade can never beat this stage's recall, so we report each proposer's standalone
-      recall first. OWLv2 already hit rifle recall 1.0 (FP 0.93) in the bench; the verifiers exist
-      to kill that FP.
+      GroundingDINO (text-guided) + OWLv2 image-guided, POOLED, low thresholds. The cascade can
+      never beat this stage's recall, so we report each proposer's standalone recall first.
 
   STAGE 2  Verify (DINOv2 crop embedding)
-      Letterbox (NEVER squash -- the rifle ref is 168x447) each candidate crop AND the reference to
-      a square 224x224, embed with DINOv2 ViT-S/14, cosine-compare (CLS + mean-pool both reported).
-      Survivor gate = cosine threshold chosen from the printed pos/neg separation, not hardcoded.
+      Letterbox (NEVER squash) each candidate crop AND the reference to a square 224x224, embed with
+      DINOv2 ViT-S/14, cosine-compare (CLS + mean-pool both reported). Survivor gate = the
+      asset class's `dino_thresh`.
 
-  STAGE 3  Geometric (per-target asymmetric -- user decision)
-      Planar poster  = HARD gate: SIFT + RANSAC homography inliers >= SIFT_MIN_INLIERS (bench: 0 FP).
-      3D rifle       = SOFT bonus: LightGlue inliers reported as confidence; NEVER vetoes (bench:
-                       LightGlue rifle recall 0.23 -> a hard gate would destroy recall).
+  STAGE 3  Geometric (asset-class-driven gate)
+      The asset class chooses the engine + mode:
+        2D_PLANAR    -> SIFT + RANSAC homography, HARD gate (>= GEOM_HARD_MIN_INLIERS inliers).
+        3D_GEOMETRY  -> LightGlue inliers, SOFT bonus (reported; NEVER vetoes a Stage-2 survivor).
 
-Output: OUTPUT/cascade/{per_frame.json, summary.json} + per-stage composite overlays/. Build the
-shareable HTML with cascade_report.py afterwards.
+  DECISION  Among accepted survivors, rank by the Stage-2 DINOv2 cosine FIRST (primary), geometric
+      inliers only as a tie-break. (Geometry-first previously mis-ranked planar targets — a loose
+      off-target box with marginally more inliers beat the near-exact box with a much higher DINOv2
+      score; appearance-primary fixes that.)
 
-GPU-only, NO SILENT FALLBACKS (CLAUDE.md): CUDA + each model load fail-fast; image resizes are
-logged (image-integrity rule). Models load ONE STAGE AT A TIME and are freed, so peak VRAM is small.
+You supply each target at runtime: TEXT + REFERENCE IMAGE + ASSET CLASS (+ frames, optional labels
+and negatives). Either one target via CLI flags, or many via a --targets YAML.
 
-  venv\\Scripts\\python.exe cascade_detector.py                 # full run, both targets
-  venv\\Scripts\\python.exe cascade_detector.py --max-frames 2  # quick smoke (skips negatives)
+GPU-only, NO SILENT FALLBACKS (CLAUDE.md): CUDA + each model load + invalid asset class / missing
+ref all fail-fast; image resizes are logged (image-integrity rule). Models load ONE STAGE AT A TIME
+and are freed, so peak VRAM stays small.
+
+  # single target
+  venv\\Scripts\\python.exe cascade_detector.py --text "a rifle" --ref test_assets/Rifle_ref.png \\
+        --asset-class 3D_GEOMETRY --frames test_assets/Rifle --labels test_assets/Rifle/labels.json \\
+        --negatives test_assets/None
+  # batch (combined summary table)
+  venv\\Scripts\\python.exe cascade_detector.py --targets cascade_targets.yaml
+  # quick smoke (N positives/target, negatives skipped)
+  venv\\Scripts\\python.exe cascade_detector.py --targets cascade_targets.yaml --max-frames 2
 """
 
 import argparse
 import json
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
 import torch
 import yaml
 
-# Reuse the proven, pure helpers + geometric engines from the benchmark harness (its main() is
-# __main__-guarded, so importing is side-effect-free).
+# Reuse only the GENERIC, pure helpers + geometric engines from the benchmark harness (its main() is
+# __main__-guarded, so importing is side-effect-free). No hardcoded TARGETS/REF_TEXT/load_dataset.
 from benchmark_detectors import (
-    REF_TEXT,
     LightGlueDetector,
     SiftDetector,
     center_in_box,
     iou,
-    load_dataset,
+    list_images,
+    load_rgb,
 )
 
 REPO = Path(__file__).resolve().parent
 
-# --- targets whose Stage-3 geometric check is a HARD gate (planar) vs SOFT bonus (3D) ----------
-PLANAR_TARGETS = {"Nasrallah"}      # poster: SIFT homography hard-gates; everything else is soft
+
+# ==============================================================================
+# Asset classes — the ONLY place per-target behavior is defined (no target names)
+# ==============================================================================
+class AssetClass(Enum):
+    """A target's geometric nature. Drives the DINOv2 threshold and the Stage-3 gate."""
+    PLANAR_2D = "2D_PLANAR"        # flat/printed (poster, sign): texture-rich -> SIFT can hard-gate
+    GEOMETRY_3D = "3D_GEOMETRY"    # 3D object (rifle): low-texture/self-similar -> geometry is soft
+
+
+# Per-class parameters. dino_thresh = Stage-2 CLS-cosine survivor gate; gate_engine/gate_mode =
+# Stage-3 geometric verifier + whether it can VETO (hard) or only annotate/rank (soft). TUNABLE.
+ASSET_CLASS_PARAMS = {
+    AssetClass.PLANAR_2D:   {"dino_thresh": 0.33, "gate_engine": "sift",      "gate_mode": "hard"},
+    AssetClass.GEOMETRY_3D: {"dino_thresh": 0.40, "gate_engine": "lightglue", "gate_mode": "soft"},
+}
+
+
+def resolve_asset_class(value) -> AssetClass:
+    """Map a CLI/YAML string ('2D_PLANAR' / '3D_GEOMETRY') to an AssetClass; fail-fast on unknown."""
+    if isinstance(value, AssetClass):
+        return value
+    try:
+        return AssetClass(str(value).strip())
+    except ValueError:
+        raise SystemExit(f"unknown asset class '{value}' — choose from "
+                         f"{[a.value for a in AssetClass]} (NO SILENT FALLBACK).")
+
 
 # --- Stage-1 proposer tunables (recall-first; the summary prints the recall ceiling) ----------
 GD_BOX_THRESH = 0.25      # GroundingDINO box confidence -- intentionally low to cast a wide net
@@ -64,16 +104,64 @@ OWLV2_TOPK = 5            # keep this many OWLv2 image-guided anchors per frame 
 OWLV2_MIN_LOGIT = 2.0     # floor on the OWLv2 abs image-guided logit to be a candidate
 NMS_IOU = 0.7             # per-source dedup of overlapping proposals
 
-# --- Stage-2 DINOv2 verifier tunables ----------------------------------------------------------
+# --- Stage-2 DINOv2 verifier tunables (threshold is per asset class, above) --------------------
 DINO_SIZE = 224           # square side fed to DINOv2 (16x16 patch grid at /14)
 DINO_PAD = 114            # neutral letterbox fill (mid-gray), applied to ref AND candidate alike
-DINO_THRESH = 0.50        # CLS-cosine survivor gate (TUNE from the printed pos/neg separation)
 
 # --- Stage-3 geometric tunables ----------------------------------------------------------------
-SIFT_MIN_INLIERS = 12     # poster HARD gate: RANSAC inliers to accept (bench: clear poster 40-67)
-GEOM_MIN_CROP = 24        # crops smaller than this skip geometric matching (explicit, logged)
+GEOM_HARD_MIN_INLIERS = 12   # HARD gate: RANSAC inliers to accept (clear planar target ~40-67)
+GEOM_MIN_CROP = 24           # crops smaller than this skip geometric matching (explicit, logged)
 
 PROPOSAL_HIT_IOU = 1e-6   # a proposal "covers" GT if IoU > 0 (recall-ceiling definition)
+
+
+# ==============================================================================
+# Target specification (supplied at runtime)
+# ==============================================================================
+@dataclass
+class TargetSpec:
+    name: str
+    text: str                       # GroundingDINO grounding phrase, e.g. "a rifle"
+    ref_path: str                   # reference crop (OWLv2 query + DINOv2 template)
+    frames_dir: str                 # folder of frames to search (positives)
+    asset_class: AssetClass
+    labels_path: Optional[str] = None     # GT boxes; default <frames_dir>/labels.json if present
+    negatives_dir: Optional[str] = None   # optional target-absent frames for the FP metric
+
+
+def _resolve(p: str) -> Path:
+    p = Path(p)
+    return p if p.is_absolute() else REPO / p
+
+
+def load_spec(spec: TargetSpec, max_frames=None):
+    """Load (ref_rgb, positives[(fname,rgb,gt)], negatives[(fname,rgb)]) for one target spec."""
+    ref_p = _resolve(spec.ref_path)
+    if not ref_p.exists():
+        raise SystemExit(f"missing reference image for '{spec.name}': {ref_p}")
+    ref = load_rgb(ref_p)
+
+    fdir = _resolve(spec.frames_dir)
+    if not fdir.is_dir():
+        raise SystemExit(f"frames dir for '{spec.name}' not found: {fdir}")
+    lp = _resolve(spec.labels_path) if spec.labels_path else fdir / "labels.json"
+    labels = json.loads(lp.read_text(encoding="utf-8")) if lp.exists() else {}
+
+    positives = []
+    for f in list_images(fdir):
+        gt = labels.get(f.name)
+        gt = [int(v) for v in gt] if isinstance(gt, list) and len(gt) == 4 else None
+        positives.append((f.name, load_rgb(f), gt))
+    if max_frames:
+        positives = positives[:max_frames]
+
+    negatives = []
+    if spec.negatives_dir and not max_frames:        # smoke check (max_frames) skips negatives
+        ndir = _resolve(spec.negatives_dir)
+        if not ndir.is_dir():
+            raise SystemExit(f"negatives dir for '{spec.name}' not found: {ndir}")
+        negatives = [(f.name, load_rgb(f)) for f in list_images(ndir)]
+    return ref, positives, negatives
 
 
 # ==============================================================================
@@ -82,8 +170,8 @@ PROPOSAL_HIT_IOU = 1e-6   # a proposal "covers" GT if IoU > 0 (recall-ceiling de
 def letterbox(rgb, size=DINO_SIZE, pad=DINO_PAD):
     """Aspect-PRESERVING resize into a square `size` canvas with neutral padding.
 
-    NEVER squashes: the rifle ref is 168x447, so a force-resize to a square would morphologically
-    distort it (thin barrel -> stubby) and tank the cosine. We scale-to-fit and pad the remainder.
+    NEVER squashes: an extreme-aspect ref (e.g. a 168x447 rifle) force-resized to a square would
+    morphologically distort it (thin barrel -> stubby) and tank the cosine. Scale-to-fit + pad.
     """
     h, w = rgb.shape[:2]
     s = min(size / w, size / h)
@@ -240,25 +328,30 @@ class DinoV2CropEmbedder:
 # ==============================================================================
 # Pipeline
 # ==============================================================================
-def build_samples(positives, negatives):
-    """One sample per (target, frame). Negatives are evaluated against BOTH targets (the GD text
-    and OWLv2 ref differ per target), mirroring benchmark_detectors' per-ref negative pass."""
-    samples = []
-    for target, items in positives.items():
-        for fname, rgb, gt in items:
-            samples.append({"target": target, "frame": fname, "rgb": rgb,
-                            "gt": gt, "is_pos": True, "cands": []})
+def build_samples(loaded):
+    """loaded = [(spec, ref_rgb, positives, negatives)]. Returns (samples, refs{name->rgb}).
+
+    Each sample carries its target's resolved asset-class params (dino_thresh / gate_engine /
+    gate_mode / text), so NO downstream stage ever looks up a target by name."""
+    samples, refs = [], {}
+    for spec, ref, positives, negatives in loaded:
+        refs[spec.name] = ref
+        p = ASSET_CLASS_PARAMS[spec.asset_class]
+        meta = {"target": spec.name, "text": spec.text, "asset_class": spec.asset_class.value,
+                "dino_thresh": p["dino_thresh"], "gate_engine": p["gate_engine"],
+                "gate_mode": p["gate_mode"]}
+        for fname, rgb, gt in positives:
+            samples.append({**meta, "frame": fname, "rgb": rgb, "gt": gt, "is_pos": True, "cands": []})
         for fname, rgb in negatives:
-            samples.append({"target": target, "frame": fname, "rgb": rgb,
-                            "gt": None, "is_pos": False, "cands": []})
-    return samples
+            samples.append({**meta, "frame": fname, "rgb": rgb, "gt": None, "is_pos": False, "cands": []})
+    return samples, refs
 
 
-def stage1_propose(samples, refs, device, owlv2_id, max_frames):
+def stage1_propose(samples, refs, device, owlv2_id):
     print("\n[cascade] === STAGE 1: propose (GroundingDINO + OWLv2) ===", flush=True)
     gd = GroundingDinoProposer(device=device)
     for s in samples:
-        s["cands"] += gd.propose(s["rgb"], REF_TEXT[s["target"]])
+        s["cands"] += gd.propose(s["rgb"], s["text"])     # text comes from the target spec
     del gd
     torch.cuda.empty_cache()
 
@@ -292,34 +385,35 @@ def stage2_verify(samples, refs, device):
             cls, mean = dino.embed(crop)
             c["dino_cls"] = dino.cosine(cls, rc)
             c["dino_mean"] = dino.cosine(mean, rm)
-            c["stage2"] = c["dino_cls"] >= DINO_THRESH
+            c["stage2"] = c["dino_cls"] >= s["dino_thresh"]   # per asset-class threshold
     del dino
     torch.cuda.empty_cache()
 
 
 def stage3_geometric(samples, refs, device):
-    print("\n[cascade] === STAGE 3: geometric (SIFT hard=poster / LightGlue soft=rifle) ===",
+    print("\n[cascade] === STAGE 3: geometric (asset-class gate: hard SIFT / soft LightGlue) ===",
           flush=True)
     sift = SiftDetector()
     lg = LightGlueDetector(device=device)
+    engines = {"sift": sift, "lightglue": lg}
     for s in samples:
-        planar = s["target"] in PLANAR_TARGETS
+        hard = s["gate_mode"] == "hard"
+        engine = engines[s["gate_engine"]]
         for c in s["cands"]:
             c["geom_inliers"] = 0
-            c["geom_engine"] = "sift" if planar else "lightglue"
+            c["geom_engine"] = s["gate_engine"]
             c["geom_note"] = None
             if not c.get("stage2"):
                 continue                                  # only verified survivors reach geometry
             crop = crop_of(s["rgb"], c["box"])
             if min(crop.shape[:2]) < GEOM_MIN_CROP:
                 c["geom_note"] = "crop_too_small"        # explicit, visible -- NOT a silent skip
-                c["stage3_hard"] = not planar             # soft target unaffected; planar fails gate
+                c["stage3_hard"] = not hard               # soft gate unaffected; hard gate fails
                 continue
-            engine = sift if planar else lg
             r = engine.detect(refs[s["target"]], crop)
             c["geom_inliers"] = int(r["score"])
-            # Planar = HARD gate; 3D = SOFT (never vetoes a Stage-2 survivor).
-            c["stage3_hard"] = (c["geom_inliers"] >= SIFT_MIN_INLIERS) if planar else True
+            # hard gate can VETO; soft gate only annotates/ranks (never vetoes a Stage-2 survivor).
+            c["stage3_hard"] = (c["geom_inliers"] >= GEOM_HARD_MIN_INLIERS) if hard else True
     del sift, lg
     torch.cuda.empty_cache()
 
@@ -327,38 +421,42 @@ def stage3_geometric(samples, refs, device):
 def decide(samples):
     """Final per-frame decision + ranking among accepted candidates."""
     for s in samples:
-        planar = s["target"] in PLANAR_TARGETS
+        hard = s["gate_mode"] == "hard"
         accepted = [c for c in s["cands"]
-                    if c.get("stage2") and (c.get("stage3_hard") if planar else True)]
+                    if c.get("stage2") and (c.get("stage3_hard") if hard else True)]
         for c in s["cands"]:
             c["accepted"] = c in accepted
-            c["reject_reason"] = _reject_reason(c, planar)
+            c["reject_reason"] = _reject_reason(c, s)
         if accepted:
-            # Rank survivors by appearance (DINOv2 cosine) FIRST, geometric inliers as tie-break,
-            # for BOTH target types. Geometry-first mis-ranked the poster: a loose off-target box
-            # with marginally more SIFT inliers (e.g. 28 vs 24) beat the near-exact poster box that
-            # had a much higher DINOv2 score (0.82 vs 0.55). For the planar poster SIFT remains the
-            # hard GATE above (in stage3_geometric); here it only breaks ties among verified survivors.
+            # Rank survivors by the Stage-2 DINOv2 cosine FIRST (appearance is the primary metric),
+            # geometric inliers ONLY as a tie-break -- for every asset class. Geometry-first
+            # mis-ranked planar targets (a loose off-target box with marginally more inliers beat the
+            # near-exact box that had a much higher DINOv2 score). A hard gate (planar) still filters
+            # above in stage3_geometric; here geometry never overrides a better appearance match.
             best = max(accepted, key=lambda c: (c["dino_cls"], c["geom_inliers"]))
             s["final"] = best
         else:
             s["final"] = None
 
 
-def _reject_reason(c, planar):
+def _reject_reason(c, s):
     if c.get("accepted"):
         return None
     if not c.get("stage2"):
-        return f"stage2_dino<{DINO_THRESH}"
-    if planar and not c.get("stage3_hard"):
+        return f"stage2_dino<{s['dino_thresh']}"
+    if s["gate_mode"] == "hard" and not c.get("stage3_hard"):
         note = c.get("geom_note")
-        return f"stage3_sift<{SIFT_MIN_INLIERS}" + (f"({note})" if note else "")
+        return f"stage3_{s['gate_engine']}<{GEOM_HARD_MIN_INLIERS}" + (f"({note})" if note else "")
     return "not_best"
 
 
 # ==============================================================================
 # Overlays
 # ==============================================================================
+def neg_subdir(target):
+    return f"neg_vs_{target}"
+
+
 def save_overlay(out_dir: Path, s):
     out_dir.mkdir(parents=True, exist_ok=True)
     img = cv2.cvtColor(s["rgb"], cv2.COLOR_RGB2BGR).copy()
@@ -383,7 +481,7 @@ def save_overlay(out_dir: Path, s):
         col = (255, 255, 0) if ok else (0, 0, 255)        # cyan correct / red wrong (BGR)
         cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), col, 3)
         cv2.circle(img, (int(ctr[0]), int(ctr[1])), 5, col, -1)
-    tag = (f"{s['target']} {s['frame']} | cands={len(s['cands'])} "
+    tag = (f"{s['target']} [{s['asset_class']}] {s['frame']} | cands={len(s['cands'])} "
            f"surv={sum(1 for c in s['cands'] if c.get('stage2'))} "
            f"final={'Y' if f else 'N'}")
     cv2.putText(img, tag, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -408,6 +506,8 @@ def record(s):
     } for c in s["cands"]]
     return {
         "target": s["target"], "frame": s["frame"], "is_pos": s["is_pos"],
+        "asset_class": s["asset_class"], "dino_thresh": s["dino_thresh"],
+        "gate_engine": s["gate_engine"], "gate_mode": s["gate_mode"],
         "gt_bbox": s["gt"],
         "stage1_covers_gt": any(c.get("covers_gt") for c in s["cands"]) if s["is_pos"] else None,
         "stage1_covers_gt_gd": any(c.get("covers_gt") for c in s["cands"] if c["source"] == "gd")
@@ -430,8 +530,9 @@ def record(s):
 def summarize(records):
     summary = {}
     for target in sorted({r["target"] for r in records}):
-        pos = [r for r in records if r["target"] == target and r["is_pos"]]
-        neg = [r for r in records if r["target"] == target and not r["is_pos"]]
+        rs = [r for r in records if r["target"] == target]
+        pos = [r for r in rs if r["is_pos"]]
+        neg = [r for r in rs if not r["is_pos"]]
         found_pos = [r for r in pos if r["found"]]
         good = [r for r in found_pos if r["center_in_gt"]]
         fp = [r for r in neg if r["found"]]
@@ -443,7 +544,9 @@ def summarize(records):
         pos_best = [max([c["dino_cls"] for c in r["candidates"]], default=0.0) for r in pos]
         neg_best = [max([c["dino_cls"] for c in r["candidates"]], default=0.0) for r in neg]
         summary[target] = {
-            "target": target, "n_pos": len(pos), "n_neg": len(neg),
+            "target": target, "asset_class": rs[0]["asset_class"], "dino_thresh": rs[0]["dino_thresh"],
+            "gate": f"{rs[0]['gate_engine']}/{rs[0]['gate_mode']}",
+            "n_pos": len(pos), "n_neg": len(neg),
             "stage1_ceiling": _frac([r["stage1_covers_gt"] for r in pos]),
             "stage1_ceiling_gd": _frac([r["stage1_covers_gt_gd"] for r in pos]),
             "stage1_ceiling_owlv2": _frac([r["stage1_covers_gt_owlv2"] for r in pos]),
@@ -468,30 +571,76 @@ def _frac(bools):
 
 
 def print_table(summary):
-    cols = [("target", 11), ("n_pos", 6), ("S1ceil", 8), ("S1_gd", 7), ("S1_owl", 8),
-            ("S2good", 8), ("S2fp", 7), ("good", 6), ("FP", 6), ("dPOS", 6), ("dNEG", 6)]
-    print("\n" + "=" * 92)
+    cols = [("target", 11), ("asset", 12), ("dThr", 6), ("n_pos", 6), ("S1ceil", 8), ("S1_gd", 7),
+            ("S1_owl", 8), ("S2good", 8), ("S2fp", 7), ("good", 6), ("FP", 6), ("dPOS", 6), ("dNEG", 6)]
+    print("\n" + "=" * 108)
     print("  CASCADE SUMMARY   S1ceil = max recall (a proposal covers GT). good = final on-target.")
     print("  S2good/S2fp = after DINOv2, before geometry. dPOS/dNEG = best-candidate DINO cosine")
     print("  median on positives vs negatives -- the gap IS the verifier's discrimination signal.")
-    print("=" * 92)
+    print("=" * 108)
     print("  " + "".join(h.ljust(w) for h, w in cols))
-    print("  " + "-" * 88)
+    print("  " + "-" * 104)
     for v in summary.values():
-        row = [v["target"], str(v["n_pos"]),
+        row = [v["target"], v["asset_class"], f"{v['dino_thresh']:.2f}", str(v["n_pos"]),
                f"{v['stage1_ceiling']:.2f}", f"{v['stage1_ceiling_gd']:.2f}",
                f"{v['stage1_ceiling_owlv2']:.2f}", f"{v['stage2_good']:.2f}", f"{v['stage2_fp']:.2f}",
                f"{v['final_good']:.2f}", f"{v['final_fp']:.2f}",
                f"{v['dino_pos_med']:.2f}", f"{v['dino_neg_med']:.2f}"]
         print("  " + "".join(c.ljust(w) for c, (_, w) in zip(row, cols)))
-    print("=" * 92 + "\n")
+    print("=" * 108 + "\n")
+
+
+# ==============================================================================
+# CLI -> target specs
+# ==============================================================================
+def parse_targets(args):
+    if args.targets:
+        tp = _resolve(args.targets)
+        if not tp.exists():
+            raise SystemExit(f"--targets file not found: {tp}")
+        doc = yaml.safe_load(tp.read_text(encoding="utf-8")) or {}
+        shared_neg = doc.get("negatives")
+        specs = []
+        for t in doc.get("targets", []):
+            for req in ("text", "ref", "frames", "asset_class"):
+                if req not in t:
+                    raise SystemExit(f"--targets entry missing '{req}': {t}")
+            specs.append(TargetSpec(
+                name=t.get("name") or Path(t["frames"]).name,
+                text=t["text"], ref_path=t["ref"], frames_dir=t["frames"],
+                asset_class=resolve_asset_class(t["asset_class"]),
+                labels_path=t.get("labels"), negatives_dir=t.get("negatives", shared_neg)))
+        if not specs:
+            raise SystemExit(f"{tp} has no 'targets:' entries.")
+        return specs
+
+    if not (args.text and args.ref and args.asset_class and args.frames):
+        raise SystemExit("provide a single target (--text --ref --asset-class --frames) "
+                         "OR a batch file (--targets <yaml>).")
+    return [TargetSpec(
+        name=args.name or Path(args.frames).name,
+        text=args.text, ref_path=args.ref, frames_dir=args.frames,
+        asset_class=resolve_asset_class(args.asset_class),
+        labels_path=args.labels, negatives_dir=args.negatives)]
 
 
 # ==============================================================================
 # Main
 # ==============================================================================
 def main():
-    ap = argparse.ArgumentParser(description="Verified cascade detector for the poster + rifle.")
+    ap = argparse.ArgumentParser(
+        description="Generalized cascade detector — any target via text + ref + asset class.")
+    # single-target
+    ap.add_argument("--text", help="GroundingDINO grounding phrase, e.g. \"a rifle\"")
+    ap.add_argument("--ref", help="reference crop image (OWLv2 query + DINOv2 template)")
+    ap.add_argument("--asset-class", help=f"one of {[a.value for a in AssetClass]}")
+    ap.add_argument("--frames", help="folder of frames to search")
+    ap.add_argument("--labels", default=None, help="GT labels.json (default <frames>/labels.json)")
+    ap.add_argument("--negatives", default=None, help="optional target-absent frames (FP metric)")
+    ap.add_argument("--name", default=None, help="target name (default = frames-dir basename)")
+    # batch
+    ap.add_argument("--targets", default=None, help="YAML listing multiple target specs")
+    # shared
     ap.add_argument("--out", default="OUTPUT/cascade", help="output dir (under repo)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--config", default=None)
@@ -510,21 +659,23 @@ def main():
     owlv2_id = (cfg.get("models", {}).get("owlv2", {}) or {}).get(
         "hf_id", "google/owlv2-base-patch16-ensemble")
 
-    print("[cascade] loading dataset ...", flush=True)
-    refs, positives, negatives = load_dataset()
-    for name, items in positives.items():
-        print(f"[cascade]   {name}: {len(items)} positives | ref "
-              f"{refs[name].shape[1]}x{refs[name].shape[0]} | text='{REF_TEXT.get(name)}'")
-    print(f"[cascade]   None: {len(negatives)} negatives")
-
+    specs = parse_targets(args)
+    print(f"[cascade] loading {len(specs)} target(s) ...", flush=True)
+    loaded = []
+    for spec in specs:
+        ref, positives, negatives = load_spec(spec, max_frames=args.max_frames)
+        p = ASSET_CLASS_PARAMS[spec.asset_class]
+        print(f"[cascade]   {spec.name}: {len(positives)} pos / {len(negatives)} neg | "
+              f"ref {ref.shape[1]}x{ref.shape[0]} | text='{spec.text}' | "
+              f"class={spec.asset_class.value} dino>={p['dino_thresh']} "
+              f"gate={p['gate_engine']}/{p['gate_mode']}", flush=True)
+        loaded.append((spec, ref, positives, negatives))
     if args.max_frames:
-        positives = {t: items[:args.max_frames] for t, items in positives.items()}
-        negatives = []                                   # smoke check: skip negatives
-        print(f"[cascade] SMOKE: {args.max_frames} positives/target, negatives skipped.", flush=True)
+        print(f"[cascade] SMOKE: max {args.max_frames} positives/target, negatives skipped.", flush=True)
 
-    samples = build_samples(positives, negatives)
+    samples, refs = build_samples(loaded)
     t0 = time.time()
-    stage1_propose(samples, refs, args.device, owlv2_id, args.max_frames)
+    stage1_propose(samples, refs, args.device, owlv2_id)
     stage2_verify(samples, refs, args.device)
     stage3_geometric(samples, refs, args.device)
     decide(samples)
@@ -535,7 +686,7 @@ def main():
     records = [record(s) for s in samples]
     if not args.no_overlays:
         for s in samples:
-            sub = s["target"] if s["is_pos"] else f"None_vs_{s['target']}"
+            sub = s["target"] if s["is_pos"] else neg_subdir(s["target"])
             save_overlay(out_dir / "overlays" / sub, s)
 
     summary = summarize(records)

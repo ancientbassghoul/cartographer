@@ -23,7 +23,8 @@ from benchmark_report import CSS, thumb_b64
 REPO = Path(__file__).resolve().parent
 
 SUMMARY_COLS = [
-    ("target", "target"), ("n_pos", "n_pos"),
+    ("target", "target"), ("asset_class", "asset"), ("dino_thresh", "dThr"), ("gate", "gate"),
+    ("n_pos", "n_pos"),
     ("stage1_ceiling", "S1 ceiling"), ("stage1_ceiling_gd", "S1 gd"),
     ("stage1_ceiling_owlv2", "S1 owlv2"), ("stage2_good", "S2 good"), ("stage2_fp", "S2 fp"),
     ("final_good", "final good"), ("final_fp", "final fp"),
@@ -49,7 +50,7 @@ EXTRA_CSS = """
 
 
 def overlay_path(out_dir: Path, rec):
-    sub = rec["target"] if rec["is_pos"] else f"None_vs_{rec['target']}"
+    sub = rec["target"] if rec["is_pos"] else f"neg_vs_{rec['target']}"
     return out_dir / "overlays" / sub / rec["frame"]
 
 
@@ -134,7 +135,7 @@ def main():
     targets = sorted({r["target"] for r in records})
     sections = []
     for t in targets:
-        for is_pos, label in ((True, "positives"), (False, "negatives (None)")):
+        for is_pos, label in ((True, "positives"), (False, "negatives")):
             recs = [r for r in records if r["target"] == t and r["is_pos"] == is_pos]
             if recs:
                 sections.append((f"{t} — {label}", recs))

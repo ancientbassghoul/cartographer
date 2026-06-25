@@ -43,6 +43,19 @@ positives. This SUPERSEDES the "no detection solution" VERDICT block below._
 cascade. The detector-agnostic 3D lift/consensus/stream/viz (KEEP list below) is untouched and ready
 to consume whatever the cascade outputs.
 
+**GENERALIZED (2026-06-26): AssetClass config — no hardcoded target names.** `cascade_detector.py`
+now takes each target at runtime (TEXT + REF IMAGE + ASSET CLASS) via CLI flags or a `--targets
+<yaml>` batch (`cascade_targets.yaml` is the example fixture). An `AssetClass` enum +
+`ASSET_CLASS_PARAMS` dict is the ONLY place per-target behavior lives: **`2D_PLANAR`** → DINOv2 ≥0.33
++ SIFT homography HARD gate; **`3D_GEOMETRY`** → DINOv2 ≥0.40 + LightGlue SOFT bonus. Ranking is
+DINOv2-cosine PRIMARY, geometry tie-break (planar-mis-rank fix). **Asymmetric gate validated:** at
+the looser planar 0.33, DINOv2 leaked 5/15 poster negatives into Stage 2 (S2fp 0→0.33) but the SIFT
+hard gate held **final FP at 0.00** — exactly why planar is hard-gated. Per-class thresholds gave
+rifle recall 0.77→0.92 (the 2 extra are loose boxes — GroundingDINO's honest localization limit on
+hard views; deliberately NOT chased), poster/rifle `good` unchanged at 0.33/0.77. **Warm per-frame
+detection (all models resident, RTX 3080, ~7 cands/2 survivors): ~1.55 s** (GD 0.44 + OWLv2 0.84 +
+DINOv2 0.08 + geom 0.18; range 1.4–2.0 s; first frame after load is slower from CUDA warmup).
+
 ## ⛔⛔ (SUPERSEDED 2026-06-25 by the CASCADE BREAKTHROUGH above) detector benchmark DONE → NO proper detection solution
 _The 5-engine benchmark below is complete and reproducible (`benchmark_detectors.py` +
 `benchmark_report.py`, artifacts in `OUTPUT/benchmark/`). **Bottom line: we still do NOT have an
