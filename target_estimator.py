@@ -1,18 +1,31 @@
-"""target_estimator.py — aggregate per-detection 3D hits into one target estimate.
+"""target_estimator.py — aggregate per-detection 3D hits into target estimate(s).
 
-Each time the object detector finds the target and the lift back-projects its center pixel
-into the voxel map (see `perception_worker` + `MapStore.raycast`), we get one world-space
-**hit point**. This module accumulates those hits and produces the Phase-3 deliverable: a
-single estimated 3D **position** plus an **uncertainty** describing how tightly the
-independent detections agree.
+Each time the object detector finds the target and the lift back-projects its center pixel into the
+voxel map (see `perception_worker` + `MapStore.raycast`), we get one world-space **hit point**. This
+module accumulates those hits and produces the Phase-3 deliverable: the estimated 3D **position(s)**
+plus **uncertainty**.
 
-Robustness: a stray detection (wrong object) or a ray that grazes the wrong wall can throw
-an outlier hit far from the cluster. We therefore report a **median** position (per-axis,
-outlier-resistant) and derive uncertainty from the **inliers** — hits within a MAD-scaled
-radius of the median — while still surfacing the raw/inlier counts so a sparse or
-disagreeing estimate is never silently presented as confident.
+**Multi-instance:** the designated object can appear MORE THAN ONCE in the lab (e.g. two rifles at two
+locations). So we report **every well-supported instance** — `estimate_all()` returns a list of
+clusters, each its own position + uncertainty + hit count. `estimate()` keeps returning the single
+best (most-supported) cluster for back-compat / single-target callers.
 
-Transport-agnostic: pure numpy in, plain dict out (the caller serializes for the bus). No
+Robustness: a stray detection or a ray grazing the wrong wall throws an isolated outlier hit. We find
+**spatial-consensus clusters** (mode-seeking): each instance is the densest group of hits within
+`CLUSTER_RADIUS`; a cluster must have at least `MIN_CLUSTER` hits to count as real (so a 1-2 hit
+wrong-wall ray is filtered, while a genuine second instance with many hits is reported). Position is
+the cluster **median** (per-axis, outlier-resistant).
+
+Thresholds (well-conditioned: intra-instance spread ~0.1-0.15u vs inter-instance gaps ~1u+):
+  * CLUSTER_RADIUS = spatial extent of ONE instance; a hit farther than this from every known cluster
+    seeds a new one.
+  * MIN_INSTANCE   = minimum RAW hit count to REPORT a cluster as a distinct target. Filters incidental
+    small clusters of early/inaccurate hits (observed: the real rifles had 50+ hits each while
+    transient blips had 4-5 — a ~10x gap). Existence is by count, NOT proximity, so a real-but-distant
+    instance seen many times is still reported.
+  * MIN_CLUSTER    = support for the `confident` flag (a cluster can be reported yet flagged tentative).
+
+Transport-agnostic: pure numpy in, plain dict(s) out (the caller serializes for the bus). No
 ZMQ / torch / SLAM imports, so it is unit-testable offline (see `__main__`).
 """
 
@@ -20,17 +33,11 @@ import numpy as np
 
 
 class TargetEstimator:
-    """Online accumulator of 3D target hits -> robust position + uncertainty.
+    """Online accumulator of 3D target hits -> robust position(s) + uncertainty via mode-seeking."""
 
-    Estimation is **spatial-consensus / mode-seeking**, not a plain median: jittery 2D
-    detections back-project to rays that fan through a cluttered room and hit the wrong wall,
-    so a large fraction of hits can be wrong (a median breaks down past 50% outliers). Instead
-    we find the **densest cluster** of hits (where many independent rays agree) and report its
-    centre; everything outside the consensus radius is discarded as a wrong-wall ray.
-    """
-
-    CLUSTER_RADIUS = 0.30   # world units: hits within this of the cluster centre are inliers
-    MIN_CLUSTER = 3         # inliers needed before the estimate is called `confident`
+    CLUSTER_RADIUS = 0.30   # world units: hits within this of a cluster centre are inliers / one instance
+    MIN_INSTANCE = 8        # raw inliers needed to REPORT a cluster as a distinct target (filters blips)
+    MIN_CLUSTER = 3         # raw inliers needed for the `confident` flag
     TIGHT_RMS = 0.30        # in-cluster radial RMS must be below this to be `confident`
 
     def __init__(self, label: str = "", max_hits: int = 500):
@@ -60,33 +67,12 @@ class TargetEstimator:
             self._hits.pop(0)
             self._frame_ids.pop(0)
 
-    def estimate(self) -> dict | None:
-        """Current best estimate, or None if there are no map hits yet.
-
-        Finds the densest cluster of hits (mode-seeking): seed = the hit with the most
-        neighbours within CLUSTER_RADIUS, refined once around the cluster centroid; the cluster
-        members are the inliers. Returns position (cluster median) + uncertainty (in-cluster
-        radial_rms, std_xyz, spread_p90), counts, cluster_frac, and a coarse `confident` flag.
-        """
-        if not self._hits:
-            return None
-        P = np.asarray(self._hits, np.float64)
-        if len(P) == 1:
-            inl = np.array([True])
-        else:
-            # Pairwise distances -> densest seed -> cluster, refined once around its centroid.
-            d = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2)
-            seed = int(np.argmax((d <= self.CLUSTER_RADIUS).sum(axis=1)))
-            inl = d[seed] <= self.CLUSTER_RADIUS
-            centroid = P[inl].mean(axis=0)
-            refined = np.linalg.norm(P - centroid, axis=1) <= self.CLUSTER_RADIUS
-            if refined.any():
-                inl = refined
-        Pin = P[inl]
+    def _cluster_dict(self, Pin: np.ndarray) -> dict:
+        """Build the position + uncertainty record for one cluster's inlier points."""
         pos = np.median(Pin, axis=0)
         rin = np.linalg.norm(Pin - pos, axis=1)
         rms = float(np.sqrt(np.mean(rin ** 2))) if len(rin) else 0.0
-        n_inl = int(inl.sum())
+        n_inl = int(len(Pin))
         return {
             "label": self.label,
             "position": [round(float(v), 4) for v in pos],
@@ -101,24 +87,74 @@ class TargetEstimator:
             "confident": bool(n_inl >= self.MIN_CLUSTER and rms <= self.TIGHT_RMS),
         }
 
+    def estimate_all(self) -> list[dict]:
+        """All well-supported instances, sorted by support (most hits first).
+
+        Iterative peel-off mode-seeking: find the densest cluster within CLUSTER_RADIUS (refined once
+        around its centroid); if it has >= MIN_CLUSTER hits, emit it and remove its inliers; repeat on
+        the remainder until no remaining cluster meets MIN_CLUSTER. Deterministic; degrades to a single
+        cluster when there is one instance; isolated wrong-wall rays (below MIN_CLUSTER) are dropped.
+        """
+        if not self._hits:
+            return []
+        P = np.asarray(self._hits, np.float64)
+        remaining = np.ones(len(P), bool)
+        out = []
+        while remaining.sum() >= self.MIN_INSTANCE:
+            idxs = np.where(remaining)[0]
+            Pr = P[idxs]
+            d = np.linalg.norm(Pr[:, None, :] - Pr[None, :, :], axis=2)
+            within = d <= self.CLUSTER_RADIUS
+            seed = int(np.argmax(within.sum(axis=1)))          # densest by RAW count (existence)
+            inl = within[seed]
+            centroid = Pr[inl].mean(axis=0)
+            refined = np.linalg.norm(Pr - centroid, axis=1) <= self.CLUSTER_RADIUS
+            if refined.any():
+                inl = refined
+            if int(inl.sum()) < self.MIN_INSTANCE:
+                break               # densest remaining cluster is a blip -> stop (rest are smaller)
+            out.append(self._cluster_dict(Pr[inl]))
+            remaining[idxs[inl]] = False
+        out.sort(key=lambda c: -c["n_inliers"])
+        return out
+
+    def estimate(self) -> dict | None:
+        """The single best (most-supported) instance, or None — back-compat single-target view."""
+        all_ = self.estimate_all()
+        return all_[0] if all_ else None
+
 
 if __name__ == "__main__":
-    # Offline self-test: a tight cluster of 8 good hits + 7 SCATTERED wrong-wall outliers (a
-    # majority that is NOT clustered). Mode-seeking must lock onto the cluster — a plain median
-    # would be dragged off by the outlier majority.
+    # Offline self-test: TWO real instances (12 + 9 tight hits), ONE incidental blip (4 hits, below
+    # MIN_INSTANCE), and 5 SCATTERED wrong-wall outliers. Peel-off must return EXACTLY the 2 real
+    # instances (tight + confident) and drop both the 4-hit blip and the scatter.
     rng = np.random.default_rng(0)
     est = TargetEstimator(label="test target")
-    true = np.array([2.0, -0.5, 3.0])
-    for i in range(8):
-        est.add(true + rng.normal(0, 0.05, 3), frame_id=i)
-    for j in range(7):                                  # scattered wrong-wall rays (majority!)
-        est.add(rng.uniform(-6, 6, 3), frame_id=100 + j)
-    est.add_found_no_hit(frame_id=200)                  # found but no map hit
-    e = est.estimate()
-    print("[target_estimator] estimate:", e)
-    err = np.linalg.norm(np.array(e["position"]) - true)
-    assert err < 0.15, f"position off by {err:.3f} (consensus failed against the outlier majority?)"
-    assert e["n_hits"] == 15 and e["n_miss"] == 1
-    assert e["n_inliers"] >= 7 and e["radial_rms"] < 0.15 and e["confident"]
-    print(f"[target_estimator] OK  (pos err {err*1000:.0f} mm, cluster {e['n_inliers']}/{e['n_hits']} "
-          f"hits, frac {e['cluster_frac']}, confident={e['confident']})")
+    A = np.array([2.0, -0.5, 3.0])      # instance 1 (more hits)
+    B = np.array([-1.5, 0.2, 6.0])      # instance 2
+    C = np.array([4.0, 1.0, 1.0])       # incidental blip (4 hits < MIN_INSTANCE=8 -> dropped)
+    for i in range(12):
+        est.add(A + rng.normal(0, 0.05, 3), frame_id=i)
+    for i in range(9):
+        est.add(B + rng.normal(0, 0.05, 3), frame_id=100 + i)
+    for i in range(4):
+        est.add(C + rng.normal(0, 0.05, 3), frame_id=200 + i)
+    for j in range(5):                   # scattered wrong-wall rays (each isolated)
+        est.add(rng.uniform(-9, 9, 3), frame_id=300 + j)
+    est.add_found_no_hit(frame_id=400)
+
+    ests = est.estimate_all()
+    print(f"[target_estimator] {len(ests)} reported instance(s):")
+    for k, e in enumerate(ests):
+        print(f"   #{k}: pos={e['position']} n_inliers={e['n_inliers']} rms={e['radial_rms']} "
+              f"confident={e['confident']}")
+    assert len(ests) == 2, f"expected 2 instances, got {len(ests)} (blip/scatter not filtered?)"
+    pA, pB = np.array(ests[0]["position"]), np.array(ests[1]["position"])
+    assert np.linalg.norm(pA - A) < 0.1, f"instance 1 off: {pA}"
+    assert np.linalg.norm(pB - B) < 0.1, f"instance 2 off: {pB}"
+    assert ests[0]["n_inliers"] == 12 and ests[1]["n_inliers"] == 9
+    assert all(e["confident"] for e in ests)
+    assert est.estimate()["n_inliers"] == 12                 # back-compat: best instance
+    assert ests[0]["n_hits"] == 30 and ests[0]["n_miss"] == 1
+    print(f"[target_estimator] OK  (2 real instances localized; 4-hit blip + 5 scattered dropped; "
+          f"best n_inliers={ests[0]['n_inliers']})")

@@ -38,6 +38,7 @@ import torch
 import yaml
 
 import frame_bus
+from diag_log import DiagLog, NullLog
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 TARGET_FILE = os.path.join(REPO, "target.yaml")
@@ -180,6 +181,16 @@ class Pipeline:
         self.last_infer_mono = 0.0
         self.n_det = 0
         self.n_found = 0
+        self.diag = NullLog()          # detection cadence/timing CSV (off unless enable_diag)
+        self._last_det_ts = None
+
+    def enable_diag(self, ts=None, out_dir=None):
+        self.diag = DiagLog("object", [
+            "wall_ts", "frame_id", "dt_since_last", "infer_ms", "found",
+            "center_x", "center_y", "bbox_area", "raw"], out_dir=out_dir, ts=ts)
+
+    def close_diag(self):
+        self.diag.close()
 
     def _to_transport(self, det, src_w, src_h):
         """Rescale a detection (in the detection frame's pixels) to the 512x288 transport space the
@@ -207,6 +218,20 @@ class Pipeline:
         self.n_det += 1
         self.n_found += int(det["found"])
 
+        # dt_since_last = wall-clock gap between detection runs = the EFFECTIVE cadence (issue A).
+        dt_since_last = (now - self._last_det_ts) if self._last_det_ts else 0.0
+        self._last_det_ts = now
+        b = det.get("bbox")
+        self.diag.row(
+            wall_ts=round(time.time(), 4), frame_id=meta.get("frame_id"),
+            dt_since_last=round(dt_since_last, 3), infer_ms=round(infer_ms, 1),
+            found=int(det["found"]),
+            center_x=(det["center"][0] if det.get("center") else ""),
+            center_y=(det["center"][1] if det.get("center") else ""),
+            bbox_area=(round((b[2] - b[0]) * (b[3] - b[1]), 1)
+                       if isinstance(b, (list, tuple)) and len(b) == 4 else ""),
+            raw=(det.get("raw") or "")[:120])
+
         # Publish the detection in transport (512x288) pixels for the lift; render on the hi-res frame.
         det_tx = self._to_transport(det, w, h)
         payload = build_payload(det_tx, meta, infer_ms, self.cadence_hz, self.label, self.asset_class)
@@ -226,12 +251,14 @@ class Pipeline:
 # ==============================================================================
 # Live loop / offline video / self-test
 # ==============================================================================
-def run_live(cfg, show=True):
+def run_live(cfg, show=True, log=False):
     # Prefer the hi-res object stream (full pixel fidelity stabilizes grounding); fall back to the
     # 512x288 perception stream only if no hi-res port is configured.
     frame_port = cfg["network"].get("frame_bus_hires_port") or cfg["network"]["frame_bus_port"]
     obj_port = cfg["network"]["object_state_port"]
     pipe = Pipeline(cfg)
+    if log:
+        pipe.enable_diag()
     frame_sub = frame_bus.FrameSubscriber(frame_port)
     state_pub = frame_bus.StatePublisher(obj_port)  # binds; fail-fast if taken
     print(f"[object] frame bus SUB :{frame_port} (hi-res) | detection PUB :{obj_port} (TOPIC_DETECTION)")
@@ -255,6 +282,7 @@ def run_live(cfg, show=True):
         pass
     finally:
         print("[object] shutting down ...")
+        pipe.close_diag()
         frame_sub.close()
         state_pub.close()
         if show:
@@ -387,6 +415,8 @@ def main():
     ap.add_argument("--out", default=None, help="offline: output dir (default: OUTPUT/)")
     ap.add_argument("--publish", action="store_true",
                     help="offline: also publish TOPIC_DETECTION on the state bus")
+    ap.add_argument("--log", action="store_true",
+                    help="live: write detection cadence/timing CSV to OUTPUT/diag/ (issue A)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -396,7 +426,7 @@ def main():
         run_offline_video(cfg, args.video, show=not args.no_display, stride=args.stride,
                           max_frames=args.max_frames, out_dir=args.out, publish=args.publish)
     else:
-        run_live(cfg, show=not args.no_display)
+        run_live(cfg, show=not args.no_display, log=args.log)
 
 
 if __name__ == "__main__":

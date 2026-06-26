@@ -115,12 +115,9 @@ def _world_to_px(x, z, m, size):
     return int(np.clip(u * size / grid, 0, size - 1)), int(np.clip(v * size / grid, 0, size - 1))
 
 
-def _target_to_px(target, m, size):
-    """Project the estimated target's world (X,Z) into map-panel pixels (or None)."""
-    if not target or not target.get("position"):
-        return None
-    tx, _ty, tz = target["position"]
-    return _world_to_px(tx, tz, m, size)
+def _target_list(target):
+    """TOPIC_TARGET carries a LIST of instances ({"targets":[...]}); return it (or [])."""
+    return (target or {}).get("targets") or []
 
 
 def overlay_live_camera(img, m, cam_track, size):
@@ -172,13 +169,19 @@ def render_map_panel(m, size=MAP_SIZE, target=None):
         cv2.circle(img, tuple(pts[0]), 6, (0, 255, 0), -1)    # start
         cv2.circle(img, tuple(pts[-1]), 6, (0, 255, 255), -1)  # end (drone now)
 
-    # Estimated target marker (magenta), projected into the same top-down frame.
-    tpx = _target_to_px(target, m, size)
-    if tpx is not None:
-        cv2.drawMarker(img, tpx, (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
-        cv2.circle(img, tpx, 10, (255, 0, 255), 2)
-        cv2.putText(img, "TARGET", (tpx[0] + 12, tpx[1] - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 2)
+    # Estimated target marker(s) (magenta), one per detected instance, projected into the map frame.
+    tgts = _target_list(target)
+    for i, t in enumerate(tgts):
+        pos = t.get("position")
+        tpx = _world_to_px(pos[0], pos[2], m, size) if pos else None
+        if tpx is None:
+            continue
+        col = (255, 0, 255) if t.get("confident") else (200, 120, 255)
+        cv2.drawMarker(img, tpx, col, cv2.MARKER_TILTED_CROSS, 20, 2)
+        cv2.circle(img, tpx, 10, col, 2)
+        lbl = f"T{i}" if len(tgts) > 1 else "TARGET"
+        cv2.putText(img, lbl, (tpx[0] + 12, tpx[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 2)
 
     cv2.putText(img, f"top-down X-Z  {m.get('n_voxels')} vox  {m.get('n_keyframes')} kf  "
                 f"~{m.get('span_world')}u  mode={m.get('tracking_mode')}",
@@ -206,12 +209,18 @@ def render_status(pose, depth, width, reloc_active, target=None):
     if reloc_active:
         cv2.putText(strip, "RELOC!", (width - 95, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-    if target and target.get("position"):
-        p = target["position"]
-        ttxt = (f"TARGET [{target.get('label','?')}] pos=({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})  "
-                f"+/-{target.get('radial_rms','?')}u  hits={target.get('n_hits')}/"
-                f"{target.get('n_found')}  {'CONFIDENT' if target.get('confident') else 'tentative'}")
-        tcol = (255, 0, 255) if target.get("confident") else (200, 120, 255)
+    tgts = _target_list(target)
+    if tgts:
+        head = f"{len(tgts)} TARGETS" if len(tgts) > 1 else "TARGET"
+        lbl = (target.get("label") or tgts[0].get("label") or "?")
+        parts = []
+        for t in tgts:
+            p = t.get("position", [0, 0, 0])
+            parts.append(f"({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})"
+                         f"{'' if t.get('confident') else '?'}")
+        n_conf = sum(1 for t in tgts if t.get("confident"))
+        ttxt = f"{head} [{lbl}]  " + "  ".join(parts) + f"  conf={n_conf}/{len(tgts)}"
+        tcol = (255, 0, 255) if n_conf else (200, 120, 255)
         cv2.putText(strip, ttxt, (8, STATUS_H - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, tcol, 1)
     else:
         cv2.putText(strip, "TARGET: not yet localized", (8, STATUS_H - 6),
@@ -258,7 +267,7 @@ class Dashboard:
             self._map_img = None  # redraw map with the updated target marker
 
     def _map_image(self):
-        tpos = tuple(self.target["position"]) if self.target and self.target.get("position") else None
+        tpos = tuple(tuple(t.get("position") or ()) for t in _target_list(self.target))
         sig = None if self.map is None else (self.map.get("n_keyframes"), self.map.get("frame_id"), tpos)
         if self._map_img is None or sig != self._map_sig:
             self._map_img = render_map_panel(self.map, target=self.target)

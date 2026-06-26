@@ -21,9 +21,39 @@ the target + report its 3D location. Every core piece is built and verified on h
 - **3D lift + consensus** — back-project each detection into the voxel map → robust 3D estimate.
   Built and verified offline; detector-agnostic.
 
-**In progress (this session): wiring the cascade into the live app** so the user can fly manually
-and have detection fire every ~2 s, with detections agreeing on one 3D point — plus auto-classifying
-the target at designation. See "## Live integration" and "## NEXT".
+The cascade is now **wired into the live app** (object_worker P4, `object_mode=CASCADE`), target
+auto-classified at designation, verified offline E2E (`confident` 3D estimate, peak VRAM 9.68 GB).
+
+**First live run done (2026-06-26)** — flight smooth, detection worked, but surfaced 3 issues; see
+"## Live-flight fixes" for the diagnosis + what's fixed vs pending.
+
+## Live-flight fixes (2026-06-26)
+First live 4-process run revealed three problems (annotated shots in `DEBUG_IMAGES/`):
+- **A. Detection slower than 2 s** — *pending*. Likely the cascade (~1.5-2 s) contends with SLAM on the
+  one GPU. Added per-detection cadence logging; needs the user's re-fly CSVs to quantify (logging-only
+  this pass).
+- **B. Flight path froze / didn't persist** — **FIXED**. Root cause: `perception_worker` recorded the
+  trajectory **only on keyframes** (~20/flight, with a ~1.5 s keyframe-creation stall every ~52
+  frames). Now records the camera pose **every frame** + publishes `TOPIC_MAP` on a 0.5 s timer (not
+  only per keyframe), trajectory capped to 1500 pts for the bus. Verified: `traj_poses` = every
+  processed frame (was 1/keyframe). Residual ~1.9 fps base rate is SLAM throughput (tied to A).
+- **C. Target marker misplaced — actually TWO RIFLES → MULTI-TARGET (FIXED).** The lift CSV showed two
+  near-tied clusters: `[0.03,0.03,3.38]` (55 hits, frames→source ~1287) and `[0.68,0.03,5.03]` (51
+  hits, source ~2419). First read them as accurate-vs-inaccurate (far ray hitting the wall) and added a
+  1/distance weighting "fix". **The user then revealed the lab has TWO rifles** (source frames ~1100 &
+  ~2300) — the two clusters are the **two real rifles**, not one good + one bad. So the weighting was
+  misguided (it just switched which rifle was reported). **Reverted it; replaced with multi-target:**
+  `TargetEstimator.estimate_all()` returns EVERY well-supported instance via iterative peel-off
+  mode-seeking (`CLUSTER_RADIUS` 0.30 u extent; `MIN_INSTANCE` 8 raw hits to report — filters
+  incidental 4-5-hit blips; `MIN_CLUSTER` 3 only gates the `confident` flag). `TOPIC_TARGET` now carries
+  a `{"targets":[...]}` list; the visualizer marks each (T0/T1…), and the offline export writes all
+  instances + a `.ply` (cloud + green flight path + magenta target points). Verified: self-test (2
+  instances + a blip + scatter → exactly 2) and replaying the real hits → **both rifles**
+  `[0.025,0.025,3.425]` and `[0.675,0.025,5.025]`, each confident.
+
+**Diagnostic logging:** `--log` on object_worker + perception_worker writes CSVs to `OUTPUT/diag/<ts>/`
+(`object` = detection cadence/timing; `perception` = per-frame SLAM/loop timing; `lift` = per-hit
+geometry + estimate). Used to diagnose B/C offline; the user re-flies with `--log` to nail A.
 
 ## The detector: a 3-stage CASCADE (the solution)
 Single-shot engines all conflated *"where is a candidate"* with *"is this THE target"* and over-fired
@@ -179,8 +209,9 @@ D:\EXTEND\C2_SIM\XLAB\
 - **M3 depth (DA-V2) overlay** ✅ (live wall/glass fly-through signed off). Finding: DA-V2 reads glass
   as open air → an M5 glass detector must make SLAM-stall authoritative.
 - **M4 SLAM + voxel map + map_store + live perception_worker + live dashboard** ✅ (fly-a-loop signed off).
-- **Target detection (cascade) + 3D localize** — detector ✅ built/generalized/committed; **live
-  integration IN PROGRESS** (this session). ← Phase-1 capstone.
+- **Target detection (cascade) + 3D localize** — detector ✅; live integration ✅; first live run ✅;
+  flight-path (B) + target-placement (C) bugs ✅ fixed offline; **detection cadence (A) pending the
+  re-fly logs**. ← Phase-1 capstone, nearly closed.
 - **DEFERRED to Phase 2:** glass + opening detectors (navigation safety, only autonomy needs them);
   live point-cloud save / 3D flight replay; then autonomy (planner, explore) + Phase-3 report polish + GUI.
 
@@ -194,8 +225,9 @@ That benchmark is the evidence base that motivated the verify-cascade above. Ful
 `OUTPUT/benchmark/` and git history.
 
 ## NEXT (exactly one)
-**Do the live 4-process run** (offline E2E already PASSED — see "## Live integration"). Follow the
-launch procedure above: `make_target` (designate + classify) → io_bridge → perception_worker →
-object_worker → visualizer. Fly manually; confirm detection fires ~every 2 s, the magenta TARGET
-marker appears, and the cluster tightens to `confident`. Watch peak VRAM (offline coexistence peaked
-9.68 GB / 16; live splits across processes). **This completes Phase 1**; then Phase 2 (autonomous flying).
+**Re-fly the live 4-process run WITH `--log`** (first live run done; B + C now fixed, A pending).
+Launch per the procedure above but add `--log` to `object_worker.py` and `perception_worker.py`. Fly
+manually, then post `OUTPUT/diag/<ts>/{object,perception,lift}.csv`. Confirm: (B) the flight path is
+now dense + persists, (C) the TARGET marker lands on the actual rifle, and (A — the open one) read the
+detection cadence + SLAM-stall correlation from the CSVs to decide the contention fix. That closes
+Phase 1; then Phase 2 (autonomous flying).

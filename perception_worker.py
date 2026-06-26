@@ -42,6 +42,7 @@ import frame_bus
 import slam_engine
 from map_store import MapStore
 from target_estimator import TargetEstimator
+from diag_log import DiagLog, NullLog
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -229,6 +230,8 @@ class Pipeline:
         self.last_infer_mono = 0.0
         self.n_depth = 0
         self.last_report = time.monotonic()
+        self.last_map_pub = 0.0           # timer for TOPIC_MAP (dense trajectory) publishing
+        self.MAP_PUB_INTERVAL = 0.5       # publish the map at >= 2 Hz even between keyframes
 
         # --- target lift (M-object Task 2): back-project detections into the voxel map ---
         # Recent per-frame poses so a detection (which lags its frame by the Qwen latency) can be
@@ -243,8 +246,32 @@ class Pipeline:
         self.n_det_seen = 0
         self.last_target_pub = 0.0
 
+        # --- diagnostic CSV logging (off unless enable_diag is called) ---
+        self.diag_perf = NullLog()    # per-frame SLAM/loop timing
+        self.diag_lift = NullLog()    # per-detection lift geometry + estimate evolution
+        self._last_step_ts = None
+
+    def enable_diag(self, ts=None, out_dir=None):
+        """Open CSV diagnostic logs (per-frame timing + per-lift hit geometry)."""
+        self.diag_perf = DiagLog("perception", [
+            "wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+            "n_keyframes", "n_voxels", "reloc"], out_dir=out_dir, ts=ts)
+        self.diag_lift = DiagLog("lift", [
+            "wall_ts", "frame_id", "found", "bbox_area", "center_x", "center_y",
+            "pose_found", "cam_x", "cam_y", "cam_z", "ray_x", "ray_y", "ray_z",
+            "hit", "hit_x", "hit_y", "hit_z", "march_dist",
+            "n_hits", "n_inliers", "cluster_frac", "est_x", "est_y", "est_z", "confident",
+        ], out_dir=out_dir, ts=ts)
+
+    def close_diag(self):
+        self.diag_perf.close()
+        self.diag_lift.close()
+
     def step(self, frame_bgr, meta, state_pub=None, show=True):
         # --- SLAM every frame ---
+        t_step = time.time()
+        loop_dt = (t_step - self._last_step_ts) if self._last_step_ts else 0.0
+        self._last_step_ts = t_step
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         t_slam = time.time()
         res = self.slam.process(rgb)
@@ -253,6 +280,12 @@ class Pipeline:
         fid = meta.get("frame_id")
         if res.pose is not None and fid is not None:
             self._remember_pose(int(fid), res.pose)
+
+        self.diag_perf.row(
+            wall_ts=round(t_step, 4), frame_id=fid, loop_dt=round(loop_dt, 4),
+            slam_ms=round(slam_ms, 1), mode=res.mode, new_keyframe=int(bool(res.new_keyframe)),
+            n_keyframes=res.n_keyframes, n_voxels=len(self.mapstore),
+            reloc=int(bool(res.reloc_event)))
 
         # One-time geometry sanity: the center-pixel ray (camera frame) should point forward.
         if self.debug_lift and not self._geom_logged and self.slam.ray_field is not None:
@@ -263,10 +296,14 @@ class Pipeline:
                   flush=True)
             self._geom_logged = True
 
+        # Trajectory: record the camera center EVERY frame so the persisted/displayed flight path is
+        # dense and "remembers" the whole flight (previously add_pose was keyframe-gated → ~1 pt/kf,
+        # a sparse path that froze between keyframes). Voxel integration still happens per keyframe.
         map_updated = False
+        if res.camera_center is not None:
+            self.mapstore.add_pose(res.camera_center)
         if res.new_keyframe and res.kf_points is not None and len(res.kf_points):
             self.mapstore.integrate(res.kf_points, res.kf_colors)
-            self.mapstore.add_pose(res.camera_center)
             map_updated = True
 
         if state_pub is not None:
@@ -279,12 +316,13 @@ class Pipeline:
                 "new_keyframe": res.new_keyframe, "reloc_event": res.reloc_event,
                 "slam_ms": round(slam_ms, 1),
             })
-            # Compact top-down occupancy snapshot — only when the map actually grew (a new
-            # keyframe), i.e. ~once/keyframe, so the bus stays light. Each message is a full
-            # self-contained snapshot, so a late-joining visualizer catches up on the next one.
-            if map_updated:
-                state_pub.publish(frame_bus.TOPIC_MAP,
-                                  self._map_payload(res, meta))
+            # Top-down occupancy snapshot: on a new keyframe (cells changed) OR on a timer, so the
+            # DENSE trajectory reaches the visualizer without waiting for the next (sparse) keyframe.
+            # Each message is a full self-contained snapshot, so a late joiner catches up immediately.
+            now_mono = time.monotonic()
+            if map_updated or (now_mono - self.last_map_pub) >= self.MAP_PUB_INTERVAL:
+                state_pub.publish(frame_bus.TOPIC_MAP, self._map_payload(res, meta))
+                self.last_map_pub = now_mono
 
         # --- DA-V2 depth, throttled to the slower cadence ---
         now = time.monotonic()
@@ -371,9 +409,34 @@ class Pipeline:
         if not self.estimator.label and det.get("target_label"):
             self.estimator.label = det["target_label"]
         fid, center = det.get("frame_id"), det.get("center")
+        bbox = det.get("bbox")
+        bbox_area = (round((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 1)
+                     if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else "")
+
+        def _log(pose_found, hit_flag, cam=None, ray=None, hw=None, dist=None):
+            """One lift.csv row per detection — logs cam+hit so true cam->hit distance + the
+            bbox size (detection reliability proxy) can be correlated against the cluster offline."""
+            e = self.estimator.estimate() or {}
+            pos = e.get("position") or [None, None, None]
+            g = lambda a, i: (round(float(a[i]), 4) if a is not None else "")
+            self.diag_lift.row(
+                wall_ts=round(time.time(), 4), frame_id=fid, found=1, bbox_area=bbox_area,
+                center_x=(round(center[0], 1) if center else ""),
+                center_y=(round(center[1], 1) if center else ""),
+                pose_found=int(pose_found),
+                cam_x=g(cam, 0), cam_y=g(cam, 1), cam_z=g(cam, 2),
+                ray_x=g(ray, 0), ray_y=g(ray, 1), ray_z=g(ray, 2), hit=int(hit_flag),
+                hit_x=g(hw, 0), hit_y=g(hw, 1), hit_z=g(hw, 2),
+                march_dist=(round(float(dist), 4) if dist is not None else ""),
+                n_hits=self.estimator.n_hits, n_inliers=e.get("n_inliers", ""),
+                cluster_frac=e.get("cluster_frac", ""),
+                est_x=pos[0], est_y=pos[1], est_z=pos[2],
+                confident=(int(bool(e.get("confident"))) if e else ""))
+
         pose = self._pose_for(fid)
         if pose is None or center is None or self.slam.ray_field is None:
             self.estimator.add_found_no_hit(fid)
+            _log(pose_found=False, hit_flag=False)
             return None
 
         # Detection center is in transport pixels (proc_w x proc_h); map it onto the ray field.
@@ -382,32 +445,43 @@ class Pipeline:
         v = int(np.clip(round(center[1] * (h - 1) / max(self.proc_h - 1, 1)), 0, h - 1))
         ray_cam = self.slam.ray_field[v, u].astype(np.float64)
         ray_world = pose[:3, :3].astype(np.float64) @ ray_cam     # Sim3 scale cancels on normalize
+        rd = ray_world / (np.linalg.norm(ray_world) + 1e-9)
+        cam = pose[:3, 3]
         hit = self.mapstore.raycast(
-            pose[:3, 3], ray_world, min_count=self.TARGET_MIN_COUNT, skip=self.TARGET_SKIP)
+            cam, ray_world, min_count=self.TARGET_MIN_COUNT, skip=self.TARGET_SKIP)
         if hit is None:
             if self.debug_lift:
                 print(f"[perception][debug-lift] frame {fid} px=({u},{v}) MISS "
-                      f"(ray hit no voxel; cam={np.round(pose[:3,3],2).tolist()})", flush=True)
+                      f"(ray hit no voxel; cam={np.round(cam,2).tolist()})", flush=True)
             self.estimator.add_found_no_hit(fid)
+            _log(pose_found=True, hit_flag=False, cam=cam, ray=rd)
             return None
         center_world, dist = hit
         self.estimator.add(center_world, fid)
         if self.debug_lift:
-            rd = ray_world / (np.linalg.norm(ray_world) + 1e-9)
-            print(f"[perception][debug-lift] frame {fid} px=({u},{v}) cam={np.round(pose[:3,3],2).tolist()} "
+            print(f"[perception][debug-lift] frame {fid} px=({u},{v}) cam={np.round(cam,2).tolist()} "
                   f"ray={np.round(rd,3).tolist()} -> hit={np.round(center_world,3).tolist()} @ {dist:.2f}u "
                   f"| n_hits={self.estimator.n_hits}", flush=True)
+        _log(pose_found=True, hit_flag=True, cam=cam, ray=rd, hw=center_world, dist=dist)
         return center_world, dist
 
     def target_payload(self):
-        """Current target estimate as a TOPIC_TARGET payload, or None if no hits yet."""
-        e = self.estimator.estimate()
-        if e is None:
+        """TOPIC_TARGET payload — a LIST of target instances (the object can appear more than once),
+        sorted by support; or None if nothing is localized yet. Each instance carries its own
+        position + uncertainty + counts + `confident` flag."""
+        ests = self.estimator.estimate_all()
+        if not ests:
             return None
-        e["tracking_mode"] = self.slam.tracking_mode
-        e["voxel_size"] = self.voxel_size
-        e["min_count"] = self.TARGET_MIN_COUNT
-        return e
+        for e in ests:
+            e["tracking_mode"] = self.slam.tracking_mode
+            e["voxel_size"] = self.voxel_size
+            e["min_count"] = self.TARGET_MIN_COUNT
+        return {
+            "targets": ests,
+            "n_targets": len(ests),
+            "label": ests[0].get("label"),
+            "tracking_mode": self.slam.tracking_mode,
+        }
 
 
 # ==============================================================================
@@ -424,11 +498,13 @@ def _show_and_quit(panel, pipe, map_updated, show):
     return (cv2.waitKey(1) & 0xFF) == ord("q")
 
 
-def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False):
+def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
     frame_port = cfg["network"]["frame_bus_port"]
     pstate_port = cfg["network"]["perception_state_port"]
     obj_port = cfg["network"]["object_state_port"]
     pipe = Pipeline(cfg, conf_thresh=conf_thresh, debug_lift=debug_lift)
+    if log:
+        pipe.enable_diag()
     frame_sub = frame_bus.FrameSubscriber(frame_port)
     state_pub = frame_bus.StatePublisher(pstate_port)  # binds; fail-fast if taken
     # SUB to object_worker's detections (lazy connect — fine whether or not it's running yet).
@@ -453,9 +529,10 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False):
             while d is not None:
                 hit = pipe.ingest_detection(d[1])
                 if hit is not None:
+                    e = pipe.estimator.estimate()
+                    epos = e["position"] if e else "(<min instance)"
                     print(f"[perception] target hit {np.round(hit[0], 3).tolist()} "
-                          f"@ {hit[1]:.2f}u | est {pipe.estimator.estimate()['position']} "
-                          f"n={pipe.estimator.n_hits}", flush=True)
+                          f"@ {hit[1]:.2f}u | best {epos} | n_hits={pipe.estimator.n_hits}", flush=True)
                 d = det_sub.recv(timeout_ms=0)
             now = time.monotonic()
             tp = pipe.target_payload()
@@ -469,6 +546,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False):
         pass
     finally:
         print("[perception] shutting down ...")
+        pipe.close_diag()
         frame_sub.close()
         state_pub.close()
         det_sub.close()
@@ -512,7 +590,7 @@ def _video_frames(path, stride, max_frames, proc_w, proc_h, object_frame_h=720):
 
 def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
                       out_dir=None, conf_thresh=1.5, publish=False,
-                      detect=False, detect_every=5, debug_lift=False):
+                      detect=False, detect_every=5, debug_lift=False, log=False):
     """M4 offline verification: drive the full pipeline from a recorded mp4, export the map.
 
     With `publish=True` it ALSO publishes TOPIC_POSE/DEPTH/MAP on the perception state bus,
@@ -536,6 +614,8 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     object_frame_h = int(cfg["perception"].get("object_frame_height", 720))
 
     pipe = Pipeline(cfg, conf_thresh=conf_thresh, debug_lift=debug_lift)
+    if log:
+        pipe.enable_diag()
     # Optional in-process object detector (offline E2E lift test).
     obj_pipe = None
     if detect:
@@ -568,8 +648,9 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
                     hit = pipe.ingest_detection(det_payload)
                     if hit is not None:
                         est = pipe.estimator.estimate()
+                        epos = est["position"] if est else "(<min instance)"
                         print(f"[perception]   target hit {np.round(hit[0],3).tolist()} "
-                              f"@ {hit[1]:.2f}u -> est {est['position']} n={est['n_hits']}",
+                              f"@ {hit[1]:.2f}u -> best {epos} n_hits={pipe.estimator.n_hits}",
                               flush=True)
                     if state_pub is not None:
                         tp = pipe.target_payload()
@@ -590,15 +671,17 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     stem = video.stem
     targets = None
     if obj_pipe is not None:
-        est = pipe.estimator.estimate()
-        if est is not None:
-            targets = [est["position"]]
+        ests = pipe.estimator.estimate_all()
+        if ests:
+            targets = [e["position"] for e in ests]
+            report = {"label": ests[0].get("label"), "n_targets": len(ests), "targets": ests}
             with open(out_dir / f"{stem}_target.json", "w", encoding="utf-8") as f:
-                json.dump(est, f, indent=2)
-            print(f"[perception] TARGET '{est['label']}' @ {est['position']} | "
-                  f"hits {est['n_hits']}/{est['n_found']} (miss {est['n_miss']}) | "
-                  f"radial_rms {est['radial_rms']}u spread_p90 {est['spread_p90']}u "
-                  f"confident={est['confident']}")
+                json.dump(report, f, indent=2)
+            print(f"[perception] {len(ests)} TARGET instance(s) of '{ests[0].get('label')}':")
+            for k, e in enumerate(ests):
+                print(f"[perception]   #{k} @ {e['position']} | inliers {e['n_inliers']}/{e['n_hits']}"
+                      f" | radial_rms {e['radial_rms']}u spread_p90 {e['spread_p90']}u "
+                      f"confident={e['confident']}")
             print(f"[perception] target report -> {out_dir / f'{stem}_target.json'}")
         else:
             print("[perception] TARGET: no map hits (target never lifted)")
@@ -606,8 +689,12 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     png = out_dir / f"{stem}_livemap_topdown.png"
     pipe.mapstore.render_topdown(png, min_count=2, targets=targets)
     pipe.mapstore.save_npz(out_dir / f"{stem}_livemap.npz", min_count=2)
-    print(f"[perception] top-down -> {png}")
+    ply = out_dir / f"{stem}_livemap.ply"
+    pipe.mapstore.save_ply(ply, min_count=2, trajectory=True, targets=targets)
+    print(f"[perception] top-down (flight path + target marks) -> {png}")
     print(f"[perception] voxel map -> {out_dir / f'{stem}_livemap.npz'}")
+    print(f"[perception] point cloud + flight path + targets (.ply) -> {ply}")
+    pipe.close_diag()
     if state_pub is not None:
         state_pub.close()
     if show:
@@ -676,6 +763,9 @@ def main():
     parser.add_argument("--debug-lift", action="store_true",
                         help="log per-detection lift geometry (pixel, cam, ray, hit) + a one-time "
                              "center-pixel ray sanity check")
+    parser.add_argument("--log", action="store_true",
+                        help="write diagnostic CSVs to OUTPUT/diag/ (per-frame SLAM/loop timing + "
+                             "per-lift hit geometry) for live-flight debugging")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -686,10 +776,10 @@ def main():
                           max_frames=args.max_frames, out_dir=args.out,
                           conf_thresh=args.conf_thresh, publish=args.publish,
                           detect=args.detect, detect_every=args.detect_every,
-                          debug_lift=args.debug_lift)
+                          debug_lift=args.debug_lift, log=args.log)
     else:
         run_live(cfg, show=not args.no_display, conf_thresh=args.conf_thresh,
-                 debug_lift=args.debug_lift)
+                 debug_lift=args.debug_lift, log=args.log)
 
 
 if __name__ == "__main__":

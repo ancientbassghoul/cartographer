@@ -190,7 +190,7 @@ class MapStore:
             "n_voxels_kept": int(len(centers)),
             "max_obs": int(counts.max()) if n else 0,
             "mean_obs": float(counts.mean()) if n else 0.0,
-            "keyframes": len(self.trajectory),
+            "traj_poses": len(self.trajectory),   # per-frame camera centers (dense path)
             "compression_x": round(self.n_points_seen / max(n, 1), 1),
         }
 
@@ -263,6 +263,11 @@ class MapStore:
 
         traj = self.trajectory_array()
         if len(traj):
+            # The trajectory is now per-FRAME (dense), so cap the bus payload by striding to at most
+            # TRAJ_MAX points (shape preserved). The full dense path still goes to the .npz export.
+            TRAJ_MAX = 1500
+            if len(traj) > TRAJ_MAX:
+                traj = traj[np.linspace(0, len(traj) - 1, TRAJ_MAX).astype(int)]
             tu, tv = to_cell(traj[:, 0], traj[:, 2])
             out["traj_u"], out["traj_v"] = tu.astype(np.int32), tv.astype(np.int32)
         return out
@@ -273,6 +278,32 @@ class MapStore:
         np.savez(path, centers=centers, colors=colors,
                  trajectory=self.trajectory_array(),
                  voxel_size=self.voxel_size, tracking_mode=self.tracking_mode)
+
+    def save_ply(self, path, min_count: int = 1, trajectory=True, targets=None):
+        """Write a viewable ASCII .ply point cloud: the voxel occupancy (true colors), plus the
+        flight path as GREEN points and any target instances as large MAGENTA points. Opens in
+        MeshLab/CloudCompare. `targets` = optional list of world (3,) points."""
+        centers, colors = self.occupied(min_count)
+        xyz = [centers.astype(np.float32)]
+        rgb = [colors.astype(np.uint8)]
+        if trajectory:
+            traj = self.trajectory_array()
+            if len(traj):
+                xyz.append(traj.astype(np.float32))
+                rgb.append(np.tile(np.array([0, 255, 0], np.uint8), (len(traj), 1)))   # path = green
+        if targets:
+            tp = np.asarray(targets, np.float32).reshape(-1, 3)
+            xyz.append(tp)
+            rgb.append(np.tile(np.array([255, 0, 255], np.uint8), (len(tp), 1)))        # target = magenta
+        P = np.concatenate(xyz, axis=0)
+        C = np.concatenate(rgb, axis=0)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {len(P)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+            for (x, y, z), (r, g, b) in zip(P, C):
+                f.write(f"{x:.4f} {y:.4f} {z:.4f} {int(r)} {int(g)} {int(b)}\n")
 
     def render_topdown(self, out_path=None, size=900, pad=0.06, min_count: int = 1,
                        point_px: int = 1, targets=None):
@@ -324,17 +355,18 @@ class MapStore:
             cv2.circle(img, tuple(path[-1]), 6, (0, 255, 255), -1)  # end
 
         if targets:
-            for tw in targets:
+            multi = len(targets) > 1
+            for i, tw in enumerate(targets):
                 tw = np.asarray(tw, np.float64).reshape(3)
                 tu, tv = to_px(np.array([tw[0]]), np.array([tw[2]]))
                 px, py = int(tu[0]), int(size - 1 - int(tv[0]))
                 cv2.drawMarker(img, (px, py), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
                 cv2.circle(img, (px, py), 11, (255, 0, 255), 2)
-                cv2.putText(img, "TARGET", (px + 14, py - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (255, 0, 255), 2)
+                cv2.putText(img, f"TARGET {i}" if multi else "TARGET", (px + 14, py - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
 
         cv2.putText(img, f"top-down X-Z  {len(centers)} voxels @ {self.voxel_size:g}u  "
-                    f"{len(traj)} kf  mode={self.tracking_mode}  ~{2*half:.2f}u across",
+                    f"{len(traj)} traj-pts  mode={self.tracking_mode}  ~{2*half:.2f}u across",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(img, "traj: green=start yellow=end (red path)", (10, size - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
