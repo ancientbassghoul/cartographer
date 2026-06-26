@@ -1,635 +1,201 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated: 2026-06-25. Read this first when resuming with fresh context, alongside the
-design plan at `C:\Users\owner\.claude\plans\hey-read-this-file-breezy-otter.md`. **The single
-actionable resume pointer is the "## NEXT" section near the bottom.**_
-
-## ✅✅ BREAKTHROUGH (2026-06-25): cascade detector WORKS — rifle 0.77 good / 0.00 FP, poster 0.33 / 0.00 FP
-_Built `cascade_detector.py` (+ `cascade_report.py` HTML). A 3-stage cascade — propose wide → verify
-appearance → verify geometry — is the FIRST approach that localizes the 3D rifle with ZERO false
-positives. This SUPERSEDES the "no detection solution" VERDICT block below._
-
-**Architecture (the detector we were waiting for):**
-- **Stage 1 — propose (recall ceiling):** GroundingDINO (text: "a rifle" / "a printed portrait
-  poster") + OWLv2 image-guided (top-K anchors), pooled, low thresholds, per-source NMS.
-- **Stage 2 — verify appearance:** DINOv2 ViT-S/14 GLOBAL crop embedding (CLS + mean-pool); each
-  candidate crop AND the ref are **letterboxed** (aspect-preserving, NEVER squashed — the rifle ref
-  is 168×447) to 224². Survivor gate = CLS cosine ≥ `DINO_THRESH` (=0.50).
-- **Stage 3 — verify geometry (asymmetric, user-decided):** planar poster = SIFT+RANSAC homography
-  **HARD gate** (≥12 inliers); 3D rifle = LightGlue inliers **SOFT bonus** that never vetoes
-  (LightGlue rifle recall is too low to gate, but scores 66–188 inliers on the localized CROP — a
-  strong tiebreak). Models load ONE STAGE AT A TIME and free (peak VRAM tiny: GD 0.69, OWLv2 0.63,
-  DINOv2 0.10 GB).
-- **Decision:** among accepted survivors rank by **DINOv2 cosine FIRST**, geometry as tiebreak.
-  (Fixed a poster mis-rank where a loose off-target box with marginally more SIFT inliers beat the
-  near-exact poster box — f2307/f3967 now land at IoU 0.93/0.96.)
-
-**Results (9 poster + 13 rifle positives, 15 negatives; `OUTPUT/cascade/{summary,per_frame}.json`):**
-| target | Stage-1 recall ceiling (gd / owlv2) | final good (on-target) | final FP | DINO sep pos/neg |
-|---|---|---|---|---|
-| Rifle (3D) | **1.00** (1.00 / 1.00) | **0.77** (10/13) | **0.00** | 0.75 / 0.15 |
-| Nasrallah (poster) | **1.00** (1.00 / 1.00) | 0.33 (3/9) | **0.00** | 0.42 / 0.29 |
-
-- **The 3D rifle was UNSOLVED by every prior engine** (best OWLv2 0.23 good / 0.93 FP). Cascade =
-  0.77 good / **0.00 FP**, IoU up to 0.94, boxes visually on the rifle.
-- **Both proposers cover GT on every positive frame** — GroundingDINO DOES find the rifle (the big
-  unknown is resolved), and **0 false positives across all 30 negative evaluations**.
-- **`DINO_THRESH=0.50` is the throttle:** every remaining miss is just under it (rifle 0.41–0.43,
-  poster 0.27–0.42). Rifle separation is huge (0.75 vs 0.15) → safe to lower; poster separation is
-  weak (0.42 vs 0.29, small flat crop) → wants a lower, **per-target** threshold. ← NEXT (user
-  instruction pending). Reproduce: `venv\Scripts\python.exe cascade_detector.py` then `cascade_report.py`.
-
-**Still a DIAGNOSTIC** (same status as `benchmark_*.py`): `object_worker.py` is NOT yet wired to the
-cascade. The detector-agnostic 3D lift/consensus/stream/viz (KEEP list below) is untouched and ready
-to consume whatever the cascade outputs.
-
-**GENERALIZED (2026-06-26): AssetClass config — no hardcoded target names.** `cascade_detector.py`
-now takes each target at runtime (TEXT + REF IMAGE + ASSET CLASS) via CLI flags or a `--targets
-<yaml>` batch (`cascade_targets.yaml` is the example fixture). An `AssetClass` enum +
-`ASSET_CLASS_PARAMS` dict is the ONLY place per-target behavior lives: **`2D_PLANAR`** → DINOv2 ≥0.33
-+ SIFT homography HARD gate; **`3D_GEOMETRY`** → DINOv2 ≥0.40 + LightGlue SOFT bonus. Ranking is
-DINOv2-cosine PRIMARY, geometry tie-break (planar-mis-rank fix). **Asymmetric gate validated:** at
-the looser planar 0.33, DINOv2 leaked 5/15 poster negatives into Stage 2 (S2fp 0→0.33) but the SIFT
-hard gate held **final FP at 0.00** — exactly why planar is hard-gated. Per-class thresholds gave
-rifle recall 0.77→0.92 (the 2 extra are loose boxes — GroundingDINO's honest localization limit on
-hard views; deliberately NOT chased), poster/rifle `good` unchanged at 0.33/0.77. **Warm per-frame
-detection (all models resident, RTX 3080, ~7 cands/2 survivors): ~1.55 s** (GD 0.44 + OWLv2 0.84 +
-DINOv2 0.08 + geom 0.18; range 1.4–2.0 s; first frame after load is slower from CUDA warmup).
-
-## ⛔⛔ (SUPERSEDED 2026-06-25 by the CASCADE BREAKTHROUGH above) detector benchmark DONE → NO proper detection solution
-_The 5-engine benchmark below is complete and reproducible (`benchmark_detectors.py` +
-`benchmark_report.py`, artifacts in `OUTPUT/benchmark/`). **Bottom line: we still do NOT have an
-adequate target detector — especially for the 3D rifle.** Do NOT pick/rewrite a detector yet. The
-**user is going to propose a NEW detection plan**; wait for it. The detector-agnostic 3D pipeline
-(lift / consensus / hi-res stream / viz — see the KEEP list further down) is untouched and reusable
-by whatever detector comes next._
-
-**What was built (benchmark harness — keep, reusable):**
-- `io_bridge.py` `space` hotkey → full-res 1280×720 frame capture (`perception.capture_key/_dir`).
-- `annotate_targets.py` → GT bbox annotator; writes `test_assets/<target>/labels.json` (`[x1,y1,x2,y2]`,
-  top-left origin).
-- Dataset: `test_assets/{Nasrallah(9), Rifle(13), None(15 neg)}/` + `*_ref.png` canonical templates.
-- `benchmark_detectors.py` — 5 engines × 2 targets + negatives; metrics **recall, good (=found AND
-  pred-center∈GT), loc/found, FP_neg, IoU**; flags `--mask-refs`, `--debug-shapes`, `--max-frames`.
-- `benchmark_report.py` — single portable `OUTPUT/benchmark/benchmark_report.html` (embedded overlays
-  GT=green / pred=cyan-correct,red-wrong + per-frame sidebar). `per_frame.json` has gt_bbox/pred_bbox
-  (+ Qwen raw replies) for machine-readable verification.
-- Deps added (clean, no torch/MASt3R/lietorch disturbance): `lightglue`(cvg)+`kornia`, `timm`,
-  `torchvision`(was present); `transformers` GroundingDINO+SAM used for `--mask-refs`.
-
-**Final numbers (canonical refs, un-throttled res). good = on-target hit rate; FP_neg = fires on empty room:**
-| engine | POSTER good / FP | RIFLE good / FP | note |
-|---|---|---|---|
-| SIFT (cv2) | **0.44 / 0.00** | 0.00 / 0.00 | clean+deterministic on poster; 0 recall on 3D rifle |
-| DINOv2 (vits14) | **0.78** / 0.60 | 0.00 / 1.00 | best poster localization but over-fires; rifle = noise |
-| OWLv2 image-guided | 0.11 / 0.13 | **0.23** / 0.93 | best rifle *good* but fires on ~all negatives |
-| Qwen2.5-VL-3B 4bit@512 | 0.22 / 0.13 | 0.08 / 0.27 | best rifle *recall* 0.77 but localizes wrong; mural mis-fires |
-| LightGlue (SuperPoint) | 0.11 / 0.00 | 0.08 / 0.00 | weak (small ref starves SuperPoint) |
-
-**Conclusions (don't re-derive):**
-- **Planar poster = solvable**: SIFT is the clean pick (0 false positives, exact homography box, but
-  recall threshold-limited — lower `SIFT_MIN_INLIERS`); DINOv2 localizes more (0.78) but needs a
-  precision gate (FP 0.60).
-- **3D rifle = UNSOLVED by every engine.** Best on-target rate is OWLv2 0.23 (with FP 0.93). A
-  low-texture, self-similar object defeats keypoints (no texture), patch-NN (DINOv2 matches dark
-  clutter everywhere), and both VLMs localize it poorly (OWLv2 loose boxes; Qwen confident-but-wrong).
-- **Experiments that did NOT rescue it (don't repeat):** (1) un-throttling resolution
-  (DINOv2 frame 700→1288, aspect-preserving zero-pad ref) — *helped the poster* (good 0.11→0.78) but
-  rifle stayed 0.00; (2) OWLv2 raw-logit gate (`verify_thresh` 5.0 vs the self-normalizing post-proc
-  score) — fixes the strawman FP but the logit scale is **query-dependent** (rifle neg-median ~6.4 >
-  gate); (3) **Grounded-SAM background masking** of refs (clean silhouettes, verified by eye) — fixed
-  OWLv2-rifle FP **0.93→0.13** (logit-cooling) but NOT its localization, did NOT restore DINOv2 rifle,
-  and *hurt* SIFT/OWLv2 on the poster. DINOv2 coord math was explicitly verified correct (not a bug).
-
-**➡️ NEXT: wait for the user's new detection plan.** Do not select/integrate a detector or edit
-`object_worker.py` until then. Everything above is the evidence base for that conversation.
-
-## ⛔ Status: ALL learned-detector attempts FAILED → benchmarking matching tools — 2026-06-25
-_Resume plan: `~/.claude/plans/parallel-weaving-orbit.md`. **Every detection engine we tried so
-far is inadequate for this target.** Decision: benchmark better-suited image-matching tools and
-pick the detection engine(s) for the pipeline._
-
-**What failed and why (don't re-try these):**
-- **Qwen2.5-VL (4-bit)** — *non-deterministic recall*: in a fixed pose it flickers `no target` ↔
-  `TARGET` (`DEBUG_IMAGES/wrong_3d_position_and_sensitive_qwen.png`). @512 finds the poster on
-  ~2 frames/flight; @720p **degenerates to `!!!` on the target frame** (inherent 4-bit fragility
-  at high vision-token counts — NOT a transformers/preprocessing bug, both ruled out). 8-bit @720p
-  is stable but **~18–20 s per *found* frame** (int8 decode); fp16 @720p also degenerates.
-- **OWLv2 image-guided** — *not discriminative*: as a verifier, its absolute crop logit
-  (`logits[0,:,0].max()`) scores window/brick/sign crops ~8, **same as the real poster** — it
-  answers "is this a framed textured rectangle," not "is this THE target." As a proposer it
-  over-proposes. (NOTE: some early "false positives" at src 150/400/700 were later found to be the
-  REAL poster seen *through a window* — but OWLv2 still can't be trusted to gate.)
-- **Qwen→OWLv2 cascade** (Qwen@512 proposes, OWLv2 verifies the crop, gate 5.0) — the current
-  uncommitted code. Self-test passes + offline E2E ran (587f, 22kf, peak 10.8 GB, geometry OK),
-  but recall is still ~2 hits → `confident:false`; the verify gate only "passed" by luck (Qwen
-  didn't propose the window/sign that run). **Inadequate.**
-
-**➡️ NEXT: benchmark image-matching tools, then rewrite ONLY the detector.**
-- Tools to benchmark: **SuperPoint + LightGlue** (learned local features + matcher; SIFT-but-better,
-  gives correspondences→homography+inlier confidence), **DINOv2** (semantic dense correspondence;
-  best for 3D / distant / through-glass), with **SIFT** (cv2, already works) and **OWLv2** as
-  baselines. SIFT already validated on the poster: 40–67 RANSAC inliers on clear views, **0 on the
-  window/sign** that fooled both VLMs — clean, deterministic, but loses recall on distant/oblique.
-- Benchmark on **TWO targets**: the **planar Nasrallah poster** (homography/SIFT/LightGlue ideal)
-  AND a **3D rifle** seen from different angles (non-planar → should favor semantic DINOv2). Likely
-  **no single winner** → the engine may end up target-type-dependent.
-- **Assets the user will provide** in `cartographer/test_assets/bench/`: `rifle_ref.png` (target
-  render/crop), `rifle_pos_*.png` (≥5, different angles), `rifle_neg_*.png` (≥3); optional extra
-  `poster_pos_*`/`poster_neg_*` (else auto-extract poster frames from
-  `../XLAB/OUTPUT/flight_20260621_120829.mp4`, poster in view src ~1260–1300).
-- **Deps likely needed:** `lightglue` (or via `kornia`) + **DINOv2** (`torch.hub`) — confirm before pip.
-- **PENDING USER DECISIONS (ask on resume):** (1) revert scope — recommended **discard detectors
-  only**, KEEP the detector-agnostic 3D pipeline; (2) which deps to install; (3) rifle assets +
-  poster-frame source.
-
-**KEEP (detector-agnostic, correct, reusable by ANY detector — do NOT delete in any revert):**
-the **3D lift** in `perception_worker.py` (`ingest_detection`, pose ring, ray-cast into the voxel
-map, `TOPIC_TARGET`; geometry verified center ray ≈[0,0,1]), **`target_estimator.py`** (cluster
-consensus + uncertainty), the **hi-res `:5605` stream** (io_bridge; full-res frames help SIFT/
-LightGlue/DINOv2), **`make_target.py`**, the **`TOPIC_DETECTION` bus contract**, the visualizer
-**target marker**, and **`--debug-lift`**. The detector is isolated in `object_worker.py`; only
-that file's detector classes get rewritten around the benchmark winner.
-
-**Working-tree state (UNCOMMITTED):** `object_worker.py` (+Owlv2Detector/CascadeDetector/modes),
-`config.yaml` (+models.owlv2, object_mode QWEN_OWLV2), `PROGRESS.md`. Last commit = `dc28876`
-(object chain + post-live fixes). Nothing committed since. `DEBUG_IMAGES/_diag_*` are throwaway.
-
-## Status: Detector swap → **Qwen+OWLv2 cascade** ("both-positive") — SUPERSEDED (see top, 2026-06-24)
-_Plan: `~/.claude/plans/parallel-weaving-orbit.md`. Replaced the single-model detector with a
-two-stage cascade after extensive empirical de-risking. **The detector is the only thing that
-changed** (lift/SLAM/map/consensus/viz all untouched)._
-- **Design:** Stage 1 (recall) = **4-bit Qwen @ 512** grounds the label + proposes a box;
-  Stage 2 (precision) = **OWLv2** verifies the proposed crop against the reference image via the
-  **absolute** image-guided logit (`out.logits[0,:,0].max()`, NOT the post-processed score which
-  self-normalizes to ~1.0 on every frame). Accept iff `logit >= models.owlv2.verify_thresh`
-  (=5.0; dev poster ≈7, murals/sign ≈3.7). Both models always run, both must agree — an
-  **ensemble, not a fallback**. New `object_worker.CascadeDetector` (resolution-adaptive: always
-  downscales to 512 for Qwen, crops at the input frame's native res for OWLv2).
-- **Visible mode flag:** `runtime.object_mode` now ∈ `{"QWEN_OWLV2" (default), "OWLV2", "QWEN"}`,
-  validated fail-fast in `set_object_mode`; standalone OWLV2/QWEN kept as diagnostics. `OBJECT_MODE`
-  in every payload + log reads the active path; per-detection `raw` carries the verify logit.
-- **Key empirical findings (this is WHY 512, not hi-res):**
-  - 4-bit Qwen **degenerates to `!!!` at 720p — worst on the target frame** (src 1290 → `!!!`
-    3/3, single- AND two-image), while only boxing *murals* on other frames. So the committed
-    hi-res path (`:5605`/720p, from commit dc28876) was MISSING the real poster and only firing
-    false positives — it was **never successfully flown live** (only offline-"verified"). The
-    live run the user remembers working was the *earlier* working-tree **4-bit @ 512** path.
-  - NOT a transformers regression (5.12.1 since 06-21) and NOT input corruption (sanity-dumped
-    `process_vision_info` output — pristine RGB). It's inherent 4-bit fragility at high token counts.
-  - 8-bit @ 720p is stable + boxes the poster but **~18–20 s per *found* frame** (int8 decode
-    ~2 tok/s) — unusable. fp16 @ 720p also degenerates. **512 is faster AND more reliable on the
-    target.** OWLv2 verify works on the 512 crop as well as a hi-res crop (logit ~7 either way).
-- **Timing (profiled, 4-bit @ 512):** empty frames ~0.5 s (fits the 2 s cadence — the ">90%"
-  case the user saw "firing every 2 s"); found frames ~4.5 s Qwen + ~0.8 s OWLv2 (autoregressive
-  bbox-JSON decode). Found-overrun accepted (drone dwells; "compute efficiency NOT graded").
-- **Verify (DONE):** `object_worker --self-test` PASS (POSITIVE boxed on the poster, logit 7.59;
-  NEGATIVE correctly empty; mode `QWEN_OWLV2`). Offline E2E `perception_worker --video <flight>
-  --detect --debug-lift` → **587 frames, 22 kf, reloc 0, 58044 voxels (== M4 baseline), peak VRAM
-  10.80 GB**, geometry intact (center ray ≈[0,0,1]). **Precision FIXED: 0 false positives lifted**
-  (at 512 Qwen didn't even propose murals; verify gate is insurance). **Recall still low (2 finds
-  → `confident:false`)** — the SAME pre-existing 3D-quality gap (2 hits ~2u apart, one near-camera
-  @0.48u), reproduced NOT introduced; it's the out-of-scope Task-3 lift tuning, best done on the
-  user's real Phase-1 target with more dwell/cadence. Live 4-process run still user-pending.
-- **Config:** `models.owlv2.verify_thresh: 5.0`, `runtime.object_mode: "QWEN_OWLV2"`,
-  `models.qwen_vl.quantization` stays `4bit`. NOT committed (awaiting user).
+_Last updated: 2026-06-26. Read this first when resuming with fresh context. The design plan is at
+`C:\Users\owner\.claude\plans\hey-read-this-file-breezy-otter.md`. **The single actionable resume
+pointer is the "## NEXT" section at the bottom.**_
 
 ## What this project is (1 paragraph)
 Assessment task: from the black-box **XLAB** Unity sim's single monocular drone feed, autonomously
-**map the room and report the 3D location of a target object**. 3 phases: Human Recon → Autonomous
-Survey → Localize & Report (+uncertainty). Later: a GUI. Grading = internal consistency (metric scale
-NOT required); compute efficiency NOT graded. All local on an RTX 3080 Laptop (16 GB).
+**map the room and report the 3D location of a target object** (+ uncertainty). Three phases: Phase 1
+Human Recon → Phase 2 Autonomous Survey → Phase 3 Localize & Report; then a GUI ("make it look like
+an app"). Grading = internal consistency (metric scale NOT required); compute efficiency NOT graded.
+All local on an RTX 3080 Laptop (16 GB).
+
+## Where we are (2026-06-26)
+**Phase 1** (the user's framing) = fly manually + SLAM-map the lab + record the flight path + detect
+the target + report its 3D location. Every core piece is built and verified on hardware:
+- **Sensing/transport** (io_bridge + frame bus), **SLAM + voxel map + live dashboard**, **depth** —
+  all done and signed off live (see Milestones).
+- **Target detector** — the hard problem; SOLVED by a **3-stage cascade** after every single-shot
+  engine failed. Built, generalized, committed.
+- **3D lift + consensus** — back-project each detection into the voxel map → robust 3D estimate.
+  Built and verified offline; detector-agnostic.
+
+**In progress (this session): wiring the cascade into the live app** so the user can fly manually
+and have detection fire every ~2 s, with detections agreeing on one 3D point — plus auto-classifying
+the target at designation. See "## Live integration" and "## NEXT".
+
+## The detector: a 3-stage CASCADE (the solution)
+Single-shot engines all conflated *"where is a candidate"* with *"is this THE target"* and over-fired
+(see "## Detector history"). The cascade separates propose from verify. It is **generalized** by an
+`AssetClass` — no hardcoded target names:
+
+- **Stage 1 — propose:** GroundingDINO (text phrase) + OWLv2 image-guided (reference crop), pooled,
+  low thresholds, per-source NMS. (Stage-1 recall ceiling = 1.00 on both test targets.)
+- **Stage 2 — verify:** DINOv2 ViT-S/14 global crop-embedding cosine vs the reference; ref AND each
+  candidate crop **letterboxed** (aspect-preserving, never squashed) to 224². Gate = the asset
+  class's DINOv2 threshold.
+- **Stage 3 — geometric gate (per asset class):** `2D_PLANAR` → SIFT+RANSAC homography **HARD gate**;
+  `3D_GEOMETRY` → LightGlue inliers **SOFT bonus** (never vetoes). Survivors ranked by **DINOv2
+  cosine first**, geometry as tie-break.
+
+`AssetClass` params live in `cascade_detector.ASSET_CLASS_PARAMS` (the only per-class config):
+`2D_PLANAR` → DINOv2 ≥0.33 + SIFT hard; `3D_GEOMETRY` → DINOv2 ≥0.40 + LightGlue soft.
+
+**Results** (9 poster + 13 rifle positives, 15 negatives — `OUTPUT/cascade/`): the **3D rifle, which
+every prior engine failed** (best 0.23 good / 0.93 FP), reaches **0.77 good / 0.00 FP**; poster 0.33
+good / 0.00 FP. **0 false positives across all negatives** — the asymmetric gate proved its worth:
+even when the looser planar DINOv2 0.33 leaked negatives into Stage 2, the SIFT hard gate held final
+FP at 0. **Warm per-frame ~1.55 s** (GD 0.44 + OWLv2 0.84 + DINOv2 0.08 + geom 0.18; all resident).
+
+**Diagnostic scripts (kept, reproducible):** `cascade_detector.py` (CLI single-target or
+`--targets cascade_targets.yaml` batch) + `cascade_report.py` (embedded HTML funnel). The earlier
+`benchmark_detectors.py`/`benchmark_report.py` (5-engine bake-off) remain as the evidence base.
+
+## Live integration (in progress this session)
+Goal: cascade running live in `object_worker` (P4) firing every ~2 s, feeding the existing 3D lift +
+consensus; target auto-classified at designation with user override. **The 3D side is unchanged** —
+the lift only consumes `found/frame_id/center/target_label` from `TOPIC_DETECTION`, which the payload
+still provides. Built:
+- `cascade_detector.LiveCascade` — all cascade models resident; `set_target(ref,text,asset_class)` +
+  `detect(frame)`. Explicit `torch.cuda.empty_cache()` after each init stage + per-frame (first live
+  VRAM-coexistence test).
+- `object_worker.py` — the three dead detectors (Qwen/OWLv2/old-cascade) **removed**; new
+  `CascadeDetector` wraps `LiveCascade`; `object_mode` is **`CASCADE`** only; loads the designated
+  target from `target.yaml`; payload + overlay carry `asset_class`.
+- `target_classifier.py` (new) — one-time Qwen2.5-VL pass on the crop → suggested text phrase +
+  PLANAR/3D class. **Designation-only**; the flight path carries no VLM.
+- `make_target.py` — crops at **native resolution** (fidelity), runs the classifier, lets the user
+  confirm/override label + class, writes `target.yaml` `{reference_crop, text, asset_class}`.
+
+**Verification status (2026-06-26):** ✅ classifier sanity (rifle→3D_GEOMETRY, poster→2D_PLANAR,
+labels correct — needed a "judge the medium not the depicted content" prompt or it called the poster
+SOLID). ✅ **offline E2E** on the rifle flight (`flight_20260622_183816.mp4`, single-process SLAM +
+cascade + lift + consensus): rifle found 119/188, 114 lifted to map hits, estimator
+**`confident=True` @ [0.025, 0.025, 3.425], radial_rms 0.14u, spread_p90 0.22u**, **peak VRAM 9.68 GB
+/ 16** (coexistence headroom confirmed), ~2 s/detection. ⏳ Live 4-process run pending (user flies).
+Note: two hit clusters appeared (estimate settled on the denser earlier one at z≈3.4; near-approach
+hits sat at ~[0.7, 0, 5.0]) — mode-seeking is internally consistent, but worth an eye on which is the
+true rifle. Not chased (per "don't over-tune the honest read").
 
 ## ⚠️ Binding rules (from `cartographer/CLAUDE.md`)
-- **NO SILENT FALLBACKS.** No auto-failover / hidden try-except downgrades. Fail-fast OR set a visible
-  state flag (`tracking_mode`, `object_mode`) that is logged + shown in the UI. Any fallback (e.g.
-  Qwen→DINOv2, MASt3R→FeatureVO) must be **approved before coding**.
+- **NO SILENT FALLBACKS.** No auto-failover / hidden try-except downgrades. Fail-fast OR set a
+  visible, logged, UI-surfaced state flag (`tracking_mode`, `object_mode`, `asset_class`). Any
+  fallback must be approved before coding.
+- **Image integrity:** no undisclosed downscaling; maximize source fidelity into each model and log
+  every resize (letterbox→224², OWLv2→960², etc.).
 - **Always start work with a TaskCreate list.** Never commit unless the user explicitly asks.
-- Work style with this user: **checkpoint at milestone boundaries**; they review each step.
+- **Checkpoint at milestone boundaries;** the user reviews each step.
 
-## Layout & environment
+## Architecture & data flow
+4 processes over a ZMQ bus (frame bus = CONFLATE newest-wins; state bus = multipart `[topic][json]`):
+- **P1 `io_bridge.py`** — NDI capture + 60 Hz TCP control + keyboard. Publishes the 512×288 transport
+  stream (:5601), a **hi-res 720p stream (:5605)** for detection, and status/`space`-capture events.
+- **P2 `perception_worker.py`** — SLAM (MASt3R) every frame + DA-V2 depth (throttled) in ONE CUDA
+  context → voxel `MapStore`; publishes TOPIC_POSE/DEPTH/MAP (:5603). SUBs TOPIC_DETECTION, **lifts**
+  each detection (`ingest_detection` ray-casts the center pixel into the map), feeds
+  `target_estimator`, publishes TOPIC_TARGET.
+- **P3 `visualizer.py`** — read-only dashboard: [status | input | depth+bar | top-down map + live
+  camera track + magenta TARGET marker].
+- **P4 `object_worker.py`** — the cascade detector; SUBs the hi-res stream, publishes TOPIC_DETECTION
+  (:5604) with bbox/center scaled to 512×288 transport.
+
+**KEEP — detector-agnostic, verified, reused by any detector (don't break):** the **3D lift** in
+`perception_worker.ingest_detection` (pose ring + `MapStore.raycast`; geometry confirmed, center ray
+≈[0,0,1]), **`target_estimator.py`** (mode-seeking cluster consensus + uncertainty), the hi-res
+`:5605` stream, the `TOPIC_DETECTION`/`TOPIC_TARGET` bus contract, the visualizer target marker, and
+`--debug-lift`.
+
+## Environment & build (don't re-derive)
 ```
 D:\EXTEND\C2_SIM\XLAB\
 ├── XLAB\          ← black-box sim (READ-ONLY). Xlab.exe, Sample_Drone_Interface.py, OUTPUT\*.mp4
-└── cartographer\  ← our repo (this dir). Referenced sim path = ../XLAB/
+└── cartographer\  ← our repo (this dir). Sim referenced as ../XLAB/
 ```
-- **One unified venv:** `cartographer\venv` — Python 3.11.9, torch 2.5.1+cu121. Activate:
-  `cartographer\venv\Scripts\python.exe`. All 3 processes run from it.
-- Re-validate the env anytime: `venv\Scripts\python.exe smoke_test_models.py` (DA-V2 + Qwen) and
-  `venv\Scripts\python.exe smoke_test_slam.py` (MASt3R two-view).
-- To rebuild MASt3R-SLAM from scratch: `build_mast3r_slam.bat` then `build_mast3r_slam_step23.bat`
-  (the int64_t kernel patch in `third_party/MASt3R-SLAM/mast3r_slam/backend/src/*.cu` must already be
-  present in the source before building — it is a manual edit baked into the third_party checkout, NOT
-  re-applied by the .bats; on a fresh clone you must re-apply it by hand).
-- **lietorch is a PATCHED LOCAL build** at `third_party/lietorch` (NOT the pip/git version, which
-  segfaults — see M4 below). To rebuild it: `build_lietorch.bat`. NEVER `pip install` upstream lietorch.
-  Re-validate group ops: `venv\Scripts\python.exe lietorch_probe.py` (expects "ALL LIETORCH CASES PASSED").
+- **One venv:** `cartographer\venv` (Python 3.11.9, torch 2.5.1+cu121). All processes run from it.
+- Re-validate models: `venv\Scripts\python.exe smoke_test_models.py` (DA-V2 + Qwen) and
+  `smoke_test_slam.py` (MASt3R two-view).
+- **lietorch is a PATCHED LOCAL build** at `third_party/lietorch` — upstream pip/git segfaults on CUDA
+  group ops (`const scalar_t*` kernels miscompiled by nvcc 12.1 + MSVC 14.36). Rebuild via
+  `build_lietorch.bat`; the tracked fix is `lietorch_windows_const_fix.patch`. NEVER `pip install`
+  upstream lietorch. Validate: `lietorch_probe.py` ("ALL LIETORCH CASES PASSED").
+- **MASt3R-SLAM** rebuild: `build_mast3r_slam.bat` then `build_mast3r_slam_step23.bat` (the int64_t
+  kernel patch must already be present in `third_party/MASt3R-SLAM/.../backend/src/*.cu`).
+- `.gitignore` excludes `venv/`, `third_party/`, `test_assets/`, `OUTPUT/`, weights.
 
-## Status: Post-live-run fixes (detection sensitivity + 3D accuracy) — IN PROGRESS 2026-06-23
-_First live 4-process run flew smoothly but: (1) Qwen detection was knife-edge sensitive (1px flips
-found/not-found), (2) the 3D target marker was wrong, (3) the visualizer lagged (updated only at
-keyframe rate). Plan: `~/.claude/plans/golden-orbiting-cherny.md`. Root cause: ~60px poster in the
-512×288 transport frame → too few Qwen patches → jittery boxes → rays fan through the partition-wall
-room → scattered 3D. **Geometry confirmed CORRECT** (center-pixel ray = [0,0,1] via `--debug-lift`),
-so the lift math is fine; the fix is better detection + outlier-robust aggregation. Detector stays
-Qwen (user-approved "full-res first"); OWLv2/Grounding-DINO swap is the gated escalation if needed._
-- **Phase A (done): viz responsiveness + diagnostics.** `visualizer.py` now draws the **live camera
-  track + position every frame** from `TOPIC_POSE.camera_center` (deque, projected via map bounds) —
-  decoupled from keyframe-rate map redraws (`overlay_live_camera`, generalized `_world_to_px`).
-  `perception_worker.py --debug-lift` logs per-detection {pixel, cam, ray, hit, dist} + a one-time
-  center-pixel ray sanity check (verified ≈[0,0,1]).
-- **Phase B (done): "sniper" full-res detection.** New `network.frame_bus_hires_port: 5605` +
-  `perception.object_frame_height: 720`. `io_bridge` publishes a 2nd **hi-res** frame stream (native
-  720p, same `meta`/`frame_id` as the 512×288 stream). `object_worker` SUBs the hi-res port, runs
-  Qwen on full pixels, and **scales the box/center back to 512×288** (`_to_transport`) before
-  publishing TOPIC_DETECTION (the lift's `ray_field` is 512×288). Offline `_video_frames` now yields
-  `(small, hires, meta)` and `--detect` feeds the hi-res frame to Qwen, mirroring live. Confirmed
-  Qwen now sees `src 1280x720`; inference ~1.85 s (≈6× tokens; fine at 0.5 Hz / detect_every=5).
-- **Phase C (done): spatial-consensus 3D.** `target_estimator.py` replaced median with
-  **mode-seeking** — densest cluster of hits within `CLUSTER_RADIUS=0.30u` wins, refined once around
-  its centroid; outliers (wrong-wall rays) discarded. Robust past a >50% outlier majority (self-test:
-  8 good + 7 scattered → locks the cluster, 20 mm err, confident). Adds `cluster_frac`. Raycast `skip`
-  raised to **0.25u** (was 0.1) so a downward ray can't grab a near-camera floor voxel.
-- **Phase D (NOT built — gated escalation):** if full-res Qwen still flickers, swap detection to
-  **OWLv2 (image-conditioned, query=reference crop)** or **Grounding DINO (text-query)** behind a new
-  visible `object_mode` flag (approval-gated per NO-SILENT-FALLBACKS). Try full-res Qwen first.
-- **Verify (DONE — mixed result, points to Phase D):** offline `--detect --debug-lift` over the full
-  flight. **Geometry CONFIRMED correct** (center ray ≈[0,0,1]); hi-res plumbing works (Qwen `src
-  1280x720`); consensus + honest uncertainty work (final est `not confident`, cluster_frac 0.25).
-  BUT hi-res did **not** fix accuracy: 5 finds (vs 2) but **scattered across the WRONG objects** —
-  the auto-label **"Man with beard" matches the graffiti murals + a framed photo by the WELCOME
-  sign, not the Nasrallah poster** (verified by rendering the detection frames). Also Qwen-4bit at
-  720p is **slow (~5–6 s per *found* detection)** and **numerically fragile** (single-image full-res
-  produced degenerate `!!!` output). Direct label test on a poster+murals frame: no label
-  (generic or specific) reliably boxed the poster at 720p. **Conclusion: Qwen-3B-4bit is unreliable
-  for this small-object, mural-competing grounding task at any resolution.** → escalate to **Phase D**
-  (OWLv2 image-query / Grounding DINO), which the user anticipated.
-  The infra fixes (hi-res stream, consensus, viz responsiveness, `--debug-lift`) are all kept.
+## Key technical facts (don't re-derive)
+- **Sim protocol** (`../XLAB/Sample_Drone_Interface.py`): Python is the TCP **SERVER**
+  (127.0.0.1:65432); Unity connects as client. 60 Hz length-prefixed `control_state` JSON
+  (trigger/reverse fwd-back, joy_horizontal strafe, joy_vertical altitude, yaw, pitch). Only
+  telemetry back = `time`. Video = **NDI** 1280×720@30 BGRA. Keys: 1=arm, w/s, a/d strafe, e/f up/down,
+  arrows yaw/pitch, b=land, c=reset cam; `space`=full-res capture, `g`=object-detect event. ('o','f' taken.)
+- **MASt3R-SLAM API** (import ONLY these — never `mast3r_slam.visualization`, needs absent pyimgui):
+  from `mast3r_slam.config` → `load_config`, `config`; `mast3r_utils` → `load_mast3r`,
+  `mast3r_inference_mono`, `mast3r_symmetric_inference`; `frame` → `create_frame`. RGB = float32 [0,1]
+  HxWx3. `os.chdir(REPO)` before loading (repo uses relative paths). Reference loop: `third_party/
+  MASt3R-SLAM/main.py`; our streaming wrapper: `slam_engine.py` (INIT→TRACKING→backend+retrieval).
+- **Driving the loop single-process:** mirror main.py but skip viz and use an `InProcessManager` shim
+  (real `mp.Manager()` deadlocks on Windows). World pts = `kf.T_WC.act(kf.X_canon)`, conf-filter
+  `kf.get_average_conf()`. Recover the 4×4 pose via **Act3 on origin+unit axes — NOT `T_WC.matrix()`**
+  (matrix() routes through Act4 and under patched lietorch corrupts the frame pose, killing keyframes).
+- **Ray geometry (lift):** camera per-pixel rays = normalized `X_canon` (intrinsics fixed → cached on
+  `SlamEngine.ray_field`); world ray = `pose[:3,:3] @ ray_cam`; raycast skip 0.25u. Verified center
+  ray ≈[0,0,1].
+- **Resolution:** transport 512×288 (16:9). MASt3R's own resize makes 512×288 from 1280×720 — do NOT
+  anamorphically squash. The cascade runs on the **hi-res** (720p/native) stream; its box is scaled to
+  512×288 by `object_worker.Pipeline._to_transport` for the lift.
 
-### ⏭️ RESUME POINTER (after context clear): swap Qwen → OWLv2 image-guided detection
-**Decision (user-approved 2026-06-23):** replace the Qwen detector with **OWLv2 image-guided
-(one-shot) detection** — query = the reference crop, find visually-matching regions in each frame.
-Rationale: Qwen-3B-4bit proved unreliable here (5 finds but all on murals / a framed photo, not the
-poster; slow ~5–6 s/found; degenerate `!!!` at full-res). OWLv2 keys off the actual poster *image*,
-so it should discriminate the printed poster from the painted murals where a text label cannot.
+## Files in repo
+- `config.yaml` — all settings (paths via ../XLAB/, ports, resolution, model ids, thresholds,
+  `runtime.object_mode: CASCADE`).
+- **io/transport:** `frame_bus.py`, `io_bridge.py`, `test_frame_subscriber.py`.
+- **perception/SLAM:** `perception_worker.py`, `slam_engine.py`, `slam_offline.py`, `map_store.py`,
+  `target_estimator.py`, `visualizer.py`; diagnostics `lietorch_probe.py`, `slam_match_probe.py`.
+- **detection:** `object_worker.py` (live, CASCADE), `cascade_detector.py` (+`LiveCascade`),
+  `cascade_report.py`, `cascade_targets.yaml`, `target_classifier.py`, `make_target.py`,
+  `benchmark_detectors.py`, `benchmark_report.py`, `annotate_targets.py`. `target.yaml` = the
+  designated target (written by make_target).
+- **build/env:** `build_lietorch.bat`, `lietorch_windows_const_fix.patch`, `build_mast3r_slam*.bat`,
+  `smoke_test_models.py`, `smoke_test_slam.py`, `third_party/` (gitignored).
 
-**SCOPE: ONLY the detector swaps.** Everything else stays exactly as built + verified: the hi-res
-`:5605` stream, `object_worker._to_transport` (box→512×288), the `TOPIC_DETECTION` schema, the
-perception lift + `MapStore.raycast` (skip 0.25u), `target_estimator` cluster-consensus, the
-visualizer live overlay, `make_target.py`, `--debug-lift`. Do NOT touch SLAM/map/lift geometry
-(geometry is CONFIRMED correct: center ray ≈[0,0,1]).
+## Live-run launch procedure (4 processes)
+0. Designate the target once: `venv\Scripts\python.exe make_target.py [--video <recon.mp4>]` → crop +
+   confirm class/label → writes `target.yaml`. Validate: `object_worker.py --self-test`.
+1. Kill stray `perception_worker`/`object_worker`/`visualizer` (a stray PUB on :5603/:5604 makes a
+   worker fail-fast on bind).
+2. Xlab.exe → T1 `python io_bridge.py` (arm with 1; Admin if the keyboard hook is dead).
+3. T2 `python perception_worker.py --no-display` (SLAM+depth+map+3D lift; SUB :5604, PUB :5603).
+4. T3 `python object_worker.py` (cascade ~0.5 Hz; PUB TOPIC_DETECTION :5604; `--no-display` for headless).
+5. T4 `python visualizer.py` (dashboard + magenta TARGET marker + uncertainty).
+- VRAM budget: perception ~7.6 GB + cascade ~1.5 GB ≈ 9.1 GB / 16 (Qwen classifier is
+  designation-only, not concurrent).
+- **Offline E2E (no hardware):** `perception_worker.py --video <flight.mp4> --detect --debug-lift
+  --no-display` runs SLAM + cascade + lift + consensus in one process. Rifle flight with the target
+  in view: `OUTPUT/flight_20260622_183816.mp4`. Poster flight: `flight_20260621_120829.mp4`.
 
-**STEP 0 — de-risk spike FIRST (before integrating).** Confirm OWLv2 discriminates poster vs murals
-on the both-visible frame (src **1290** of `../XLAB/OUTPUT/flight_20260621_120829.mp4`; poster RIGHT
-~x>950, murals LEFT ~x<350 of the 1280×720 frame):
-```
-from transformers import Owlv2Processor, Owlv2ForObjectDetection
-import torch, cv2
-proc  = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
-model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to("cuda").eval()
-crop  = cv2.cvtColor(cv2.imread("test_assets/target_dev.png"), cv2.COLOR_BGR2RGB)   # query image
-frame = cv2.cvtColor(<src1290 bgr>, cv2.COLOR_BGR2RGB)                              # search image
-inp = proc(images=frame, query_images=crop, return_tensors="pt").to("cuda")
-with torch.no_grad(): out = model.image_guided_detection(**inp)
-res = proc.post_process_image_guided_detection(
-        out, target_sizes=torch.tensor([frame.shape[:2]]), threshold=0.9, nms_threshold=0.3)[0]
-# take the highest-score box; its center should land on the RIGHT (poster), not LEFT (murals)
-```
-If it boxes the poster → integrate. If not → tune threshold, then try Grounding DINO, then
-Qwen2.5-VL-7B fp16 (all approval-gated, all visible NO-SILENT-FALLBACK flags).
+## Milestones
+- **M1 env + all models on GPU** ✅
+- **M2 io_bridge + frame_bus** ✅ (hardware-verified)
+- **M3 depth (DA-V2) overlay** ✅ (live wall/glass fly-through signed off). Finding: DA-V2 reads glass
+  as open air → an M5 glass detector must make SLAM-stall authoritative.
+- **M4 SLAM + voxel map + map_store + live perception_worker + live dashboard** ✅ (fly-a-loop signed off).
+- **Target detection (cascade) + 3D localize** — detector ✅ built/generalized/committed; **live
+  integration IN PROGRESS** (this session). ← Phase-1 capstone.
+- **DEFERRED to Phase 2:** glass + opening detectors (navigation safety, only autonomy needs them);
+  live point-cloud save / 3D flight replay; then autonomy (planner, explore) + Phase-3 report polish + GUI.
 
-**STEP 1 — integrate in `object_worker.py`.** Add `Owlv2Detector` with the SAME interface the
-pipeline already calls: `detect(ref_rgb, frame_rgb, label) -> {found, bbox, center, raw}` (label is
-unused for OWLv2 — keep the arg for signature compat; skip the startup label-derivation in OWLv2
-mode). Return box/center in the frame's (hi-res) pixels — existing `_to_transport` scales to
-512×288. Take the single highest-score detection above `score_thresh`. Select the detector by
-`runtime.object_mode`: `"QWEN"`→`QwenDetector` (keep intact), `"OWLV2"`→`Owlv2Detector`; set module
-`OBJECT_MODE` from it so the visible flag + every payload reflect the active path.
+## Detector history (compressed — don't re-try these)
+Every learned/VLM single-shot detector was inadequate for this small-object, mural/clutter-competing,
+low-texture-3D task: **Qwen2.5-VL-3B 4-bit** (non-deterministic, degenerates to `!!!` at 720p, boxes
+murals not the poster); **OWLv2 image-guided** as a gate (scores any framed rectangle ~the same);
+**Qwen→OWLv2 cascade** (recall too low); and a 5-engine benchmark (SIFT/LightGlue/DINOv2-dense/OWLv2/
+Qwen) confirming the planar poster is solvable but the **3D rifle is unsolved by any single engine**.
+That benchmark is the evidence base that motivated the verify-cascade above. Full numbers in
+`OUTPUT/benchmark/` and git history.
 
-**CONFIG to add:** `models.owlv2: {hf_id: "google/owlv2-base-patch16-ensemble", score_thresh: 0.9,
-nms_thresh: 0.3}` and flip `runtime.object_mode: "OWLV2"`. Reference crop stays
-`models.qwen_vl.reference_crop` (`test_assets/target_dev.png`) — OWLv2 needs only the crop, no label.
-
-**NOTES / gotchas:**
-- VRAM: OWLv2-base ≈0.6 GB (vs Qwen 2.6 GB) → more headroom; inference ~50–100 ms → could raise
-  `object_cadence_hz` later (keep 0.5 first).
-- Resolution: OWLv2-base resizes internally to 960²; the 720p stream is fine. Worth testing whether
-  plain 512×288 already suffices — if so, point object_worker back at `:5601` and retire `:5605`
-  (but keep `:5605` until proven unneeded).
-- `image_guided_detection` returns MANY boxes → threshold + take top score. OWLv2 image-guided scores
-  are NOT 0–1 calibrated; 0.9 is a starting guess — tune on the spike.
-- Verify `from transformers import Owlv2ForObjectDetection` works in the venv. If missing,
-  `pip install -U transformers` then re-run `object_worker.py --self-test` (a transformers bump can
-  perturb the Qwen path).
-- **Verify chain:** spike (poster vs murals) → offline `perception_worker.py --video
-  ../XLAB/OUTPUT/flight_20260621_120829.mp4 --detect --debug-lift --no-display` (expect poster finds
-  cluster, marker on poster wall, `confident`) → live 4-process run.
-
-## Status: 3D lift (Task 2 of the gradable core) — WIRED + proven E2E offline 2026-06-22
-_The full object chain runs end-to-end offline: Qwen detection → ray-cast into the voxel map →
-3D hit → aggregated estimate, with a dashboard target marker. **Quality is not yet good (only 2
-noisy hits on the small dev poster; see below) — that tuning is Task 3 / waits for the real
-target.** The wiring is done and correct._
-- **Lift design (user-approved): ray-cast into the voxel map.** `MapStore.raycast(origin, dir,
-  max_range, min_count, skip)` (pure numpy, O(1) per step via the occupancy hash) marches the
-  detection pixel's ray and returns the first occupied voxel — grounds the target on the exact
-  geometry we report. Runs in **`perception_worker`** (owns SLAM poses + map): it SUBs
-  TOPIC_DETECTION (:5604), keeps a ring of recent `frame_id→pose`, looks up the detection frame's
-  pose (nearest if dropped), builds the world ray from the camera ray field + pose, casts, and
-  feeds `TargetEstimator`. Publishes **TOPIC_TARGET** on :5603 (position + uncertainty).
-- **Ray geometry:** camera per-pixel rays = normalized `X_canon` from the latest keyframe
-  (intrinsics are fixed → view-independent, cached on `SlamEngine.ray_field`). Pose recovered via
-  **Act3 on origin + unit axes** to build the 4×4 — NOT `T_WC.matrix()` (matrix() routes through
-  Act4 on a view of the pose data and under the patched lietorch corrupts/freezes the frame pose,
-  which silently kills keyframe creation; Act3 is proven safe). **Don't reintroduce matrix().**
-- **`target_estimator.py`** (new, pure numpy): accumulates per-detection world hits → robust
-  **median** position + uncertainty (radial_rms, per-axis std, spread_p90, inlier/hit/found/miss
-  counts, coarse `confident` bool). MAD-trims outliers only when ≥4 hits; never lets inliers go
-  empty (fixed a NaN-on-2-disagreeing-hits bug). Self-test passes (rejects a gross outlier, 10 mm).
-- **E2E offline run** (`perception_worker --video <flight> --detect --no-display`, single process):
-  587 frames, **22 kf / 58044 voxels (== M4 baseline) / peak 10.17 GB** (SLAM+DA-V2+Qwen together),
-  1.4 fps. Qwen found the dev poster on **2 frames**; both lifted to map hits. Exports
-  `OUTPUT/<stem>_target.json` + marks the target on `_livemap_topdown.png`. New flags `--detect`,
-  `--detect-every`. **NOTE: single-process offline does NOT test the live 4-process VRAM/timing.**
-- **KNOWN QUALITY GAP (→ Task 3):** only 2 hits, ~2u apart, one suspiciously near the camera
-  (0.48u — likely a floor/near-voxel the downward ray hit before the poster wall). Fix levers:
-  denser detection while the target is in view (lower `--detect-every` / live cadence) so the
-  estimator's MAD trim rejects the floor outliers, + possibly a larger raycast `skip`/min-range.
-  Deferred: tuning the **dev** poster isn't worthwhile — do it on the user's real Phase-1 target.
-- **`visualizer.py`** now consumes TOPIC_TARGET: magenta target marker on the top-down map +
-  a target line in the status strip (position, ±radial_rms, hits, confident/tentative).
-
-## Status: Object detection (Task 1 of the gradable core) — `object_worker.py` BUILT + offline-verified 2026-06-22
-_The detection leg of the object chain is done and self-test-passing; **live VRAM coexistence
-(Qwen + SLAM + depth all running) is NOT yet tested** — that needs the 4-process live run. Next
-= the 3D lift (Task 2). Decisions below settled with the user 2026-06-22._
-- **Triggering (user-approved):** detection runs **continuously, throttled** to
-  `perception.object_cadence_hz` (=0.5, start conservative), NOT hotkey-gated. Rationale: this is
-  the eventual Phase-2 autonomy mode (no human to press a key); surface VRAM/latency cost now.
-- **Separate process P4** (`object_worker.py`), its OWN CUDA context — Qwen-VL generation is
-  autoregressive + slow (cold ~3.5 s, warm ~0.4–0.5 s/detection on the 3B 4-bit); folding it into
-  the SLAM loop would stall tracking. New state-bus port **`object_state_port: 5604`**; publishes
-  **TOPIC_DETECTION** `{object_mode, target_label, frame_id, sim_time, found, bbox[x1y1x2y2],
-  center[cx,cy], infer_ms, raw}` — bbox/center in 512×288 frame pixels (null when not seen).
-- **Reference crop = PROVIDED ASSET** (`models.qwen_vl.reference_crop`), loaded at startup. KEY
-  FINDING: Qwen-VL **image-to-image matching of a small reference returns `[]`** (unreliable), but
-  **label-driven text grounding lands the box**. So we derive a short text **label from the crop
-  once at startup** (overridable via `models.qwen_vl.target_label`) and ground THAT per frame (the
-  crop still rides along as the FIRST image, visual aid). This is the visible primary path, not a
-  silent fallback — `target_label` is in every payload + logged. Prompt must stay **short/direct**;
-  a verbose prompt that double-emphasizes the empty case makes the 3B model collapse to `[]`.
-- **Coord mapping:** Qwen returns bbox in its smart-resized pixel space; resized side =
-  `image_grid_thw[patch]*14` (smart_resize rounds each side to a multiple of 28). 512×288 →
-  Qwen sees **504×280**; rescale by orig/resized. Verified correct on the self-test.
-- **DEV TARGET = a framed portrait poster** ("Man with beard") cropped from the flight recording
-  (`test_assets/target_dev.png`; scene `target_scene.png`, negative `no_target_scene.png`). This is
-  a **stand-in to validate the pipeline** — the user must designate/provide their real Phase-1 target.
-- Self-test: `object_worker.py --self-test` → loads 2.58 GB, derives label, POSITIVE frame boxed on
-  the poster (`object_selftest.png`), NEGATIVE correctly empty, PASS. Modes: `--self-test`,
-  `--video <mp4> [--publish]` (offline scan, saves overlays where found), live (default; SUB :5601,
-  PUB :5604). NO SILENT FALLBACKS: CUDA + Qwen load fail-fast; no CPU/DINOv2 path.
-
-## Status: Milestone 4 DONE ✅ — SLAM + offline map + map_store + live perception_worker + live dashboard
-_M4 fully complete: `slam_engine` + `perception_worker` SLAM/depth fusion + `map_store` voxel map +
-`visualizer.py` (Task 3) live dashboard, with the **on-hardware fly-a-loop SIGNED OFF 2026-06-22**
-(live map globally consistent during a real flight). Next = **object detection (Qwen) + 3D
-localize/report** — M5 (glass + opening) was deferred to Phase-2 on 2026-06-22; see "## NEXT". M4
-history is below; a PARKED follow-up sits at the end of this section._
-- Built `slam_offline.py` to drive the FULL MASt3R-SLAM loop (tracker + FactorGraph + retrieval)
-  over a recorded flight (`../XLAB/OUTPUT/flight_20260621_120829.mp4`), single-process, no viz.
-  Diagnostics: `slam_match_probe.py`, `lietorch_probe.py`. Map export → `.ply` + `.npz` + top-down PNG.
-- **Fixed: `mp.Manager()` deadlock** on Windows (spawn re-imports this module) → replaced with an
-  in-process `InProcessManager` shim (we run tracker + backend in ONE process, no separate viz).
-- **Fixed: lietorch CUDA group-op segfault (the real blocker).** A bare
-  `lietorch.Sim3.Identity(1,device='cuda').inv()*...` access-violated (0xC0000005); the two-view smoke
-  test missed it because it never called a group op. **Root cause:** in
-  `third_party/lietorch/lietorch/src/lietorch_gpu.cu`, the `__global__` kernels declared input pointers
-  `const scalar_t*`; with Eigen, `const` vs non-const selects different `Eigen::Map` template
-  instantiations, and the const path is **miscompiled by nvcc 12.1 + MSVC 14.36** → illegal access.
-  **Fix (user-authorized quarantine bypass, community-vetted):** changed input-pointer params from
-  `const scalar_t*` → `scalar_t*` in ALL forward kernels (exp/log/inv/mul/adj/adjT/act/act4/as_matrix/
-  orthogonal_projector/jleft). Rebuilt from a LOCAL clone via `build_lietorch.bat` (MSVC 14.36 + CUDA
-  12.1, `TORCH_CUDA_ARCH_LIST=8.6`). `lietorch_probe.py` now passes inv/mul/act/retr (fresh +
-  shared-memory). `slam_offline.py` runs the full tracker+backend end-to-end (~3 fps, peak 6.75 GB).
-  **NOTE:** lietorch is now a LOCAL source build at `third_party/lietorch` — to rebuild, run
-  `build_lietorch.bat` (do NOT `pip install` the upstream git version, which reintroduces the crash).
-- **Full-video run VERIFIED:** 587 frames (stride 3) → **23 keyframes**, tracking never lost (0 reloc),
-  retrieval backend found loop-closure candidates, 2.08M world points, ~2 fps, peak 7.2 GB. Map artifacts
-  in `OUTPUT/`: `*_cloud.ply`, `*_map.npz`, `*_topdown.png`. Top-down shows a globally-consistent
-  room/corridor with coherent walls + a clean forward trajectory. **Offline SLAM milestone done.**
-- **Live integration DONE + offline-verified 2026-06-22.** `slam_engine.py` wraps the proven loop as a
-  streaming `SlamEngine.process(rgb)->SlamResult` (lazy/side-effect-free import; chdir's into the SLAM
-  repo only on init). `perception_worker.py` now runs **SLAM every frame + DA-V2 throttled in ONE CUDA
-  context**, fuses each new keyframe's pointmap into an in-process `MapStore`, and publishes TOPIC_POSE
-  (+TOPIC_DEPTH) — never raw pointmaps. New offline mode `perception_worker.py --video <mp4>` drives the
-  whole pipeline from a recording and exports the map. **Verified vs the slam_offline reference:** full
-  587-frame pass → **22 keyframes, 0 reloc** (tracking never lost), 2.37M pts → 58K voxels, **peak 7.57 GB**
-  (DA-V2+SLAM together), ~2 fps; `*_livemap_topdown.png` is structurally identical to the offline map.
-- **Task 3 (live dashboard) DONE 2026-06-22.** Added `frame_bus.TOPIC_MAP` + `MapStore.topdown_summary`
-  (compact sparse occupancy snapshot: occupied cells + count-weighted colors + trajectory, already in
-  pixel coords, ~220 KB, one per keyframe — each a full self-contained snapshot). `perception_worker`
-  PUBs it per keyframe (and `--publish` replays pose/depth/map from a recording to drive the dashboard
-  offline); `visualizer.py` composes [status | input | depth+bar | top-down map+traj]. Verified offline
-  (render path + live bus on real GPU: pose/depth/map all flow) AND on hardware (fly-a-loop, live map
-  globally consistent). Shipped in commit `ed92e1a`. Note: kill stray `perception_worker` (holds :5603)
-  before the next live run.
-
-### PARKED (raised 2026-06-22, defer to Phase-2 autonomy): live point-cloud save + 3D flight replay
-Live flights do NOT auto-save the map yet — only the offline `--video` path exports (`*_livemap.npz` =
-voxel centers+colors+**trajectory**; `slam_offline.py` dumps a dense `.ply`). The user wants the *live*
-run to also persist the cloud so a flight can be replayed/recreated in 3D. Small change: save-on-exit
-(and/or a snapshot hotkey) in `run_live` calling `MapStore.save_npz` + `render_topdown`, optionally
-streaming the dense per-keyframe pointmaps too. Flagged as important for autonomy: the planner needs the
-voxel occupancy + pointmaps to reason about free space and gap-vs-drone-clearance ("which holes can I
-fly through"). Do when we start autonomy, not before.
-
-## Status: Milestone 3 DONE ✅ (depth overlay) — LIVE wall-vs-glass SIGNED OFF 2026-06-22
-_(Live hardware fly-through complete. Opaque surfaces read near/red, clearance collapses on approach
-and recovers on retreat (`raw med` tracks distance correctly); ~2.5 Hz depth @ ~64 ms infer, no
-crash; 60 Hz manual flight had NO lag while perception ran.)_
-- **GLASS BEHAVIOR CONFIRMED (key M3→M5 finding):** when approaching the glass *pane* with a gap, DA-V2
-  reads it as **far / open air** — the forward obstacle bars stay GREEN even though a barrier is there
-  (`DEBUG_IMAGES/one_more.png`, `looking at glass window from afar.png`). i.e. **depth cannot see the
-  glass, so depth alone would fly you straight into it** — this validates the plan's premise that the
-  M5 glass detector must make the **SLAM-stall authoritative** and treat depth-open as only
-  *corroborating*. Caveat: pressed right against the glass, the opaque **window frame/mullions** fill
-  the forward band and read near (`fwd_clear`→0.09 in `bumping into glass window.png`) — frame ≠ pane.
-- `perception_worker.py` written (P2, first GPU worker). Subscribes to the frame bus, runs **Depth
-  Anything V2** (`depth-anything/Depth-Anything-V2-Base-hf`) capped at `perception.depth_cadence_hz`
-  (3 Hz), derives a **forward-obstacle bar** (16 columns) + `forward_clearance` scalar + a coarse
-  18×32 proximity grid, publishes them as JSON on the state bus topic `depth`, and renders a live
-  `[ input | depth-colormap + obstacle-bar ]` window with telemetry.
-- **Offline self-test PASSED** (`perception_worker.py --self-test` on `test_assets/frame_a.png`):
-  DA-V2 loads 1.6 s / **0.39 GB VRAM**, infer ~340–470 ms, depth (288,512). On the recon frame the
-  wall reads mid-distance → obstacle bar ~0.20 (green/clear), `fwd_clearance` 0.80. Overlay saved to
-  `test_assets/perception_selftest.png`.
-- **Design choices made:** new **`perception_state_port: 5603`** in config — each PUB binds its own
-  port (frame_bus convention; io_bridge keeps 5602 for status/detect, perception owns 5603 for depth),
-  subscribers connect to both. **Depth semantics:** DA-V2 `-hf` relative model emits inverse depth
-  (larger = nearer); we robustly normalize (2nd/98th pctl) to `proximity ∈ [0,1]` (1=nearest, bright
-  in the INFERNO colormap). Glass reads as open air → low proximity = the corroborating signal M5
-  wants. Raw stats published too. **Obstacle band = 0.25–0.70 of frame height** (forward view; excludes
-  the floor directly beneath, which always reads "near" but is not a forward hazard) — a TUNABLE to
-  revisit during live flight. Uses `torch.autocast` fp16; no CPU fallback (fail-fast if no CUDA).
-- **Live M3 verification: DONE 2026-06-22** (see the M3 status block above for the wall/glass result).
-
-## Status: Milestone 2 DONE ✅ (io_bridge + frame_bus) — verified on hardware 2026-06-21
-- `frame_bus.py`, `io_bridge.py`, `test_frame_subscriber.py` written and verified.
-- **Hardware verification PASSED** (user ran Xlab.exe + io_bridge + test_frame_subscriber): live frames
-  flowing to a 2nd process with no control lag. Earlier synthetic loopback confirmed ~10 fps 512×288 BGR,
-  per-frame control/sim_time metadata, ~0 ms localhost latency, 'g' detect event on the state bus.
-- Design choices made: frame bus uses ZMQ **CONFLATE** (newest-wins, true drop-old) with a single
-  length-prefixed `[hdr_len][hdr_json][raw bytes]` blob (CONFLATE forbids multipart). State bus is
-  non-conflated multipart `[topic][json]`. Per-frame meta carries `frame_id`, `mono_ts`, `sim_time`,
-  and a `controls` snapshot (trigger/reverse/joy/yaw/pitch) so the glass detector later knows
-  "forward-commanded". Dropped the sample's YOLO 'o'-autopilot + `detect_target` try-except (GPU work
-  + silent fallback — both forbidden); manual flight mapping is otherwise byte-for-byte unchanged.
-
-## Status: Milestone 1 DONE ✅ (env + all models verified on GPU)
-- Depth Anything V2 (`depth-anything/Depth-Anything-V2-Base-hf`): 0.49 s/frame, 0.40 GB.
-- Qwen2.5-VL-3B 4-bit (`Qwen/Qwen2.5-VL-3B-Instruct`): 2.6 GB, reads scenes correctly. Helper:
-  `qwen_vl_utils.process_vision_info`, class `Qwen2_5_VLForConditionalGeneration`.
-- MASt3R-SLAM native Windows build works: two-view inference 0.7 s/pair, peak 3.2 GB,
-  pointmaps (4,288,512,3) at 512×288.
-
-## Files in repo now
-- `config.yaml` — all settings (paths use ../XLAB/, ports, resolution, model ids, thresholds).
-- `requirements-ai.txt` — installed deps (torch via cu121 index, NOT listed there).
-- `smoke_test_models.py`, `smoke_test_slam.py` — env validators (keep working).
-- `build_mast3r_slam.bat` (steps 0-1), `build_mast3r_slam_step23.bat` (steps 2-4) — Windows build.
-- `test_assets/` — sample_frame.png, frame_a/b.png (512-ready XLAB frames), smoke_depth.png.
-- `third_party/MASt3R-SLAM/` — built editable + checkpoints/ (2.6 GB metric + retrieval).
-- `frame_bus.py` — DropOldRing + ZMQ Frame/State Pub/Sub + encode/decode. Self-test: `python frame_bus.py`.
-- `io_bridge.py` — P1: NDI capture + 60 Hz TCP control server + keyboard, fail-fast init, publishes
-  downscaled frames + status/detect events. Flags: `--debug-keys`, `--no-display`, `--config`.
-- `test_frame_subscriber.py` — M2 verification stand-in for perception_worker (prints fps/shape/latency).
-- `perception_worker.py` — P2 GPU worker. M3: DA-V2 depth → obstacle bar/clearance/grid. M4: + SLAM
-  every frame (via `slam_engine`) fused into an in-process `MapStore`; publishes TOPIC_POSE + TOPIC_DEPTH
-  on :5603; depth/map windows. `Pipeline.step()` is the shared per-frame body. Flags: `--self-test`,
-  `--video <mp4>` (offline: full pipeline from a recording + map export), `--stride`, `--max-frames`,
-  `--conf-thresh`, `--out`, `--no-display`, `--config`.
-- `slam_engine.py` — M4: `SlamEngine` streaming wrapper around the MASt3R-SLAM loop (INIT/TRACKING/RELOC
-  + backend + retrieval) extracted from `slam_offline.py`; `process(rgb)->SlamResult` (mode, pose,
-  new-keyframe world points+colors). Lazy import + chdir-on-init so importing it is side-effect-free.
-- `slam_offline.py` — M4 de-risk: drives the FULL MASt3R-SLAM loop over a recorded mp4 (single-process,
-  no viz; in-process `InProcessManager` shim), exports `.ply`/`.npz`/top-down PNG. Flags: `--video`,
-  `--stride`, `--max-frames`, `--conf-thresh`, `--out`. Run unbuffered (`$env:PYTHONUNBUFFERED=1`).
-- `build_lietorch.bat` — rebuilds the patched local lietorch (`third_party/lietorch`).
-- `lietorch_windows_const_fix.patch` — the tracked const→non-const kernel fix (third_party is
-  gitignored, so this patch is the version-controlled copy; `git apply` it onto a fresh lietorch clone).
-- `lietorch_probe.py`, `slam_match_probe.py` — M4 diagnostics (lietorch group ops; matching kernels).
-- `third_party/lietorch/` — patched local clone (`lietorch_gpu.cu` const→non-const kernel fix).
-- `map_store.py` — M4: `MapStore` fuses per-keyframe world pointmaps+poses into a sparse voxel/occupancy
-  grid (`map.voxel_size`=0.05) + trajectory; top-down render + `.npz` export. Transport-agnostic (pure
-  numpy, no ZMQ/torch) so it runs in-process inside perception_worker AND is offline-testable. Offline
-  build vs the 2.08M-pt npz: 52.6K voxels (39.5x), coherent top-down. Flags: `--npz`, `--voxel-size`,
-  `--min-count`, `--chunks`, `--out`.
-- `visualizer.py` — M4 Task 3: P3 live dashboard. Read-only SUB on the perception state bus
-  (:5603) for TOPIC_POSE+TOPIC_DEPTH+**TOPIC_MAP** (+ optional frame-bus :5601 for the input
-  panel). Composes [status strip | input | depth+bar | top-down map+traj]. Caches the map
-  render (redraws only on a new keyframe snapshot). Surfaces tracking_mode/reloc visibly
-  (NO SILENT FALLBACKS). Flags: `--no-frame`, `--config`. No GPU/SLAM — pure display.
-- NOT yet created: object_worker.py, report.py, run.py.
-
-## Key technical facts already learned (don't re-derive)
-- **Sim protocol** (`../XLAB/Sample_Drone_Interface.py`): Python is the TCP **SERVER** (127.0.0.1:65432);
-  Unity connects as client. Python sends `control_state` JSON at 60 Hz (length-prefixed: 4-byte big-
-  endian len + payload). Controls: trigger/reverse (fwd/back 0..1), joy_horizontal (strafe -1..1),
-  joy_vertical (altitude -1..1), yaw, pitch (camera). Only telemetry back = `time`. Video = **NDI**
-  (1280×720@30, BGRA). `static_boxes` is an overlay-draw channel TO Unity. Keys: 1=arm, w/s, a/d
-  strafe, e/f up/down, arrows yaw/pitch, b=land, c=reset cam. 'o' and 'f' are TAKEN — use 'g' for
-  object-detect hotkey.
-- **MASt3R-SLAM API** (import only these — NEVER `mast3r_slam.visualization`, it needs the absent
-  pyimgui): from `mast3r_slam.config` → `load_config("config/base.yaml")`, `config`; from
-  `mast3r_slam.mast3r_utils` → `load_mast3r(device="cuda")`, `mast3r_inference_mono(model, frame)`,
-  `mast3r_symmetric_inference(model, fi, fj)`; from `mast3r_slam.frame` → `create_frame(i, rgb, T_WC,
-  img_size=512, device="cuda")`. `T_WC = lietorch.Sim3.Identity(1, device="cuda")`. RGB input =
-  float32 [0,1], HxWx3 (cv2 BGR→RGB /255). The repo uses RELATIVE paths, so `os.chdir(REPO)` before
-  loading. Full driving loop reference: `third_party/MASt3R-SLAM/main.py`.
-- **Resolution:** transport 512×288 (16:9). MASt3R's own resize already produces 512×288 from
-  1280×720 — do NOT anamorphically squash; letterbox if a model needs square.
-- **lietorch CUDA group ops (inv/mul/act/retr) crash on the stock Windows build** — bug is `const
-  scalar_t*` kernel params in `lietorch_gpu.cu` (Eigen picks a miscompiled `Eigen::Map` instantiation
-  under nvcc 12.1 + MSVC 14.36). FIXED in the local patched build (`third_party/lietorch`, const→non-
-  const on all forward kernels). Don't re-debug; just ensure `lietorch_probe.py` passes after any rebuild.
-- **Driving the SLAM loop single-process:** mirror `main.py` (INIT mono → TRACKING `tracker.track` →
-  `run_backend`), but skip the viz process and feed `SharedKeyframes`/`SharedStates` an `InProcessManager`
-  shim (real `mp.Manager()` deadlocks on Windows). World points = `kf.T_WC.act(kf.X_canon)`, conf-filter
-  `kf.get_average_conf() > thresh`, color from `kf.uimg`. See `slam_offline.py`.
-
-## NEXT (2026-06-25): ➡️ see the TOP block "⛔⛔ VERDICT: detector benchmark DONE → NO proper
-detection solution". The 5-engine benchmark (SIFT, LightGlue, DINOv2, OWLv2, Qwen-4bit) is complete:
-the **planar poster is solvable (SIFT clean / DINOv2 high-recall), but the 3D rifle is unsolved for
-precise localization by every engine** (best on-target rate 0.23 w/ 93% false positives). **We do NOT
-have an adequate detector.** **The user will propose a NEW detection plan — wait for it.** Do not pick
-or integrate an engine, and do not touch `object_worker.py`, until the user's new plan lands. The
-detector-agnostic 3D lift/consensus/stream/viz (KEEP list above) stays as-is for whatever comes next.
-Older resume pointers below are superseded.
-
-## (history) object detection (Qwen) + 3D localize/report — prior resume point
-**M4 is DONE.** **Re-prioritization 2026-06-22 (user-approved): M5 (glass + opening detectors) is
-DEFERRED to Phase-2 autonomy.** Rationale: both are navigation-safety features only an *autonomous*
-drone needs — a human pilot already avoids glass / picks gaps during recon, and neither feeds the
-grader. The gradable deliverable is **map the room + report the target object's 3D location (with
-uncertainty)**, so jump straight to the object chain. It depends on NOTHING in M5 — it reuses the SLAM
-pose + per-keyframe pointmaps we already produce, and the hotkey-`g` trigger fits the current
-human-flying recon mode.
-
-Build a thin END-TO-END vertical (human flies recon → reported 3D target):
-1. ✅ **Detect — `object_worker.py`** DONE + offline-verified 2026-06-22 (see the status block at the
-   top). Separate process P4, Qwen2.5-VL-3B 4-bit, **continuous-throttled** (not hotkey), derives a
-   text label from the provided reference crop and grounds it (image-only matching was unreliable),
-   publishes TOPIC_DETECTION on :5604. `object_mode="QWEN"` visible; DINOv2 fallback approval-gated
-   only. **Live VRAM coexistence with SLAM+DA-V2 still untested** (needs the 4-process live run).
-2. ✅ **Lift to 3D:** DONE + proven E2E (see the status block at the top). Ray-cast into the voxel
-   map in `perception_worker`; `target_estimator.py` aggregates hits → position + uncertainty.
-3. **← RESUME HERE. Report (Phase-3 core) + quality:** the wiring exists (TOPIC_TARGET + `_target.json`
-   + dashboard marker). Remaining: (a) get a *confident* estimate — denser detection while the target
-   is in view so the estimator trims outliers, + tune raycast skip/min-range to drop near-camera floor
-   hits; (b) decide the final report artifact (the JSON + marked top-down may already suffice). **Best
-   done on the user's REAL Phase-1 target, not the dev poster.** Also still pending: the live 4-process
-   run (Xlab + io_bridge + perception + object_worker + visualizer) to test real VRAM/timing coexistence.
-
-**Settle with the user BEFORE coding (checkpoint culture):** where does the target **reference crop**
-come from — a provided asset, or picked from a recon frame? That choice shapes the Qwen prompt and the
-worker's inputs. Also confirm: run object detection only on the `g` hotkey (recommended, VRAM) vs.
-continuously.
-
-### Designate the real Phase-1 target (do this BEFORE the live object run):
-- Fly a recon with `io_bridge.py` (it records to `../XLAB/OUTPUT/flight_*.mp4`), looking at your target.
-- `venv\Scripts\python.exe make_target.py [--video <that mp4>]` → browse frames (n/p ±1, N/P ±15,
-  ENTER pick), drag a box around the target. Saves the crop → `models.qwen_vl.reference_crop`
-  (`test_assets/target_dev.png`) AND the full frame → `test_assets/target_scene.png`.
-- Validate: `venv\Scripts\python.exe object_worker.py --self-test` (must box your target; label is
-  auto-derived from the crop — pin `models.qwen_vl.target_label` in config if you want a specific one).
-
-### Live-run launch procedure (4 processes — object detection + 3D target):
-1. Kill any stray `perception_worker`/`object_worker`/`visualizer` (stray PUB on :5603/:5604 makes a worker fail-fast on bind).
-2. Xlab.exe → Terminal 1 `venv\Scripts\python.exe io_bridge.py` (arm with 1; Admin if keyboard hook dead).
-3. Terminal 2 `venv\Scripts\python.exe perception_worker.py --no-display` (SLAM+depth+map+3D lift; SUBs detections :5604, PUBs POSE/DEPTH/MAP/TARGET :5603).
-4. Terminal 3 `venv\Scripts\python.exe object_worker.py` (Qwen detection ~0.5 Hz; PUBs TOPIC_DETECTION :5604; shows the live bbox overlay — add `--no-display` for headless).
-5. Terminal 4 `venv\Scripts\python.exe visualizer.py` → dashboard (input+depth+top-down map + magenta TARGET marker + uncertainty).
-- VRAM budget: perception ~7.6 GB + Qwen ~2.6 GB ≈ 10.2 GB of 16 (single-process combined peaked 10.17 GB — fits; live 2-process timing still to confirm).
-- (M4 3-process map-only run = same minus Terminal 3.)
-- Offline re-verify anytime (no hardware, drives the dashboard too with `--publish`):
-  `perception_worker.py --video ../XLAB/OUTPUT/flight_20260621_120829.mp4 [--publish --no-display]`
-  → exports `OUTPUT/*_livemap_topdown.png` (known-good baseline: 22 kf, 0 reloc, peak ~7.6 GB, 58044 voxels).
-  Pair with `visualizer.py --no-frame` to watch it grow.
-- Depth obstacle-bar tunables if needed: `BAND_TOP/BAND_BOTTOM` (0.25/0.70) + `COL_NEAR_PCTL` in `perception_worker.py`.
-
-## Remaining milestones (see plan file for detail)
-- M3: Depth overlay (DA-V2) ✅ offline AND ✅ live wall/glass fly-through signed off on hardware 2026-06-22.
-- M4: SLAM engine ✅ Windows + ✅ offline map + ✅ `map_store.py` voxel/trajectory + ✅ live
-  perception_worker integration + ✅ live dashboard (`visualizer.py`, Task 3) + ✅ on-hardware
-  fly-a-loop signed off 2026-06-22. **DONE.**
-- **NEXT — object detection + 3D localize/report (the gradable core):** `object_worker.py` (Qwen
-  multi-image: reference crop + live frame, hotkey 'g') → back-project the detection through the SLAM
-  pose + pointmap into a 3D world position → report position + uncertainty. DINOv2 fallback approval-
-  gated only. _(Formerly "M6"; promoted ahead of M5 on 2026-06-22.)_
-- **DEFERRED to Phase-2 — glass + opening detectors** _(formerly M5)_: glass = SLAM translation≈0 while
-  forward-commanded (authoritative; depth can't see glass); opening = RANSAC wall planes, gaps vs
-  `map.drone_clearance_m`. Navigation safety only an autonomous drone needs — NOT on the grading path.
-  Build alongside autonomy. (Config keys `map.glass_stall_seconds`=1.5, `map.drone_clearance_m`=0.30
-  already exist; M3 confirmed DA-V2 reads glass as open air, so SLAM-stall must be authoritative.)
-- Later: Phase-2 autonomy (planner, bump-and-recover, frontier explore, + the deferred glass/opening
-  detectors) + Phase-3 report polish + GUI.
+## NEXT (exactly one)
+**Do the live 4-process run** (offline E2E already PASSED — see "## Live integration"). Follow the
+launch procedure above: `make_target` (designate + classify) → io_bridge → perception_worker →
+object_worker → visualizer. Fly manually; confirm detection fires ~every 2 s, the magenta TARGET
+marker appears, and the cluster tightens to `confident`. Watch peak VRAM (offline coexistence peaked
+9.68 GB / 16; live splits across processes). **This completes Phase 1**; then Phase 2 (autonomous flying).

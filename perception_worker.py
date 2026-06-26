@@ -542,8 +542,8 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
         import object_worker
         obj_pipe = object_worker.Pipeline(cfg)
         obj_pipe.min_interval = 0.0   # cadence is governed by detect_every here, not wall-clock
-        print(f"[perception] OFFLINE --detect: Qwen target '{obj_pipe.label}' every "
-              f"{detect_every} frames -> 3D lift")
+        print(f"[perception] OFFLINE --detect: {obj_pipe.detector.object_mode} target "
+              f"'{obj_pipe.label}' [{obj_pipe.asset_class}] every {detect_every} frames -> 3D lift")
     # Offline mode is self-contained by default: it builds + exports the map and does NOT
     # touch the state bus. --publish opts into the live bus to drive the visualizer offline.
     state_pub = None

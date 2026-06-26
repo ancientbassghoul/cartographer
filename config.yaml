@@ -56,4 +56,4 @@ map:
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.
   tracking_mode: "MASt3R"               # {"MASt3R"} only unless an alternate is approved
-  object_mode: "QWEN_OWLV2"             # {"QWEN_OWLV2" (default cascade), "OWLV2", "QWEN"} — set in config, never auto-swapped
+  object_mode: "CASCADE"                # {"CASCADE"} — the verified GD+OWLv2 -> DINOv2 -> geometric cascade; never auto-swapped

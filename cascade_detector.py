@@ -326,6 +326,114 @@ class DinoV2CropEmbedder:
 
 
 # ==============================================================================
+# LiveCascade — all models resident, one target, per-frame detect() for the live app
+# ==============================================================================
+class LiveCascade:
+    """Holds every cascade model RESIDENT and runs the full per-frame chain for ONE designated
+    target (text + reference image + asset class). Used by the live `object_worker` (P4) and the
+    offline `perception_worker --detect` E2E. Same components + logic as the batch diagnostic, but
+    all models stay loaded (no per-stage load/free) so each frame is a single fast pass.
+
+    Explicit `torch.cuda.empty_cache()` after each init stage, after target onboarding, and at the
+    end of every detect() — this run is the FIRST live VRAM coexistence test (cascade + SLAM +
+    depth across processes), so we proactively release per-frame fragmentation.
+    """
+
+    def __init__(self, device="cuda", owlv2_id="google/owlv2-base-patch16-ensemble"):
+        if not torch.cuda.is_available():
+            raise SystemExit("CUDA not available — LiveCascade is GPU-only (NO SILENT FALLBACKS).")
+        self.device = device
+        self.gd = GroundingDinoProposer(device=device)
+        torch.cuda.empty_cache()
+        self.owl = Owlv2Proposer(device=device, hf_id=owlv2_id)
+        torch.cuda.empty_cache()
+        self.dino = DinoV2CropEmbedder(device=device)
+        torch.cuda.empty_cache()
+        self.sift = SiftDetector()
+        self.lg = LightGlueDetector(device=device)
+        torch.cuda.empty_cache()
+        self._engines = {"sift": self.sift, "lightglue": self.lg}
+        # target state (set via set_target)
+        self.ref_rgb = None
+        self.text = None
+        self.asset_class = None
+        self.params = None
+        self._ref_cls = None
+        self._ref_mean = None
+        print(f"[livecascade] all stages resident | VRAM {torch.cuda.memory_allocated()/1e9:.2f} GB "
+              f"(reserved {torch.cuda.memory_reserved()/1e9:.2f} GB)", flush=True)
+
+    def set_target(self, ref_rgb, text, asset_class):
+        """Onboard the designated target: cache the reference DINOv2 embedding + the class params."""
+        self.asset_class = resolve_asset_class(asset_class)
+        self.params = ASSET_CLASS_PARAMS[self.asset_class]
+        self.ref_rgb = ref_rgb
+        self.text = str(text).strip()
+        self._ref_cls, self._ref_mean = self.dino.embed(ref_rgb)
+        torch.cuda.empty_cache()
+        p = self.params
+        print(f"[livecascade] target set: text={self.text!r} | class={self.asset_class.value} | "
+              f"dino>={p['dino_thresh']} gate={p['gate_engine']}/{p['gate_mode']} | "
+              f"ref {ref_rgb.shape[1]}x{ref_rgb.shape[0]}", flush=True)
+
+    def detect(self, frame_rgb):
+        """Run the cascade on ONE frame -> the single best accepted detection (or none).
+
+        Returns {found, bbox[x1,y1,x2,y2] (frame px), center, score (DINOv2 cosine), geom_inliers,
+        source, n_cands, n_surv, raw}. bbox/center are in the input frame's pixels — the caller's
+        _to_transport scales to the 512x288 lift space.
+        """
+        if self.ref_rgb is None:
+            raise RuntimeError("LiveCascade.detect called before set_target (NO SILENT FALLBACKS).")
+        p = self.params
+        hard = p["gate_mode"] == "hard"
+
+        # Stage 1 — propose (per-source NMS, pooled).
+        cands = nms(self.gd.propose(frame_rgb, self.text)) + nms(self.owl.propose(frame_rgb, self.ref_rgb))
+
+        # Stage 2 (DINOv2 verify) + Stage 3 (geometric gate) per candidate.
+        accepted = []
+        for c in cands:
+            crop = crop_of(frame_rgb, c["box"])
+            if crop.size == 0:
+                c["dino_cls"], c["stage2"], c["geom_inliers"] = 0.0, False, 0
+                continue
+            cls, _ = self.dino.embed(crop)
+            c["dino_cls"] = self.dino.cosine(cls, self._ref_cls)
+            c["stage2"] = c["dino_cls"] >= p["dino_thresh"]
+            c["geom_inliers"] = 0
+            if not c["stage2"]:
+                continue
+            if min(crop.shape[:2]) >= GEOM_MIN_CROP:
+                r = self._engines[p["gate_engine"]].detect(self.ref_rgb, crop)
+                c["geom_inliers"] = int(r["score"])
+                stage3_hard = (c["geom_inliers"] >= GEOM_HARD_MIN_INLIERS) if hard else True
+            else:
+                stage3_hard = (not hard)      # tiny crop fails a hard gate; soft gate unaffected
+            if stage3_hard:
+                accepted.append(c)
+
+        n_surv = sum(1 for c in cands if c.get("stage2"))
+        torch.cuda.empty_cache()            # release this frame's per-candidate allocations
+        if not accepted:
+            return {"found": False, "bbox": None, "center": None, "score": 0.0, "geom_inliers": 0,
+                    "source": None, "n_cands": len(cands), "n_surv": n_surv,
+                    "raw": f"cascade[{self.asset_class.value}]: no accepted candidate "
+                           f"({len(cands)} cands, {n_surv} survived DINOv2)"}
+        # Rank survivors by DINOv2 cosine FIRST, geometry as tie-break (appearance-primary).
+        best = max(accepted, key=lambda c: (c["dino_cls"], c["geom_inliers"]))
+        box = [round(float(v), 1) for v in best["box"]]
+        ctr = box_center(box)
+        return {
+            "found": True, "bbox": box, "center": [round(ctr[0], 1), round(ctr[1], 1)],
+            "score": round(best["dino_cls"], 4), "geom_inliers": best["geom_inliers"],
+            "source": best["source"], "n_cands": len(cands), "n_surv": n_surv,
+            "raw": f"cascade[{self.asset_class.value}] {best['source']} dino={best['dino_cls']:.2f} "
+                   f"geom={best['geom_inliers']} ({len(accepted)} accepted of {n_surv} surv)",
+        }
+
+
+# ==============================================================================
 # Pipeline
 # ==============================================================================
 def build_samples(loaded):
