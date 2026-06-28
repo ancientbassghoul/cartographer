@@ -35,6 +35,7 @@ TOPIC_MAP = b"map"          # perception_worker -> visualizer: compact top-down 
 TOPIC_DETECTION = b"detection"   # object_worker -> perception/UI: target bbox/center in a frame
 TOPIC_TARGET = b"target"    # perception_worker -> UI/report: {"targets":[{position,uncertainty,..}],"n_targets":N} (object may appear >1x)
 TOPIC_STATUS = b"status"
+TOPIC_CONTROL = b"control"  # autopilot (P5) -> io_bridge: desired control vector, applied ONLY while autonomy_active
 
 
 def _addr(port: int) -> str:

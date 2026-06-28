@@ -26,6 +26,20 @@ Whenever any script or process processes an image as an input (whether it is a s
 2. **Mandatory Model Preprocessing Disclosure:** If a model's native architecture strictly requires a specific input tensor size (like OWLv2's 960x960 grid or DINOv2's 14-pixel patch alignments), you must explicitly state this resolution transformation in the code documentation and logs. You must maximize the source asset's data fidelity before it enters the model processor.
 3. If you are ever in doubt about whether a resolution change degrades the data, **STOP** and validate the execution parameters with the user.
 
+### CRITICAL AUTONOMY STANDARD: NO MANUAL-FLIGHT DATA LEAKAGE INTO AUTONOMOUS LIMITS
+
+You are strictly forbidden from using any specific value observed during a manual flight, a dry-run, or a recorded flight as a hardcoded limit, threshold, target, or trigger for the autonomous drone. The autonomous system must detect every condition (ceiling, wall, opening, obstacle, …) from GENERAL, SELF-CALIBRATING signals it computes LIVE in the current room — never a pre-known answer for a specific flight or room.
+
+**The discriminator is room-specific ANSWER vs platform/signal BEHAVIOR — not "measured number vs not."**
+
+1. **FORBIDDEN (a room-specific answer baked as a constant):** any value that encodes *the answer for THIS room/flight* — e.g. "stop ascending at altitude Y = −2.3", "176 frames forward until the wall", "stop after 4.2 s", "the ceiling is at Z = …", a precomputed target xyz, or seeding a detector with a measured plateau value. If a number encodes the answer for this room, it must not exist in the code — it must be detected LIVE.
+2. **ALLOWED (general parameters + platform/signal characteristics):**
+   - General robustness params that do NOT encode the answer — durations (e.g. a 1.5 s stall window), ratios (e.g. rate < 15 % of the LIVE-measured rise rate), noise floors, physics constants.
+   - **Platform/signal CHARACTERISTICS** — properties of the drone/camera/physics that hold in ANY room, legitimately LEARNED (e.g. from `learn_to_fly.py`) and used: optical-flow SIGNATURES of events ("ceiling contact while ascending → vertical flow `dy_med` → ~0"; "wall contact while moving forward → looming radial `expansion` collapses from its live free-forward level → ~0; this ONE signal unifies a textureless wall that freezes the image AND a textured wall that shows a slow vertical climb"), and drone CONTROL DYNAMICS / maneuver magnitudes ("~N presses of `s` backs off a wall", "arm = tap `1` then hold ~10 frames", "press `c` to reset attitude BEFORE a forward push so a wall reads as a clean expansion-collapse", ramp rates). These generalize, and some (e.g. the back-off count) are impractical to calibrate live with SLAM running. Implemented in `flow_contact_detector.py` (detection, self-calibrating) + `flight_playbook.json` (control recipes).
+3. **Best-practice rider:** even for a legitimate signature, prefer RELATIVE/self-calibrating use in the live detector where easy ("flow dropped below ~15 % of the ascent flow JUST measured in this climb") over a baked absolute. A learned platform constant is acceptable only where live calibration is impractical.
+4. **Dry-run / manual logging / `learn_to_fly.py` are for VALIDATION + LEARNING ONLY.** Use them to confirm the detection LOGIC fires and to characterize platform signatures. A room-specific MEASURED value (this flight's ceiling altitude/frame) must NEVER be fed back as a constant into the live logic.
+5. **Rationale:** the drone must generalize to any unseen room. Baking in one flight's answer is overfitting / cheating and defeats the autonomy. When in doubt whether a constant leaks the room's answer (vs a platform signature), **STOP** and validate with the user.
+
 ## Overview
 The user is a candidate for an AI Assisted App Developer. This is the task he was given:
 

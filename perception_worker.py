@@ -315,6 +315,11 @@ class Pipeline:
                 "camera_center": [round(float(x), 4) for x in cc] if cc is not None else None,
                 "new_keyframe": res.new_keyframe, "reloc_event": res.reloc_event,
                 "slam_ms": round(slam_ms, 1),
+                # Forwarded from io_bridge meta so the autopilot can (a) gate the ceiling-stall on
+                # commanded ascent (controls.joy_vertical) and (b) tag each log line with the
+                # recording-relative frame index (rec_frame) for video correlation.
+                "controls": meta.get("controls"),
+                "rec_frame": meta.get("rec_frame"),
             })
             # Top-down occupancy snapshot: on a new keyframe (cells changed) OR on a timer, so the
             # DENSE trajectory reaches the visualizer without waiting for the next (sparse) keyframe.

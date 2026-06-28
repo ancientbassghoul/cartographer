@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Flight playbook — the autopilot's CONTROL VOCABULARY (what to drive, in what order, to get a",
+    "result). These are PLATFORM control dynamics (how THIS airframe responds), legitimate to encode",
+    "per the HARD RULE (CLAUDE.md 'CRITICAL AUTONOMY STANDARD'); nothing here is this room's geometry",
+    "(distance-to-wall, ceiling altitude) which is detected LIVE by flow_contact_detector.py.",
+    "",
+    "SCHEMA:",
+    "  presets = a continuous drive vector held for a whole state-machine state.",
+    "  recipes = an ORDERED list of steps; each step = control fields to hold + 'duration_s' (SECONDS).",
+    "            A step with ONLY 'duration_s' (no fields) releases everything (neutral) for that long.",
+    "  rules   = operating flags.",
+    "The autopilot lays each active step's fields over the neutral 20 Hz control vector (the fields it is",
+    "allowed to drive = DroneControl.AUTONOMY_FIELDS). NOTE: io_bridge applies the autopilot's value",
+    "DIRECTLY (no manual ramp), and it does NOT decay yaw on release (yaw latches until btnCdown zeroes",
+    "it) — so a turn is one continuous yaw command until the reset, not a pulse-then-coast.",
+    "",
+    "FIELDS: trigger 0.0-1.0 forward throttle (manual 'w' ramps to 1.0; 0.55 ~ moderate cruise, a",
+    "  deliberate control choice — NOT measured); reverse 0.0-1.0 back throttle; joy_vertical -1 up /",
+    "  +1 down (discrete); yaw -1..1 turn rate (+ = right, - = left); btnARMdown / btnCdown momentary",
+    "  buttons (btnCdown = reset attitude).",
+    "",
+    "DERIVATION (2026-06-29, honest re-measure — replaces fabricated values): all durations are REAL",
+    "seconds computed from the keystroke logs' mono_ts (wall-clock), NOT from frame counts. (History: the",
+    "recording is ~58 fps, so an earlier frames/30 derivation inflated everything ~1.92x; a later 'fix'",
+    "that merely divided those by ~1.92 and rounded produced fabricated numbers — both discarded.) Sources",
+    "(learn_to_fly.py re-run + direct mono_ts analysis of the keys CSVs):",
+    "  arm     <- 20260627_214613_keys.csv: the one real double-press — tap 0.11 / gap 0.08 / hold 0.80.",
+    "  takeoff <- 20260627_214613: actual takeoff 'e'-hold 3.25s, 0.55s coast, then 'f' arrest 0.17s.",
+    "             (A manual probe found 3.0s fails / 3.1s works; the measured 3.25s sits safely above that.)",
+    "  turn    <- 20260628_092608_keys.csv: 24 clean arrow->c cycles. The SPIN = yaw-press-start -> next",
+    "             'c' (yaw latches until 'c'), NOT the ~0.6s key-hold. Median spin 2.016s (range 1.84-2.16,",
+    "             both directions); c-hold median 0.156s. CAVEAT: the autopilot snaps yaw to 1.0 with no",
+    "             ramp while the pilot ramped over ~0.33s, so it rotates slightly more per second — if 2.0s",
+    "             overshoots ~90deg, trim toward ~1.85s. Open-loop; angle approximate; TUNABLE live.",
+    "  back_off<- 20260628_092608: 5 deliberate continuous back-off presses, median ~0.30s of 's'. Manual",
+    "             's' ramps reverse toward ~0.9 peak; constant reverse 0.7 for ~0.3s impulse-matches one",
+    "             nudge. (Multi-tap back-offs reached ~0.6s of 's' / ~2x retreat; the single nudge was chosen.)",
+    "All durations are platform-dynamics medians and are TUNABLE live."
+  ],
+
+  "presets": {
+    "ascend":  {"joy_vertical": -1},
+    "forward": {"trigger": 0.55},
+    "hold":    {}
+  },
+
+  "recipes": {
+    "arm": [
+      {"btnARMdown": true, "duration_s": 0.11},
+      {"duration_s": 0.08},
+      {"btnARMdown": true, "duration_s": 0.8}
+    ],
+    "takeoff": [
+      {"joy_vertical": -1, "duration_s": 3.25},
+      {"duration_s": 0.55},
+      {"joy_vertical": 1, "duration_s": 0.17}
+    ],
+    "reset_attitude": [{"btnCdown": true, "duration_s": 0.16}],
+    "turn_right": [
+      {"yaw": 1.0, "duration_s": 2.0},
+      {"btnCdown": true, "duration_s": 0.16}
+    ],
+    "turn_left": [
+      {"yaw": -1.0, "duration_s": 2.0},
+      {"btnCdown": true, "duration_s": 0.16}
+    ],
+    "back_off": [{"reverse": 0.7, "duration_s": 0.3}]
+  },
+
+  "rules": {
+    "reset_attitude_before_forward": true
+  }
+}

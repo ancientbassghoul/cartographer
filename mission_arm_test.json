@@ -1,0 +1,11 @@
+{
+  "_comment": [
+    "Focused diagnostic mission: ONLY arm, then hover-hold, so you can confirm the arm recipe alone",
+    "arms the drone. Run: autopilot.py --mission mission_arm_test.json --log ; press 'm' to hand over;",
+    "watch for props/arming during the 'arm' step, and compare the autopilot [CMD] log (src=recipe:arm",
+    "fields={btnARMdown:true}) against the io_bridge [AUTO] console line (btnARM=True)."
+  ],
+  "rest_between_s": 1.0,
+  "max_contact_s": 25.0,
+  "steps": ["arm", {"rest": 10}]
+}

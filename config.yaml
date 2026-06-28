@@ -17,6 +17,7 @@ network:
   perception_state_port: 5603           # perception_worker -> UI/map: depth, obstacle bar, poses
   object_state_port: 5604               # object_worker -> UI/report: target detections (bbox/center)
   frame_bus_hires_port: 5605            # io_bridge -> object_worker: high-res frames for Qwen grounding
+  autonomy_control_port: 5606           # autopilot (P5) -> io_bridge: TOPIC_CONTROL desired control fields
 
 perception:
   target_processing_fps: 10             # sub-sample 30 -> 10 into the GPU workers
@@ -52,6 +53,25 @@ map:
   voxel_size: 0.05                      # 5 cm occupancy voxels (consistent units, metric NOT required)
   glass_stall_seconds: 1.5              # forward-commanded + SLAM translation ~0 => virtual wall
   drone_clearance_m: 0.30               # opening passability threshold
+
+# Phase-2 autonomy. GENERAL, SELF-CALIBRATING params ONLY — NO value here may encode the answer for a
+# specific room/flight (see CLAUDE.md "CRITICAL AUTONOMY STANDARD"). These are durations / ratios /
+# noise floors tuned to physics + robustness; the ceiling altitude itself is measured LIVE per flight.
+autonomy:
+  enable_key: "m"                # io_bridge: toggle autonomy ON/OFF (any manual flight key aborts to manual)
+  ascend_cmd: -1                 # joy_vertical value for "rise" (camera Y is DOWN, so up = -1; matches io_bridge joy_up)
+  cmd_timeout_s: 0.5             # io_bridge zeroes autonomous controls if no fresh command within this window
+  # Maneuver recipes (arm pulse, turn unit, back-off, reset-attitude) live in flight_playbook.json.
+  # Optical-flow contact detector (flow_contact_detector.py) — replaces the SLAM-pose ceiling detector.
+  # GENERAL, SELF-CALIBRATING only: ratios + durations + noise floors on a fixed working resolution.
+  # NO value encodes this room (ceiling altitude / distance-to-wall / a frame index). See CLAUDE.md.
+  flow:
+    flow_long_side: 320          # normalize each frame to this long side before Farneback (resolution-independent + fast)
+    stall_frac: 0.15             # CONTACT when the flow signal < this fraction of the LIVE per-command reference (scale-free)
+    dy_noise_floor: 0.05         # |dy_med| (px on working res) below this counts as "vertically stopped" (ceiling contact)
+    exp_noise_floor: 0.05        # expansion below this counts as "no forward progress" (wall contact)
+    contact_seconds: 0.8         # the collapse must hold continuously this long before declaring CONTACT
+    arm_blank_s: 0.4             # onset blanking: suppress the collapse test this long after a push starts (accel dead-zone)
 
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.

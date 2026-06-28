@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Mission script for autopilot.py (--mission). An EDITABLE list of steps the autopilot flies in",
+    "order, handing control over once you press 'm' on io_bridge (any flight key aborts).",
+    "",
+    "STEP GRAMMAR:",
+    "  \"<recipe>\"            -> play a flight_playbook.json recipe to completion",
+    "                          (arm | takeoff | turn_left | turn_right | back_off | reset_attitude)",
+    "  \"ascend_until_ceiling\" -> hold the ascend preset until the flow detector reports CEILING",
+    "  \"forward_until_wall\"   -> reset attitude, then hold the forward preset until the detector reports WALL",
+    "  {\"rest\": N}            -> hold neutral for N seconds",
+    "",
+    "rest_between_s : auto-inserted neutral pause between consecutive NON-rest steps (default settle).",
+    "max_contact_s : SAFETY — if an until-contact step doesn't fire within this many seconds, the whole",
+    "                mission aborts to HOLD (reported as a non-detection, NEVER as a contact).",
+    "",
+    "This default = arm -> controlled takeoff -> settle 3s -> climb to the ceiling -> turn right ->",
+    "forward into a wall -> turn left -> forward into a wall. Turn angle is approximate (not yet",
+    "calibrated). Add a \"back_off\" after a \"forward_until_wall\" if you don't want it to sit at the wall."
+  ],
+
+  "rest_between_s": 1.0,
+  "max_contact_s": 25.0,
+
+  "steps": [
+    "arm",
+    "takeoff",
+    {"rest": 3},
+    "ascend_until_ceiling",
+    "turn_right",
+    "forward_until_wall",
+    "turn_left",
+    "forward_until_wall"
+  ]
+}
