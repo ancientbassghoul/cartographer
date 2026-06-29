@@ -216,13 +216,16 @@ def _normalize_step(s, recipe_names):
     if isinstance(s, dict):
         if "rest" in s:
             return {"type": "rest", "seconds": float(s["rest"])}
-        raise ValueError(f"bad mission step {s!r} (expected a recipe/keyword string or {{'rest': N}})")
+        if "duration_s" in s:
+            fields = {k: v for k, v in s.items() if k != "duration_s"}
+            return {"type": "inline", "fields": fields, "seconds": float(s["duration_s"])}
+        raise ValueError(f"bad mission step {s!r} (dict must have 'rest' or 'duration_s')")
     if s in UNTIL_STEPS:
         return {"type": "until", "name": s}
     if s in recipe_names:
         return {"type": "recipe", "name": s}
     raise ValueError(f"unknown mission step '{s}' — must be a playbook recipe {sorted(recipe_names)}, "
-                     f"an until-keyword {sorted(UNTIL_STEPS)}, or {{'rest': N}}")
+                     f"an until-keyword {sorted(UNTIL_STEPS)}, {{'rest': N}}, or {{'<field>':v, 'duration_s':N}}")
 
 
 def expand_mission(mission: dict, pb: FlightPlaybook) -> list:
@@ -257,6 +260,8 @@ def _step_source(step, phase):
     t = step["type"]
     if t == "rest":
         return "preset:hold"
+    if t == "inline":
+        return "inline"
     if t == "recipe":
         return f"recipe:{step['name']}"
     if phase == "reset":                      # forward_until_wall's attitude-reset prefix
@@ -287,7 +292,7 @@ def run_mission(cfg, mission_path=None, max_contact_s=None, stop_event=None, log
           f"({len(steps)} steps incl. auto-rests). PUB TOPIC_CONTROL :{ctrl_port} | SUB frame bus :{frame_port}")
     print("[autopilot] On io_bridge press 'm' to hand control over; any flight key aborts.")
     for i, s in enumerate(steps):
-        extra = f" {s['seconds']}s" if s["type"] == "rest" else ""
+        extra = f" {s['seconds']}s" if s["type"] in ("rest", "inline") else ""
         print(f"   {i+1:>2}. {s.get('name', s['type'])}{extra}")
     if mcs > 0:
         print(f"[autopilot] SAFETY: an until-contact step aborts the MISSION to HOLD after {mcs}s "
@@ -396,11 +401,15 @@ def run_mission(cfg, mission_path=None, max_contact_s=None, stop_event=None, log
                     elif step["type"] == "until":
                         phase = "reset" if (step["name"] == "forward_until_wall" and reset_before_fwd) else "contact"
                         reset_player = pb.player("reset_attitude") if phase == "reset" else None
-                    extra = f" ({step['seconds']}s)" if step["type"] == "rest" else ""
+                    extra = f" ({step['seconds']}s)" if step["type"] in ("rest", "inline") else ""
                     print(f"[autopilot] step {idx+1}/{len(steps)}: {cur_name}{extra}", flush=True)
 
                 if step["type"] == "rest":
                     active = presets["hold"]
+                    if now - phase_t0 >= step["seconds"]:
+                        advance = True
+                elif step["type"] == "inline":
+                    active = step["fields"]
                     if now - phase_t0 >= step["seconds"]:
                         advance = True
                 elif step["type"] == "recipe":
@@ -497,10 +506,14 @@ def run_self_test(cfg):
         rejected = False
     except ValueError:
         rejected = True
-    good = len(steps) > 0 and no_adjacent and rejected
+    inline_steps = expand_mission({"steps": [{"joy_vertical": 1, "duration_s": 0.17}]}, pb)
+    inline_ok = (len(inline_steps) == 1 and inline_steps[0]["type"] == "inline"
+                 and inline_steps[0]["fields"] == {"joy_vertical": 1}
+                 and inline_steps[0]["seconds"] == 0.17)
+    good = len(steps) > 0 and no_adjacent and rejected and inline_ok
     ok = ok and good
     print(f"[self-test] {'PASS' if good else 'FAIL'}  mission expands ({len(steps)} steps), auto-rests "
-          f"interleaved, unknown step rejected")
+          f"interleaved, unknown step rejected, inline step parses")
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
 

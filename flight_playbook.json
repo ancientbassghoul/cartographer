@@ -58,11 +58,11 @@
     ],
     "reset_attitude": [{"btnCdown": true, "duration_s": 0.16}],
     "turn_right": [
-      {"yaw": 1.0, "duration_s": 2.0},
+      {"yaw": 1.0, "duration_s": 1.625},
       {"btnCdown": true, "duration_s": 0.16}
     ],
     "turn_left": [
-      {"yaw": -1.0, "duration_s": 2.0},
+      {"yaw": -1.0, "duration_s": 1.625},
       {"btnCdown": true, "duration_s": 0.16}
     ],
     "back_off": [{"reverse": 0.7, "duration_s": 0.3}]

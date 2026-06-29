@@ -4,11 +4,13 @@
     "order, handing control over once you press 'm' on io_bridge (any flight key aborts).",
     "",
     "STEP GRAMMAR:",
-    "  \"<recipe>\"            -> play a flight_playbook.json recipe to completion",
-    "                          (arm | takeoff | turn_left | turn_right | back_off | reset_attitude)",
-    "  \"ascend_until_ceiling\" -> hold the ascend preset until the flow detector reports CEILING",
-    "  \"forward_until_wall\"   -> reset attitude, then hold the forward preset until the detector reports WALL",
-    "  {\"rest\": N}            -> hold neutral for N seconds",
+    "  \"<recipe>\"                       -> play a flight_playbook.json recipe to completion",
+    "                                     (arm | takeoff | turn_left | turn_right | back_off | reset_attitude)",
+    "  \"ascend_until_ceiling\"           -> hold the ascend preset until the flow detector reports CEILING",
+    "  \"forward_until_wall\"             -> reset attitude, then hold the forward preset until the detector reports WALL",
+    "  {\"rest\": N}                      -> hold neutral for N seconds",
+    "  {\"<field>\": v, \"duration_s\": N} -> hold the given control fields for N seconds (inline step)",
+    "                                     e.g. {\"joy_vertical\": 1, \"duration_s\": 0.17} for a timed descent",
     "",
     "rest_between_s : auto-inserted neutral pause between consecutive NON-rest steps (default settle).",
     "max_contact_s : SAFETY — if an until-contact step doesn't fire within this many seconds, the whole",
@@ -27,9 +29,13 @@
     "takeoff",
     {"rest": 3},
     "ascend_until_ceiling",
+    {"rest": 1},
+    {"joy_vertical": 1, "duration_s": 0.17},
     "turn_right",
     "forward_until_wall",
+    "back_off",
     "turn_left",
-    "forward_until_wall"
+    "forward_until_wall",
+    "back_off"
   ]
 }
