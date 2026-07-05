@@ -181,6 +181,11 @@ def overlay_plan(img, plan, m, size):
 
     pos = plan.get("pos")
     goal = plan.get("goal")
+    # Blacklisted (unreachable) goals: red X — visible so the operator sees WHY the drone gave up on a
+    # frontier behind glass/a wall instead of silently looping (NO SILENT FALLBACK).
+    for bx, bz in (plan.get("blacklist") or []):
+        bu, bv = to_px_vec(np.array([bx]), np.array([bz]))
+        cv2.drawMarker(img, (int(bu[0]), int(bv[0])), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
     if goal is not None:
         gu, gv = to_px_vec(np.array([goal[0]]), np.array([goal[1]]))
         cv2.drawMarker(img, (int(gu[0]), int(gv[0])), (0, 255, 255), cv2.MARKER_STAR, 18, 2)
@@ -205,9 +210,11 @@ def overlay_plan(img, plan, m, size):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
     else:
         be = plan.get("bearing_err")
+        nbl = plan.get("n_blacklisted") or 0
         cv2.putText(img, f"explore: frontiers={plan.get('n_frontiers')} "
                     f"bearing_err={be if be is not None else '--'} "
-                    f"clear={f'{clr:.2f}u' if clr is not None else '--'}  "
+                    f"clear={f'{clr:.2f}u' if clr is not None else '--'} "
+                    f"{f'blacklist={nbl} ' if nbl else ''}"
                     f"{'DONE' if plan.get('done') else ''}", (8, 36),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 

@@ -387,7 +387,8 @@ class Pipeline:
                 self.last_map_pub = now_mono
             # Map mode: republish the explore plan (goal/bearing/done + ground layer) on a timer.
             if (now_mono - self.last_plan_pub) >= self.PLAN_PUB_INTERVAL:
-                state_pub.publish(frame_bus.TOPIC_PLAN, self._plan_payload(res, meta, heading_deg, slam_ms))
+                state_pub.publish(frame_bus.TOPIC_PLAN,
+                                  self._plan_payload(res, meta, heading_deg, slam_ms, now_mono))
                 self.last_plan_pub = now_mono
 
         # --- DA-V2 depth, throttled to the slower cadence ---
@@ -451,13 +452,16 @@ class Pipeline:
         }
 
     # ------------------------------------------------------------- map mode planner
-    def _plan_payload(self, res, meta, heading_deg, slam_ms=None):
+    def _plan_payload(self, res, meta, heading_deg, slam_ms=None, now_mono=None):
         """TOPIC_PLAN payload: drone pose (X-Z + heading), the chosen frontier goal + bearing, the
         done flag, and a compact ground-grid raster for the visualizer. NO SILENT FALLBACK: if SLAM
         is not TRACKING (or pose/heading missing) the plan is published with plan_valid=false and NO
         goal, so the autopilot holds instead of chasing a stale target. `slam_ms` (this frame's SLAM
         build time) rides on EVERY plan — even when invalid — so the autopilot's SLAM settle gate can
-        watch it (a healthy solve is sub-second; a choke spikes it) independent of tracking state."""
+        watch it (a healthy solve is sub-second; a choke spikes it) independent of tracking state.
+        `now_mono` (monotonic clock) drives the planner's progress-stall unreachable-goal watchdog."""
+        if now_mono is None:
+            now_mono = time.monotonic()
         cc = res.camera_center
         pos = [float(cc[0]), float(cc[2])] if cc is not None else None
         valid = (res.mode == "TRACKING") and pos is not None and heading_deg is not None
@@ -467,6 +471,7 @@ class Pipeline:
             "heading_deg": (round(heading_deg, 2) if heading_deg is not None else None),
             "goal": None, "bearing_deg": None, "bearing_err": None,
             "n_frontiers": 0, "done": False, "forward_clearance_dist": None,
+            "n_blacklisted": len(self.planner._blacklist), "blacklist": self.planner.blacklist_points(),
             "pos_y": None, "clearance_ring": None,
             "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
@@ -511,9 +516,25 @@ class Pipeline:
         # verification (no frontiers AND not already verifying) so it is evaluated exactly once per
         # done-attempt and stays a STATIC target (no oscillating between equidistant corners).
         fr = self.ground.frontiers()
+        # `farthest_free` (the reposition target) is needed whenever NOTHING is reachable-from-here — that's
+        # no frontiers at all OR every frontier blacklisted from this vantage (the glass-loop escape). Flying
+        # to the far corner moves the drone off the give-up spot, re-enabling the position-conditioned
+        # blacklist so those frontiers become reachable again on arrival.
+        reachable = self.planner.any_reachable(fr, pos)
         farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64))
-                    if (not fr and not self.planner.verifying) else None)
-        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, farthest)
+                    if (not reachable and not self.planner.verifying) else None)
+        # forward_clearance + slam_ms gate the WEDGED watchdog: it only blacklists a goal when the drone is
+        # genuinely stuck (blocked ahead + SLAM alive), NOT during a ground prelude or a SLAM-settle pause.
+        goal, n_frontiers, done = self.planner.select(
+            fr, pos, heading_deg, farthest, now_mono,
+            forward_clearance=payload["forward_clearance_dist"], slam_ms=slam_ms)
+        if self.planner.last_blacklist is not None:
+            print(f"[perception] planner: goal {self.planner.last_blacklist} UNREACHABLE (no progress "
+                  f"~{self.planner.stall_s:.0f}s while aimed) -> BLACKLIST from vantage "
+                  f"[{pos[0]:.2f}, {pos[1]:.2f}] ({len(self.planner._blacklist)} total) -> reselecting",
+                  flush=True)
+        payload["n_blacklisted"] = len(self.planner._blacklist)
+        payload["blacklist"] = self.planner.blacklist_points()
         if self.planner.verifying and not self._verify_logged:
             print(f"[perception] planner: no frontiers -> VERIFYING via far corner {self.planner.verify_target}",
                   flush=True)

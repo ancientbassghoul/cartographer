@@ -605,7 +605,11 @@ class ExploreController:
         self.parallax_scout = bool(e.get("parallax_scout", True))
         self.parallax_push_dist = float(e.get("parallax_push_dist", 0.5))  # translate this far per push (SLAM units)
         self.parallax_pad = float(e.get("parallax_pad", 0.4))
-        self.parallax_push_s = float(e.get("parallax_push_s", 1.2))        # SAFETY time cap on a push
+        self.parallax_push_s = float(e.get("parallax_push_s", 2.0))        # SAFETY time cap on a push
+        # FORWARD push magnitude, DECOUPLED from the deliberately-slow ADVANCE forward_throttle (0.1 crawls
+        # -> no parallax). The push is a short, clearance-guarded, deliberate translation -> it can be brisk.
+        # Backward push keeps reverse_throttle (already strong enough). General platform param (HARD RULE).
+        self.parallax_push_throttle = float(e.get("parallax_push_throttle", 0.4))
         self.parallax_max_pushes = int(e.get("parallax_max_pushes", 8))
         self._push_count = 0                 # consecutive scout pushes this leg (anti-deadlock cap)
         self._push_dir = None                # "forward" | "backward" for the active PARALLAX_PUSH
@@ -1066,7 +1070,7 @@ class ExploreController:
                     self._push_start_pos = plan.get("pos")
             if self.state == "PARALLAX_PUSH":    # still pushing (didn't bail to SETTLE above)
                 if self._push_dir == "forward":
-                    active = dict(self.forward_preset)
+                    active = {"trigger": self.parallax_push_throttle}   # brisk, decoupled from the ADVANCE crawl
                     guard = self._ring_get(ring, 0.0)
                 else:
                     active = dict(self.pb.recipe("back_off")[0])   # reverse magnitude, held continuously
@@ -1075,7 +1079,7 @@ class ExploreController:
                 if self._slam_slow:
                     # SLAM choking mid-push -> log what we translated, stop, and settle before re-planning.
                     kind = "forward" if self._push_dir == "forward" else "reverse"
-                    mag = float(self.forward_preset.get("trigger", 0.0)) if kind == "forward" else self.reverse_throttle
+                    mag = self.parallax_push_throttle if kind == "forward" else self.reverse_throttle
                     self._log_move(kind, mag, now - self.t_state)
                     self._push_dir = None
                     self._settle_to = "REPLAN"
@@ -1090,7 +1094,7 @@ class ExploreController:
                     why = "dist" if far else "blocked" if blocked else "timer"
                     dirn = self._push_dir
                     if dirn == "forward":
-                        self._log_move("forward", float(self.forward_preset.get("trigger", 0.0)), now - self.t_state)
+                        self._log_move("forward", self.parallax_push_throttle, now - self.t_state)
                     else:
                         self._log_move("reverse", self.reverse_throttle, now - self.t_state)
                     self._push_dir = None
@@ -1511,19 +1515,23 @@ def run_self_test(cfg):
     ca2 = ExploreController(cfg, no_takeoff=True)
     _, _, _, st2 = _drive(ca2, _plan_be(30.0), False, 1.5, 0.0)   # >1 turn duration so ORIENT completes -> ADVANCE
     aim_adv = ("ADVANCE" in st2) and ("PARALLAX_PUSH" not in st2)
-    # (c) distance-quantized: the push ends by 'dist' once translated parallax_push_dist (before the time cap).
+    # (c) distance-quantized: the push ends by 'dist' once translated parallax_push_dist (before the time cap),
+    #     and the FORWARD push uses the brisk parallax_push_throttle (decoupled from the 0.1 ADVANCE crawl).
     cd = ExploreController(cfg, no_takeoff=True)
     cd._enter("PARALLAX_PUSH", 0.0)
     cd._push_dir = None
-    tt, moved, ended = 0.0, 0.0, None
+    tt, moved, ended, push_trig = 0.0, 0.0, None, None
     for _ in range(400):
         a, s, _ = cd.step(tt, _plan_be(90.0, pos=(0.0, moved)), False)
         if s != "PARALLAX_PUSH":
             ended = (moved, tt)
             break
-        moved += 0.05                         # drone translates 0.05u/tick -> reaches 0.5u well before the 1.2s cap
+        if a.get("trigger") is not None:      # forward push magnitude actually commanded
+            push_trig = a["trigger"]
+        moved += 0.05                         # drone translates 0.05u/tick -> reaches 0.5u well before the cap
         tt += 0.05
-    dist_stop = (ended is not None and ended[0] >= cd.parallax_push_dist - 1e-6 and ended[1] < cd.parallax_push_s)
+    dist_stop = (ended is not None and ended[0] >= cd.parallax_push_dist - 1e-6 and ended[1] < cd.parallax_push_s
+                 and push_trig is not None and abs(push_trig - cd.parallax_push_throttle) < 1e-9)
     # (d) boxed in (no room fwd/back) -> skip the push (enter PARALLAX_PUSH but bail, no push counted).
     cb = ExploreController(cfg, no_takeoff=True)
     tight = [[r, 0.5] for r in (0.0, 45.0, 90.0, 135.0, 180.0, -135.0, -90.0, -45.0)]

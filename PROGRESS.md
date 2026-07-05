@@ -1,9 +1,41 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated 2026-07-05 (post test-flight fixes, then re-flown). Resume from THIS file._
+_Last updated 2026-07-05 (glass-window blacklist FLOWN → gating + parallax follow-up fixes; self-tested, NOT
+yet re-flown. Plus a NEW open issue below: drone won't turn to the goal). Resume from THIS file._
 
-**⚠️ A NEW ISSUE was observed on the latest flight ("good progress" — the fixes below worked — but a new
-problem appeared). It has NOT been described/recorded yet: get the details before acting.**
+**⚠️⚠️ OPEN — DRONE FLIES STRAIGHT PAST THE GOAL, WON'T TURN (diagnosed, NOT fixed).** Flight
+`OUTPUT/diag/20260705_174456_autopilot.log` + `DEBUG_IMAGES/when will you turn to the goal.png`: the drone
+takes off, flies its takeoff heading, and sails past an off-axis goal — the path-vs-goal angle reaches ~45°
+and STEEPENS as it passes, yet it never turns. Root cause (CONFIRMED in code, NOT a quantizer dead-zone red
+herring):
+- **The heading is re-decided ONLY at REPLAN, and REPLAN only runs at LEG-END. There is ZERO re-aiming
+  mid-leg.** `bearing_err` → `_quantize_turn` → turn is computed once, at REPLAN (`autopilot.py:921`).
+  `ADVANCE` (`autopilot.py:974-1016`) flies straight OPEN-LOOP and never re-reads the bearing; it ends only
+  on one of four leg-end events: forward-clearance stand-off (wall mapped ahead), flow wall-contact,
+  goal-reached (< `goal_reach_dist` 0.4), or the `leg_max_s` **20 s** timeout.
+- **In open space** (no wall ahead, never within 0.4 of the goal) NONE of the first three fire, so the leg
+  runs the full **20 s straight** — the drone drifts 45°+ off the goal with no replan, no turn. It only
+  re-aims when the 20 s expires (or it finally hits a wall).
+- **A SLAM choke does NOT cause a replan.** The settle gate (`autopilot.py:978`) enters `SLAM_HOLD` and
+  RESUMES the SAME leg (same `leg_goal`/heading); STALE/LOST → HOLD_LOST/rewind recovery. Neither re-aims.
+- (Secondary: even at leg-end, `_quantize_turn = round(be/45)*45` ignores |be| < 22.5°, so small errors
+  never turn either — but the PRIMARY problem here is the no-mid-leg-reaiming above.)
+- **NOT yet fixed / no approach chosen.** The fix direction (mid-leg re-aim? shorter leg cap? close-loop
+  heading correction / strafe?) was NOT agreed — do not assume. Get the user's decision before building.
+
+**⚠️ GLASS-WINDOW blacklist — v1 flew, TWO follow-up bugs FIXED (self-tested, awaiting a live re-fly).** The
+unreachable-goal blacklist (`## DONE — unreachable-goal blacklist`) flew and revealed two problems, now fixed:
+1. **Blacklist fired FAR too early** — red X's before the drone even flew, and goals turned red mid-approach
+   (the user's read: when the drone stops to let SLAM cool down). Cause: the watchdog accrued **wall-clock**
+   time on merely *aimed + not-closing*, counting the ground prelude and SLAM-settle/HOLD pauses. **Fix:**
+   accrue stall ONLY while GENUINELY WEDGED — armed (moved from start) + aimed + **blocked ahead** (small
+   `forward_clearance_dist`) + **SLAM alive** (`slam_ms < slam_slow_ms`) + not-closing; an accumulator that
+   pauses when any gate fails and resets on progress. All gate signals are already on TOPIC_PLAN (no new
+   channel). See `## DONE — unreachable-goal blacklist`.
+2. **Parallax push too weak, esp. FORWARD.** The forward push reused the 0.1 ADVANCE crawl (`forward_throttle`)
+   → never covered `parallax_push_dist` before the time cap → ~no parallax. **Fix:** a dedicated brisk
+   `parallax_push_throttle` (0.4) for the forward push, decoupled from the cautious ADVANCE throttle; backward
+   kept on `reverse_throttle`; `parallax_push_s` 1.2→2.0 so DISTANCE ends the push.
 
 **Test flight 2026-07-05 (`OUTPUT/diag/20260705_094830_autopilot.log`) — much better; two critical bugs +
 one minor, addressed below and then re-flown 07-05 with GOOD PROGRESS (the rewind fix + SLAM settle gate
@@ -25,8 +57,8 @@ throttle knobs, SLAM altitude lock, ray-guided parallax scouting, a new frontier
 done-verification (`frontier_planner.py`), a **control-space SLAM-loss recovery** (hold-on-LOST →
 command-rewind on STALE → parallax+≤45 fallback), and the **fallback-sweep tweak** (unidirectional +45°
 sweep, fwd/back-alternating retreat, `fallback_max_attempts` 16). See "## BUILT THIS SESSION".
-**NEXT = triage the NEW ISSUE from the latest flight** (details pending from the user — see the ⚠️ note at
-the top). The rewind fix + SLAM settle gate flew with good progress.
+**NEXT = live re-fly to validate the unreachable-goal blacklist** (the glass-window loop; see
+`## DONE — unreachable-goal blacklist`). The rewind fix + SLAM settle gate flew with good progress.
 
 **Where we are:** Phase-1 (manual map + target localize) built & verified. Phase-2 autonomous
 **Map-mode explorer** (`autopilot.py --explore`) flies live and **stops before ramming walls** via the
@@ -40,6 +72,60 @@ planner + done-verification (`frontier_planner.py`), and a **control-space SLAM-
 attempt 0 by the roomier body axis from `_last_ring`); `fallback_max_attempts` 4 → 16. `autopilot.py
 --self-test` ALL PASS (case-d now asserts both a fwd `trigger>0` and a back `reverse>0` retreat, turn always
 `yaw>0` never `<0`, STUCK reached). **NEXT = the full live flight (checklist under "## BUILT THIS SESSION").**
+
+## DONE — unreachable-goal blacklist (progress-stall) — the glass-window loop
+**Problem (latest flight):** a goal behind a GLASS WINDOW is physically unreachable (no path planner — the
+drone flies a STRAIGHT line to the goal bearing). Its frontier is never consumed (SLAM never sees behind the
+glass → the FREE↔UNKNOWN seam persists), and `FrontierPlanner`'s commitment re-hands the same goal every
+replan → an endless `REPLAN→ORIENT→ADVANCE→standoff→SETTLE→REPLAN` loop. Generalizes to any goal behind a
+wall / around a corner.
+
+**Why not the first idea (a REPLAN repeat-counter):** REPLAN fires many times while HEALTHILY approaching a
+far goal — once per ≤45° parallax-scout step (`autopilot.py:932-935`, drone ~stationary, same goal) and once
+per `leg_max_s` timeout (`autopilot.py:1012`). A bare repeat-count would abandon good far goals. The fix is
+the SAME counter gated on PROGRESS.
+
+**Fix (all in `frontier_planner.py`, wired through perception):** a per-committed-goal WEDGED watchdog.
+It tracks the BEST (closest) distance achieved toward the goal and accrues a stall accumulator ONLY while
+the drone is GENUINELY WEDGED — **armed** (moved ≥ `goal_stall_arm_dist` from its start, so the ground
+prelude is skipped) + **aimed** (`|bearing_err| ≤ goal_stall_aim_deg`, so a multi-step turn isn't mistaken
+for wedged) + **blocked ahead** (`forward_clearance_dist ≤ goal_stall_clearance`) + **SLAM alive**
+(`slam_ms < slam_slow_ms`, so a SLAM-settle/HOLD cooldown doesn't count) + **not closing**. The accumulator
+PAUSES when any gate fails and RESETS on real progress; at `goal_stall_s` of wedged time the goal is declared
+UNREACHABLE and BLACKLISTED and the planner reselects. Healthy far goals keep closing → never blacklisted.
+(v1 used a wall-clock timer on aimed+not-closing → fired on the ground prelude and during SLAM cooldowns;
+the five gates fixed that. All gate signals were already on TOPIC_PLAN — no new channel.)
+- **Position-conditioned** (per the user): a blacklist entry stores the give-up VANTAGE; the region is
+  excluded only while the drone is within `goal_vantage_radius` of that spot, so a different angle / a newly
+  opened route can retry it. Re-blacklisting one region from ~the same vantage `goal_blacklist_permanent_after`
+  times promotes it to permanent (stops two dead goals ping-ponging the drone).
+- **All-frontiers-dead-from-here** routes into the existing done-verification path (fly to
+  `farthest_free`) — which doubles as a REPOSITION: moving off the give-up spot re-enables the blacklist so
+  those frontiers become reachable again on arrival. Perception now computes `farthest_free` on
+  `not planner.any_reachable(...)` (was `not frontiers`).
+- **NO SILENT FALLBACK:** perception logs `planner: goal […] UNREACHABLE … -> BLACKLIST from vantage […]`;
+  TOPIC_PLAN carries `n_blacklisted` + `blacklist` points; the visualizer draws blacklisted goals as a red
+  tilted-cross and shows `blacklist=N` on the HUD.
+- **No-leakage-safe:** blacklist POINTS are computed LIVE from the drone's own failure to progress; the
+  thresholds are general map-scale params (`goal_blacklist_radius` defaults to `goal_assoc_dist`;
+  `goal_progress_eps` ≈ ½·`goal_reach_dist`) + a time window — none encodes this room's geometry.
+- **Config** (`config.yaml autonomy.explore`): `goal_stall_s` (6.0), `goal_progress_eps` (0.2),
+  `goal_stall_aim_deg` (45), `goal_stall_clearance` (0.8), `goal_stall_arm_dist` (0.5), `goal_blacklist_radius`
+  (1.0), `goal_vantage_radius` (1.0), `goal_blacklist_permanent_after` (3); reuses `slam_slow_ms`. Signature:
+  `FrontierPlanner.select(..., now=None, forward_clearance=None, slam_ms=None)` — perception passes
+  `payload["forward_clearance_dist"]` + `slam_ms`.
+- **Tests:** `frontier_planner.py --self-test` ALL PASS (15) — healthy far goal (closing, gates open) never
+  blacklists; wedged goal blacklists at `stall_s`; aim-gate ignores turning; **each of not-armed / not-blocked
+  / SLAM-slow alone SUPPRESSES the blacklist**; position-conditioned retry-from-far / excluded-from-near;
+  permanent promotion; all-dead-from-here → reposition.
+- **Parallax push (paired fix):** the FORWARD push now uses `parallax_push_throttle` (0.4, `autopilot.py`
+  PARALLAX_PUSH), decoupled from the 0.1 ADVANCE crawl; backward stays on `reverse_throttle`; `parallax_push_s`
+  2.0 so DISTANCE ends the push. `autopilot.py --self-test` PARALLAX-SCOUT asserts the forward push commands
+  `parallax_push_throttle`.
+- **TO DO — live re-fly:** confirm NO red X's before takeoff or during SLAM-cooldown pauses; a healthy goal
+  being approached stays golden; the glass loop STILL blacklists (aimed + standoff + SLAM alive) then picks a
+  DIFFERENT goal; the forward parallax push visibly moves the drone (log `parallax forward push done (dist)`,
+  not `(timer)`). Tune `parallax_push_throttle`/`parallax_push_dist` + `goal_stall_clearance`/`goal_stall_s` live.
 
 ## What this project is
 Assessment task: from the black-box **XLAB** Unity sim's single monocular drone feed, autonomously

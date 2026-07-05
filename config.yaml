@@ -97,6 +97,22 @@ autonomy:
     goal_behind_floor: 0.15      # utility multiplier floor for a frontier behind the drone (cos(turn) floored to this)
     goal_switch_factor: 1.5      # only abandon the committed goal if another frontier's utility beats it by this factor
     goal_assoc_dist: 1.0         # associate the committed goal with a live frontier centroid within this (SLAM units)
+    # --- unreachable-goal blacklist (WEDGED watchdog): there is NO path planner (the drone flies a STRAIGHT
+    #     line to the goal bearing), so a goal behind glass / a wall / a corner is never reachable and its
+    #     frontier is never consumed -> an endless REPLAN->ADVANCE->standoff->REPLAN loop (seen at the glass
+    #     window). A per-goal watchdog accrues "stall" time ONLY while the drone is GENUINELY WEDGED: armed
+    #     (moved from start) + aimed at the goal + blocked ahead (small forward clearance) + SLAM alive (not a
+    #     cooldown) + not closing. Those gates stop it firing on the ground prelude or during SLAM-settle/HOLD
+    #     pauses. Position-conditioned: excluded only near the give-up spot, so a new angle/opening can retry
+    #     it. NOT a repeat-counter (healthy far goals keep closing). General params + LIVE-computed points.
+    goal_stall_s: 6.0            # accumulated WEDGED seconds before a goal is declared unreachable
+    goal_progress_eps: 0.2       # min closing distance (SLAM units) that counts as progress (~0.5*goal_reach_dist; noise floor)
+    goal_stall_aim_deg: 45.0     # only accrue stall while bearing error <= this (still turning to face it = not a stall)
+    goal_stall_clearance: 0.8    # forward clearance <= this = "blocked ahead" (>= stop_clearance_dist so a stand-off counts)
+    goal_stall_arm_dist: 0.5     # drone must move this far (SLAM units) from its start before the watchdog arms (skips prelude)
+    goal_blacklist_radius: 1.0   # a frontier within this of a dead goal is "the same" region (defaults to goal_assoc_dist)
+    goal_vantage_radius: 1.0     # how far the drone must move from the give-up spot for a dead goal to be retryable (SLAM units)
+    goal_blacklist_permanent_after: 3  # re-blacklists of one region from ~the same vantage before it goes permanent (stops ping-pong)
     # --- done verification: before declaring the map complete, fly to the farthest known free corner and
     #     re-scan for uncharted territory (the corner is cached ONCE as a static target -> no oscillation). ---
     verify_done: true            # enable the farthest-corner verification trip before declaring done
@@ -171,7 +187,9 @@ autonomy:
     parallax_scout: true         # enable turn<->push<->turn for goals more than one turn_step away
     parallax_push_dist: 0.5      # push until the SLAM pose has translated this far (SLAM units) -> "a few units" of parallax
     parallax_pad: 0.4            # only push into a body axis whose clearance > stop_clearance_dist + this (else skip; just turn)
-    parallax_push_s: 1.2         # SAFETY time cap on a push (ends it if the distance target isn't reached, e.g. slow / SLAM stale)
+    parallax_push_throttle: 0.4  # FORWARD push magnitude, DECOUPLED from the 0.1 ADVANCE crawl (which gave ~no parallax);
+                                 #   the push is short + clearance-guarded so it can be brisk. Backward stays on reverse_throttle.
+    parallax_push_s: 2.0         # SAFETY time cap on a push (raised so DISTANCE, not the timer, ends the push at the new throttle)
     parallax_max_pushes: 8       # cap consecutive pushes per leg (anti-deadlock; a 180-deg goal needs ~4 at 45-deg steps)
 
 runtime:
