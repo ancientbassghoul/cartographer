@@ -72,6 +72,101 @@ autonomy:
     exp_noise_floor: 0.05        # expansion below this counts as "no forward progress" (wall contact)
     contact_seconds: 0.8         # the collapse must hold continuously this long before declaring CONTACT
     arm_blank_s: 0.4             # onset blanking: suppress the collapse test this long after a push starts (accel dead-zone)
+  # Map mode (frontier exploration). GENERAL platform/robustness params ONLY — NO value encodes this
+  # room's geometry (the occupancy grid + frontiers are built LIVE from SLAM; see CLAUDE.md + ground_grid.py).
+  # Lengths are in SLAM units (metric scale NOT recovered — internal consistency is what matters).
+  explore:
+    # --- GroundGrid (2D X-Z log-odds free/unknown/occupied; ground_grid.py) ---
+    ground_cell_size: 0.10       # ground cell edge (SLAM units); coarser than the 5cm voxel map (planning, not rendering)
+    height_band_frac: 0.20       # keep world points within +/- this fraction of the per-keyframe vertical span around the LIVE camera Y (wall slice; floor/ceiling out)
+    logodds_hit: 0.85            # occupied evidence added at a ray endpoint
+    logodds_miss: 0.40           # free evidence subtracted along a carved ray (one clean carve => FREE)
+    logodds_clamp: 4.0           # |log-odds| ceiling (keeps a cell revisable, not saturated)
+    free_thresh: -0.3            # log-odds <= this => FREE
+    occ_thresh: 0.4              # log-odds >= this => OCC
+    min_frontier_cells: 6        # drop frontier clusters smaller than this (noise)
+    obstacle_inflation: 2        # dilate OCC by this many cells (drone-clearance margin); frontier cells inside are dropped
+    # --- planner / goal selection (frontier_planner.py) ---
+    # Frontier UTILITY = size * max(goal_behind_floor, cos(turn)) / (1 + goal_dist_weight*dist): prefer BIG,
+    # AHEAD, NEAR frontiers (a frontier behind the drone is floored low, so it's a last resort -> no
+    # behind-me flips). STRONG COMMITMENT keeps the chosen goal until reached/gone or clearly beaten, so it
+    # stops abandoning a good far goal. General planner params (the map/frontiers are LIVE; HARD RULE).
+    goal_reach_dist: 0.4         # a goal is "reached" when the drone is within this distance of it (X-Z)
+    replan_period_s: 0.5         # how often perception republishes TOPIC_PLAN
+    goal_dist_weight: 0.5        # distance penalty in the frontier utility (higher = prefer nearer frontiers)
+    goal_behind_floor: 0.15      # utility multiplier floor for a frontier behind the drone (cos(turn) floored to this)
+    goal_switch_factor: 1.5      # only abandon the committed goal if another frontier's utility beats it by this factor
+    goal_assoc_dist: 1.0         # associate the committed goal with a live frontier centroid within this (SLAM units)
+    # --- done verification: before declaring the map complete, fly to the farthest known free corner and
+    #     re-scan for uncharted territory (the corner is cached ONCE as a static target -> no oscillation). ---
+    verify_done: true            # enable the farthest-corner verification trip before declaring done
+    verify_min_dist: 0.6         # skip verification (declare done) if the farthest free corner is already within this
+    # --- forward clearance (raycast stand-off; primary forward stop) ---
+    # Perception casts a small FAN of ground-plane rays into the voxel map it built (along the LIVE
+    # heading) and publishes the nearest hit distance as TOPIC_PLAN forward_clearance_dist; the autopilot
+    # stops the ADVANCE leg before ramming a wall (a head-on ram freezes the image -> monocular SLAM dies).
+    # General stand-off margin (like goal_reach_dist / map.drone_clearance_m), NOT a room answer: the wall
+    # position is mapped LIVE; we only hold a fixed clearance. Distances in SLAM units (scale not recovered).
+    stop_on_clearance: true      # enable the raycast stand-off stop (flow contact stays as the glass/unmapped fallback)
+    clearance_fan_deg: 15.0      # cast rays across +/- this half-angle around forward (off-center walls / sparse voxels)
+    clearance_fan_n: 3           # rays in the fan (odd -> includes the center ray)
+    clearance_skip: 0.25         # ignore mapped points within this of the camera (matches the target-lift skip)
+    clearance_min_count: 2       # a voxel needs >= this many observations to count as a wall (ignore single-hit noise)
+    clearance_max_range: 10.0    # cap the ray length (SLAM units); beyond this is treated as "open"
+    stop_clearance_dist: 0.6     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
+    # NOTE: the settle pause between maneuvers/legs is rules.rest_between_s in flight_playbook.json (tune it there).
+    # --- prelude (autopilot: arm -> takeoff -> [ascend to ceiling -> descend a bit] -> explore) ---
+    ascend_to_ceiling: true      # after takeoff, climb until the flow CEILING fires, then drop a bit, so mapping runs at a consistent height near the ceiling
+    ascend_max_s: 15.0           # SAFETY: stop ascending after this even if no ceiling is detected, then proceed (general, not a room answer)
+    # NOTE: the post-ceiling descent is the "descend" recipe in flight_playbook.json — tune its key-press duration there.
+    # --- executor (autopilot run_explore) ---
+    # The engine is a "fly toward your aim" scheme: yaw moves an aim crosshair, forward thrust flies
+    # toward it, and a sustained yaw HOLD (then 'c' reset) rotates the body. A turn's ANGLE = how long
+    # yaw is held -> we turn OPEN-LOOP in quantized steps using the user-calibrated playbook turn recipe
+    # (its yaw-hold = turn_recipe_deg), scaling the hold per step. The per-leg re-plan after each ADVANCE
+    # is the outer correction loop. NO pulsing, NO closed-loop on SLAM heading. See FOLLOW-UP FIX #2.
+    # EXPERIMENT (reverse-probe): a big open-loop turn breaks MASt3R-SLAM (RELOC freezes the pose); straight
+    # translation should keep it TRACKING. When ON: cap each leg's turn to ONE turn_step_deg (<=45 -> SLAM
+    # still alive at the wall) and, on WALL, fly straight BACKWARD (camera still facing the wall, sees
+    # familiar features) instead of the tiny back-off, to test whether reverse keeps SLAM alive. General
+    # platform behavior, NOT a room answer (the reverse DURATION lives in flight_playbook.json reverse_probe).
+    reverse_probe_on_wall: true  # FALLBACK action on a flow WALL hit (glass/unmapped): SETTLE -> REVERSE_PROBE -> SETTLE -> REPLAN
+    clamp_leg_turn: true         # cap each leg's turn to ONE turn_step (<=45 deg) -> SLAM survives the turn (proven live); per-leg replan corrects
+    forward_throttle: 0.2        # forward trigger (0-1) for ADVANCE + forward parallax pushes; lower = slower
+                                 # approach so SLAM maps the wall before impact and the clearance stop can fire.
+                                 # Platform control magnitude (like the playbook's 0.55 cruise), NOT a room answer.
+                                 # 0.1 is a deliberately extreme first value to confirm the knob bites (may barely move).
+    reverse_throttle: 0.2        # reverse (0-1) for ALL backward maneuvers (back_off, reverse_probe, recovery
+                                 # back-off, backward parallax push); overrides the playbook's 0.7. Lower = gentler
+                                 # retreat so a fast backward ram can't throw the drone to SLAM-killing angles.
+                                 # Continuous throttle like forward (manual 's' ramps it the same way); general magnitude.
+    turn_step_deg: 45.0          # quantize each aim change to this (45 -> 8 headings; 90 -> exact recipe only)
+    turn_recipe_deg: 90.0        # the angle the playbook turn_left/right recipe produces (platform constant the user calibrated)
+    leg_max_s: 20.0              # SAFETY: cap a single ADVANCE leg (then back off + replan)
+    plan_timeout_s: 3.0          # NO SILENT FALLBACK: if no TOPIC_PLAN arrives within this window (perception dead) while airborne, HOLD
+    # --- SLAM-loss recovery (CONTROL-SPACE; pose is invalid during a tracking loss, so recovery replays
+    #     inverse COMMANDS, not a fly-to-pose). PLAN-LOST (perception silent) = hard hover-hold indefinitely
+    #     (no time-based escalation). PLAN-STALE = RECOVERY_REWIND: replay the inverse of the last
+    #     command_history_s of maneuvers to re-expose keyframes, watching for OK; empty/exhausted history ->
+    #     parallax + <=45deg fallback. General platform params; nothing here is this room's geometry. ---
+    command_history_s: 12.0      # rewind horizon: retrace ~this many seconds of recent maneuvers (inverse replay)
+    fallback_retreat_s: 0.5      # translate this long toward the roomier axis per fallback attempt (parallax + <=45 turn)
+    fallback_max_attempts: 16    # unidirectional +45deg sweep attempts (16 = >360deg full re-expose) before STUCK (HOLD until perception recovers)
+    # --- altitude lock (hold the LIVE-cached mapping height; counters the forward-push sink that drifts the
+    #     drone into inner walls). target altitude is cached LIVE from this flight's pose (self-calibrating,
+    #     NOT a baked room value); the floor/threshold are general margins. World frame is +Y DOWN. ---
+    altitude_lock: true          # actively hold altitude during ADVANCE using the live SLAM Y (TOPIC_PLAN pos_y)
+    alt_drift_floor: 0.3         # only correct once sunk MORE than this below the cached target (SLAM units; deadband, anti-chatter)
+    # --- parallax scouting (a goal needing MORE than one turn_step is reached as turn -> short translate
+    #     (forward/back, whichever the rays say is roomier) -> settle -> turn again -> ... -> aim -> advance.
+    #     The translation between rotations gives SLAM the parallax it needs to survive a multi-step turn,
+    #     and keeps the drone roughly in place instead of advancing off-goal into inner walls. All decisions
+    #     from LIVE raycast clearance / SLAM pose; general margins only — no room answer. ---
+    parallax_scout: true         # enable turn<->push<->turn for goals more than one turn_step away
+    parallax_push_dist: 0.5      # push until the SLAM pose has translated this far (SLAM units) -> "a few units" of parallax
+    parallax_pad: 0.4            # only push into a body axis whose clearance > stop_clearance_dist + this (else skip; just turn)
+    parallax_push_s: 1.2         # SAFETY time cap on a push (ends it if the distance target isn't reached, e.g. slow / SLAM stale)
+    parallax_max_pushes: 8       # cap consecutive pushes per leg (anti-deadlock; a 180-deg goal needs ~4 at 45-deg steps)
 
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.

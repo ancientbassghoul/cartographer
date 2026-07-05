@@ -30,6 +30,7 @@ no-depth mode. The active path is published as a visible `depth_mode` flag in ev
 """
 
 import argparse
+import math
 import os
 import time
 
@@ -41,6 +42,8 @@ import yaml
 import frame_bus
 import slam_engine
 from map_store import MapStore
+from ground_grid import GroundGrid, explore_cfg
+from frontier_planner import FrontierPlanner
 from target_estimator import TargetEstimator
 from diag_log import DiagLog, NullLog
 
@@ -63,6 +66,25 @@ def load_config(path=None):
     path = path or os.path.join(REPO, "config.yaml")
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _wrap180(a):
+    """Wrap an angle (deg) to (-180, 180]."""
+    return (a + 180.0) % 360.0 - 180.0
+
+
+def heading_from_pose(pose):
+    """World heading (deg) of the camera's forward axis projected onto the X-Z ground plane.
+
+    The camera looks along +Z in its own frame (the lift confirms the center ray ~[0,0,1]), so the
+    world forward vector is `R @ [0,0,1]` = the 3rd column of the rotation. Sim3 scale cancels in
+    atan2. Returns None if pose is missing / degenerate. heading 0 = +Z, +90 = +X (right)."""
+    if pose is None:
+        return None
+    fwd = np.asarray(pose, dtype=np.float64)[:3, 2]   # R @ [0,0,1]
+    if abs(fwd[0]) < 1e-9 and abs(fwd[2]) < 1e-9:
+        return None
+    return math.degrees(math.atan2(fwd[0], fwd[2]))
 
 
 # ==============================================================================
@@ -246,6 +268,35 @@ class Pipeline:
         self.n_det_seen = 0
         self.last_target_pub = 0.0
 
+        # --- Map mode (Phase 2): 2D ground occupancy + frontier planner ---
+        # GroundGrid is the free/unknown/occupied layer MapStore lacks; the planner picks the next
+        # frontier and publishes it on TOPIC_PLAN for the autopilot to execute. Pure numpy → no GPU.
+        self.ground = GroundGrid(cfg)
+        # Goal selection + done verification (utility + strong commitment + farthest-corner verify) lives
+        # in the pure-numpy FrontierPlanner; perception just feeds it the live frontiers + pose.
+        self.planner = FrontierPlanner(cfg)
+        e = explore_cfg(cfg)
+        self.goal_reach_dist = float(e.get("goal_reach_dist", 0.4))
+        self.PLAN_PUB_INTERVAL = float(e.get("replan_period_s", 0.5))
+        self.GROUND_RASTER = 160
+        self.last_plan_pub = 0.0
+        # Forward clearance: cast a ground-plane ray fan into the voxel map we built and report the
+        # nearest hit distance on TOPIC_PLAN, so the autopilot stops BEFORE ramming a wall (a head-on
+        # ram freezes the image and kills monocular SLAM). General stand-off, NOT a room answer (the wall
+        # is mapped LIVE). Knobs in config.yaml autonomy.explore; reuses MapStore.clearance().
+        self.clearance_fan_deg = float(e.get("clearance_fan_deg", 15.0))
+        self.clearance_fan_n = int(e.get("clearance_fan_n", 3))
+        self.clearance_skip = float(e.get("clearance_skip", 0.25))
+        self.clearance_min_count = int(e.get("clearance_min_count", 2))
+        self.clearance_max_range = float(e.get("clearance_max_range", 10.0))
+        # Clearance RING: clearance at headings around the drone (for the autopilot's parallax scouting).
+        # Sampled at multiples of turn_step_deg so it lines up with the autopilot's turn quantization.
+        self.clearance_ring_step = float(e.get("turn_step_deg", 45.0))
+        self._last_clearance = None       # last published forward_clearance_dist (for the report line)
+        self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
+        self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
+        self._verify_logged = False      # one-shot log when the planner enters done-verification
+
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
         self.diag_perf = NullLog()    # per-frame SLAM/loop timing
         self.diag_lift = NullLog()    # per-detection lift geometry + estimate evolution
@@ -304,7 +355,12 @@ class Pipeline:
             self.mapstore.add_pose(res.camera_center)
         if res.new_keyframe and res.kf_points is not None and len(res.kf_points):
             self.mapstore.integrate(res.kf_points, res.kf_colors)
+            if res.camera_center is not None:
+                # Same per-keyframe data feeds the 2D free/unknown/occupied ground layer.
+                self.ground.integrate(res.camera_center, res.kf_points)
             map_updated = True
+
+        heading_deg = heading_from_pose(res.pose)
 
         if state_pub is not None:
             cc = res.camera_center
@@ -313,6 +369,7 @@ class Pipeline:
                 "n_keyframes": res.n_keyframes, "n_voxels": len(self.mapstore),
                 "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
                 "camera_center": [round(float(x), 4) for x in cc] if cc is not None else None,
+                "heading_deg": (round(heading_deg, 2) if heading_deg is not None else None),
                 "new_keyframe": res.new_keyframe, "reloc_event": res.reloc_event,
                 "slam_ms": round(slam_ms, 1),
                 # Forwarded from io_bridge meta so the autopilot can (a) gate the ceiling-stall on
@@ -328,6 +385,10 @@ class Pipeline:
             if map_updated or (now_mono - self.last_map_pub) >= self.MAP_PUB_INTERVAL:
                 state_pub.publish(frame_bus.TOPIC_MAP, self._map_payload(res, meta))
                 self.last_map_pub = now_mono
+            # Map mode: republish the explore plan (goal/bearing/done + ground layer) on a timer.
+            if (now_mono - self.last_plan_pub) >= self.PLAN_PUB_INTERVAL:
+                state_pub.publish(frame_bus.TOPIC_PLAN, self._plan_payload(res, meta, heading_deg))
+                self.last_plan_pub = now_mono
 
         # --- DA-V2 depth, throttled to the slower cadence ---
         now = time.monotonic()
@@ -347,9 +408,13 @@ class Pipeline:
             c = meta.get("controls", {}) or {}
             depth_hz = self.n_depth / (now - self.last_report)
             fc = f"{payload['forward_clearance']:.2f}" if payload else " -- "
+            rc = f"{self._last_clearance:.2f}u" if self._last_clearance is not None else " -- "
+            py = f"{self._last_pos_y:+.2f}" if self._last_pos_y is not None else " -- "
+            rf, rb = self._last_ring_fb
+            rfb = (f"{rf:.2f}" if rf is not None else "--") + "/" + (f"{rb:.2f}" if rb is not None else "--")
             print(f"[perception] SLAM {res.mode:<8} kf {res.n_keyframes:3d} | "
                   f"vox {len(self.mapstore):6d} | slam {slam_ms:5.1f} ms | "
-                  f"depth {depth_hz:3.1f} Hz | fwd_clear {fc} | "
+                  f"depth {depth_hz:3.1f} Hz | fwd_clear {fc} | ray_clear {rc} | y {py} | ring f/b {rfb} | "
                   f"trigger {c.get('trigger')} yaw {c.get('yaw')}")
             self.n_depth = 0
             self.last_report = now
@@ -384,6 +449,83 @@ class Pipeline:
             "traj_u": s["traj_u"].tolist(), "traj_v": s["traj_v"].tolist(),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
         }
+
+    # ------------------------------------------------------------- map mode planner
+    def _plan_payload(self, res, meta, heading_deg):
+        """TOPIC_PLAN payload: drone pose (X-Z + heading), the chosen frontier goal + bearing, the
+        done flag, and a compact ground-grid raster for the visualizer. NO SILENT FALLBACK: if SLAM
+        is not TRACKING (or pose/heading missing) the plan is published with plan_valid=false and NO
+        goal, so the autopilot holds instead of chasing a stale target."""
+        cc = res.camera_center
+        pos = [float(cc[0]), float(cc[2])] if cc is not None else None
+        valid = (res.mode == "TRACKING") and pos is not None and heading_deg is not None
+        payload = {
+            "plan_valid": bool(valid), "mode": res.mode, "tracking_mode": res.tracking_mode,
+            "pos": ([round(pos[0], 4), round(pos[1], 4)] if pos else None),
+            "heading_deg": (round(heading_deg, 2) if heading_deg is not None else None),
+            "goal": None, "bearing_deg": None, "bearing_err": None,
+            "n_frontiers": 0, "done": False, "forward_clearance_dist": None,
+            "pos_y": None, "clearance_ring": None,
+            "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
+            "ground": self.ground.summary(raster=self.GROUND_RASTER),
+        }
+        if not valid:
+            return payload
+        # Distance to the nearest mapped wall straight ahead (a fan of ground-plane rays into the voxel
+        # map). Only needs pose+heading (independent of whether a goal exists). None = nothing mapped
+        # within range ahead -> the autopilot leans on the flow contact detector instead.
+        clr = self.mapstore.clearance(cc, heading_deg, fan_deg=self.clearance_fan_deg,
+                                      fan_n=self.clearance_fan_n, skip=self.clearance_skip,
+                                      min_count=self.clearance_min_count, max_range=self.clearance_max_range)
+        payload["forward_clearance_dist"] = (round(float(clr), 4) if clr is not None else None)
+        self._last_clearance = payload["forward_clearance_dist"]
+        # Camera altitude for the autopilot's altitude lock. World frame is camera-convention +Y DOWN
+        # (map_store.py), so a SINKING drone has an INCREASING pos_y — the autopilot corrects on that sign.
+        payload["pos_y"] = round(float(cc[1]), 4)
+        self._last_pos_y = payload["pos_y"]
+        # Clearance ring: nearest mapped obstacle at headings around the drone (multiples of the turn step),
+        # so the autopilot can check the intended turn heading + pick a roomier axis for a parallax push.
+        step = self.clearance_ring_step
+        n = max(1, int(round(360.0 / step)))
+        ring = []
+        for i in range(n):
+            relw = ((i * step + 180.0) % 360.0) - 180.0     # wrap each offset to (-180, 180]
+            d = self.mapstore.clearance(cc, heading_deg + i * step, fan_deg=self.clearance_fan_deg,
+                                        fan_n=self.clearance_fan_n, skip=self.clearance_skip,
+                                        min_count=self.clearance_min_count, max_range=self.clearance_max_range)
+            ring.append([round(relw, 1), (round(float(d), 4) if d is not None else None)])
+        payload["clearance_ring"] = ring
+
+        def _ring_fb(target):                                # nearest-offset lookup (forward=0, backward=180)
+            best, bd = None, 1e9
+            for r, dd in ring:
+                diff = abs(((target - r + 180.0) % 360.0) - 180.0)
+                if diff < bd:
+                    bd, best = diff, dd
+            return best
+        self._last_ring_fb = (_ring_fb(0.0), _ring_fb(180.0))
+        # Goal selection + done verification. `farthest_free` is computed ONLY on the transition into
+        # verification (no frontiers AND not already verifying) so it is evaluated exactly once per
+        # done-attempt and stays a STATIC target (no oscillating between equidistant corners).
+        fr = self.ground.frontiers()
+        farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64))
+                    if (not fr and not self.planner.verifying) else None)
+        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, farthest)
+        if self.planner.verifying and not self._verify_logged:
+            print(f"[perception] planner: no frontiers -> VERIFYING via far corner {self.planner.verify_target}",
+                  flush=True)
+            self._verify_logged = True
+        elif not self.planner.verifying and self._verify_logged:
+            print(f"[perception] planner: verification {'COMPLETE -> done' if done else 'cleared -> frontiers found'}",
+                  flush=True)
+            self._verify_logged = False
+        payload["n_frontiers"], payload["done"] = n_frontiers, done
+        if goal is not None:
+            payload["goal"] = [round(float(goal[0]), 4), round(float(goal[1]), 4)]
+            bearing = math.degrees(math.atan2(goal[0] - pos[0], goal[1] - pos[1]))
+            payload["bearing_deg"] = round(bearing, 2)
+            payload["bearing_err"] = round(_wrap180(bearing - heading_deg), 2)
+        return payload
 
     # ------------------------------------------------------------- target lift
     def _remember_pose(self, fid: int, pose: np.ndarray):
@@ -699,6 +841,12 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     print(f"[perception] top-down (flight path + target marks) -> {png}")
     print(f"[perception] voxel map -> {out_dir / f'{stem}_livemap.npz'}")
     print(f"[perception] point cloud + flight path + targets (.ply) -> {ply}")
+    # Map-mode ground layer: free/unknown/occupied + frontier centroids + last committed goal.
+    gpng = out_dir / f"{stem}_groundgrid.png"
+    pipe.ground.render_overlay(gpng, goal=pipe.planner.committed_goal)
+    fr = pipe.ground.frontiers()
+    print(f"[perception] ground grid (free/unknown/occ/frontier) -> {gpng} "
+          f"| {len(fr)} frontier cluster(s), {len(pipe.ground)} cells")
     pipe.close_diag()
     if state_pub is not None:
         state_pub.close()

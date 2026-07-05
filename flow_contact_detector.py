@@ -148,6 +148,15 @@ class FlowContactDetector:
         self._ref_up = 0.0
         self._ref_fwd = 0.0
 
+    def reset_forward_ref(self):
+        """Recalibrate the WALL (forward-looming) reference for a NEW forward leg, so each exploration
+        leg measures its OWN free-forward looming instead of inheriting a prior leg's near-wall maximum
+        (which makes a fresh open-space push read as 'collapsed'). Keeps the airborne latch + ceiling
+        ref. Call on each ADVANCE entry."""
+        self._ref_fwd = 0.0
+        self._contact = False
+        self._contact_since = None
+
     def _prep_gray(self, frame):
         """BGR/gray frame -> grayscale, downscaled so the long side == flow_long_side (resolution
         normalization: identical behavior whether fed the 512x288 live transport or a 1280x720
@@ -434,6 +443,15 @@ def run_self_test():
     ok = ok and good
     print(f"[self-test] {'PASS' if good else 'FAIL'}  contact resets on command change: "
           f"{'no carry-over' if good else 'FALSE carry-over @f'+str(fired2)}")
+
+    # 13. reset_forward_ref clears the WALL reference for a new leg but keeps the airborne latch.
+    det = _mk()
+    _feed_signal(det, rise_then_plateau(3.0, 15, 40), CMD_FWD)   # build ref_fwd + airborne
+    had_ref = det._ref_fwd > 0
+    det.reset_forward_ref()
+    good = had_ref and det._ref_fwd == 0.0 and det._airborne
+    ok = ok and good
+    print(f"[self-test] {'PASS' if good else 'FAIL'}  reset_forward_ref clears WALL ref, keeps airborne latch")
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

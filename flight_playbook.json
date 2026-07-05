@@ -9,7 +9,8 @@
     "  presets = a continuous drive vector held for a whole state-machine state.",
     "  recipes = an ORDERED list of steps; each step = control fields to hold + 'duration_s' (SECONDS).",
     "            A step with ONLY 'duration_s' (no fields) releases everything (neutral) for that long.",
-    "  rules   = operating flags.",
+    "  rules   = operating flags + rest_between_s: the neutral SETTLE (seconds) inserted BETWEEN composed",
+    "            maneuvers (recovery = back off -> SETTLE -> rotate -> SETTLE -> decide) and explore legs.",
     "The autopilot lays each active step's fields over the neutral 20 Hz control vector (the fields it is",
     "allowed to drive = DroneControl.AUTONOMY_FIELDS). NOTE: io_bridge applies the autopilot's value",
     "DIRECTLY (no manual ramp), and it does NOT decay yaw on release (yaw latches until btnCdown zeroes",
@@ -36,7 +37,10 @@
     "  back_off<- 20260628_092608: 5 deliberate continuous back-off presses, median ~0.30s of 's'. Manual",
     "             's' ramps reverse toward ~0.9 peak; constant reverse 0.7 for ~0.3s impulse-matches one",
     "             nudge. (Multi-tap back-offs reached ~0.6s of 's' / ~2x retreat; the single nudge was chosen.)",
-    "All durations are platform-dynamics medians and are TUNABLE live."
+    "All durations are platform-dynamics medians and are TUNABLE live.",
+    "  reverse_probe = a SUSTAINED reverse (experiment: does straight-back translation keep MASt3R-SLAM",
+    "             TRACKING while a big turn breaks it?). reverse 0.7 like back_off; the 4.0s duration is a",
+    "             deliberate tunable KNOB (NOT measured, NOT a room distance) — trim it live in the experiment."
   ],
 
   "presets": {
@@ -57,6 +61,7 @@
       {"joy_vertical": 1, "duration_s": 0.17}
     ],
     "reset_attitude": [{"btnCdown": true, "duration_s": 0.16}],
+    "descend": [{"joy_vertical": 1, "duration_s": 0.1}],
     "turn_right": [
       {"yaw": 1.0, "duration_s": 1.625},
       {"btnCdown": true, "duration_s": 0.16}
@@ -65,10 +70,12 @@
       {"yaw": -1.0, "duration_s": 1.625},
       {"btnCdown": true, "duration_s": 0.16}
     ],
-    "back_off": [{"reverse": 0.7, "duration_s": 0.3}]
+    "back_off": [{"reverse": 0.7, "duration_s": 0.3}],
+    "reverse_probe": [{"reverse": 0.7, "duration_s": 4.0}]
   },
 
   "rules": {
-    "reset_attitude_before_forward": true
+    "reset_attitude_before_forward": true,
+    "rest_between_s": 1.0
   }
 }

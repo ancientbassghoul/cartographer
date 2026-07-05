@@ -174,6 +174,30 @@ class MapStore:
             t += step
         return None
 
+    def clearance(self, origin, heading_deg, fan_deg: float = 15.0, fan_n: int = 3,
+                  skip: float = 0.25, min_count: int = 2, max_range: float = 10.0):
+        """Forward stand-off distance to the nearest mapped obstacle ahead, for "stop before you ram a
+        wall" navigation. Casts a small FAN of GROUND-PLANE rays (Y component zeroed, so they stay at the
+        camera's height and read vertical walls, not the floor/ceiling) spread over +/- `fan_deg` around
+        `heading_deg`, and returns the NEAREST hit distance (SLAM units), or None if nothing is hit within
+        `max_range` (or the map is empty). Heading convention matches `heading_from_pose`: 0 = +Z,
+        +90 = +X. Taking the MIN over the fan is robust to a sparse reconstruction / off-center walls
+        (a single ray can thread between voxels). Reuses `raycast` (a non-normalized direction is fine)."""
+        if origin is None or heading_deg is None or not self._row_of:
+            return None
+        h0 = np.radians(float(heading_deg))
+        n = max(int(fan_n), 1)
+        offs = np.zeros(1) if n == 1 else np.linspace(-np.radians(float(fan_deg)),
+                                                       np.radians(float(fan_deg)), n)
+        best = None
+        for a in offs:
+            h = h0 + a
+            hit = self.raycast(origin, (float(np.sin(h)), 0.0, float(np.cos(h))),
+                               max_range=max_range, min_count=min_count, skip=skip)
+            if hit is not None and (best is None or hit[1] < best):
+                best = hit[1]
+        return best
+
     def trajectory_array(self):
         return (np.asarray(self.trajectory, dtype=np.float32)
                 if self.trajectory else np.zeros((0, 3), np.float32))

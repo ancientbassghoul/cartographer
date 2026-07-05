@@ -137,6 +137,81 @@ def overlay_live_camera(img, m, cam_track, size):
         cv2.circle(img, pts[-1], 7, (0, 0, 0), 1)
 
 
+# Class ids in the plan's ground raster (must match ground_grid.CLS_*).
+_CLS_FREE, _CLS_FRONTIER = 1, 3
+
+
+def overlay_plan(img, plan, m, size):
+    """Overlay the Map-mode plan on the (world-aligned) map panel: explored-FREE cells (dim),
+    FRONTIER cells (cyan), the current goal (yellow star), and a heading arrow at the drone — all
+    projected through the SAME TOPIC_MAP bounds as the occupancy map so they line up. Also surfaces a
+    degraded plan (PLAN-STALE) rather than hiding it (NO SILENT FALLBACKS)."""
+    if not plan or not m or not m.get("bounds"):
+        return
+    x0, x1, z0, _z1 = m["bounds"]
+    grid = int(m["grid"])
+    span = max(x1 - x0, 1e-6)
+    sc = (grid - 1) / span
+
+    def to_px_vec(X, Z):
+        u = (X - x0) * sc
+        v = (grid - 1) - (Z - z0) * sc
+        return (np.clip(u * size / grid, 0, size - 1).astype(int),
+                np.clip(v * size / grid, 0, size - 1).astype(int))
+
+    g = plan.get("ground")
+    if g and g.get("bounds") and g.get("cls"):
+        gx0, gx1, gz0, gz1 = g["bounds"]
+        rows, cols = int(g["rows"]), int(g["cols"])
+        cls = np.asarray(g["cls"], np.int16)
+        if rows > 0 and cols > 0 and cls.size == rows * cols:
+            idx = np.arange(cls.size)
+            r, c = idx // cols, idx % cols
+            # Cell centers -> world (row 0 is +Z up, matching ground_grid.summary's flip).
+            X = gx0 + (c + 0.5) / cols * (gx1 - gx0)
+            Z = gz1 - (r + 0.5) / rows * (gz1 - gz0)
+            px, py = to_px_vec(X, Z)
+            free = cls == _CLS_FREE
+            front = cls == _CLS_FRONTIER
+            img[py[free], px[free]] = (70, 70, 70)            # explored free = dim gray
+            for dv in (-1, 0, 1):                              # thicken frontiers so they read
+                for du in (-1, 0, 1):
+                    img[np.clip(py[front] + dv, 0, size - 1),
+                        np.clip(px[front] + du, 0, size - 1)] = (255, 255, 0)  # frontier = cyan
+
+    pos = plan.get("pos")
+    goal = plan.get("goal")
+    if goal is not None:
+        gu, gv = to_px_vec(np.array([goal[0]]), np.array([goal[1]]))
+        cv2.drawMarker(img, (int(gu[0]), int(gv[0])), (0, 255, 255), cv2.MARKER_STAR, 18, 2)
+    clr = plan.get("forward_clearance_dist")
+    if pos is not None and plan.get("heading_deg") is not None:
+        h = np.radians(plan["heading_deg"])     # 0 = +Z, +90 = +X
+        L = 0.08 * span
+        pu, pv = to_px_vec(np.array([pos[0]]), np.array([pos[1]]))
+        hu, hv = to_px_vec(np.array([pos[0] + L * np.sin(h)]), np.array([pos[1] + L * np.cos(h)]))
+        cv2.arrowedLine(img, (int(pu[0]), int(pv[0])), (int(hu[0]), int(hv[0])),
+                        (0, 255, 0), 2, tipLength=0.3)
+        # Forward-clearance ray (red): drone -> nearest mapped wall ahead, in WORLD units, so the
+        # operator sees the geometric stand-off the autopilot stops on (NO SILENT FALLBACK = visible).
+        if clr is not None:
+            cu, cv = to_px_vec(np.array([pos[0] + clr * np.sin(h)]),
+                               np.array([pos[1] + clr * np.cos(h)]))
+            cv2.line(img, (int(pu[0]), int(pv[0])), (int(cu[0]), int(cv[0])), (0, 0, 255), 1)
+            cv2.circle(img, (int(cu[0]), int(cv[0])), 3, (0, 0, 255), -1)
+
+    if not plan.get("plan_valid"):
+        cv2.putText(img, f"PLAN-STALE (SLAM {plan.get('mode')})", (8, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+    else:
+        be = plan.get("bearing_err")
+        cv2.putText(img, f"explore: frontiers={plan.get('n_frontiers')} "
+                    f"bearing_err={be if be is not None else '--'} "
+                    f"clear={f'{clr:.2f}u' if clr is not None else '--'}  "
+                    f"{'DONE' if plan.get('done') else ''}", (8, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+
 def render_map_panel(m, size=MAP_SIZE, target=None):
     img = np.full((size, size, 3), 18, np.uint8)
     if not m or not m.get("cells_u"):
@@ -244,6 +319,7 @@ class Dashboard:
         self.depth = None
         self.map = None
         self.target = None
+        self.plan = None
         self.cam_track = deque(maxlen=600)   # recent world camera centers (live, per-frame)
         self._map_img = None
         self._map_sig = None
@@ -265,6 +341,8 @@ class Dashboard:
         elif topic == "target":
             self.target = payload
             self._map_img = None  # redraw map with the updated target marker
+        elif topic == "plan":
+            self.plan = payload   # drawn live on the map copy each tick (no cache invalidation)
 
     def _map_image(self):
         tpos = tuple(tuple(t.get("position") or ()) for t in _target_list(self.target))
@@ -280,6 +358,7 @@ class Dashboard:
         # Cached voxel/keyframe base + live camera overlay (per-frame, so position feels live).
         map_p = self._map_image().copy()
         overlay_live_camera(map_p, self.map, self.cam_track, map_p.shape[0])
+        overlay_plan(map_p, self.plan, self.map, map_p.shape[0])
 
         col_gap = np.zeros((GAP, PANEL_W, 3), np.uint8)
         left = np.vstack([frame_p, col_gap, depth_p])          # (MAP_SIZE, PANEL_W)
@@ -300,7 +379,7 @@ def run(cfg, show_frame=True):
     state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/depth/map)
     frame_sub = frame_bus.FrameSubscriber(frame_port) if show_frame else None
 
-    print(f"[visualizer] state bus SUB :{pstate_port} (pose+depth+map)"
+    print(f"[visualizer] state bus SUB :{pstate_port} (pose+depth+map+target+plan)"
           + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF"))
     print("[visualizer] === READY === waiting for perception_worker ('q' to quit).\n")
 

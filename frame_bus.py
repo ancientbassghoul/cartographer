@@ -32,6 +32,7 @@ import zmq
 TOPIC_POSE = b"pose"
 TOPIC_DEPTH = b"depth"
 TOPIC_MAP = b"map"          # perception_worker -> visualizer: compact top-down occupancy summary
+TOPIC_PLAN = b"plan"        # perception_worker -> autopilot/visualizer: explore plan (goal bearing, heading, frontiers, done)
 TOPIC_DETECTION = b"detection"   # object_worker -> perception/UI: target bbox/center in a frame
 TOPIC_TARGET = b"target"    # perception_worker -> UI/report: {"targets":[{position,uncertainty,..}],"n_targets":N} (object may appear >1x)
 TOPIC_STATUS = b"status"
