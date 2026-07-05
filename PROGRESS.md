@@ -1,7 +1,32 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated 2026-07-05. Resume from THIS file. (The fallback-sweep plan
-`C:\Users\owner\.claude\plans\enchanted-inventing-wilkes.md` is now DONE — see below.)_
+_Last updated 2026-07-05 (post test-flight fixes, then re-flown). Resume from THIS file._
+
+**⚠️ A NEW ISSUE was observed on the latest flight ("good progress" — the fixes below worked — but a new
+problem appeared). It has NOT been described/recorded yet: get the details before acting.**
+
+**Test flight 2026-07-05 (`OUTPUT/diag/20260705_094830_autopilot.log`) — much better; two critical bugs +
+one minor, addressed below and then re-flown 07-05 with GOOD PROGRESS (the rewind fix + SLAM settle gate
+behaved as intended):**
+- **Rewind spun in place (bug 1, FIXED).** Every `REWIND` command was a turn — translations were missing
+  from `command_history`. Root cause was the `duration > 0.1` drop in `_log_move` (micro-short ADVANCE legs
+  of a loss-spiral never logged). **Dropped the guard** (translations always log now); kept the wall-contact
+  history-wipe. Added a rewind-composition diagnostic (`[history: N turns, M translations / S s]`).
+- **Heading drift + constant PLAN-LOST after turns (bug 2, MITIGATED via a SLAM frame-timing settle gate).**
+  The drone flew on shaky poses computed while SLAM was choking right after a turn (the ~45° Visualizer gap).
+  New rule: SLAM is "stable" only after **>2 consecutive FRESH frames each built <1000 ms**; while
+  translating / just after a turn / on recovering, **HOLD (`SLAM_HOLD`) until settled, then fly**. `slam_ms`
+  now rides on TOPIC_PLAN. Did NOT chase the indexing/order bug yet (deferred, per the user). Knobs:
+  `slam_slow_ms` (1000, a COMPUTE characteristic — not room geometry), `slam_settle_frames` (3).
+- **Minor depth "too-low" cue — PARKED** (see "## Second-priority / future fixes").
+
+**Earlier this session (07-04/05, self-test-verified, NOT yet all flown together):** forward & reverse
+throttle knobs, SLAM altitude lock, ray-guided parallax scouting, a new frontier goal planner +
+done-verification (`frontier_planner.py`), a **control-space SLAM-loss recovery** (hold-on-LOST →
+command-rewind on STALE → parallax+≤45 fallback), and the **fallback-sweep tweak** (unidirectional +45°
+sweep, fwd/back-alternating retreat, `fallback_max_attempts` 16). See "## BUILT THIS SESSION".
+**NEXT = triage the NEW ISSUE from the latest flight** (details pending from the user — see the ⚠️ note at
+the top). The rewind fix + SLAM settle gate flew with good progress.
 
 **Where we are:** Phase-1 (manual map + target localize) built & verified. Phase-2 autonomous
 **Map-mode explorer** (`autopilot.py --explore`) flies live and **stops before ramming walls** via the
@@ -148,17 +173,27 @@ inner walls; 45° batch turns head-butting partitions). Implemented + self-test-
   "done" log `planner: … VERIFYING via far corner` + fly there before truly stopping. Tune `goal_dist_weight`
   / `goal_switch_factor` / `verify_min_dist` live.
 
-## NEXT — implement the FALLBACK-sweep tweak (active plan)
-Small change in `autopilot.py ExploreController._begin_fallback`, per `enchanted-inventing-wilkes.md`:
-make the SLAM-loss fallback turn **always +45°** (unidirectional sweep, drop the `_fallback_turn_sign`
-alternation) and instead **alternate the RETREAT fwd/back** (new `_fallback_retreat_forward`, seeded on
-attempt 0 by the roomier axis from `_last_ring`); set `fallback_max_attempts` 4 → **16** (config +
-`__init__` default). Update the `RECOVERY` fallback self-test (case d) accordingly; run
-`autopilot.py --self-test` → ALL PASS. Then do the full live flight (checklist above).
+## Second-priority / future fixes
+- **Depth "too-low" bump-up (PARKED — approved design, not yet built).** When a stripe of hard-yellow
+  (very-near) appears in the LOWER part of the depth frame, nudge the drone UP a bit — guards both "too
+  close to the FLOOR" and "about to hit a LOW wall instead of flying over it"
+  (`DEBUG_IMAGES/almost_too_low_02.png`). Note `obstacle_bar` deliberately EXCLUDES the bottom 30%
+  (`BAND_BOTTOM=0.70`, "floor always near"), so this needs its own lower-band read. Design: perception
+  computes a self-calibrating `low_obstacle` from the per-frame **normalized** proximity (lower band,
+  fraction of columns above a "hard-yellow" threshold forming a stripe), publishes it on TOPIC_PLAN;
+  autopilot injects UP (`joy_vertical`) during ADVANCE/PARALLAX_PUSH with a visible `LOW-OBSTACLE -> bump up`
+  event; visualizer flags it on the depth panel. Complements (does NOT replace) the SLAM-`pos_y` altitude
+  lock. No-leakage-safe (relative signal, no baked altitude).
+- **Heading indexing / order-of-operations bug (DEFERRED, per user).** A ~45° gap between the aimed heading
+  and the actual heading was visible in Visualizer during the PLAN-LOST-spiral stretch. The SLAM settle-gate
+  (wait after a turn until the solve settles) is the first-pass mitigation; if the gap persists once SLAM is
+  stable, hunt the actual pose/heading indexing. No automated "angle-vs-Visualizer" verifier exists today.
+
+## Standing rules (every change)
 - **NO SILENT FALLBACKS:** fail-fast OR set a visible/logged/HUD state flag; any fallback approved first.
 - **HARD RULE — no manual-flight data leakage:** every autonomous limit is a LIVE self-calibrating
-  signal; platform/signal characteristics (flow signatures, control magnitudes, turn calibration) are
-  legitimate, this room's geometry is not.
+  signal; platform/signal characteristics (flow signatures, control magnitudes, turn calibration, the
+  ~1 s healthy-SLAM compute time) are legitimate, this room's geometry is not.
 - Image integrity (no undisclosed downscaling); start multi-step work with a TaskCreate list; **never
   commit unless asked**; self-test offline before live.
 

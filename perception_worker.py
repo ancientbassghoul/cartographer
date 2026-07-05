@@ -387,7 +387,7 @@ class Pipeline:
                 self.last_map_pub = now_mono
             # Map mode: republish the explore plan (goal/bearing/done + ground layer) on a timer.
             if (now_mono - self.last_plan_pub) >= self.PLAN_PUB_INTERVAL:
-                state_pub.publish(frame_bus.TOPIC_PLAN, self._plan_payload(res, meta, heading_deg))
+                state_pub.publish(frame_bus.TOPIC_PLAN, self._plan_payload(res, meta, heading_deg, slam_ms))
                 self.last_plan_pub = now_mono
 
         # --- DA-V2 depth, throttled to the slower cadence ---
@@ -451,11 +451,13 @@ class Pipeline:
         }
 
     # ------------------------------------------------------------- map mode planner
-    def _plan_payload(self, res, meta, heading_deg):
+    def _plan_payload(self, res, meta, heading_deg, slam_ms=None):
         """TOPIC_PLAN payload: drone pose (X-Z + heading), the chosen frontier goal + bearing, the
         done flag, and a compact ground-grid raster for the visualizer. NO SILENT FALLBACK: if SLAM
         is not TRACKING (or pose/heading missing) the plan is published with plan_valid=false and NO
-        goal, so the autopilot holds instead of chasing a stale target."""
+        goal, so the autopilot holds instead of chasing a stale target. `slam_ms` (this frame's SLAM
+        build time) rides on EVERY plan — even when invalid — so the autopilot's SLAM settle gate can
+        watch it (a healthy solve is sub-second; a choke spikes it) independent of tracking state."""
         cc = res.camera_center
         pos = [float(cc[0]), float(cc[2])] if cc is not None else None
         valid = (res.mode == "TRACKING") and pos is not None and heading_deg is not None
@@ -466,6 +468,7 @@ class Pipeline:
             "goal": None, "bearing_deg": None, "bearing_err": None,
             "n_frontiers": 0, "done": False, "forward_clearance_dist": None,
             "pos_y": None, "clearance_ring": None,
+            "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
             "ground": self.ground.summary(raster=self.GROUND_RASTER),
         }

@@ -152,6 +152,12 @@ autonomy:
     command_history_s: 12.0      # rewind horizon: retrace ~this many seconds of recent maneuvers (inverse replay)
     fallback_retreat_s: 0.5      # translate this long toward the roomier axis per fallback attempt (parallax + <=45 turn)
     fallback_max_attempts: 16    # unidirectional +45deg sweep attempts (16 = >360deg full re-expose) before STUCK (HOLD until perception recovers)
+    # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
+    #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
+    #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are
+    #     COMPUTE characteristics (tunable), NOT this room's geometry. ---
+    slam_slow_ms: 1000.0         # a frame build >= this = SLAM choking -> stop moving and hold
+    slam_settle_frames: 3        # "stable" only after >2 consecutive FRESH frames each built under slam_slow_ms
     # --- altitude lock (hold the LIVE-cached mapping height; counters the forward-push sink that drifts the
     #     drone into inner walls). target altitude is cached LIVE from this flight's pose (self-calibrating,
     #     NOT a baked room value); the floor/threshold are general margins. World frame is +Y DOWN. ---

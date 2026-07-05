@@ -562,6 +562,18 @@ class ExploreController:
         self._last_ring = None           # last non-None clearance ring (for fallback direction choice while STALE)
         self._leg_theta = 0.0            # theta of the current ORIENT turn (logged into command_history when flown)
         self._explore_started = bool(no_takeoff)   # recovery only after the prelude (True immediately if no_takeoff)
+        # --- SLAM frame-timing settle gate ---
+        # A healthy MASt3R-SLAM solve on this GPU builds a frame in well under a second; a choke (esp. right
+        # after a turn) spikes it and the pose it emits is unreliable -> the drone flew on a bad heading. So:
+        # while translating (or right after a turn / on recovering) HOLD until SLAM is "stable" = >N consecutive
+        # FRESH frames each built in < slam_slow_ms. The threshold is a COMPUTE characteristic (tunable),
+        # NOT this room's geometry. slam_ms + frame_id ride on TOPIC_PLAN.
+        self.slam_slow_ms = float(e.get("slam_slow_ms", 1000.0))
+        self.slam_settle_frames = int(e.get("slam_settle_frames", 3))   # ">2 consecutive" fresh fast frames
+        self._slam_fast_streak = 0        # consecutive FRESH frames under the slow threshold
+        self._slam_ms_latest = None       # last FRESH frame's build time (ms)
+        self._slam_frame_id = None        # frame_id of that last-counted frame (dedup; plan republishes on a timer)
+        self._slam_resume = None          # state SLAM_HOLD re-enters once SLAM settles
         # Yaw is "fly toward your aim": a SUSTAINED hold (then 'c' reset) rotates the body; the turn ANGLE
         # is set by the hold DURATION, not a steerable rate (pulses do nothing; SLAM under-tracks rotation
         # so no in-turn closed loop). Turn OPEN-LOOP in quantized steps using the user's calibrated turn
@@ -626,6 +638,7 @@ class ExploreController:
         self._after_orient = "ADVANCE"
         self._fallback_attempts = 0
         self._fallback_retreat_forward = None
+        self._slam_resume = None    # SLAM streak/latest persist (health is flight-level); only the pending resume clears
         # An interruption (autonomy off = a manual takeover) invalidates the command history: the drone may
         # have been moved by hand, so the recorded maneuvers no longer map to the trajectory. Drop it.
         self.command_history.clear()
@@ -657,9 +670,10 @@ class ExploreController:
             self.command_history.append({"kind": "turn", "theta": float(theta)})
 
     def _log_move(self, kind, value, duration):
-        """Record a flown translation (kind='forward'|'reverse') for a later inverse replay."""
-        if duration > 0.1:
-            self.command_history.append({"kind": kind, "value": float(value), "duration_s": float(duration)})
+        """Record a flown translation (kind='forward'|'reverse') for a later inverse replay. EVERY flown
+        translation is logged — no minimum-duration guard: the SLAM-loss spiral is made of micro-short
+        ADVANCE legs, and dropping them left the rewind with turns only (it just spun in place)."""
+        self.command_history.append({"kind": kind, "value": float(value), "duration_s": float(max(0.0, duration))})
 
     def _invert_history(self):
         """Flatten the recent command history into inverse recipe steps: reverse chronological order and
@@ -713,8 +727,14 @@ class ExploreController:
         if steps:
             self._player = RecipePlayer(steps, name="rewind")
             self._enter("REWIND", now)
+            # DIAGNOSTIC (bug-1 watch): report what the rewind is actually made of. A turns-only rewind =
+            # translations never reached command_history (the spin-in-place failure we just fixed).
+            n_turn = sum(1 for m in self.command_history if m["kind"] == "turn")
+            n_move = sum(1 for m in self.command_history if m["kind"] in ("forward", "reverse"))
+            move_s = sum(m.get("duration_s", 0.0) for m in self.command_history if m["kind"] != "turn")
             return {}, "REWIND", ("PLAN-STALE -> RECOVERY_REWIND: retracing the last "
-                                  f"{self.command_history_s:g}s of maneuvers to re-expose keyframes")
+                                  f"{self.command_history_s:g}s of maneuvers to re-expose keyframes "
+                                  f"[history: {n_turn} turns, {n_move} translations / {move_s:.1f}s]")
         return self._begin_fallback(now, "PLAN-STALE + EMPTY command history (post-collision?) -> parallax fallback")
 
     def _begin_fallback(self, now, event):
@@ -747,6 +767,36 @@ class ExploreController:
     @staticmethod
     def _fmt(be):
         return f"{be:+.1f}" if be is not None else "n/a"
+
+    # ------------------------------------------------- SLAM frame-timing settle gate
+    def _update_slam(self, plan):
+        """Track SLAM health from the plan's per-frame build time. Count consecutive FRESH frames (dedup on
+        frame_id, since the plan republishes on a timer) that came in under slam_slow_ms; a slow frame resets
+        the streak. 'Stable' = the streak has exceeded the settle count."""
+        ms = plan.get("slam_ms")
+        fid = plan.get("frame_id")
+        if ms is None or fid == self._slam_frame_id:
+            return
+        self._slam_frame_id = fid
+        self._slam_ms_latest = float(ms)
+        self._slam_fast_streak = self._slam_fast_streak + 1 if ms < self.slam_slow_ms else 0
+
+    @property
+    def _slam_slow(self):
+        """The most recent FRESH frame took too long to build (SLAM choking; its pose is untrustworthy)."""
+        return self._slam_ms_latest is not None and self._slam_ms_latest >= self.slam_slow_ms
+
+    @property
+    def _slam_stable(self):
+        """More than the settle count of consecutive fresh frames each built fast -> the solve has settled."""
+        return self._slam_fast_streak >= self.slam_settle_frames
+
+    def _enter_slam_hold(self, resume, now, why):
+        """Hover-hold (zero velocity) until SLAM settles, then re-enter `resume`. Returned by a gate site."""
+        self._slam_resume = resume
+        self._player = None
+        self._enter("SLAM_HOLD", now)
+        return {}, "SLAM_HOLD", why
 
     def _enter(self, state, now):
         self.state = state
@@ -781,6 +831,7 @@ class ExploreController:
         if (self.altitude_lock and self.airborne_done and self.target_altitude_y is None
                 and plan.get("plan_valid") and plan.get("pos_y") is not None):
             self.target_altitude_y = float(plan["pos_y"])
+        self._update_slam(plan)   # track SLAM frame-build time for the settle gate (below + at the gate sites)
 
         # --- status-gated SLAM-loss recovery (CONTROL-SPACE); active only in the explore phase ---
         if self._explore_started:
@@ -796,13 +847,23 @@ class ExploreController:
             if status == "PLAN-STALE":
                 # Perception is publishing but SLAM is not TRACKING -> retrace to re-expose keyframes.
                 return self._step_stale(now, plan, wall_contact)
-            # status OK: if we were recovering, perception is healthy again -> brake, then fresh REPLAN.
+            # status OK: if we were recovering, perception is TRACKING again -> DON'T fly on the first frame
+            # back (a fresh RELOC pose is shaky). Hold until SLAM settles (>N fast frames), THEN brake + REPLAN.
             if st in _RECOVERY_STATES:
-                self._player = None
                 self._fallback_attempts = 0
                 self._settle_to = "REPLAN"
-                self._enter("SETTLE", now)
-                return {}, "SETTLE", "plan OK -> brake -> replan (SLAM recovered)"
+                return self._enter_slam_hold("SETTLE", now,
+                                             "plan OK -> wait for SLAM to settle -> brake -> replan (recovered)")
+
+        # SLAM settle gate: hover until the solve is stable again, then resume the deferred state.
+        if st == "SLAM_HOLD":
+            if self._slam_stable:
+                nxt = self._slam_resume or "REPLAN"
+                self._slam_resume = None
+                self._enter(nxt, now)
+                return {}, nxt, (f"SLAM settled ({self._slam_fast_streak} fast frames, "
+                                 f"last {self._slam_ms_latest:.0f}ms) -> resume {nxt}")
+            return {}, "SLAM_HOLD", None
 
         if st == "ARM":
             if self._player is None:
@@ -901,6 +962,12 @@ class ExploreController:
                     self._push_count = 0      # aimed -> real ADVANCE leg = progress; reset the scout cap
                 else:
                     self._push_dir = None     # choose the push axis fresh from the post-turn ring
+                # Turns are the hardest thing for monocular SLAM; if the solve is still choking, HOLD before
+                # flying on a shaky post-turn pose (the ~45deg heading gap). Settle first, then proceed to nxt.
+                if self._slam_slow:
+                    return self._enter_slam_hold(nxt, now,
+                                                 f"turn complete, SLAM slow ({self._slam_ms_latest:.0f}ms "
+                                                 f">= {self.slam_slow_ms:.0f}) -> hold to settle before {nxt}")
                 self._enter(nxt, now)
                 event = f"turn complete -> {nxt}"
 
@@ -908,6 +975,14 @@ class ExploreController:
             reached = self._dist(plan.get("pos"), self.leg_goal)
             clr = plan.get("forward_clearance_dist")
             fwd_dur, fwd_val = (now - self.t_state), float(self.forward_preset.get("trigger", 0.0))
+            if self._slam_slow:
+                # SLAM started choking mid-leg -> STOP moving and let it settle before it loses the track.
+                # Log the clean sub-leg flown so far (also keeps translations in the rewind history), then hold
+                # and resume ADVANCE (leg_goal persists) once stable.
+                self._log_move("forward", fwd_val, fwd_dur)
+                return self._enter_slam_hold("ADVANCE", now,
+                                             f"ADVANCE: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
+                                             "hold to settle, then resume")
             if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
                 # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
                 # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
@@ -997,6 +1072,16 @@ class ExploreController:
                     active = dict(self.pb.recipe("back_off")[0])   # reverse magnitude, held continuously
                     active.pop("duration_s", None)
                     guard = self._ring_get(ring, 180.0)
+                if self._slam_slow:
+                    # SLAM choking mid-push -> log what we translated, stop, and settle before re-planning.
+                    kind = "forward" if self._push_dir == "forward" else "reverse"
+                    mag = float(self.forward_preset.get("trigger", 0.0)) if kind == "forward" else self.reverse_throttle
+                    self._log_move(kind, mag, now - self.t_state)
+                    self._push_dir = None
+                    self._settle_to = "REPLAN"
+                    return self._enter_slam_hold("SETTLE", now,
+                                                 f"parallax push: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
+                                                 "hold to settle -> replan")
                 traveled = self._dist(plan.get("pos"), self._push_start_pos)
                 far = traveled is not None and traveled >= self.parallax_push_dist
                 blocked = guard is not None and guard <= self.stop_clearance_dist
@@ -1518,16 +1603,19 @@ def run_self_test(cfg):
     ch = ExploreController(cfg, no_takeoff=True)
     _, ah, sh, _ = _drive(ch, {"plan_valid": False, "goal": None, "pos": [0.0, 0.0]}, False, 3.0, 0.0, status="PLAN-LOST")
     hold_ok = (sh == "HOLD_LOST" and ah == {})
-    # (c) PLAN-STALE (with history) -> RECOVERY_REWIND; then OK -> brake (SETTLE) -> resume.
+    # (c) PLAN-STALE (with history) -> RECOVERY_REWIND; then OK -> wait for SLAM to settle -> brake -> resume.
     cw = ExploreController(cfg, no_takeoff=True)
+    cw.slam_settle_frames = 1          # one fresh fast frame is enough to declare settled for this test
     cw.command_history.append({"kind": "forward", "value": 0.2, "duration_s": 2.0})
     cw.command_history.append({"kind": "turn", "theta": 45.0})
     stale = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None}
     t, _, _, st_st = _drive(cw, stale, False, 1.0, 0.0, status="PLAN-STALE")
     rewind_ok = ("REWIND" in st_st)
-    _, _, so, st_ok = _drive(cw, {"plan_valid": True, "goal": [1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0},
-                             False, cw.rest_between_s + 0.4, t, status="OK")
-    snap_ok = ("SETTLE" in st_ok) and (so in ("REPLAN", "ORIENT", "ADVANCE"))
+    _, _, so, st_ok = _drive(cw, {"plan_valid": True, "goal": [1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+                                  "slam_ms": 120.0, "frame_id": 1},
+                             False, cw.rest_between_s + 0.6, t, status="OK")
+    # recovery-exit now HOLDs for SLAM to settle before braking (strengthen the solve) -> SETTLE -> replan.
+    snap_ok = ("SLAM_HOLD" in st_ok) and ("SETTLE" in st_ok) and (so in ("REPLAN", "ORIENT", "ADVANCE"))
     # (d) PLAN-STALE + EMPTY history -> parallax+<=45 FALLBACK -> STUCK after cap. The sweep is UNIDIRECTIONAL
     #     (turn always +45, never <0) while the RETREAT alternates fwd/back (seeded forward by the roomier ring).
     cf = ExploreController(cfg, no_takeoff=True)
@@ -1568,6 +1656,66 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if rec_ok else 'FAIL'}  RECOVERY control-space (invert={invert_ok}, "
           f"LOST->hold={hold_ok}, STALE->rewind={rewind_ok}, OK->snapback={snap_ok}, "
           f"empty->fallback<=45={fallback_ok and fallback_le45}, wall-clears-history={wall_clear_ok})")
+
+    # ---- SLAM frame-timing settle gate (stop moving while SLAM chokes; resume once it settles) ----
+    # (a) _update_slam: counts consecutive FRESH fast frames (deduped on frame_id); a slow frame resets.
+    cs = ExploreController(cfg, no_takeoff=True)
+    cs.slam_slow_ms, cs.slam_settle_frames = 1000.0, 3
+    cs._update_slam({"slam_ms": 200, "frame_id": 1})
+    cs._update_slam({"slam_ms": 200, "frame_id": 1})              # same frame_id -> counted once
+    streak1 = (cs._slam_fast_streak == 1)
+    cs._update_slam({"slam_ms": 200, "frame_id": 2})
+    cs._update_slam({"slam_ms": 200, "frame_id": 3})             # now >2 fresh fast frames
+    stable_ok = cs._slam_stable and not cs._slam_slow
+    cs._update_slam({"slam_ms": 1500, "frame_id": 4})           # a slow fresh frame resets the streak
+    slow_ok = cs._slam_slow and (cs._slam_fast_streak == 0) and (not cs._slam_stable)
+    track_ok = streak1 and stable_ok and slow_ok
+
+    # (b) ADVANCE + a slow frame -> SLAM_HOLD (logs the sub-leg), then fast frames settle -> resume ADVANCE.
+    cadv = ExploreController(cfg, no_takeoff=True)
+    cadv.slam_settle_frames = 2
+    padv2 = {"plan_valid": True, "done": False, "goal": [5.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+             "forward_clearance_dist": 5.0}
+    t = 0.0
+    for i in range(30):
+        _a, s, _ = cadv.step(t, dict(padv2, frame_id=i, slam_ms=200.0), False, status="OK"); t += 0.05
+        if s == "ADVANCE":
+            break
+    reached_adv = (cadv.state == "ADVANCE")
+    _a, s_hold, _ = cadv.step(t, dict(padv2, frame_id=100, slam_ms=1500.0), False, status="OK"); t += 0.05
+    adv_held = (s_hold == "SLAM_HOLD")
+    logged_fwd = any(m["kind"] == "forward" for m in cadv.command_history)
+    for i in range(101, 106):
+        _a, _s, _ = cadv.step(t, dict(padv2, frame_id=i, slam_ms=200.0), False, status="OK"); t += 0.05
+    adv_resumed = (cadv.state == "ADVANCE")
+    adv_gate_ok = reached_adv and adv_held and logged_fwd and adv_resumed
+
+    # (c2) a slow frame AT turn completion -> hold before flying the shaky post-turn pose (the ~45deg gap).
+    cpt = ExploreController(cfg, no_takeoff=True)
+    cpt.slam_settle_frames = 2
+    pturn = {"plan_valid": True, "done": False, "goal": [0.0, 5.0], "pos": [0.0, 0.0], "bearing_err": 45.0,
+             "forward_clearance_dist": 5.0,
+             "clearance_ring": [[r, 5.0] for r in (0.0, 45.0, 90.0, 135.0, 180.0, -135.0, -90.0, -45.0)]}
+    t, saw_orient = 0.0, False
+    for i in range(80):
+        _a, s, _ = cpt.step(t, dict(pturn, frame_id=i, slam_ms=1500.0), False, status="OK"); t += 0.05
+        saw_orient = saw_orient or (s == "ORIENT")
+        if s == "SLAM_HOLD":
+            break
+    postturn_ok = saw_orient and (cpt.state == "SLAM_HOLD") and (cpt._slam_resume in ("ADVANCE", "PARALLAX_PUSH"))
+
+    # (d2) bug-1: a sub-0.1s translation is now LOGGED (no duration guard) and inverts into the rewind.
+    csh = ExploreController(cfg, no_takeoff=True)
+    csh._log_move("forward", 0.2, 0.02)
+    short_logged = (len(csh.command_history) == 1 and csh.command_history[0]["kind"] == "forward")
+    short_inv_ok = any("reverse" in step for step in csh._invert_history())
+    bug1_ok = short_logged and short_inv_ok
+
+    slam_ok = track_ok and adv_gate_ok and postturn_ok and bug1_ok
+    ok = ok and slam_ok
+    print(f"[self-test] {'PASS' if slam_ok else 'FAIL'}  SLAM settle-gate (track={track_ok}, "
+          f"ADVANCE-slow->hold->resume={adv_gate_ok}, turn-slow->hold={postturn_ok}, "
+          f"bug1 short-move-logged={bug1_ok})")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
