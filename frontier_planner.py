@@ -14,17 +14,23 @@ Chooses the next frontier the drone should fly to, from `ground_grid.GroundGrid.
     the caller exactly once on the transition, cached here as a STATIC target — never re-evaluated while
     verifying, so it can't oscillate between equidistant corners) to look for uncharted territory; only
     declare `done` if, after reaching that corner, there are STILL no frontiers.
-  * UNREACHABLE-GOAL BLACKLIST (progress-stall) — there is NO path planner: the drone flies a STRAIGHT
-    LINE toward the goal bearing, so a goal behind glass / a wall / a corner can never be reached and its
-    frontier is never consumed (the loop the operator hit at the glass window). A per-committed-goal
-    progress watchdog measures the BEST (closest) distance achieved; while the drone is roughly AIMED at
-    the goal yet that best distance fails to improve by `progress_eps` for `stall_s`, the goal is declared
-    unreachable, its region is BLACKLISTED, and the planner reselects. The blacklist is POSITION-
-    CONDITIONED — a region is excluded only while the drone is within `vantage_radius` of the spot it gave
-    up from, so a different angle / a newly-opened route can still retry it (promoted to permanent after
-    `blacklist_permanent_after` re-blacklists from the same vantage, to stop two dead goals ping-ponging).
-    This is NOT a repeat-counter: healthy far goals (re-committed every replan, approached over many legs /
-    parallax-scout steps) keep improving best-distance and are never blacklisted.
+  * UNREACHABLE-GOAL BLACKLIST (progress-stall, PERMANENT round-based) — there is NO path planner: the
+    drone flies a STRAIGHT LINE toward the goal bearing, so a goal behind glass / a wall / a corner can
+    never be reached and its frontier is never consumed (the loop the operator hit at the glass window). A
+    per-committed-goal progress watchdog measures the BEST (closest) distance achieved; while the drone is
+    roughly AIMED at the goal yet that best distance fails to improve by `progress_eps` for `stall_s`, the
+    goal is declared unreachable, its region is BLACKLISTED, and the planner reselects. The blacklist is
+    POSITION-UNCONDITIONED: once blacklisted a goal STAYS excluded — it is not silently re-enabled by the
+    drone merely moving away (that position-conditioning was the ping-pong: goal A blacklisted, drone
+    starts toward B, moving off the give-up spot re-whitelisted A, drone turns back, wedges, repeat). A
+    blacklisted goal is whitelisted only when we have "been over all other goals" — every live frontier is
+    excluded — at which point the planner REPOSITIONS to the farthest free corner and, on arrival, clears
+    the round's soft blacklist so the goals get one retry from a genuinely new vantage. CONVERGENCE: a goal
+    blacklisted AGAIN in a later round WITHOUT ever having gotten closer (best-distance never improved past
+    its prior best) is promoted to PERMANENT and never whitelisted again — so each truly-dead goal gets at
+    most ~2 real attempts, then drops out for good (no endless A->B->A cycle). This is NOT a repeat-counter:
+    healthy far goals (re-committed every replan, approached over many legs / parallax-scout steps) keep
+    improving best-distance and are never blacklisted.
 
 Transport-agnostic (mirrors ground_grid.py / map_store.py): plain values in, plain values out. No ZMQ,
 no torch, no SLAM. HARD RULE (CLAUDE.md): every knob is a GENERAL planner param and every blacklist POINT
@@ -70,8 +76,6 @@ class FrontierPlanner:
         self.stall_arm_dist = float(g("goal_stall_arm_dist", 0.5))  # move this far from start before the watchdog arms
         self.slam_slow_ms = float(g("slam_slow_ms", 1000.0))  # SLAM build time >= this = choking (a cooldown; don't accrue)
         self.blacklist_radius = float(g("goal_blacklist_radius", self.assoc_dist))  # "same region" as a dead goal
-        self.vantage_radius = float(g("goal_vantage_radius", 1.0))  # give-up spot influence (position-conditioned)
-        self.permanent_after = int(g("goal_blacklist_permanent_after", 3))  # re-blacklists -> promote to permanent
         self.committed_goal = None     # [x, z] currently committed, or None
         self.verifying = False         # True while flying to the cached far corner to confirm "done"
         self.verify_target = None      # frozen [x, z] of the corner during verification (NEVER recomputed)
@@ -79,7 +83,11 @@ class FrontierPlanner:
         self._stall_accum = 0.0        # accumulated WEDGED seconds (all gates true) — the stall clock
         self._last_now = None          # previous watchdog timestamp (for dt); None until first tick
         self._start_pos = None         # first pose the planner ever saw (drone start) — for the arm gate
-        self._blacklist = []           # [{goal:[x,z], from_pos:[x,z]|None, count:int}] — LIVE dead-goal regions
+        # Position-UNCONDITIONED dead-goal regions. Each: {goal:[x,z], best_ever:float, permanent:bool,
+        # active:bool}. `active` = excluded THIS round (cleared by _whitelist_round on the reposition
+        # arrival); `permanent` = excluded forever (a goal re-blacklisted with no cross-round progress).
+        # `best_ever` = the closest distance ever achieved toward the region (persists across rounds).
+        self._blacklist = []
         self.last_blacklist = None     # [x,z] blacklisted on THIS select() call (caller logs it once), else None
 
     @staticmethod
@@ -87,39 +95,51 @@ class FrontierPlanner:
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
     # ---------------------------------------------------------------- blacklist
-    def _blacklisted(self, center, pos):
-        """True if `center` falls in a dead-goal region that is STILL active from `pos` (position-
-        conditioned: a give-up region only excludes while the drone is near where it gave up; a
-        promoted entry has from_pos=None and excludes everywhere)."""
+    def _excluded(self, center):
+        """True if `center` falls in a dead-goal region that is currently excluded — PERMANENT (forever)
+        or ACTIVE (this round). Position-UNCONDITIONED: a blacklisted goal is not re-enabled by the drone
+        moving away (that was the ping-pong); a soft entry clears only via _whitelist_round on reposition."""
         for e in self._blacklist:
-            if self._d(center, e["goal"]) <= self.blacklist_radius and (
-                    e["from_pos"] is None or self._d(pos, e["from_pos"]) <= self.vantage_radius):
+            if self._d(center, e["goal"]) <= self.blacklist_radius and (e["permanent"] or e["active"]):
                 return True
         return False
 
-    def _blacklist_goal(self, goal, pos):
-        """Record `goal` as unreachable FROM near `pos`. Re-blacklisting the same region from ~the same
-        vantage bumps a counter and, past `permanent_after`, promotes the entry to permanent (from_pos
-        None) so two mutually-unreachable goals can't ping-pong the drone forever."""
+    def _blacklist_goal(self, goal):
+        """Record `goal` as unreachable, using the best (closest) distance reached this commit
+        (`self._best_dist`). Re-blacklisting the same region: if we NEVER got closer than a prior round
+        (no cross-round progress) -> promote to PERMANENT (drops out for good, so two dead goals can't
+        cycle the drone forever); if we DID get closer (a new route opened) -> keep it soft/retryable.
+        A first-ever blacklist is soft."""
         g = [float(goal[0]), float(goal[1])]
-        p = [float(pos[0]), float(pos[1])]
+        best_now = self._best_dist if self._best_dist is not None else float("inf")
         for e in self._blacklist:
-            same_region = self._d(e["goal"], g) <= self.blacklist_radius
-            same_vantage = e["from_pos"] is not None and self._d(e["from_pos"], p) <= self.vantage_radius
-            if same_region and (e["from_pos"] is None or same_vantage):
-                e["count"] += 1
+            if self._d(e["goal"], g) <= self.blacklist_radius:
+                improved = best_now < e["best_ever"] - self.progress_eps
+                e["best_ever"] = min(e["best_ever"], best_now)
                 e["goal"] = g
-                if e["from_pos"] is not None:
-                    e["from_pos"] = (None if (self.permanent_after > 0 and e["count"] >= self.permanent_after)
-                                     else p)
+                e["active"] = True
+                if not improved:
+                    e["permanent"] = True          # re-dead with no cross-round progress -> for good
                 self.last_blacklist = g
                 return
-        self._blacklist.append({"goal": g, "from_pos": p, "count": 1})
+        self._blacklist.append({"goal": g, "best_ever": best_now, "permanent": False, "active": True})
         self.last_blacklist = g
 
+    def _whitelist_round(self):
+        """Clear the round's SOFT exclusions (set active=False on every non-permanent entry) so the
+        surviving goals get one retry from the new vantage. Permanent entries and best_ever memory stay."""
+        for e in self._blacklist:
+            if not e["permanent"]:
+                e["active"] = False
+
     def blacklist_points(self):
-        """Public snapshot for telemetry/visualizer: [[x, z], ...] of every dead-goal region."""
+        """Public snapshot for telemetry/visualizer: [[x, z], ...] of every dead-goal region (soft+permanent)."""
         return [[e["goal"][0], e["goal"][1]] for e in self._blacklist]
+
+    def blacklist_permanent(self):
+        """Parallel [bool, ...] flag list (matches blacklist_points order) so the visualizer can mark a
+        'dead for good' region distinctly from a 'dead this round' one."""
+        return [bool(e["permanent"]) for e in self._blacklist]
 
     # ------------------------------------------------------------ progress stall
     def _reset_progress(self):
@@ -159,7 +179,7 @@ class FrontierPlanner:
             return                                 # a gate failed -> PAUSE the clock (don't reset, don't fire)
         self._stall_accum += dt
         if self._stall_accum >= self.stall_s:
-            self._blacklist_goal(self.committed_goal, pos)
+            self._blacklist_goal(self.committed_goal)
             self.committed_goal = None
             self._reset_progress()
 
@@ -196,37 +216,41 @@ class FrontierPlanner:
                 return centers[j]      # keep commitment, snapped to the live centroid
         return centers[best_i]
 
-    def any_reachable(self, frontiers, pos):
-        """True if at least one live frontier is NOT blacklisted-from-here. The caller uses this to decide
-        whether to compute `farthest_free` (the reposition target when every frontier is dead-from-here)."""
-        pos = (float(pos[0]), float(pos[1]))
-        return any(not self._blacklisted((float(f["center"][0]), float(f["center"][1])), pos)
-                   for f in frontiers)
+    def any_reachable(self, frontiers):
+        """True if at least one live frontier is NOT excluded (soft or permanent). The caller uses this to
+        decide whether to compute `farthest_free` (the reposition target when every frontier is dead)."""
+        return any(not self._excluded((float(f["center"][0]), float(f["center"][1]))) for f in frontiers)
+
+    def _select_reachable(self, frontiers, pos, heading_deg):
+        """Choose + commit among the currently non-excluded frontiers, clearing any verify state."""
+        reachable = [f for f in frontiers
+                     if not self._excluded((float(f["center"][0]), float(f["center"][1])))]
+        if not reachable:
+            return None
+        self.verifying = False                         # something to chase -> not done, not verifying
+        self.verify_target = None
+        goal = self._choose(reachable, pos, heading_deg)
+        self._commit(goal)
+        return self.committed_goal
 
     def select(self, frontiers, pos, heading_deg=None, farthest_free=None, now=None,
                forward_clearance=None, slam_ms=None):
         """Returns (goal [x,z] | None, n_frontiers, done). `now` (monotonic), `forward_clearance` and
         `slam_ms` drive the WEDGED watchdog (which blacklists only when armed+aimed+blocked+SLAM-alive+
         not-progressing; inert when `now` is None). `farthest_free` is consulted ONLY on the transition into
-        verification (and the caller only computes it when no frontier is reachable-from-here)."""
+        verification/reposition (and the caller only computes it when no frontier is reachable)."""
         pos = (float(pos[0]), float(pos[1]))
         self.last_blacklist = None
         self._watchdog(pos, heading_deg, now, forward_clearance, slam_ms)  # may blacklist + clear the commitment
 
-        # Reachable = live frontiers not blacklisted from the current vantage.
-        reachable = [f for f in frontiers
-                     if not self._blacklisted((float(f["center"][0]), float(f["center"][1])), pos)]
-        if reachable:
-            self.verifying = False                     # something to chase -> not done, not verifying
-            self.verify_target = None
-            goal = self._choose(reachable, pos, heading_deg)
-            self._commit(goal)
-            return self.committed_goal, len(frontiers), False
+        goal = self._select_reachable(frontiers, pos, heading_deg)
+        if goal is not None:
+            return goal, len(frontiers), False
 
-        # --- nothing reachable-from-here (no frontiers exist, OR all are blacklisted from this vantage) ---
-        # Same path as "done verification": fly ONCE to the farthest free corner. That doubles as a
-        # REPOSITION — moving away from the give-up vantage re-enables the position-conditioned blacklist,
-        # so on arrival those frontiers become reachable again and exploration resumes.
+        # --- nothing reachable: no frontiers exist, OR every live frontier is excluded ("been over all
+        # goals"). Fly ONCE to the farthest free corner (a fresh vantage); this doubles as done-verification
+        # (empty frontiers) AND a REPOSITION-then-retry (all excluded) — on arrival the round's soft
+        # blacklist is cleared and the surviving goals get one retry from there.
         self.committed_goal = None
         self._reset_progress()
         if not self.verify_done:
@@ -235,13 +259,30 @@ class FrontierPlanner:
             if self.verify_target is None or self._d(pos, self.verify_target) <= self.goal_reach_dist:
                 self.verifying = False
                 self.verify_target = None
-                return None, len(frontiers), True
+                if frontiers:                          # they were all excluded -> whitelist the round + retry
+                    self._whitelist_round()
+                    g = self._select_reachable(frontiers, pos, heading_deg)
+                    if g is not None:
+                        return g, len(frontiers), False
+                return None, len(frontiers), True      # no live frontiers -> verification complete = done
             return list(self.verify_target), len(frontiers), False
-        # Transition INTO verifying: cache the far corner EXACTLY ONCE (caller computed it just now).
+        # Transition INTO reposition/verify: cache the (inset) far corner EXACTLY ONCE (caller computed it).
         if farthest_free is not None and self._d(pos, farthest_free) > self.verify_min_dist:
             self.verifying = True
             self.verify_target = [float(farthest_free[0]), float(farthest_free[1])]
             return list(self.verify_target), len(frontiers), False
+        # No corner worth repositioning to (no free space beyond verify_min_dist). If frontiers exist (all
+        # excluded) whitelist + retry IN PLACE — but NOT on the same tick we just blacklisted one: let the
+        # exclusion stand a tick so we don't instantly re-commit the goal we just killed (cross-round
+        # no-progress then promotes it to permanent). If frontiers exist but we can't retry yet, idle (not
+        # done); only a truly empty frontier list is "done".
+        if frontiers and self.last_blacklist is None:
+            self._whitelist_round()
+            g = self._select_reachable(frontiers, pos, heading_deg)
+            if g is not None:
+                return g, len(frontiers), False
+        if frontiers:
+            return None, len(frontiers), False
         return None, len(frontiers), True              # nothing worth verifying -> truly done
 
 
@@ -326,15 +367,16 @@ def run_self_test():
     check("(d) healthy far goal (closing) never blacklists", len(p._blacklist) == 0 and close(gg, [0.0, 20.0]))
 
     # (e) a WEDGED goal is blacklisted once the accumulated wedged time reaches stall_s — but not before.
-    pe = FrontierPlanner(None)                                      # kept for (g) — position-conditioned retry
+    pe = FrontierPlanner(None)                                      # kept for (g) — position-UNconditioned check
     pe.select([W], [0.0, 0.0], heading_deg=0.0, now=0.0)            # start=[0,0], commit W
     wedged(pe, [0.0, 2.4], 0.5)                                     # approach to the stand-off (progress) -> best=0.6
     for t in (1.5, 2.5, 3.5, 4.5, 5.5):                            # 5 wedged ticks -> accum ~5 s (< stall_s)
         wedged(pe, [0.0, 2.4], t)
     before = len(pe._blacklist) == 0 and pe.committed_goal is not None
-    g6, n6, _ = wedged(pe, [0.0, 2.4], 6.6)                        # accum crosses stall_s (6) -> blacklist
+    g6, n6, _ = wedged(pe, [0.0, 2.4], 6.6)                        # accum crosses stall_s (6) -> blacklist (soft)
     check("(e) wedged goal blacklists at stall_s (not before)",
-          before and len(pe._blacklist) == 1 and close(pe.last_blacklist, [0.0, 3.0]) and n6 == 1)
+          before and len(pe._blacklist) == 1 and not pe._blacklist[0]["permanent"]
+          and close(pe.last_blacklist, [0.0, 3.0]) and n6 == 1)
 
     # (f) AIM gate: armed + blocked + SLAM alive, but bearing err > aim window (still turning to FACE the
     #     goal — legit parallax scout) -> no accrual, never blacklisted.
@@ -345,12 +387,11 @@ def run_self_test():
         wedged(p, [3.0, 0.0], t, head=0.0, goal=side)              # at [3,0] bearing to [10,0]=90 deg > 45 -> not aimed
     check("(f) not-aimed (still scouting) never stalls", len(p._blacklist) == 0 and p.committed_goal is not None)
 
-    # (g) POSITION-CONDITIONED: the goal blacklisted in (e) from ~[0,2.4] is reachable again from a far
-    #     vantage, but still excluded from near the give-up spot. (reuses pe, which holds that blacklist.)
-    g_far, _, _ = pe.select([W], [0.0, -10.0], heading_deg=0.0, now=8.0)
-    g_near, _, _ = pe.select([W], [0.0, 2.5], heading_deg=0.0, now=9.0)
-    check("(g) blacklist is position-conditioned (far=retry, near=excluded)",
-          close(g_far, [0.0, 3.0]) and g_near is None)
+    # (g) POSITION-UNCONDITIONED (the ping-pong fix): the goal blacklisted in (e) from ~[0,2.4] stays
+    #     excluded no matter where the drone moves — moving away does NOT silently re-whitelist it (that
+    #     re-whitelisting was the A->B->A oscillation). (reuses pe, which holds that soft blacklist.)
+    check("(g) blacklist stays excluded regardless of vantage (no re-whitelist by moving)",
+          pe._excluded([0.0, 3.0]) and not pe.any_reachable([W]))
 
     # (d2) GATE SUPPRESSION — each missing gate alone prevents a blacklist even over a long window:
     #      not-armed (never moved from start), not-blocked (clearance large), SLAM slow (a cooldown).
@@ -368,21 +409,40 @@ def run_self_test():
     check("(d2) not-armed / not-blocked / SLAM-slow each SUPPRESS the blacklist",
           len(p_arm._blacklist) == 0 and len(p_blk._blacklist) == 0 and len(p_slam._blacklist) == 0)
 
-    # (h) re-blacklisting the same region from ~the same vantage promotes it to PERMANENT (from_pos None
-    #     -> excluded everywhere) so two dead goals can't ping-pong the drone forever.
-    p = FrontierPlanner(None)                        # permanent_after = 3
-    for _ in range(3):
-        p._blacklist_goal([1.0, 1.0], [0.0, 0.0])
-    check("(h) promoted to permanent after N re-blacklists",
-          p._blacklist[0]["from_pos"] is None and p._blacklisted([1.0, 1.0], [99.0, 99.0]))
-
-    # (i) when EVERY live frontier is dead-from-here, route to the far-corner reposition (not a crash, not
-    #     a premature done); the true frontier count is still reported.
+    # (h) CROSS-ROUND CONVERGENCE: a goal re-blacklisted in a later round WITHOUT ever having gotten
+    #     closer (best_ever never improved by progress_eps) is promoted to PERMANENT (excluded forever,
+    #     survives a whitelist); but if a new vantage DID close the distance, it stays soft (retryable).
     p = FrontierPlanner(None)
-    p._blacklist_goal([0.0, 3.0], [0.0, 2.4])
+    p._best_dist = 2.0
+    p._blacklist_goal([1.0, 1.0])                     # round 1: soft, best_ever=2.0
+    soft_ok = p._blacklist[0]["permanent"] is False and p._blacklist[0]["active"] is True
+    p._whitelist_round()                              # "been over all goals" -> retry round
+    inactive_ok = p._blacklist[0]["active"] is False and p._excluded([1.0, 1.0]) is False
+    p._best_dist = 2.0                                # round 2: no closer than before (no progress)
+    p._blacklist_goal([1.0, 1.0])
+    check("(h) re-dead with no cross-round progress -> PERMANENT (survives whitelist)",
+          soft_ok and inactive_ok and p._blacklist[0]["permanent"] is True
+          and (p._whitelist_round() or p._excluded([1.0, 1.0])))
+    p2 = FrontierPlanner(None)                        # WITH progress -> stays soft/retryable
+    p2._best_dist = 2.0
+    p2._blacklist_goal([1.0, 1.0])
+    p2._whitelist_round()
+    p2._best_dist = 1.5                               # got 0.5 closer (> progress_eps) from the new vantage
+    p2._blacklist_goal([1.0, 1.0])
+    check("(h) re-dead but progressed -> stays soft (best_ever updated, retryable)",
+          p2._blacklist[0]["permanent"] is False and abs(p2._blacklist[0]["best_ever"] - 1.5) < 1e-9)
+
+    # (i) when EVERY live frontier is excluded, route to the (inset) far-corner reposition (not a crash,
+    #     not a premature done); on ARRIVAL the round's soft blacklist clears and the frontier is retried.
+    p = FrontierPlanner(None)
+    p._best_dist = 0.6
+    p._blacklist_goal([0.0, 3.0])                     # W soft-excluded
     g_v, n_v, done_v = p.select([W], [0.0, 2.4], heading_deg=0.0, farthest_free=[5.0, 5.0], now=0.0)
-    check("(i) all-dead-from-here -> reposition via far corner, frontiers still reported, not done",
+    check("(i) all-excluded -> reposition via far corner, frontiers still reported, not done",
           close(g_v, [5.0, 5.0]) and n_v == 1 and not done_v and p.verifying)
+    g_r, n_r, done_r = p.select([W], [5.0, 5.0], heading_deg=0.0, now=1.0)   # reached the corner
+    check("(i) reached corner -> whitelist the round + retry the frontier (not done)",
+          close(g_r, [0.0, 3.0]) and n_r == 1 and not done_r and not p.verifying)
 
     print(f"\n[frontier_planner][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

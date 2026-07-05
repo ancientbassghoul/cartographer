@@ -1,7 +1,40 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated 2026-07-05 (glass-window blacklist FLOWN → gating + parallax follow-up fixes; self-tested, NOT
-yet re-flown. Plus a NEW open issue below: drone won't turn to the goal). Resume from THIS file._
+_Last updated 2026-07-06 (goal-selection PING-PONG fixed: blacklist is now permanent + round-based, not
+position-conditioned; self-tested, NOT yet re-flown. The drone-won't-turn issue below is still open). Resume
+from THIS file._
+
+**✅ DONE — goal-selection PING-PONG fixed (self-tested, NOT yet re-flown).** The drone oscillated between
+two unreachable goals: A blacklisted → start toward B → **moving away silently re-whitelisted A** → turn back
+→ wedge → repeat. Root cause = the blacklist was **position-conditioned** (`_blacklisted(center, pos)`: a
+dead goal was only excluded while the drone stayed within `goal_vantage_radius` of the give-up spot), and the
+`goal_blacklist_permanent_after` guard never fired because the give-up vantage drifted each time.
+**Fix (all in `frontier_planner.py`, wired through perception):** the blacklist is now
+**position-UNconditioned + round-based**:
+- Each entry `{goal, best_ever, permanent, active}`. `_excluded(center)` (no pos) excludes a goal that is
+  `permanent` OR `active` — a blacklisted goal STAYS excluded; moving no longer re-whitelists it.
+- **Whitelist only when "been over all goals"** (every live frontier excluded) → the planner REPOSITIONS to
+  the farthest free corner (existing `farthest_free`/verify path) and, **on arrival**, `_whitelist_round()`
+  clears the round's soft exclusions so the goals get ONE retry from a fresh vantage.
+- **Convergence:** a goal re-blacklisted in a later round WITHOUT ever getting closer (`best_ever` never
+  improved by `goal_progress_eps`) is promoted to **PERMANENT** (never whitelisted) → each dead goal gets
+  ≤2 real attempts then drops out for good. (User pick: "re-dead with no progress → permanent".)
+- **Reachable corner ("almost in the corner"):** `ground_grid.farthest_free(pos, margin=reposition_inset)`
+  pulls the target inward so the drone can actually reach it (the raw farthest cell sits against the wall,
+  inside the stand-off shell — the "goal stuck in the corner, never reached" the user saw). `reposition_inset`
+  (0.8) is clamped to the reachable band `[stop_clearance_dist, stop_clearance_dist+goal_reach_dist]` with a
+  visible warning in perception (NO SILENT FALLBACK).
+- Telemetry: TOPIC_PLAN now also carries `blacklist_permanent` (bool list); the visualizer rings PERMANENT
+  dead goals with a diamond. Retired knobs `goal_vantage_radius`/`goal_blacklist_permanent_after`; added
+  `reposition_inset`. Tests: `frontier_planner.py --self-test` ALL PASS (17, incl. no-re-whitelist-by-moving,
+  reposition-then-whitelist-on-arrival, cross-round permanent promotion, cross-round-progress-stays-soft);
+  `ground_grid.py --self-test` + `autopilot.py --self-test` ALL PASS.
+- **DEFERRED (user pick):** the glass-window altitude descend-probe (Part 2 — descend in small steps to hunt
+  a lower opening; clear-but-can't-advance ⇒ permanent-blacklist goal + XZ). It is control-space and needs a
+  new autopilot→perception channel; revisit later.
+- **TO DO — live re-fly:** confirm once a goal goes red it STAYS red (no turn-back); all-dead → the drone
+  flies to a corner it can REACH, whitelists, retries; a re-wedged no-progress goal goes permanent (diamond)
+  and drops out; the log no longer shows the A→B→A oscillation.
 
 **⚠️⚠️ OPEN — DRONE FLIES STRAIGHT PAST THE GOAL, WON'T TURN (diagnosed, NOT fixed).** Flight
 `OUTPUT/diag/20260705_174456_autopilot.log` + `DEBUG_IMAGES/when will you turn to the goal.png`: the drone
@@ -74,6 +107,12 @@ attempt 0 by the roomier body axis from `_last_ring`); `fallback_max_attempts` 4
 `yaw>0` never `<0`, STUCK reached). **NEXT = the full live flight (checklist under "## BUILT THIS SESSION").**
 
 ## DONE — unreachable-goal blacklist (progress-stall) — the glass-window loop
+**⚠️ PARTLY SUPERSEDED (2026-07-05):** the WEDGED watchdog + gates below still stand, but the blacklist is no
+longer POSITION-CONDITIONED (that caused the ping-pong — see the "goal-selection PING-PONG fixed" block at the
+top). It is now permanent + round-based with a reposition-then-whitelist retry and cross-round no-progress
+promotion. Ignore the "position-conditioned / vantage / permanent-after" details in this section; keep the
+watchdog-gate description.
+
 **Problem (latest flight):** a goal behind a GLASS WINDOW is physically unreachable (no path planner — the
 drone flies a STRAIGHT line to the goal bearing). Its frontier is never consumed (SLAM never sees behind the
 glass → the FREE↔UNKNOWN seam persists), and `FrontierPlanner`'s commitment re-hands the same goal every

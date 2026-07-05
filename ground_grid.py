@@ -212,10 +212,16 @@ class GroundGrid:
         out.sort(key=lambda d: d["size"], reverse=True)
         return out
 
-    def farthest_free(self, pos):
+    def farthest_free(self, pos, margin=0.0):
         """World [X, Z] of the FREE (confirmed-empty) cell farthest (Euclidean) from `pos`, or None if
-        no free cells. The planner uses this for done-verification: when no frontiers remain, the farthest
-        known free point is the best place to fly to look for uncharted territory before declaring done."""
+        no free cells. The planner uses this for done-verification / reposition: when no frontiers are
+        reachable, the farthest known free point is the best place to fly to look for uncharted territory.
+
+        `margin` (SLAM units) pulls the returned point back toward `pos` by min(margin, 0.5*dist), so the
+        target sits ALMOST in the corner rather than hard against the wall — otherwise the raw farthest
+        free cell is inside the forward stand-off shell and the drone (which stops `stop_clearance_dist`
+        short of walls) can never reach it. A general stand-off-scale value (like `stop_clearance_dist` /
+        `goal_reach_dist`), NOT a room answer."""
         c = self.classify_dense()
         free = c["free"]
         if free.size == 0 or not free.any():
@@ -225,7 +231,14 @@ class GroundGrid:
         Z = (rr + c["iz0"] + 0.5) * self.cell
         d2 = (X - float(pos[0])) ** 2 + (Z - float(pos[1])) ** 2
         i = int(np.argmax(d2))
-        return [float(X[i]), float(Z[i])]
+        fx, fz = float(X[i]), float(Z[i])
+        if margin > 0.0:
+            dist = math.hypot(fx - float(pos[0]), fz - float(pos[1]))
+            if dist > 1e-9:
+                pull = min(margin, 0.5 * dist) / dist          # unit step toward pos, clamped to half-way
+                fx -= (fx - float(pos[0])) * pull
+                fz -= (fz - float(pos[1])) * pull
+        return [fx, fz]
 
     # ------------------------------------------------------------------ bus summary
     def summary(self, raster: int = 160):
@@ -389,6 +402,13 @@ def run_self_test():
     check("farthest_free returns a free cell well away from the camera",
           ff is not None and cls_at(ff[0], ff[1]) == "FREE" and math.hypot(ff[0] - cam[0], ff[1] - cam[2]) > 1.0)
     check("farthest_free is None on an empty grid", GroundGrid(None).farthest_free([0.0, 0.0]) is None)
+    # margin pulls the returned point inward toward pos (reachable "almost in the corner"): the inset
+    # point is closer to the camera than the raw corner, by ~margin, and still on the same bearing.
+    ff_in = gg.farthest_free([cam[0], cam[2]], margin=0.3)
+    d_raw = math.hypot(ff[0] - cam[0], ff[1] - cam[2])
+    d_in = math.hypot(ff_in[0] - cam[0], ff_in[1] - cam[2])
+    check("farthest_free(margin) pulls the target inward by ~margin",
+          ff_in is not None and abs((d_raw - d_in) - 0.3) < 1e-6)
 
     # Summary raster is well-formed and label-preserving in size.
     s = gg.summary(raster=64)

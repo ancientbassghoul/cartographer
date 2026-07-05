@@ -182,10 +182,17 @@ def overlay_plan(img, plan, m, size):
     pos = plan.get("pos")
     goal = plan.get("goal")
     # Blacklisted (unreachable) goals: red X — visible so the operator sees WHY the drone gave up on a
-    # frontier behind glass/a wall instead of silently looping (NO SILENT FALLBACK).
-    for bx, bz in (plan.get("blacklist") or []):
+    # frontier behind glass/a wall instead of silently looping (NO SILENT FALLBACK). A PERMANENT entry
+    # (dead for good, no cross-round progress) gets a second diamond ring to distinguish it from a soft
+    # (this-round) exclusion that will be retried after a reposition.
+    bl = plan.get("blacklist") or []
+    perm = plan.get("blacklist_permanent") or []
+    for i, (bx, bz) in enumerate(bl):
         bu, bv = to_px_vec(np.array([bx]), np.array([bz]))
-        cv2.drawMarker(img, (int(bu[0]), int(bv[0])), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
+        px, py = int(bu[0]), int(bv[0])
+        cv2.drawMarker(img, (px, py), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
+        if i < len(perm) and perm[i]:
+            cv2.drawMarker(img, (px, py), (0, 0, 255), cv2.MARKER_DIAMOND, 20, 1)
     if goal is not None:
         gu, gv = to_px_vec(np.array([goal[0]]), np.array([goal[1]]))
         cv2.drawMarker(img, (int(gu[0]), int(gv[0])), (0, 255, 255), cv2.MARKER_STAR, 18, 2)

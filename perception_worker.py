@@ -277,6 +277,21 @@ class Pipeline:
         self.planner = FrontierPlanner(cfg)
         e = explore_cfg(cfg)
         self.goal_reach_dist = float(e.get("goal_reach_dist", 0.4))
+        # Pull the reposition/verify far-corner target inward by this margin so it is REACHABLE (the raw
+        # farthest free cell sits against the wall, inside the stand-off shell). General stand-off scale.
+        # It must be coordinated with the autopilot's forward stand-off: the drone stops
+        # stop_clearance_dist short of walls and "reaches" a goal within goal_reach_dist, so the inset
+        # target is reachable only for stop_clearance_dist <= inset <= stop_clearance_dist + goal_reach_dist.
+        # Clamp into that band with a VISIBLE warning (NO SILENT FALLBACK) rather than strand the drone.
+        self.reposition_inset = float(e.get("reposition_inset", 0.8))
+        _stop_clr = float(e.get("stop_clearance_dist", 0.6))
+        _lo, _hi = _stop_clr, _stop_clr + self.goal_reach_dist
+        if not (_lo <= self.reposition_inset <= _hi):
+            clamped = min(max(self.reposition_inset, _lo), _hi)
+            print(f"[perception] WARNING: reposition_inset {self.reposition_inset:.2f} outside the reachable "
+                  f"band [{_lo:.2f}, {_hi:.2f}] (stop_clearance_dist + goal_reach_dist) -> clamped to "
+                  f"{clamped:.2f} so the reposition corner stays reachable", flush=True)
+            self.reposition_inset = clamped
         self.PLAN_PUB_INTERVAL = float(e.get("replan_period_s", 0.5))
         self.GROUND_RASTER = 160
         self.last_plan_pub = 0.0
@@ -472,6 +487,7 @@ class Pipeline:
             "goal": None, "bearing_deg": None, "bearing_err": None,
             "n_frontiers": 0, "done": False, "forward_clearance_dist": None,
             "n_blacklisted": len(self.planner._blacklist), "blacklist": self.planner.blacklist_points(),
+            "blacklist_permanent": self.planner.blacklist_permanent(),
             "pos_y": None, "clearance_ring": None,
             "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
@@ -516,12 +532,12 @@ class Pipeline:
         # verification (no frontiers AND not already verifying) so it is evaluated exactly once per
         # done-attempt and stays a STATIC target (no oscillating between equidistant corners).
         fr = self.ground.frontiers()
-        # `farthest_free` (the reposition target) is needed whenever NOTHING is reachable-from-here — that's
-        # no frontiers at all OR every frontier blacklisted from this vantage (the glass-loop escape). Flying
-        # to the far corner moves the drone off the give-up spot, re-enabling the position-conditioned
-        # blacklist so those frontiers become reachable again on arrival.
-        reachable = self.planner.any_reachable(fr, pos)
-        farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64))
+        # `farthest_free` (the reposition target) is needed whenever NOTHING is reachable — that's no
+        # frontiers at all OR every live frontier blacklisted (the glass-loop escape). Flying to the far
+        # corner moves the drone to a fresh vantage; on arrival the planner clears the round's soft
+        # blacklist so those goals get one retry from there. Pulled inward (`reposition_inset`) to be reachable.
+        reachable = self.planner.any_reachable(fr)
+        farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64), margin=self.reposition_inset)
                     if (not reachable and not self.planner.verifying) else None)
         # forward_clearance + slam_ms gate the WEDGED watchdog: it only blacklists a goal when the drone is
         # genuinely stuck (blocked ahead + SLAM alive), NOT during a ground prelude or a SLAM-settle pause.
@@ -529,12 +545,15 @@ class Pipeline:
             fr, pos, heading_deg, farthest, now_mono,
             forward_clearance=payload["forward_clearance_dist"], slam_ms=slam_ms)
         if self.planner.last_blacklist is not None:
+            perm = any(self.planner._d(e["goal"], self.planner.last_blacklist) <= self.planner.blacklist_radius
+                       and e["permanent"] for e in self.planner._blacklist)
             print(f"[perception] planner: goal {self.planner.last_blacklist} UNREACHABLE (no progress "
-                  f"~{self.planner.stall_s:.0f}s while aimed) -> BLACKLIST from vantage "
-                  f"[{pos[0]:.2f}, {pos[1]:.2f}] ({len(self.planner._blacklist)} total) -> reselecting",
+                  f"~{self.planner.stall_s:.0f}s while aimed) -> BLACKLIST "
+                  f"{'PERMANENT' if perm else 'soft'} ({len(self.planner._blacklist)} total) -> reselecting",
                   flush=True)
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()
+        payload["blacklist_permanent"] = self.planner.blacklist_permanent()
         if self.planner.verifying and not self._verify_logged:
             print(f"[perception] planner: no frontiers -> VERIFYING via far corner {self.planner.verify_target}",
                   flush=True)
