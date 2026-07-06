@@ -165,6 +165,23 @@ def forward_clearance(bars):
     return float(1.0 - max(central))
 
 
+def top_clearance(proximity: np.ndarray, n_bars=N_BARS):
+    """Openness of the TOP band straight ahead (1 = open air above, 0 = something near). Reads the top
+    slice of the frame [0 : BAND_TOP*h] that obstacle_bar deliberately EXCLUDES, using the same per-column
+    near-ness percentile + central-third focus as forward_clearance. Used by the autopilot's depth bump-up:
+    a wall close ahead (forward clearance ray) BUT open air above => a LOW inner wall to fly over. RELATIVE,
+    self-calibrating (per-frame normalized proximity) -> leakage-safe."""
+    h, w = proximity.shape
+    band = proximity[0:int(h * BAND_TOP), :]
+    if band.size == 0:
+        return 0.0
+    edges = np.linspace(0, w, n_bars + 1, dtype=int)
+    bars = [float(np.percentile(band[:, edges[i]:edges[i + 1]], COL_NEAR_PCTL))
+            if edges[i + 1] > edges[i] else 0.0 for i in range(n_bars)]
+    central = bars[n_bars // 3: 2 * n_bars // 3] or bars
+    return float(1.0 - max(central))
+
+
 # ==============================================================================
 # Visualization
 # ==============================================================================
@@ -213,6 +230,7 @@ def build_payload(meta, depth, infer_ms, cadence_hz):
         "cadence_hz": cadence_hz,
         "obstacle_bar": [round(b, 3) for b in bars],
         "forward_clearance": round(forward_clearance(bars), 3),
+        "top_clear": round(top_clearance(proximity), 3),   # openness above (bump-up over low walls)
         "depth_stats": {k: round(v, 3) for k, v in stats.items()},
         "grid_rows": GRID_ROWS, "grid_cols": GRID_COLS,
         "depth_grid": np.round(grid, 3).tolist(),
@@ -310,6 +328,8 @@ class Pipeline:
         self._last_clearance = None       # last published forward_clearance_dist (for the report line)
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
+        self._last_top_clear = None       # last depth top-band openness (depth runs slower than the plan;
+        #                                   cached here so _plan_payload can ride it on TOPIC_PLAN)
         self._verify_logged = False      # one-shot log when the planner enters done-verification
 
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
@@ -417,6 +437,7 @@ class Pipeline:
             infer_ms = (time.time() - t0) * 1000.0
             self.n_depth += 1
             payload, proximity, bars = build_payload(meta, depth_map, infer_ms, self.cadence_hz)
+            self._last_top_clear = payload["top_clear"]   # ride the freshest depth top-band on TOPIC_PLAN
             if state_pub is not None:
                 state_pub.publish(frame_bus.TOPIC_DEPTH, payload)
 
@@ -489,6 +510,7 @@ class Pipeline:
             "n_blacklisted": len(self.planner._blacklist), "blacklist": self.planner.blacklist_points(),
             "blacklist_permanent": self.planner.blacklist_permanent(),
             "pos_y": None, "clearance_ring": None,
+            "top_clear": self._last_top_clear,   # depth top-band openness (autopilot bump-up over low walls)
             "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
             "ground": self.ground.summary(raster=self.GROUND_RASTER),
@@ -539,17 +561,17 @@ class Pipeline:
         reachable = self.planner.any_reachable(fr)
         farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64), margin=self.reposition_inset)
                     if (not reachable and not self.planner.verifying) else None)
-        # forward_clearance + slam_ms gate the WEDGED watchdog: it only blacklists a goal when the drone is
-        # genuinely stuck (blocked ahead + SLAM alive), NOT during a ground prelude or a SLAM-settle pause.
+        # now_mono + slam_ms drive the distance-stagnation watchdog: it permanently blacklists a committed
+        # goal whose best distance never improves for stagnation_s of SLAM-healthy time (a glass collider or a
+        # rammed wall behind the goal). It ticks only on this VALID branch, so a SLAM loss naturally pauses it.
         goal, n_frontiers, done = self.planner.select(
-            fr, pos, heading_deg, farthest, now_mono,
-            forward_clearance=payload["forward_clearance_dist"], slam_ms=slam_ms)
+            fr, pos, heading_deg, farthest, now_mono, slam_ms=slam_ms)
         if self.planner.last_blacklist is not None:
             perm = any(self.planner._d(e["goal"], self.planner.last_blacklist) <= self.planner.blacklist_radius
                        and e["permanent"] for e in self.planner._blacklist)
-            print(f"[perception] planner: goal {self.planner.last_blacklist} UNREACHABLE (no progress "
-                  f"~{self.planner.stall_s:.0f}s while aimed) -> BLACKLIST "
-                  f"{'PERMANENT' if perm else 'soft'} ({len(self.planner._blacklist)} total) -> reselecting",
+            print(f"[perception] planner: goal {self.planner.last_blacklist} UNREACHABLE (no distance progress "
+                  f"for ~{self.planner.stagnation_s:.0f}s of SLAM-healthy time; glass collider or wall behind goal) "
+                  f"-> BLACKLIST {'PERMANENT' if perm else 'soft'} ({len(self.planner._blacklist)} total) -> reselecting",
                   flush=True)
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()

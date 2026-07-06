@@ -1,8 +1,64 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated 2026-07-06 (goal-selection PING-PONG fixed: blacklist is now permanent + round-based, not
-position-conditioned; self-tested, NOT yet re-flown. The drone-won't-turn issue below is still open). Resume
-from THIS file._
+_Last updated 2026-07-06 (session 2: reworked the glass fix + shipped 3 more flight fixes — all
+self-test-verified, NOT yet re-flown. NEXT UP = build the F8 flight-replay debug tool in a FRESH session,
+then re-fly. The drone-won't-TURN issue further down is STILL open; we blacklist unreachable goals instead.)
+Resume from THIS file._
+
+**✅ SESSION 2 (2026-07-06) — CORRECTED GLASS MODEL + 3 flight fixes (self-tested, NOT yet re-flown).**
+A live flight showed the session-1 "glass-stuck" watchdog was built on a WRONG glass model. **User's
+correction:** the monocular camera looks THROUGH clear glass and tracks features on the far side, so **SLAM
+stays healthy + FAST and the depth/forward-clearance ray reads clear**; the drone hits the invisible
+collider, bounces, and pushes again — an **invisible treadmill**. So a watchdog that required SLAM to CHOKE +
+the path BLOCKED was exactly backwards. Reworked into ONE robust detector, plus fixes for takeoff-startup
+spins, the bump-up ceiling smash, and opaque-wall ramming.
+1. **F4 rewrite — DISTANCE-STAGNATION goal watchdog** (`frontier_planner._watchdog`, replaces the
+   slam_alive/blocked stuck-clock). A committed goal whose best-ever Euclidean distance fails to improve by
+   `goal_progress_eps` for **`goal_stagnation_s` (60 s) of SLAM-HEALTHY time** is **PERMANENTLY blacklisted**
+   (+ reposition). No aim/clearance/thrust gates. It ticks only on VALID (TRACKING) frames (perception skips
+   `select()` otherwise) so a full SLAM loss pauses it; a `slam_ms` choke also pauses (unstable pose). ONE
+   timer catches BOTH the glass treadmill (pos plateaus at the collider, SLAM healthy) AND the opaque-wall
+   ram-and-recommit loop (pos plateaus at the wall, accruing on the healthy stretches). `_blacklist_goal`
+   gained a `permanent=` arg. `select()` trimmed to `(…, now, slam_ms)` — the old `forward_clearance`
+   arg + the considered `controls.trigger` plumbing are gone.
+2. **F5 — GENTLE + ceiling-safe bump-up** (`autopilot.py`, fixes the session-1 F3 ceiling smash). The old
+   bump injected `joy_vertical=-1` (full up) EVERY tick → sustained full-thrust climb into the ceiling. Now a
+   new **`BUMP` state** plays a short bounded UP-**pulse** (`bump_pulse_s` 0.2 s), raises `target_altitude_y`
+   by `bump_step`, then rests (SETTLE) and re-checks the stand-off; capped by `bump_max_per_leg` (lowered
+   0.6→0.3). `BUMP` maps to `CMD_UP` so the flow **CEILING** detector is armed and aborts the climb on
+   contact; `top_clear` dropping near the ceiling also ends it.
+3. **F6 — NO-SPIN startup** (`autopilot.py`). The prelude finishes on the flow ceiling detector while SLAM is
+   still initializing → the first `PLAN-STALE` with an empty history launched the full 16-attempt 360° sweep
+   (~50 s spinning). Added `_ever_tracked` (set on the first valid plan); an empty-history `PLAN-STALE` while
+   `not _ever_tracked` now enters a **`WARMUP`** hold (waits for SLAM) instead of the blind sweep. A real
+   mid-flight loss (history wiped by a wall hit, already tracked) still goes to the fallback.
+4. **F7 — RAM GUARD** (`autopilot.py`). Opaque-wall loop: the forward-clearance ray never stopped the drone
+   (it's `None` when SLAM flickers, and rises above the wall's voxels as the drone climbs it), the flow WALL
+   needs a looming COLLAPSE that never comes on a slow ram, so the drone rammed → SLAM died → recovered →
+   re-rammed for ~2 min. New pos-space guard in `ADVANCE`: if forward-commanded but the SLAM pos hasn't
+   advanced toward the goal by `ram_progress_eps` for `ram_stall_s` (3 s), STOP the leg (→SETTLE→REPLAN).
+   Cuts each ram; the F4 60 s stagnation blacklist then breaks the re-commit loop.
+- **Diagnoses (logs):** `20260706_124600` — startup `PLAN-STALE`→16-spin sweep (F6). `20260706_124858` —
+  opaque-wall ram loop on goal `[4.1569,-4.1532]` (F7 + F4). Takeoff violence: **no fix possible** —
+  `joy_vertical` is a DISCRETE ±1 axis (full thrust), takeoff is a measured 3.25 s hold (3.1 s floor), so it
+  can't be throttled; only the hold duration is tunable and it's near-minimal.
+- **Config (`autonomy.explore`):** REMOVED `goal_stall_s`/`goal_stuck_s`/`goal_stall_aim_deg`/
+  `goal_stall_clearance`/`goal_stall_arm_dist`; ADDED `goal_stagnation_s` (60), `bump_pulse_s` (0.2),
+  `ram_stall_s` (3.0), `ram_progress_eps` (0.15); `bump_step` 0.05→0.1, `bump_max_per_leg` 0.6→0.3.
+  (Session-1 knobs `slam_stepback_*`, `depth_bump_up`, `top_clear_thresh` stay.) All general params.
+- **Tests:** `frontier_planner.py --self-test` (rewrote the watchdog cases: stagnation-blacklists-at-60s,
+  SLAM-choke-pauses, ram/recover-plateau-still-blacklists), `autopilot.py --self-test` (rewrote bump-up for
+  BUMP, added no-spin-startup + ram-guard), `ground_grid.py --self-test` — **ALL PASS**; perception compiles.
+- **⏭ NEXT (deferred, user's call) — F8 FLIGHT-REPLAY DEBUG TOOL.** Build in a FRESH session, THEN re-fly
+  these fixes and debug with it. (1) a structured `<ts>_timeline.jsonl` written by `autopilot.py run_explore`
+  on `--log` (per-step pose/heading/slam_ms/clearance/top_clear/goal/bearing + goals-with-states +
+  event/state + periodic bbox) — the log *I* read instead of 2 000-line text; (2) `flight_replay.py` → a
+  **self-contained HTML** (Canvas + timeline scrubber + play/pause; side panel with the event log +
+  SLAM-ms sparkline) rendering room bbox / path / goals-by-state / drone. See the plan file
+  `read-cartographer-progress-md-...` F8 section.
+- **TO DO — live re-fly (after F8):** startup holds for SLAM (no spin); a low wall gets a gentle stepped bump
+  (no ceiling smash); a goal behind a solid wall stops ramming within ~3 s and goes **RED (permanent)** after
+  ~60 s, then repositions; a glass goal likewise goes red. Tune `goal_stagnation_s`/`ram_stall_s`/`bump_*` live.
 
 **✅ DONE — goal-selection PING-PONG fixed (self-tested, NOT yet re-flown).** The drone oscillated between
 two unreachable goals: A blacklisted → start toward B → **moving away silently re-whitelisted A** → turn back

@@ -97,24 +97,21 @@ autonomy:
     goal_behind_floor: 0.15      # utility multiplier floor for a frontier behind the drone (cos(turn) floored to this)
     goal_switch_factor: 1.5      # only abandon the committed goal if another frontier's utility beats it by this factor
     goal_assoc_dist: 1.0         # associate the committed goal with a live frontier centroid within this (SLAM units)
-    # --- unreachable-goal blacklist (WEDGED watchdog): there is NO path planner (the drone flies a STRAIGHT
-    #     line to the goal bearing), so a goal behind glass / a wall / a corner is never reachable and its
-    #     frontier is never consumed -> an endless REPLAN->ADVANCE->standoff->REPLAN loop (seen at the glass
-    #     window). A per-goal watchdog accrues "stall" time ONLY while the drone is GENUINELY WEDGED: armed
-    #     (moved from start) + aimed at the goal + blocked ahead (small forward clearance) + SLAM alive (not a
-    #     cooldown) + not closing. Those gates stop it firing on the ground prelude or during SLAM-settle/HOLD
-    #     pauses. PERMANENT round-based: once blacklisted a goal STAYS excluded (no re-whitelist by moving --
-    #     that was the ping-pong); it is retried only after "all goals exhausted" -> reposition to the far
-    #     corner -> whitelist the round. A goal re-blacklisted with NO cross-round progress goes PERMANENT.
-    #     NOT a repeat-counter (healthy far goals keep closing). General params + LIVE-computed points.
-    goal_stall_s: 6.0            # accumulated WEDGED seconds before a goal is declared unreachable
-    goal_progress_eps: 0.2       # min closing distance (SLAM units) that counts as progress (~0.5*goal_reach_dist).
-                                 #   DUAL ROLE: per-tick stall reset AND the cross-round "did a new vantage get us
-                                 #   closer?" test that decides soft-vs-PERMANENT. Keep it DEFINITIVE (>= ~0.05) so
-                                 #   SLAM noise / a different approach angle can't fake progress and dodge permanence.
-    goal_stall_aim_deg: 45.0     # only accrue stall while bearing error <= this (still turning to face it = not a stall)
-    goal_stall_clearance: 0.8    # forward clearance <= this = "blocked ahead" (>= stop_clearance_dist so a stand-off counts)
-    goal_stall_arm_dist: 0.5     # drone must move this far (SLAM units) from its start before the watchdog arms (skips prelude)
+    # --- unreachable-goal DISTANCE-STAGNATION watchdog: there is NO path planner (the drone flies a STRAIGHT
+    #     line to the goal bearing), so a goal behind an invisible GLASS collider (SLAM sees THROUGH it, stays
+    #     healthy, the ray reads clear -> the drone bounces on the collider = a treadmill) OR behind an opaque
+    #     wall it rams (SLAM dies, recovers, re-commits, rams again) is never reachable -> an endless loop. One
+    #     robust timer catches BOTH: accrue SLAM-HEALTHY time in which the best-ever Euclidean distance toward
+    #     the committed goal fails to improve by goal_progress_eps; at goal_stagnation_s the goal is declared
+    #     UNREACHABLE and PERMANENTLY blacklisted (+ reposition to the far corner). No aim/clearance/thrust
+    #     gates -- a goal that simply never gets closer is unreachable however the sensors read. Ticks only on
+    #     VALID (TRACKING) frames, so a full SLAM loss pauses it; a slam_ms CHOKE (unstable pose) also pauses.
+    #     General params + LIVE-computed points -- nothing here encodes this room's geometry.
+    goal_stagnation_s: 60.0      # SLAM-healthy seconds with NO distance progress toward a committed goal -> permanent blacklist.
+                                 #   Generous so the slow flight + noisy yaw/stabilization scouting don't clip a reachable goal.
+    goal_progress_eps: 0.2       # min closing distance (SLAM units) that counts as progress (~0.5*goal_reach_dist); resets the
+                                 #   stagnation clock. Also the cross-round soft-vs-PERMANENT test. Keep DEFINITIVE (>= ~0.05) so
+                                 #   SLAM noise / a different approach angle can't fake progress.
     goal_blacklist_radius: 1.0   # a frontier within this of a dead goal is "the same" region (defaults to goal_assoc_dist)
     # --- done verification / reposition: fly ONCE to the farthest known free corner -- to re-scan for
     #     uncharted territory before declaring done AND to relocate to a fresh vantage when every goal is
@@ -184,11 +181,35 @@ autonomy:
     #     COMPUTE characteristics (tunable), NOT this room's geometry. ---
     slam_slow_ms: 1000.0         # a frame build >= this = SLAM choking -> stop moving and hold
     slam_settle_frames: 3        # "stable" only after >2 consecutive FRESH frames each built under slam_slow_ms
+    # SLAM-settle REWIND step-back: if SLAM stays slow in a HOLD (plan still OK), stepping one entry back
+    # through the rewind queue re-exposes known-good geometry to help the solve re-lock (the user's
+    # "back up until it settles" idea). Re-arm needs another full run of slow frames; capped per hold.
+    slam_stepback_after_frames: 10   # consecutive slow FRESH frames in a HOLD before a rewind step-back
+    slam_stepback_max_steps: 3       # max step-backs per SLAM_HOLD (then just keep holding)
     # --- altitude lock (hold the LIVE-cached mapping height; counters the forward-push sink that drifts the
     #     drone into inner walls). target altitude is cached LIVE from this flight's pose (self-calibrating,
     #     NOT a baked room value); the floor/threshold are general margins. World frame is +Y DOWN. ---
     altitude_lock: true          # actively hold altitude during ADVANCE using the live SLAM Y (TOPIC_PLAN pos_y)
     alt_drift_floor: 0.3         # only correct once sunk MORE than this below the cached target (SLAM units; deadband, anti-chatter)
+    # --- depth inner-wall bump-up: at a forward-clearance stand-off, if the TOP band of the depth frame is
+    #     OPEN air (a LOW inner wall), rise a little and keep advancing to fly OVER it instead of stopping. A
+    #     GENTLE, ceiling-safe UP-PULSE (state BUMP, mapped to CMD_UP so the flow CEILING detector is armed):
+    #     pulse up briefly, rest, re-check the stand-off; a ceiling contact or the top band no longer being
+    #     clear ends bumping. Raising the altitude-lock target holds the gain; the clearance ray is cast at the
+    #     drone's height, so once it clears the low wall the ray opens. top_clear is RELATIVE self-calibrating
+    #     (no baked height) -> leakage-safe; bounded per leg so a tall wall/glass can't climb into the ceiling. ---
+    depth_bump_up: true          # enable the top-band-clear bump-up over low inner walls
+    top_clear_thresh: 0.6        # top-band openness (0-1, 1 = open air above) required to bump up at a stand-off
+    bump_step: 0.1               # altitude-lock target raise (SLAM units) per gentle up-pulse
+    bump_pulse_s: 0.2            # duration of ONE up-pulse (a bounded impulse; then rest + re-check -- NOT sustained thrust)
+    bump_max_per_leg: 0.3        # cumulative rise budget per ADVANCE leg (anti-smash: caps a mis-fire's total climb)
+    # --- ram guard: "forward-commanded but the SLAM pos isn't advancing toward the goal" = riding an invisible
+    #     collider (the forward-clearance ray can't stop it -- None when SLAM flickers, and it rises with the
+    #     drone as it climbs the wall; the flow WALL needs a looming COLLAPSE that never comes on a slow ram).
+    #     Detect it in POS space and STOP the leg before the ram kills SLAM; a repeated re-commit then hits the
+    #     goal_stagnation_s blacklist. General robustness params, not room geometry. ---
+    ram_stall_s: 3.0             # forward-advancing seconds with NO leg-distance progress before the leg is stopped
+    ram_progress_eps: 0.15       # min leg-distance improvement (SLAM units) that counts as advancing (resets the ram timer)
     # --- parallax scouting (a goal needing MORE than one turn_step is reached as turn -> short translate
     #     (forward/back, whichever the rays say is roomier) -> settle -> turn again -> ... -> aim -> advance.
     #     The translation between rotations gives SLAM the parallax it needs to survive a multi-step turn,

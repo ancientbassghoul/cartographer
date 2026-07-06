@@ -126,7 +126,10 @@ class AutopilotLog:
 
     def line(self, text: str):
         if self._txt is not None:
-            self._txt.write(text + "\n")
+            # Wall-clock stamp on every line so a flight log can be read back in real time
+            # ("when did the drone wait for SLAM, and for how long").
+            stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self._txt.write(f"{stamp} {text}\n")
             self._txt.flush()
 
     def cmd(self, rec_frame, seq, step, source, fields):
@@ -562,6 +565,7 @@ class ExploreController:
         self._last_ring = None           # last non-None clearance ring (for fallback direction choice while STALE)
         self._leg_theta = 0.0            # theta of the current ORIENT turn (logged into command_history when flown)
         self._explore_started = bool(no_takeoff)   # recovery only after the prelude (True immediately if no_takeoff)
+        self._ever_tracked = False        # SLAM has produced >=1 valid TRACKING plan in explore (gates the startup no-spin)
         # --- SLAM frame-timing settle gate ---
         # A healthy MASt3R-SLAM solve on this GPU builds a frame in well under a second; a choke (esp. right
         # after a turn) spikes it and the pose it emits is unreliable -> the drone flew on a bad heading. So:
@@ -571,9 +575,18 @@ class ExploreController:
         self.slam_slow_ms = float(e.get("slam_slow_ms", 1000.0))
         self.slam_settle_frames = int(e.get("slam_settle_frames", 3))   # ">2 consecutive" fresh fast frames
         self._slam_fast_streak = 0        # consecutive FRESH frames under the slow threshold
+        self._slam_slow_streak = 0        # consecutive FRESH frames AT/OVER it (arms a rewind step-back)
         self._slam_ms_latest = None       # last FRESH frame's build time (ms)
         self._slam_frame_id = None        # frame_id of that last-counted frame (dedup; plan republishes on a timer)
         self._slam_resume = None          # state SLAM_HOLD re-enters once SLAM settles
+        # SLAM-settle REWIND step-back: while SLAM stays slow in a HOLD and the plan is still OK (NOT
+        # lost/stale — those keep their own recovery), stepping one entry back through the rewind queue
+        # re-exposes known-good geometry to help the solve re-lock (the user's "back up until it settles"
+        # heuristic). Re-arm needs another full run of slow frames; capped per hold. Platform params.
+        self.slam_stepback_after_frames = int(e.get("slam_stepback_after_frames", 10))
+        self.slam_stepback_max_steps = int(e.get("slam_stepback_max_steps", 3))
+        self._slam_stepback_count = 0     # step-backs taken during the CURRENT SLAM_HOLD
+        self._slam_hold_start = None      # 'now' when the current SLAM_HOLD began (total-wait logging)
         # Yaw is "fly toward your aim": a SUSTAINED hold (then 'c' reset) rotates the body; the turn ANGLE
         # is set by the hold DURATION, not a steerable rate (pulses do nothing; SLAM under-tracks rotation
         # so no in-turn closed loop). Turn OPEN-LOOP in quantized steps using the user's calibrated turn
@@ -600,6 +613,28 @@ class ExploreController:
         self.altitude_lock = bool(e.get("altitude_lock", True))
         self.alt_drift_floor = float(e.get("alt_drift_floor", 0.3))
         self.target_altitude_y = None        # cached lazily; PERSISTS across reset_leg (flight-level hold target)
+        # Depth inner-wall bump-up: when the forward clearance ray says "wall ahead" but the TOP band of the
+        # depth frame is open air (a LOW inner wall), rise a little and keep advancing to fly OVER it instead
+        # of stopping. Raising target_altitude_y makes the altitude lock hold the new height. The clearance
+        # ray is cast at the drone's height (map_store), so once the drone clears the low wall the ray opens.
+        # top_clear is a RELATIVE, self-calibrating depth signal (no baked height) -> leakage-safe. Bounded
+        # per leg so a truly tall wall / glass (which depth reads as open air) can't make it climb forever.
+        self.depth_bump_up = bool(e.get("depth_bump_up", True))
+        self.top_clear_thresh = float(e.get("top_clear_thresh", 0.6))  # top-band openness needed to bump up
+        self.bump_step = float(e.get("bump_step", 0.1))                # target-altitude raise per gentle pulse (SLAM units)
+        self.bump_pulse_s = float(e.get("bump_pulse_s", 0.2))          # duration of ONE gentle up-pulse (bounded impulse)
+        self.bump_max_per_leg = float(e.get("bump_max_per_leg", 0.3))  # cumulative rise budget per ADVANCE leg (anti-smash)
+        self._bump_accum = 0.0               # rise applied on the current leg (reset when a new leg is planned)
+        # Ram guard: "pushing forward but the SLAM pos isn't advancing toward the goal" = riding an unmapped
+        # (invisible) collider. The forward-clearance ray can't see it (None when SLAM flickers; it also rises
+        # with the drone as it climbs the wall) and the flow WALL needs a looming COLLAPSE that never comes on a
+        # slow ram. So detect it in POS space: accrue forward-advancing time without progress; stop the leg
+        # before the ram kills SLAM. Repeated re-commits then hit the F4 60 s stagnation blacklist.
+        self.ram_stall_s = float(e.get("ram_stall_s", 3.0))            # advancing-but-not-progressing seconds -> stop the leg
+        self.ram_progress_eps = float(e.get("ram_progress_eps", 0.15)) # min leg-distance improvement that counts as advancing
+        self._ram_accum = 0.0                # accrued forward-advancing time with no leg progress
+        self._leg_best_dist = None           # best distance to leg_goal this ADVANCE leg
+        self._ram_last_t = None              # last advancing-tick time (for a clamped dt)
         # Parallax scouting: a goal needing MORE than one turn_step is reached as turn -> short translate
         # (forward/back per the rays, for SLAM parallax) -> settle -> turn again -> ... -> aim -> advance.
         self.parallax_scout = bool(e.get("parallax_scout", True))
@@ -643,6 +678,12 @@ class ExploreController:
         self._fallback_attempts = 0
         self._fallback_retreat_forward = None
         self._slam_resume = None    # SLAM streak/latest persist (health is flight-level); only the pending resume clears
+        self._slam_stepback_count = 0   # per-hold step-back counter + timer clear on interruption
+        self._slam_hold_start = None
+        self._bump_accum = 0.0      # bump-up budget is per-leg
+        self._ram_accum = 0.0       # ram-guard accumulators are per-leg
+        self._leg_best_dist = None
+        self._ram_last_t = None
         # An interruption (autonomy off = a manual takeover) invalidates the command history: the drone may
         # have been moved by hand, so the recorded maneuvers no longer map to the trajectory. Drop it.
         self.command_history.clear()
@@ -679,6 +720,17 @@ class ExploreController:
         ADVANCE legs, and dropping them left the rewind with turns only (it just spun in place)."""
         self.command_history.append({"kind": kind, "value": float(value), "duration_s": float(max(0.0, duration))})
 
+    def _invert_one(self, m):
+        """Inverse recipe steps for ONE recorded maneuver (forward<->reverse, turn theta -> -theta).
+        Shared by the full-history rewind and the single SLAM-settle step-back."""
+        if m["kind"] == "turn":
+            return list(self._turn_steps(-m["theta"]))
+        if m["kind"] == "forward":
+            return [{"reverse": m["value"], "duration_s": m["duration_s"]}]
+        if m["kind"] == "reverse":
+            return [{"trigger": m["value"], "duration_s": m["duration_s"]}]
+        return []
+
     def _invert_history(self):
         """Flatten the recent command history into inverse recipe steps: reverse chronological order and
         invert each maneuver (forward<->reverse; turn theta -> -theta), bounded to the last
@@ -686,18 +738,25 @@ class ExploreController:
         re-exposing the camera to keyframes it already recorded so RELOC can re-match."""
         steps, acc = [], 0.0
         for m in reversed(self.command_history):
+            steps.extend(self._invert_one(m))
             if m["kind"] == "turn":
-                steps.extend(self._turn_steps(-m["theta"]))
                 acc += self._turn_hold_dur * abs(m["theta"]) / self.turn_recipe_deg
-            elif m["kind"] == "forward":
-                steps.append({"reverse": m["value"], "duration_s": m["duration_s"]})
-                acc += m["duration_s"]
-            elif m["kind"] == "reverse":
-                steps.append({"trigger": m["value"], "duration_s": m["duration_s"]})
+            else:
                 acc += m["duration_s"]
             if acc >= self.command_history_s:
                 break
         return steps
+
+    def _pop_stepback(self):
+        """Pop the MOST-RECENT recorded maneuver off the rewind queue and return its inverse recipe steps
+        (ONE step back through the queue). Progresses backward through the history on each call. Returns
+        None when nothing poppable remains."""
+        while self.command_history:
+            m = self.command_history.pop()
+            steps = self._invert_one(m)
+            if steps:
+                return steps
+        return None
 
     def _step_stale(self, now, plan, wall_contact):
         """PLAN-STALE (SLAM not TRACKING, perception publishing): RECOVERY_REWIND (replay the inverse of the
@@ -707,8 +766,8 @@ class ExploreController:
         if ring:
             self._last_ring = ring          # remember the last good ring for the fallback direction choice
         st = self.state
-        if st == "STUCK":
-            return {}, "STUCK", None         # gave up; hold until OK returns (handled at the step() top)
+        if st in ("STUCK", "WARMUP"):
+            return {}, st, None              # hold until OK returns (handled at the step() top)
         if st == "REWIND":
             active, done = self._player.fields(now)
             if not done:
@@ -739,6 +798,12 @@ class ExploreController:
             return {}, "REWIND", ("PLAN-STALE -> RECOVERY_REWIND: retracing the last "
                                   f"{self.command_history_s:g}s of maneuvers to re-expose keyframes "
                                   f"[history: {n_turn} turns, {n_move} translations / {move_s:.1f}s]")
+        if not self._ever_tracked:
+            # STARTUP: SLAM has never TRACKED yet (the prelude finishes on the FLOW ceiling detector, not on
+            # SLAM). Don't spin a blind 360deg fallback into an unmapped room — HOLD and wait for SLAM to
+            # initialize. The step() top snaps WARMUP -> SLAM_HOLD -> SETTLE -> REPLAN when OK returns.
+            self._enter("WARMUP", now)
+            return {}, "WARMUP", "PLAN-STALE at startup (SLAM still initializing) -> HOLD (no blind sweep)"
         return self._begin_fallback(now, "PLAN-STALE + EMPTY command history (post-collision?) -> parallax fallback")
 
     def _begin_fallback(self, now, event):
@@ -783,7 +848,12 @@ class ExploreController:
             return
         self._slam_frame_id = fid
         self._slam_ms_latest = float(ms)
-        self._slam_fast_streak = self._slam_fast_streak + 1 if ms < self.slam_slow_ms else 0
+        if ms < self.slam_slow_ms:
+            self._slam_fast_streak += 1
+            self._slam_slow_streak = 0
+        else:
+            self._slam_fast_streak = 0
+            self._slam_slow_streak += 1
 
     @property
     def _slam_slow(self):
@@ -796,9 +866,13 @@ class ExploreController:
         return self._slam_fast_streak >= self.slam_settle_frames
 
     def _enter_slam_hold(self, resume, now, why):
-        """Hover-hold (zero velocity) until SLAM settles, then re-enter `resume`. Returned by a gate site."""
+        """Hover-hold (zero velocity) until SLAM settles, then re-enter `resume`. Returned by a gate site.
+        Stamps the hold start + resets the per-hold step-back counter (a step-back re-enters SLAM_HOLD via
+        `_enter` directly, so those persist across step-backs within one hold)."""
         self._slam_resume = resume
         self._player = None
+        self._slam_stepback_count = 0
+        self._slam_hold_start = now
         self._enter("SLAM_HOLD", now)
         return {}, "SLAM_HOLD", why
 
@@ -836,6 +910,8 @@ class ExploreController:
                 and plan.get("plan_valid") and plan.get("pos_y") is not None):
             self.target_altitude_y = float(plan["pos_y"])
         self._update_slam(plan)   # track SLAM frame-build time for the settle gate (below + at the gate sites)
+        if plan.get("plan_valid"):
+            self._ever_tracked = True   # SLAM has tracked at least once -> a later empty-history STALE is a real loss, not warmup
 
         # --- status-gated SLAM-loss recovery (CONTROL-SPACE); active only in the explore phase ---
         if self._explore_started:
@@ -864,10 +940,41 @@ class ExploreController:
             if self._slam_stable:
                 nxt = self._slam_resume or "REPLAN"
                 self._slam_resume = None
+                waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
                 self._enter(nxt, now)
-                return {}, nxt, (f"SLAM settled ({self._slam_fast_streak} fast frames, "
+                return {}, nxt, (f"SLAM settled after {waited:.1f}s ({self._slam_fast_streak} fast frames, "
                                  f"last {self._slam_ms_latest:.0f}ms) -> resume {nxt}")
+            # SLAM is still choking. If it has been slow for a sustained run (and the plan is OK — LOST/STALE
+            # are handled at the step() top), step one entry back through the rewind queue to re-expose
+            # known-good geometry so the solve can re-lock. Re-arm needs another full run of slow frames.
+            if self._slam_slow_streak >= self.slam_stepback_after_frames:
+                waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
+                if self._slam_stepback_count >= self.slam_stepback_max_steps:
+                    self._slam_slow_streak = 0            # stop re-checking every frame; keep holding (visible)
+                    return {}, "SLAM_HOLD", (f"SLAM still slow after {waited:.1f}s and "
+                                             f"{self.slam_stepback_max_steps} step-backs -> keep holding")
+                steps = self._pop_stepback()
+                if steps is None:
+                    self._slam_slow_streak = 0
+                    return {}, "SLAM_HOLD", (f"SLAM slow {waited:.1f}s but rewind queue empty -> keep holding")
+                self._slam_stepback_count += 1
+                self._slam_slow_streak = 0
+                self._player = RecipePlayer(steps, name=f"slam-stepback#{self._slam_stepback_count}")
+                self._enter("SLAM_STEPBACK", now)
+                return {}, "SLAM_STEPBACK", (
+                    f"SLAM still slow {waited:.1f}s ({self._slam_ms_latest:.0f}ms) -> REWIND step-back "
+                    f"#{self._slam_stepback_count}/{self.slam_stepback_max_steps} to re-expose geometry")
             return {}, "SLAM_HOLD", None
+
+        # One rewind step-back: play the single inverse maneuver, then return to SLAM_HOLD to keep waiting
+        # for the solve to settle (the step-back count + hold timer persist across this).
+        if st == "SLAM_STEPBACK":
+            active, done = self._player.fields(now)
+            if done:
+                self._player = None
+                self._enter("SLAM_HOLD", now)
+                return {}, "SLAM_HOLD", "step-back done -> hold for SLAM to settle"
+            return active, "SLAM_STEPBACK", None
 
         if st == "ARM":
             if self._player is None:
@@ -922,6 +1029,10 @@ class ExploreController:
                 event = "mission complete — no frontiers remain"
             elif plan.get("goal") is not None:
                 self.leg_goal = list(plan["goal"])
+                self._bump_accum = 0.0            # fresh bump-up budget for this leg
+                self._ram_accum = 0.0             # fresh ram-guard tracking for this leg
+                self._leg_best_dist = None
+                self._ram_last_t = None
                 be = plan.get("bearing_err")
                 theta = self._quantize_turn(be)
                 if self.clamp_leg_turn:
@@ -979,6 +1090,11 @@ class ExploreController:
             reached = self._dist(plan.get("pos"), self.leg_goal)
             clr = plan.get("forward_clearance_dist")
             fwd_dur, fwd_val = (now - self.t_state), float(self.forward_preset.get("trigger", 0.0))
+            # Ram-guard progress tracking: real closing toward the goal resets the ram timer.
+            if reached is not None and (self._leg_best_dist is None
+                                        or reached < self._leg_best_dist - self.ram_progress_eps):
+                self._leg_best_dist = reached
+                self._ram_accum = 0.0
             if self._slam_slow:
                 # SLAM started choking mid-leg -> STOP moving and let it settle before it loses the track.
                 # Log the clean sub-leg flown so far (also keeps translations in the rewind history), then hold
@@ -988,12 +1104,24 @@ class ExploreController:
                                              f"ADVANCE: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
                                              "hold to settle, then resume")
             if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
-                # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
-                # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
-                # the next frontier. No reverse/back-off: we're already at a safe stand-off.
-                self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
-                self._enter("SETTLE", now)
-                event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
+                top_clear = plan.get("top_clear")
+                if (self.depth_bump_up and top_clear is not None and top_clear >= self.top_clear_thresh
+                        and self.target_altitude_y is not None and self._bump_accum < self.bump_max_per_leg):
+                    # The forward ray says a wall is close, but the TOP band of the depth frame is open air
+                    # -> a LOW inner wall we can fly OVER. Rise a little via a GENTLE, ceiling-safe up-PULSE
+                    # (state BUMP) instead of a sustained full-thrust climb (which smashed the ceiling), then
+                    # re-check the stand-off. Bounded per leg by bump_max_per_leg.
+                    self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward sub-leg before the bump
+                    self._enter("BUMP", now)
+                    event = (f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} but top clear "
+                             f"({top_clear:.2f} >= {self.top_clear_thresh:.2f}) -> gentle BUMP UP over low wall")
+                else:
+                    # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
+                    # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
+                    # the next frontier. No reverse/back-off: we're already at a safe stand-off.
+                    self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
+                    self._enter("SETTLE", now)
+                    event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
             elif wall_contact:
                 # A COLLISION invalidates the command history (unknown post-impact orientation) -> drop it.
                 self.command_history.clear()
@@ -1019,19 +1147,53 @@ class ExploreController:
                 self._enter("BACKOFF", now)
                 event = f"LEG-TIMEOUT (>{self.leg_max_s}s) -> back off"
             else:
-                active = dict(self.forward_preset)
-                # Altitude lock: counter the forward-push sink. World frame +Y is DOWN, so a drone that has
-                # sunk reads a LARGER pos_y than the cached target -> inject UP until it climbs back (deadband).
-                y = plan.get("pos_y")
-                if (self.altitude_lock and self.target_altitude_y is not None and y is not None
-                        and y > self.target_altitude_y + self.alt_drift_floor):
-                    active["joy_vertical"] = self.ascend_preset["joy_vertical"]   # -1 = up (camera Y down)
+                # Ram guard: accrue forward-advancing time (clamped dt, so an interleaved hold doesn't dump)
+                # and stop the leg once we've pushed forward `ram_stall_s` without any leg progress — the drone
+                # is riding an invisible collider the sensors can't stop it on. Hand back to REPLAN; a repeated
+                # re-commit then hits the F4 stagnation blacklist.
+                dt = 0.0 if self._ram_last_t is None else min(max(now - self._ram_last_t, 0.0), 0.5)
+                self._ram_last_t = now
+                self._ram_accum += dt
+                if self.ram_stall_s > 0 and reached is not None and self._ram_accum >= self.ram_stall_s:
+                    self._log_move("forward", fwd_val, fwd_dur)
+                    self._enter("SETTLE", now)
+                    event = (f"ram guard: forward-commanded but not advancing {self._ram_accum:.1f}s "
+                             f"(d={reached:.2f}) -> stop leg -> settle -> replan")
+                else:
+                    active = dict(self.forward_preset)
+                    # Altitude lock: counter the forward-push sink. World frame +Y is DOWN, so a drone that has
+                    # sunk reads a LARGER pos_y than the cached target -> inject UP until it climbs back (deadband).
+                    y = plan.get("pos_y")
+                    if (self.altitude_lock and self.target_altitude_y is not None and y is not None
+                            and y > self.target_altitude_y + self.alt_drift_floor):
+                        active["joy_vertical"] = self.ascend_preset["joy_vertical"]   # -1 = up (camera Y down)
 
         elif st == "BACKOFF":
             active, bdone = self._player.fields(now)
             if bdone:
                 self._enter("SETTLE", now)
                 event = "backed off -> settle"
+
+        elif st == "BUMP":
+            # GENTLE, ceiling-safe up-pulse to clear a LOW inner wall (replaces the old sustained full-thrust
+            # climb that smashed the ceiling). Command UP only for `bump_pulse_s` (a bounded impulse), then
+            # raise the altitude-lock target by `bump_step` and rest (SETTLE) so momentum dies before we
+            # re-check the stand-off in ADVANCE. BUMP maps to CMD_UP so the flow CEILING detector is armed;
+            # a ceiling contact (or `top_clear` dropping on the ADVANCE re-check) ends bumping this leg.
+            if ceiling_contact:
+                self._bump_accum = self.bump_max_per_leg   # stop bumping this leg -> next stand-off will SETTLE
+                self._settle_to = "REPLAN"
+                self._enter("SETTLE", now)
+                event = "BUMP: CEILING contact -> stop bumping -> settle"
+            elif (now - self.t_state) >= self.bump_pulse_s:
+                self.target_altitude_y -= self.bump_step   # +Y is DOWN -> subtract to rise; lock holds the gain
+                self._bump_accum += self.bump_step
+                self._settle_to = "ADVANCE"                # rest, then re-check the stand-off (did we clear it?)
+                self._enter("SETTLE", now)
+                event = (f"BUMP: up-pulse done (+{self._bump_accum:.2f}/{self.bump_max_per_leg:.2f}) "
+                         "-> settle -> re-check")
+            else:
+                active = {"joy_vertical": self.ascend_preset["joy_vertical"]}   # -1 = up (gentle bounded pulse)
 
         elif st == "REVERSE_PROBE":
             # EXPERIMENT: sustained straight reverse (playbook "reverse_probe" recipe — tune its duration
@@ -1115,11 +1277,11 @@ class ExploreController:
 # Which flow event the detector should test for, by the state we're IN: takeoff + ascend command UP
 # (airborne latch / CEILING), ADVANCE commands FWD (WALL); everything else idles. REVERSE_PROBE is
 # intentionally absent (detector idle): no contact test while reversing — back-wall detection is future work.
-_EXPLORE_STATE_CMD = {"TAKEOFF": CMD_UP, "ASCEND": CMD_UP, "ADVANCE": CMD_FWD}
+_EXPLORE_STATE_CMD = {"TAKEOFF": CMD_UP, "ASCEND": CMD_UP, "ADVANCE": CMD_FWD, "BUMP": CMD_UP}
 
 # Recovery states (SLAM-loss). The step() top snaps out of these to a brake+REPLAN when the plan returns OK.
 # None are in _EXPLORE_STATE_CMD, so the flow detector idles during recovery (open-loop control-space).
-_RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK"}
+_RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK", "WARMUP"}
 
 
 def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
@@ -1628,6 +1790,7 @@ def run_self_test(cfg):
     #     (turn always +45, never <0) while the RETREAT alternates fwd/back (seeded forward by the roomier ring).
     cf = ExploreController(cfg, no_takeoff=True)
     cf.fallback_max_attempts = 3            # small cap so STUCK is reached within the drive window
+    cf._ever_tracked = True                 # a MID-FLIGHT loss (history wiped by a wall hit), not startup warmup
     cf.command_history.clear()
     cf._last_ring = [[0.0, 5.0], [45.0, 5.0], [90.0, 5.0], [135.0, 1.0],
                      [180.0, 1.0], [-135.0, 1.0], [-90.0, 5.0], [-45.0, 5.0]]   # forward roomier than back
@@ -1724,6 +1887,177 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if slam_ok else 'FAIL'}  SLAM settle-gate (track={track_ok}, "
           f"ADVANCE-slow->hold->resume={adv_gate_ok}, turn-slow->hold={postturn_ok}, "
           f"bug1 short-move-logged={bug1_ok})")
+
+    # ---- SLAM-settle REWIND step-back (sustained slow in a HOLD -> step back through the rewind queue) ----
+    padv3 = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+             "forward_clearance_dist": 9.0}
+    # (a) the slow-streak counter mirrors the fast-streak: increments on slow FRESH frames, resets on a fast one.
+    csb = ExploreController(cfg, no_takeoff=True)
+    for i in range(4):
+        csb._update_slam({"slam_ms": 1500.0, "frame_id": i})
+    slow_streak_ok = (csb._slam_slow_streak == 4 and csb._slam_fast_streak == 0)
+    csb._update_slam({"slam_ms": 200.0, "frame_id": 99})
+    slow_reset_ok = (csb._slam_slow_streak == 0)
+
+    # (b) ADVANCE -> a slow frame -> SLAM_HOLD; sustained slow -> SLAM_STEPBACK pops the forward move and
+    #     plays its inverse (a reverse), then returns to SLAM_HOLD to keep waiting.
+    csb2 = ExploreController(cfg, no_takeoff=True)
+    csb2.slam_settle_frames, csb2.slam_stepback_after_frames, csb2.slam_stepback_max_steps = 3, 4, 2
+    tb, fb = 0.0, 0
+    reached = False
+    for _ in range(40):
+        _a, s, _ = csb2.step(tb, dict(padv3, frame_id=fb, slam_ms=200.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "ADVANCE":
+            reached = True; break
+    _a, s, _ = csb2.step(tb, dict(padv3, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+    held_ok = reached and (s == "SLAM_HOLD") and any(m["kind"] == "forward" for m in csb2.command_history)
+    hist_before = len(csb2.command_history)
+    saw_stepback = False
+    for _ in range(12):
+        _a, s, _ = csb2.step(tb, dict(padv3, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "SLAM_STEPBACK":
+            saw_stepback = True; break
+    popped_ok = saw_stepback and (len(csb2.command_history) == hist_before - 1) and (csb2._slam_stepback_count == 1)
+    saw_reverse, back_hold = False, False
+    for _ in range(60):
+        a, s, _ = csb2.step(tb, dict(padv3, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if a.get("reverse"):
+            saw_reverse = True
+        if s == "SLAM_HOLD":
+            back_hold = True; break
+    stepback_ok = held_ok and popped_ok and saw_reverse and back_hold
+
+    # (c) cap: a longer pre-seeded history + sustained slow -> at most slam_stepback_max_steps step-backs.
+    csb3 = ExploreController(cfg, no_takeoff=True)
+    csb3.slam_settle_frames, csb3.slam_stepback_after_frames, csb3.slam_stepback_max_steps = 3, 3, 2
+    for _ in range(4):
+        csb3._log_move("forward", 0.2, 0.05)
+    hist0 = len(csb3.command_history)
+    csb3._enter_slam_hold("ADVANCE", 0.0, "test")
+    tb, fb = 0.05, 0
+    for _ in range(200):
+        csb3.step(tb, dict(padv3, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+    cap_ok = (csb3._slam_stepback_count == 2) and (len(csb3.command_history) == hist0 - 2)
+
+    # (d) empty rewind queue -> never enters SLAM_STEPBACK, just keeps holding (no silent fallback / crash).
+    csb4 = ExploreController(cfg, no_takeoff=True)
+    csb4.slam_stepback_after_frames = 3
+    csb4._enter_slam_hold("ADVANCE", 0.0, "test")     # command_history is empty
+    tb, fb, empty_ok = 0.05, 0, True
+    for _ in range(20):
+        _a, s, _ = csb4.step(tb, dict(padv3, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "SLAM_STEPBACK":
+            empty_ok = False; break
+    empty_ok = empty_ok and (csb4.state == "SLAM_HOLD")
+
+    # (e) PLAN-LOST while holding -> HOLD_LOST (the step-back is OK-only; recovery owns the loss path).
+    csb5 = ExploreController(cfg, no_takeoff=True)
+    for _ in range(3):
+        csb5._log_move("forward", 0.2, 0.05)
+    csb5._enter_slam_hold("ADVANCE", 0.0, "test")
+    for i in range(10):
+        csb5._update_slam({"slam_ms": 1500.0, "frame_id": i})
+    _a, s_lost, _ = csb5.step(0.5, dict(padv3, frame_id=50, slam_ms=1500.0), False, status="PLAN-LOST")
+    lost_ok = (s_lost == "HOLD_LOST")
+
+    stepback_selftest_ok = (slow_streak_ok and slow_reset_ok and stepback_ok and cap_ok and empty_ok and lost_ok)
+    ok = ok and stepback_selftest_ok
+    print(f"[self-test] {'PASS' if stepback_selftest_ok else 'FAIL'}  SLAM step-back "
+          f"(streak={slow_streak_ok and slow_reset_ok}, ADVANCE-slow->stepback={stepback_ok}, "
+          f"cap={cap_ok}, empty->hold={empty_ok}, LOST-suppresses={lost_ok})")
+
+    # ---- F5 gentle + ceiling-safe bump-up: at a stand-off with the top band clear, a bounded UP-PULSE
+    #      (BUMP state) raises the altitude target and re-checks; ceiling contact aborts; capped per leg ----
+    pbump = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+             "forward_clearance_dist": 0.3, "top_clear": 0.9, "pos_y": 0.0}
+    def _reach_advance(ctrl, plan):
+        t, f = 0.0, 0
+        for _ in range(60):
+            _a, s, _ = ctrl.step(t, dict(plan, frame_id=f, slam_ms=200.0, forward_clearance_dist=9.0),
+                                 False, status="OK"); t += 0.05; f += 1
+            if s == "ADVANCE":
+                return t, f
+        return t, f
+    cbu = ExploreController(cfg, no_takeoff=True)
+    cbu.rest_between_s, cbu.bump_pulse_s, cbu.ram_stall_s = 0.0, 0.1, 0.0   # speed up + isolate from ram guard
+    cbu.depth_bump_up, cbu.top_clear_thresh, cbu.bump_step, cbu.bump_max_per_leg = True, 0.6, 0.1, 0.25
+    cbu.target_altitude_y = 0.0
+    tb, fb = _reach_advance(cbu, pbump)
+    y0 = cbu.target_altitude_y
+    saw_bump = saw_up = saw_replan = False
+    for _ in range(300):   # BUMP pulses (up) -> settle -> re-check; budget caps -> stand-off stop -> REPLAN
+        a, s, _ = cbu.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "BUMP":
+            saw_bump = True
+            if a.get("joy_vertical") == cbu.ascend_preset["joy_vertical"]:
+                saw_up = True
+        if s == "REPLAN":
+            saw_replan = True; break
+    raised = cbu.target_altitude_y < y0            # +Y is DOWN -> rising lowers the target
+    capped = cbu._bump_accum <= cbu.bump_max_per_leg + cbu.bump_step + 1e-9   # no runaway climb
+    bump_ok = saw_bump and saw_up and raised and saw_replan and capped
+
+    # ceiling contact DURING a bump aborts the climb (no smash)
+    cbc = ExploreController(cfg, no_takeoff=True)
+    cbc.rest_between_s, cbc.bump_pulse_s, cbc.ram_stall_s = 0.0, 0.5, 0.0
+    cbc.depth_bump_up, cbc.target_altitude_y = True, 0.0
+    tb, fb = _reach_advance(cbc, pbump)
+    cbc.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0), False, status="OK"); tb += 0.05; fb += 1   # enter BUMP
+    _a, s_c, _ = cbc.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0), False, ceiling_contact=True, status="OK")
+    ceiling_abort_ok = (cbc._bump_accum >= cbc.bump_max_per_leg)   # ceiling -> stop bumping this leg
+
+    # a LOW top-clear must NOT bump (a real tall wall ahead) -> normal stand-off stop
+    cbu2 = ExploreController(cfg, no_takeoff=True)
+    cbu2.ram_stall_s, cbu2.target_altitude_y = 0.0, 0.0
+    tb, fb = _reach_advance(cbu2, dict(pbump, top_clear=0.1))
+    _a, s2, _ = cbu2.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0, top_clear=0.1), False, status="OK")
+    no_bump_ok = (s2 == "SETTLE")
+    bump_all_ok = bump_ok and ceiling_abort_ok and no_bump_ok
+    ok = ok and bump_all_ok
+    print(f"[self-test] {'PASS' if bump_all_ok else 'FAIL'}  gentle bump-up "
+          f"(pulse-up={saw_bump and saw_up}, raised+capped={raised and capped and saw_replan}, "
+          f"ceiling-aborts={ceiling_abort_ok}, low-top->no-bump={no_bump_ok})")
+
+    # ---- F6 no-spin startup: empty history + SLAM never tracked -> WARMUP hold (not the fallback sweep) ----
+    cw = ExploreController(cfg, no_takeoff=True)          # _explore_started True (no_takeoff)
+    _a, s_warm, _ = cw.step(0.0, {"plan_valid": False}, False, status="PLAN-STALE")
+    warmup_ok = (s_warm == "WARMUP") and not cw._ever_tracked
+    ct = ExploreController(cfg, no_takeoff=True)          # once SLAM tracks, empty-history STALE -> fallback
+    ct.step(0.0, {"plan_valid": True, "done": False, "goal": [1.0, 0.0], "pos": [0.0, 0.0],
+                  "bearing_err": 0.0, "frame_id": 0, "slam_ms": 200.0}, False, status="OK")
+    tracked_ok = ct._ever_tracked
+    _a, s_fb, _ = ct.step(0.1, {"plan_valid": False}, False, status="PLAN-STALE")
+    fallback_ok = s_fb in ("REWIND", "FALLBACK")
+    startup_ok = warmup_ok and tracked_ok and fallback_ok
+    ok = ok and startup_ok
+    print(f"[self-test] {'PASS' if startup_ok else 'FAIL'}  no-spin startup "
+          f"(warmup-hold={warmup_ok}, marks-tracked={tracked_ok}, later-stale->fallback={fallback_ok})")
+
+    # ---- F7 ram guard: forward-commanded but SLAM pos not advancing for ram_stall_s -> stop the leg ----
+    cr = ExploreController(cfg, no_takeoff=True)
+    cr.ram_stall_s, cr.ram_progress_eps = 0.5, 0.15
+    pram = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+            "forward_clearance_dist": 9.0, "pos_y": 0.0}   # clear path, but pos never changes (collider)
+    tr, fr, ram_stopped = 0.0, 0, False
+    for _ in range(160):
+        _a, s, ev = cr.step(tr, dict(pram, frame_id=fr, slam_ms=200.0), False, status="OK"); tr += 0.05; fr += 1
+        if ev and "ram guard" in ev:
+            ram_stopped = True; break
+    ram_ok = ram_stopped and cr.state == "SETTLE"
+    # a leg that IS advancing (pos closing) must NOT trip the ram guard
+    cr2 = ExploreController(cfg, no_takeoff=True)
+    cr2.ram_stall_s = 0.5
+    tr, fr, tripped = 0.0, 0, False
+    for i in range(40):
+        pos = [min(9.0, i * 0.3), 0.0]                   # steadily advancing toward the goal
+        _a, s, ev = cr2.step(tr, dict(pram, pos=pos, frame_id=fr, slam_ms=200.0), False, status="OK")
+        tr += 0.05; fr += 1
+        if ev and "ram guard" in ev:
+            tripped = True; break
+    ram_ok = ram_ok and not tripped
+    ok = ok and ram_ok
+    print(f"[self-test] {'PASS' if ram_ok else 'FAIL'}  ram guard "
+          f"(stuck-collider->stop={ram_stopped}, advancing->no-trip={not tripped})")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
