@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""flight_replay.py — turn a flight's structured timeline (OUTPUT/diag/<ts>_timeline.jsonl, written by
+`autopilot.py run_explore --log`, F8 Part A) into a SELF-CONTAINED animated HTML replay.
+
+The HTML (vanilla JS + Canvas, no libraries, no server) shows a top-down 2D scene — room bbox / occupancy
+outline, the flight-path trail, the drone (dot + heading arrow), and the goals colored by their state at the
+cursor time (active = gold, soft-blacklist = orange, permanent = red X) — over a scrubbable timeline with
+play/pause, plus a side panel with the autopilot event log and a SLAM frame-time sparkline at the cursor.
+
+Usage:
+    python flight_replay.py OUTPUT/diag/<ts>_timeline.jsonl [-o out.html] [--open] [--slam-slow-ms 1000]
+    python flight_replay.py --self-test
+
+Stdlib only (json, argparse, os, webbrowser). The replay is a POST-HOC tool from a log — a different use
+case from the live visualizer.py, so it is a new file, not an edit (it reuses the visualizer's top-down
+color/marker conventions: goal gold, permanent-dead red X).
+"""
+import argparse
+import json
+import os
+import sys
+import webbrowser
+
+
+def load_timeline(path):
+    """Read a <ts>_timeline.jsonl into a list of records. Each line is one JSON object — either a per-step
+    record (has 'state'/'pos'/'goals') or a periodic map record (has 'map'). Blank lines are skipped;
+    a malformed line fails fast (NO SILENT FALLBACK) with its line number."""
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{lineno}: malformed JSON in timeline: {e}") from e
+    return records
+
+
+def build_html(records, slam_slow_ms=1000.0, title="flight replay"):
+    """Embed the timeline records into the self-contained HTML template and return it as a string."""
+    data_json = json.dumps(records, separators=(",", ":"))
+    return (_HTML_TEMPLATE
+            .replace("__TITLE__", title)
+            .replace("__SLAM_SLOW_MS__", repr(float(slam_slow_ms)))
+            .replace("__DATA__", data_json))
+
+
+def render_file(jsonl_path, out_path=None, slam_slow_ms=1000.0, open_browser=False):
+    """Build the HTML for a timeline JSONL and write it (next to the log by default). Returns out_path."""
+    if jsonl_path.lower().endswith(".html"):
+        raise ValueError(f"{jsonl_path}: that's the VIEWER output - open it in a browser (start <file>). "
+                         f"Pass the <ts>_timeline.jsonl to this script instead.")
+    records = load_timeline(jsonl_path)
+    if not records:
+        raise ValueError(f"{jsonl_path}: no records — nothing to replay")
+    if out_path is None:
+        base = os.path.splitext(jsonl_path)[0]
+        out_path = base + ".html"
+    title = os.path.basename(jsonl_path)
+    html = build_html(records, slam_slow_ms=slam_slow_ms, title=title)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    n_steps = sum(1 for r in records if "state" in r)
+    n_maps = sum(1 for r in records if "map" in r)
+    print(f"[flight_replay] {jsonl_path}: {len(records)} records ({n_steps} steps, {n_maps} maps) "
+          f"-> {out_path}")
+    if open_browser:
+        webbrowser.open("file://" + os.path.abspath(out_path))
+    return out_path
+
+
+# ============================================================================
+# The HTML template. __DATA__ is replaced with a JSON array of the timeline records; __SLAM_SLOW_MS__ with
+# the green/red slam-ms threshold (a platform compute characteristic, ~1000 ms — NOT room geometry).
+# ============================================================================
+_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd;
+               font-family: Consolas, "Courier New", monospace; }
+  #wrap { display: flex; height: 100vh; }
+  #left { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+  #scene { flex: 1 1 auto; background: #161616; }
+  #bar { flex: 0 0 auto; padding: 8px 10px; background: #1c1c1c; border-top: 1px solid #333;
+         display: flex; align-items: center; gap: 10px; }
+  #bar input[type=range] { flex: 1 1 auto; }
+  #bar button { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 4px 10px;
+                cursor: pointer; font-family: inherit; }
+  #bar button:hover { background: #3a3a3a; }
+  #clock { min-width: 210px; font-size: 12px; color: #9ad; }
+  #right { flex: 0 0 340px; display: flex; flex-direction: column; background: #191919;
+           border-left: 1px solid #333; }
+  #hud { padding: 8px 10px; font-size: 12px; border-bottom: 1px solid #333; line-height: 1.5; }
+  #hud .k { color: #888; }
+  #slamwrap { padding: 8px 10px; border-bottom: 1px solid #333; }
+  #slamval { font-size: 12px; margin-bottom: 4px; }
+  #events { flex: 1 1 auto; overflow-y: auto; padding: 6px 10px; font-size: 11px; line-height: 1.45; }
+  #events .ev { white-space: pre-wrap; }
+  #events .cur { color: #fff; }
+  #events .old { color: #777; }
+  .legend { font-size: 11px; color: #999; padding: 6px 10px; border-bottom: 1px solid #333; }
+  .sw { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="left">
+    <canvas id="scene"></canvas>
+    <div id="bar">
+      <button id="play">&#9654; Play</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+      <label style="font-size:12px;color:#999">speed
+        <select id="speed">
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+          <option value="8">8x</option>
+        </select>
+      </label>
+      <span id="clock"></span>
+    </div>
+  </div>
+  <div id="right">
+    <div class="legend">
+      <span class="sw" style="background:#d9b400"></span>active goal
+      <span class="sw" style="background:#e07b1a"></span>soft
+      <span class="sw" style="background:#d33"></span>permanent
+      <span class="sw" style="background:#3aa0ff"></span>drone
+    </div>
+    <div id="hud"></div>
+    <div id="slamwrap">
+      <div id="slamval"></div>
+      <canvas id="slam" height="46"></canvas>
+    </div>
+    <div id="events"></div>
+  </div>
+</div>
+<script>
+const RECORDS = __DATA__;
+const SLAM_SLOW_MS = __SLAM_SLOW_MS__;
+
+// Split records into step records (the timeline) and map records (occupancy snapshots).
+const STEPS = RECORDS.filter(r => r.state !== undefined);
+const MAPS  = RECORDS.filter(r => r.map !== undefined);
+
+// ---- static world extent (fit once so scrubbing never jumps the view) ----
+function computeExtent() {
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  const ext = (x, z) => { if (x < x0) x0 = x; if (x > x1) x1 = x;
+                          if (z < z0) z0 = z; if (z > z1) z1 = z; };
+  for (const m of MAPS) { const b = m.map.bounds; if (b) { ext(b[0], b[2]); ext(b[1], b[3]); } }
+  for (const s of STEPS) {
+    if (s.pos) ext(s.pos[0], s.pos[1]);
+    if (s.goal) ext(s.goal[0], s.goal[1]);
+    if (s.goals) for (const g of s.goals) if (g.xz) ext(g.xz[0], g.xz[1]);
+  }
+  if (!isFinite(x0)) { x0 = -1; x1 = 1; z0 = -1; z1 = 1; }
+  const padX = Math.max(0.5, (x1 - x0) * 0.08), padZ = Math.max(0.5, (z1 - z0) * 0.08);
+  return { x0: x0 - padX, x1: x1 + padX, z0: z0 - padZ, z1: z1 + padZ };
+}
+const EXT = computeExtent();
+
+const scene = document.getElementById('scene');
+const sctx = scene.getContext('2d');
+const slam = document.getElementById('slam');
+const slctx = slam.getContext('2d');
+
+// World X-Z -> canvas px, equal aspect, +Z up. Recomputed on resize.
+let VP = null;
+function fit() {
+  const r = scene.getBoundingClientRect();
+  scene.width = r.width; scene.height = r.height;
+  slam.width = document.getElementById('slamwrap').clientWidth - 20;
+  const w = EXT.x1 - EXT.x0, h = EXT.z1 - EXT.z0;
+  const s = Math.min(scene.width / w, scene.height / h) * 0.92;
+  const ox = (scene.width - w * s) / 2, oy = (scene.height - h * s) / 2;
+  VP = { s, ox, oy };
+  render(cur);
+}
+function P(x, z) {
+  return [VP.ox + (x - EXT.x0) * VP.s,
+          scene.height - VP.oy - (z - EXT.z0) * VP.s];  // flip so +Z is up
+}
+
+const CLS_COL = { 1: '#2c2c2c', 2: '#5a5a66', 3: '#0d5a66' };  // free / occ / frontier (unknown skipped)
+function drawMap(tMono) {
+  // newest map at/under the cursor time
+  let m = null;
+  for (const r of MAPS) { if (r.t_mono <= tMono) m = r.map; else break; }
+  if (!m || !m.bounds) return;
+  const [bx0, bx1, bz0, bz1] = m.bounds, rows = m.rows, cols = m.cols, cls = m.cls;
+  const cw = (bx1 - bx0) / cols, ch = (bz1 - bz0) / rows;
+  for (let ri = 0; ri < rows; ri++) {
+    for (let ci = 0; ci < cols; ci++) {
+      const v = cls[ri * cols + ci];
+      const col = CLS_COL[v];
+      if (!col) continue;
+      const wx = bx0 + ci * cw;            // cell world X (left edge)
+      const wz = bz1 - ri * ch;            // row 0 = +Z up (summary flips rows)
+      const p0 = P(wx, wz), p1 = P(wx + cw, wz - ch);
+      sctx.fillStyle = col;
+      sctx.fillRect(p0[0], p0[1], Math.max(1, p1[0] - p0[0]), Math.max(1, p1[1] - p0[1]));
+    }
+  }
+}
+
+const GOAL_COL = { active: '#d9b400', blacklist_soft: '#e07b1a', blacklist_permanent: '#d33' };
+function drawGoals(step) {
+  const gs = step.goals || [];
+  for (const g of gs) {
+    if (!g.xz) continue;
+    const [px, py] = P(g.xz[0], g.xz[1]);
+    const col = GOAL_COL[g.state] || '#888';
+    if (g.state === 'blacklist_permanent') {          // red X
+      sctx.strokeStyle = col; sctx.lineWidth = 2;
+      sctx.beginPath(); sctx.moveTo(px-6, py-6); sctx.lineTo(px+6, py+6);
+      sctx.moveTo(px+6, py-6); sctx.lineTo(px-6, py+6); sctx.stroke();
+    } else {
+      sctx.fillStyle = col;
+      sctx.beginPath(); sctx.arc(px, py, 5, 0, 2*Math.PI); sctx.fill();
+      if (g.state === 'active') {                     // ring the current goal
+        sctx.strokeStyle = col; sctx.lineWidth = 2;
+        sctx.beginPath(); sctx.arc(px, py, 9, 0, 2*Math.PI); sctx.stroke();
+      }
+    }
+  }
+}
+
+function drawPath(idx) {
+  sctx.strokeStyle = '#3aa0ff'; sctx.lineWidth = 1.5;
+  sctx.beginPath();
+  let started = false;
+  for (let i = 0; i <= idx; i++) {
+    const p = STEPS[i].pos;
+    if (!p) { started = false; continue; }
+    const [x, y] = P(p[0], p[1]);
+    if (!started) { sctx.moveTo(x, y); started = true; } else { sctx.lineTo(x, y); }
+  }
+  sctx.stroke();
+}
+
+function drawDrone(step) {
+  if (!step.pos) return;
+  const [x, y] = P(step.pos[0], step.pos[1]);
+  sctx.fillStyle = '#3aa0ff';
+  sctx.beginPath(); sctx.arc(x, y, 5, 0, 2*Math.PI); sctx.fill();
+  if (step.heading !== null && step.heading !== undefined) {
+    // heading_deg = atan2(dx, dz): 0 = +Z, 90 = +X (perception convention)
+    const h = step.heading * Math.PI / 180.0;
+    const dx = Math.sin(h), dz = Math.cos(h), L = 22;
+    sctx.strokeStyle = '#9fd0ff'; sctx.lineWidth = 2;
+    sctx.beginPath(); sctx.moveTo(x, y);
+    sctx.lineTo(x + dx * L, y - dz * L); sctx.stroke();
+  }
+}
+
+function render(idx) {
+  if (!VP) return;
+  idx = Math.max(0, Math.min(STEPS.length - 1, idx));
+  const step = STEPS[idx];
+  sctx.clearRect(0, 0, scene.width, scene.height);
+  drawMap(step.t_mono);
+  drawPath(idx);
+  drawGoals(step);
+  drawDrone(step);
+  updatePanel(idx);
+  drawSlam(idx);
+}
+
+const fmt = (v, d=2) => (v === null || v === undefined) ? '—' : (+v).toFixed(d);
+function updatePanel(idx) {
+  const s = STEPS[idx];
+  document.getElementById('clock').textContent =
+    `${s.t_wall || ''}  t=${fmt(s.t_mono, 2)}s  #${idx+1}/${STEPS.length}` +
+    (s.rec_frame != null ? `  frame ${s.rec_frame}` : '');
+  const hud = document.getElementById('hud');
+  hud.innerHTML =
+    `<span class="k">state</span> ${s.state}  <span class="k">status</span> ${s.status||'—'}<br>` +
+    `<span class="k">pos</span> ${s.pos?('['+fmt(s.pos[0])+', '+fmt(s.pos[1])+']'):'—'} ` +
+    `<span class="k">hdg</span> ${fmt(s.heading,1)}&deg;<br>` +
+    `<span class="k">y</span> ${fmt(s.pos_y)} <span class="k">bearing_err</span> ${fmt(s.bearing_err,1)}&deg;<br>` +
+    `<span class="k">fwd_clear</span> ${fmt(s.fwd_clear)} <span class="k">top_clear</span> ${fmt(s.top_clear)}<br>` +
+    `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'}`;
+  // event log up to the cursor
+  const ev = document.getElementById('events');
+  let html = '';
+  for (let i = 0; i <= idx; i++) {
+    const e = STEPS[i].event;
+    if (!e) continue;
+    const cls = (i === idx) ? 'cur' : 'old';
+    html += `<div class="ev ${cls}">${STEPS[i].t_wall||''} ${STEPS[i].state}: ${e}</div>`;
+  }
+  ev.innerHTML = html;
+  ev.scrollTop = ev.scrollHeight;
+}
+
+function drawSlam(idx) {
+  const s = STEPS[idx];
+  const ms = s.slam_ms;
+  const col = (ms == null) ? '#888' : (ms < SLAM_SLOW_MS ? '#3c3' : '#e33');
+  document.getElementById('slamval').innerHTML =
+    `<span style="color:#888">slam_ms</span> <span style="color:${col}">${fmt(ms,0)}</span>` +
+    ` <span style="color:#555">(slow &ge; ${SLAM_SLOW_MS})</span>`;
+  const W = slam.width, H = slam.height, N = 120;
+  slctx.clearRect(0, 0, W, H);
+  const lo = Math.max(0, idx - N + 1);
+  const vals = [];
+  for (let i = lo; i <= idx; i++) vals.push(STEPS[i].slam_ms);
+  let mx = SLAM_SLOW_MS;
+  for (const v of vals) if (v != null && v > mx) mx = v;
+  // threshold line
+  slctx.strokeStyle = '#444'; slctx.lineWidth = 1;
+  const ty = H - (SLAM_SLOW_MS / mx) * (H - 2) - 1;
+  slctx.beginPath(); slctx.moveTo(0, ty); slctx.lineTo(W, ty); slctx.stroke();
+  slctx.lineWidth = 1.5; slctx.beginPath();
+  let started = false;
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i]; if (v == null) { started = false; continue; }
+    const x = (vals.length <= 1) ? 0 : (i / (vals.length - 1)) * W;
+    const y = H - (v / mx) * (H - 2) - 1;
+    if (!started) { slctx.moveTo(x, y); started = true; } else { slctx.lineTo(x, y); }
+  }
+  slctx.strokeStyle = (s.slam_ms != null && s.slam_ms >= SLAM_SLOW_MS) ? '#e33' : '#3c3';
+  slctx.stroke();
+}
+
+// ---- timeline controls ----
+let cur = 0, playing = false, timer = null;
+const scrub = document.getElementById('scrub');
+scrub.max = Math.max(0, STEPS.length - 1);
+scrub.addEventListener('input', () => { cur = +scrub.value; render(cur); });
+
+function tick() {
+  const sp = +document.getElementById('speed').value;
+  cur += Math.max(1, Math.round(sp));
+  if (cur >= STEPS.length - 1) { cur = STEPS.length - 1; setPlaying(false); }
+  scrub.value = cur; render(cur);
+}
+function setPlaying(p) {
+  playing = p;
+  document.getElementById('play').innerHTML = p ? '&#10073;&#10073; Pause' : '&#9654; Play';
+  if (timer) { clearInterval(timer); timer = null; }
+  if (p) {
+    if (cur >= STEPS.length - 1) { cur = 0; }
+    timer = setInterval(tick, 100);
+  }
+}
+document.getElementById('play').addEventListener('click', () => setPlaying(!playing));
+window.addEventListener('resize', fit);
+
+if (STEPS.length === 0) {
+  document.getElementById('hud').textContent = 'No step records in this timeline.';
+} else {
+  fit();
+}
+</script>
+</body>
+</html>
+"""
+
+
+# ============================================================================
+def _self_test():
+    """Offline smoke test: synthesize a tiny timeline (pose + a goal that flips active->soft->permanent,
+    a slam_ms spike, a map record, an event line), build the HTML, and assert the embedded record count
+    matches and the key scene pieces are present. No hardware."""
+    import tempfile
+    recs = [
+        {"t_mono": 0.0, "map": {"bounds": [-2.0, 2.0, -2.0, 2.0], "rows": 2, "cols": 2,
+                                "cls": [1, 1, 2, 3]}},
+        {"t_wall": "00:00:00.000", "t_mono": 0.0, "rec_frame": 0, "state": "REPLAN", "event": None,
+         "status": "OK", "pos": [0.0, 0.0], "heading": 0.0, "pos_y": -1.0, "slam_ms": 400.0,
+         "fwd_clear": 1.5, "top_clear": 0.8, "goal": [1.0, 1.0], "bearing_err": 5.0,
+         "goals": [{"xz": [1.0, 1.0], "state": "active"}]},
+        {"t_wall": "00:00:01.000", "t_mono": 1.0, "rec_frame": 5, "state": "ADVANCE",
+         "event": "leg start", "status": "OK", "pos": [0.3, 0.3], "heading": 45.0, "pos_y": -1.0,
+         "slam_ms": 480.0, "fwd_clear": 1.0, "top_clear": 0.8, "goal": [1.0, 1.0], "bearing_err": 2.0,
+         "goals": [{"xz": [1.0, 1.0], "state": "active"}]},
+        {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
+         "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
+         "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "top_clear": 0.8, "goal": [1.0, 1.0],
+         "bearing_err": 2.0, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_soft"}]},
+        {"t_wall": "00:00:03.000", "t_mono": 3.0, "rec_frame": 15, "state": "REPLAN",
+         "event": "goal UNREACHABLE -> permanent", "status": "OK", "pos": [0.6, 0.6], "heading": 45.0,
+         "pos_y": -1.0, "slam_ms": 500.0, "fwd_clear": 0.5, "top_clear": 0.8, "goal": None,
+         "bearing_err": None, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_permanent"}]},
+    ]
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        jl = os.path.join(d, "t_timeline.jsonl")
+        with open(jl, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r) + "\n")
+        loaded = load_timeline(jl)
+        c1 = (len(loaded) == len(recs))
+        print(f"[self-test] {'PASS' if c1 else 'FAIL'}  load_timeline round-trips {len(recs)} records "
+              f"(got {len(loaded)})")
+        ok = ok and c1
+
+        out = os.path.join(d, "t.html")
+        render_file(jl, out_path=out)
+        html = open(out, "r", encoding="utf-8").read()
+        # every record's JSON must be embedded (record count preserved through the template)
+        embedded = json.loads(html.split("const RECORDS = ", 1)[1].split(";\n", 1)[0])
+        c2 = (len(embedded) == len(recs))
+        print(f"[self-test] {'PASS' if c2 else 'FAIL'}  embedded record count matches ({len(embedded)})")
+        ok = ok and c2
+
+        n_steps = sum(1 for r in embedded if "state" in r)
+        n_maps = sum(1 for r in embedded if "map" in r)
+        c3 = (n_steps == 4 and n_maps == 1)
+        print(f"[self-test] {'PASS' if c3 else 'FAIL'}  split: {n_steps} steps + {n_maps} map "
+              f"(expected 4 + 1)")
+        ok = ok and c3
+
+        # the goal state transition (active -> soft -> permanent) survived into the embedded data
+        states = [r["goals"][0]["state"] for r in embedded if r.get("goals")]
+        c4 = states == ["active", "active", "blacklist_soft", "blacklist_permanent"]
+        print(f"[self-test] {'PASS' if c4 else 'FAIL'}  goal state timeline {states}")
+        ok = ok and c4
+
+        # the slam spike + the canvas scene scaffolding are present in the HTML
+        c5 = ("2200" in html and "drawSlam" in html and "drawGoals" in html and "<canvas id=\"scene\"" in html)
+        print(f"[self-test] {'PASS' if c5 else 'FAIL'}  HTML carries slam spike + scene/goal/slam draw code")
+        ok = ok and c5
+
+    print(f"[self-test] {'ALL PASS' if ok else 'FAILURES'} (flight_replay)")
+    return ok
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Animated HTML replay of a flight timeline JSONL.")
+    ap.add_argument("jsonl", nargs="?", help="OUTPUT/diag/<ts>_timeline.jsonl")
+    ap.add_argument("-o", "--out", help="output .html path (default: next to the JSONL)")
+    ap.add_argument("--open", action="store_true", dest="open_browser", help="open the HTML in a browser")
+    ap.add_argument("--slam-slow-ms", type=float, default=1000.0,
+                    help="green/red slam_ms threshold in the sparkline (platform compute characteristic)")
+    ap.add_argument("--self-test", action="store_true", help="run the offline smoke test and exit")
+    args = ap.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if _self_test() else 1)
+    if not args.jsonl:
+        ap.error("a timeline JSONL path is required (or use --self-test)")
+    render_file(args.jsonl, out_path=args.out, slam_slow_ms=args.slam_slow_ms,
+                open_browser=args.open_browser)
+
+
+if __name__ == "__main__":
+    main()
