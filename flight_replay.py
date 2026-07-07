@@ -286,7 +286,7 @@ function updatePanel(idx) {
     `<span class="k">pos</span> ${s.pos?('['+fmt(s.pos[0])+', '+fmt(s.pos[1])+']'):'—'} ` +
     `<span class="k">hdg</span> ${fmt(s.heading,1)}&deg;<br>` +
     `<span class="k">y</span> ${fmt(s.pos_y)} <span class="k">bearing_err</span> ${fmt(s.bearing_err,1)}&deg;<br>` +
-    `<span class="k">fwd_clear</span> ${fmt(s.fwd_clear)} <span class="k">top_clear</span> ${fmt(s.top_clear)}<br>` +
+    `<span class="k">fwd_clear</span> ${fmt(s.fwd_clear)}<br>` +
     `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'}`;
   // event log up to the cursor
   const ev = document.getElementById('events');
@@ -377,19 +377,19 @@ def _self_test():
                                 "cls": [1, 1, 2, 3]}},
         {"t_wall": "00:00:00.000", "t_mono": 0.0, "rec_frame": 0, "state": "REPLAN", "event": None,
          "status": "OK", "pos": [0.0, 0.0], "heading": 0.0, "pos_y": -1.0, "slam_ms": 400.0,
-         "fwd_clear": 1.5, "top_clear": 0.8, "goal": [1.0, 1.0], "bearing_err": 5.0,
+         "fwd_clear": 1.5, "goal": [1.0, 1.0], "bearing_err": 5.0,
          "goals": [{"xz": [1.0, 1.0], "state": "active"}]},
         {"t_wall": "00:00:01.000", "t_mono": 1.0, "rec_frame": 5, "state": "ADVANCE",
          "event": "leg start", "status": "OK", "pos": [0.3, 0.3], "heading": 45.0, "pos_y": -1.0,
-         "slam_ms": 480.0, "fwd_clear": 1.0, "top_clear": 0.8, "goal": [1.0, 1.0], "bearing_err": 2.0,
+         "slam_ms": 480.0, "fwd_clear": 1.0, "goal": [1.0, 1.0], "bearing_err": 2.0,
          "goals": [{"xz": [1.0, 1.0], "state": "active"}]},
         {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
          "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
-         "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "top_clear": 0.8, "goal": [1.0, 1.0],
+         "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "goal": [1.0, 1.0],
          "bearing_err": 2.0, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_soft"}]},
         {"t_wall": "00:00:03.000", "t_mono": 3.0, "rec_frame": 15, "state": "REPLAN",
          "event": "goal UNREACHABLE -> permanent", "status": "OK", "pos": [0.6, 0.6], "heading": 45.0,
-         "pos_y": -1.0, "slam_ms": 500.0, "fwd_clear": 0.5, "top_clear": 0.8, "goal": None,
+         "pos_y": -1.0, "slam_ms": 500.0, "fwd_clear": 0.5, "goal": None,
          "bearing_err": None, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_permanent"}]},
     ]
     ok = True

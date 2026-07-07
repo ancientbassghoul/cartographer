@@ -1,32 +1,25 @@
-"""perception_worker.py — Process P2: GPU perception. M3 = depth overlay; M4 = + SLAM.
+"""perception_worker.py — Process P2: GPU perception (MASt3R-SLAM + fused map).
 
-Subscribes to the io_bridge frame bus (downscaled 512x288 BGR frames) and, in ONE CUDA
-context, runs:
-  * **MASt3R-SLAM** (via `slam_engine.SlamEngine`) every frame — camera trajectory + dense
-    per-keyframe pointmaps, fused in-process into a `map_store.MapStore` voxel/occupancy map;
-  * **Depth Anything V2** (relative model) at a capped, *slower* cadence
-    (`perception.depth_cadence_hz`) so its passes never stall SLAM tracking — yielding a
-    forward-obstacle bar + a coarse depth grid.
+Subscribes to the io_bridge frame bus (downscaled 512x288 BGR frames) and runs
+**MASt3R-SLAM** (via `slam_engine.SlamEngine`) every frame — camera trajectory + dense
+per-keyframe pointmaps, fused in-process into a `map_store.MapStore` voxel/occupancy map and
+a `ground_grid.GroundGrid` 2D free/unknown/occupied layer for the frontier planner.
 
-It publishes two compact JSON payloads on its state bus (`perception_state_port`):
-TOPIC_POSE (pose / mode / keyframe + voxel counts) and TOPIC_DEPTH (obstacle bar / grid) —
-never raw pointmaps (those stay in-process; they are ~440 K floats/keyframe). A live window
-shows the depth colormap + obstacle bar; in display mode a second window previews the
-growing top-down map.
+DA-V2 depth was REMOVED (2026-07-07 refactor): the sim can't crash, so the depth-map height
+adjustments it fed are gone, and dropping it frees the GPU that SLAM shares (SLAM is the
+sensitive consumer). The autopilot's wall stand-off uses the SLAM raycast (forward_clearance_dist
+on TOPIC_PLAN), not depth. Obstacle/clearance signals are all SLAM-derived now.
 
-Offline mode (`--video`) drives the entire pipeline straight from a recorded mp4 (no
-io_bridge/NDI), then exports the fused map — this is the M4 offline verification.
+It publishes compact JSON payloads on its state bus (`perception_state_port`):
+TOPIC_POSE (pose / mode / keyframe + voxel counts), TOPIC_MAP (top-down snapshot), TOPIC_PLAN
+(frontier goal + clearances), TOPIC_TARGET — never raw pointmaps (those stay in-process; they
+are ~440 K floats/keyframe). In display mode a window previews the growing top-down map.
 
-Depth semantics: Depth Anything V2's `-hf` relative model emits affine-invariant
-**inverse depth** — larger value = *nearer*. We robustly normalize it per frame to a
-`proximity` field in [0,1] (1 = nearest). "Obstacle near" = high proximity; the glass
-window (which the model reads as open air) stays *low* proximity, which is exactly the
-corroborating signal M5's glass detector wants. Raw (un-normalized) stats are published
-too so absolute movement is visible, not just the per-frame normalization.
+Offline mode (`--video`) drives the entire SLAM+map pipeline straight from a recorded mp4 (no
+io_bridge/NDI), then exports the fused map — the offline verification path.
 
-NO SILENT FALLBACKS (per CLAUDE.md): CUDA availability and the model load are asserted up
-front; any failure raises. There is no CPU fallback and no try-except that downgrades to a
-no-depth mode. The active path is published as a visible `depth_mode` flag in every payload.
+NO SILENT FALLBACKS (per CLAUDE.md): CUDA availability and the SLAM load are asserted up front;
+any failure raises. There is no CPU fallback.
 """
 
 import argparse
@@ -48,16 +41,6 @@ from target_estimator import TargetEstimator
 from diag_log import DiagLog, NullLog
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-
-# Depth Anything V2 relative model: predicted_depth is inverse-depth (larger = nearer).
-DEPTH_MODE = "DAv2-relative"
-
-# Forward-obstacle bar geometry.
-N_BARS = 16                 # columns across the frame width
-BAND_TOP = 0.25             # forward-view band (fraction of height): focus on what's *ahead*,
-BAND_BOTTOM = 0.70          # excluding the floor directly beneath (always "near", not a fwd hazard)
-COL_NEAR_PCTL = 75          # per-column near-ness = this percentile of proximity (emphasize near)
-GRID_ROWS, GRID_COLS = 18, 32   # coarse proximity grid shipped on the bus for the map/UI
 
 MAP_GRID = 200              # resolution of the compact top-down occupancy summary on TOPIC_MAP
 
@@ -88,187 +71,30 @@ def heading_from_pose(pose):
 
 
 # ==============================================================================
-# Depth Anything V2
+# Pipeline: SLAM (every frame), fused into the map. (DA-V2 depth removed 2026-07-07.)
 # ==============================================================================
-class DepthEstimator:
-    """Wraps DA-V2 relative depth. Fail-fast load; returns raw predicted depth.
-
-    `infer(bgr)` takes an HxWx3 uint8 BGR frame and returns a float32 depth map at
-    the same HxW (raw inverse-depth, larger = nearer).
-    """
-
-    def __init__(self, hf_id: str, device: str = "cuda"):
-        assert torch.cuda.is_available(), (
-            "CUDA not available — perception_worker requires the GPU. "
-            "No CPU fallback (NO SILENT FALLBACKS)."
-        )
-        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-
-        self.device = device
-        self.hf_id = hf_id
-        t0 = time.time()
-        self.processor = AutoImageProcessor.from_pretrained(hf_id)
-        self.model = AutoModelForDepthEstimation.from_pretrained(hf_id).to(device).eval()
-        torch.cuda.synchronize()
-        print(f"[perception] DA-V2 '{hf_id}' loaded in {time.time() - t0:.1f}s "
-              f"| VRAM {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-
-    def infer(self, bgr: np.ndarray) -> np.ndarray:
-        h, w = bgr.shape[:2]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        inputs = self.processor(images=rgb, return_tensors="pt").to(self.device)
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-            out = self.model(pixel_values=inputs.pixel_values)
-        # predicted_depth: (1, H', W') at the model grid -> resize back to the frame.
-        pred = out.predicted_depth[:, None]  # (1,1,H',W')
-        pred = torch.nn.functional.interpolate(
-            pred, size=(h, w), mode="bicubic", align_corners=False
-        )
-        return pred[0, 0].float().cpu().numpy()
-
-
-# ==============================================================================
-# Depth -> obstacle features
-# ==============================================================================
-def robust_proximity(depth: np.ndarray):
-    """Normalize raw inverse-depth to proximity in [0,1] (1 = nearest).
-
-    Uses the 2nd/98th percentiles so a few hot pixels don't crush the scale.
-    Returns (proximity, raw_stats_dict).
-    """
-    lo, hi = np.percentile(depth, 2), np.percentile(depth, 98)
-    span = max(hi - lo, 1e-6)
-    proximity = np.clip((depth - lo) / span, 0.0, 1.0).astype(np.float32)
-    stats = {
-        "min": float(depth.min()), "max": float(depth.max()),
-        "mean": float(depth.mean()), "median": float(np.median(depth)),
-    }
-    return proximity, stats
-
-
-def obstacle_bar(proximity: np.ndarray, n_bars=N_BARS):
-    """Per-column near-ness across the central band. Returns a list of n_bars floats."""
-    h, w = proximity.shape
-    band = proximity[int(h * BAND_TOP):int(h * BAND_BOTTOM), :]
-    edges = np.linspace(0, w, n_bars + 1, dtype=int)
-    bars = []
-    for i in range(n_bars):
-        col = band[:, edges[i]:edges[i + 1]]
-        bars.append(float(np.percentile(col, COL_NEAR_PCTL)) if col.size else 0.0)
-    return bars
-
-
-def forward_clearance(bars):
-    """1 - (near-ness of the central third) => higher means more open straight ahead."""
-    n = len(bars)
-    central = bars[n // 3: 2 * n // 3] or bars
-    return float(1.0 - max(central))
-
-
-def top_clearance(proximity: np.ndarray, n_bars=N_BARS):
-    """Openness of the TOP band straight ahead (1 = open air above, 0 = something near). Reads the top
-    slice of the frame [0 : BAND_TOP*h] that obstacle_bar deliberately EXCLUDES, using the same per-column
-    near-ness percentile + central-third focus as forward_clearance. Used by the autopilot's depth bump-up:
-    a wall close ahead (forward clearance ray) BUT open air above => a LOW inner wall to fly over. RELATIVE,
-    self-calibrating (per-frame normalized proximity) -> leakage-safe."""
-    h, w = proximity.shape
-    band = proximity[0:int(h * BAND_TOP), :]
-    if band.size == 0:
-        return 0.0
-    edges = np.linspace(0, w, n_bars + 1, dtype=int)
-    bars = [float(np.percentile(band[:, edges[i]:edges[i + 1]], COL_NEAR_PCTL))
-            if edges[i + 1] > edges[i] else 0.0 for i in range(n_bars)]
-    central = bars[n_bars // 3: 2 * n_bars // 3] or bars
-    return float(1.0 - max(central))
-
-
-# ==============================================================================
-# Visualization
-# ==============================================================================
-def render(frame_bgr, proximity, bars, telemetry):
-    """Compose [ input | depth-colormap ] with an obstacle bar + telemetry overlay."""
-    h, w = proximity.shape
-    depth_u8 = (proximity * 255.0).astype(np.uint8)
-    depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)  # bright = near
-
-    # Obstacle bar drawn across the bottom of the depth panel.
-    n = len(bars)
-    bar_h = max(28, h // 5)
-    y0 = h - bar_h
-    edges = np.linspace(0, w, n + 1, dtype=int)
-    cv2.rectangle(depth_color, (0, y0), (w, h), (0, 0, 0), -1)
-    for i, nearness in enumerate(bars):
-        x0, x1 = edges[i], edges[i + 1]
-        bh = int(nearness * (bar_h - 4))
-        # green (far/clear) -> red (near/obstacle)
-        color = (0, int(255 * (1 - nearness)), int(255 * nearness))
-        cv2.rectangle(depth_color, (x0 + 1, h - 2 - bh), (x1 - 1, h - 2), color, -1)
-    cv2.putText(depth_color, "OBSTACLE  near=red", (6, y0 + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-    panel = np.hstack([frame_bgr, depth_color])
-    cv2.putText(panel, "input", (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    cv2.putText(panel, f"depth ({DEPTH_MODE})  bright=near", (w + 6, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-    for i, line in enumerate(telemetry):
-        cv2.putText(panel, line, (6, h - 10 - 16 * (len(telemetry) - 1 - i)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
-    return panel
-
-
-def build_payload(meta, depth, infer_ms, cadence_hz):
-    proximity, stats = robust_proximity(depth)
-    bars = obstacle_bar(proximity)
-    grid = cv2.resize(proximity, (GRID_COLS, GRID_ROWS), interpolation=cv2.INTER_AREA)
-    payload = {
-        "depth_mode": DEPTH_MODE,
-        "frame_id": meta.get("frame_id"),
-        "mono_ts": meta.get("mono_ts"),
-        "sim_time": meta.get("sim_time"),
-        "controls": meta.get("controls"),
-        "infer_ms": round(infer_ms, 1),
-        "cadence_hz": cadence_hz,
-        "obstacle_bar": [round(b, 3) for b in bars],
-        "forward_clearance": round(forward_clearance(bars), 3),
-        "top_clear": round(top_clearance(proximity), 3),   # openness above (bump-up over low walls)
-        "depth_stats": {k: round(v, 3) for k, v in stats.items()},
-        "grid_rows": GRID_ROWS, "grid_cols": GRID_COLS,
-        "depth_grid": np.round(grid, 3).tolist(),
-    }
-    return payload, proximity, bars
-
-
-# ==============================================================================
-# Pipeline: SLAM (every frame) + DA-V2 depth (throttled), fused into the map.
-# ==============================================================================
-DEPTH_WINDOW = "Cartographer — perception (depth + obstacles)"
 MAP_WINDOW = "Cartographer — top-down map"
 
 
 class Pipeline:
-    """Holds the GPU workers + the map, and processes one frame at a time.
+    """Holds the SLAM worker + the map, and processes one frame at a time.
 
-    `step()` runs SLAM on every frame and DA-V2 at the depth cadence, integrates each new
-    keyframe's pointmap into the voxel map, publishes TOPIC_POSE (every frame) + TOPIC_DEPTH
-    (when depth ran), and returns the render panel (or None on a depth-skipped frame).
+    `step()` runs SLAM on every frame, integrates each new keyframe's pointmap into the voxel
+    map + ground grid, and publishes TOPIC_POSE (every frame) plus TOPIC_MAP/PLAN on their
+    timers. (DA-V2 depth was removed 2026-07-07; the panel return is always None now.)
     """
 
     def __init__(self, cfg, conf_thresh=1.5, debug_lift=False):
         self.debug_lift = debug_lift
         self._geom_logged = False
-        self.cadence_hz = float(cfg["perception"]["depth_cadence_hz"])
-        self.min_interval = 1.0 / self.cadence_hz
         self.voxel_size = float(cfg["map"]["voxel_size"])
         self.proc_w = int(cfg["perception"]["processing_width"])
         self.proc_h = int(cfg["perception"]["processing_height"])
 
-        # DA-V2 first (no cwd dependency), then SLAM (chdir's into its repo last).
-        self.depth = DepthEstimator(cfg["models"]["depth_anything"]["hf_id"])
+        # SLAM chdir's into its repo on load; it owns the GPU alone now (depth removed).
         self.slam = slam_engine.SlamEngine(conf_thresh=conf_thresh)
         self.mapstore = MapStore(self.voxel_size, tracking_mode=self.slam.tracking_mode)
 
-        self.last_infer_mono = 0.0
-        self.n_depth = 0
         self.last_report = time.monotonic()
         self.last_map_pub = 0.0           # timer for TOPIC_MAP (dense trajectory) publishing
         self.MAP_PUB_INTERVAL = 0.5       # publish the map at >= 2 Hz even between keyframes
@@ -328,8 +154,6 @@ class Pipeline:
         self._last_clearance = None       # last published forward_clearance_dist (for the report line)
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
-        self._last_top_clear = None       # last depth top-band openness (depth runs slower than the plan;
-        #                                   cached here so _plan_payload can ride it on TOPIC_PLAN)
         self._verify_logged = False      # one-shot log when the planner enters done-verification
 
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
@@ -426,48 +250,21 @@ class Pipeline:
                                   self._plan_payload(res, meta, heading_deg, slam_ms))
                 self.last_plan_pub = now_mono
 
-        # --- DA-V2 depth, throttled to the slower cadence ---
         now = time.monotonic()
-        payload = proximity = bars = None
-        infer_ms = None
-        if now - self.last_infer_mono >= self.min_interval:
-            self.last_infer_mono = now
-            t0 = time.time()
-            depth_map = self.depth.infer(frame_bgr)
-            infer_ms = (time.time() - t0) * 1000.0
-            self.n_depth += 1
-            payload, proximity, bars = build_payload(meta, depth_map, infer_ms, self.cadence_hz)
-            self._last_top_clear = payload["top_clear"]   # ride the freshest depth top-band on TOPIC_PLAN
-            if state_pub is not None:
-                state_pub.publish(frame_bus.TOPIC_DEPTH, payload)
-
         if now - self.last_report >= 1.0:
             c = meta.get("controls", {}) or {}
-            depth_hz = self.n_depth / (now - self.last_report)
-            fc = f"{payload['forward_clearance']:.2f}" if payload else " -- "
             rc = f"{self._last_clearance:.2f}u" if self._last_clearance is not None else " -- "
             py = f"{self._last_pos_y:+.2f}" if self._last_pos_y is not None else " -- "
             rf, rb = self._last_ring_fb
             rfb = (f"{rf:.2f}" if rf is not None else "--") + "/" + (f"{rb:.2f}" if rb is not None else "--")
             print(f"[perception] SLAM {res.mode:<8} kf {res.n_keyframes:3d} | "
                   f"vox {len(self.mapstore):6d} | slam {slam_ms:5.1f} ms | "
-                  f"depth {depth_hz:3.1f} Hz | fwd_clear {fc} | ray_clear {rc} | y {py} | ring f/b {rfb} | "
+                  f"ray_clear {rc} | y {py} | ring f/b {rfb} | "
                   f"trigger {c.get('trigger')} yaw {c.get('yaw')}")
-            self.n_depth = 0
             self.last_report = now
 
-        panel = None
-        if show and payload is not None:
-            telem = [
-                f"SLAM {res.mode} kf={res.n_keyframes} vox={len(self.mapstore)} "
-                f"slam={slam_ms:.0f}ms{'  RELOC!' if res.reloc_event else ''}",
-                f"depth_mode={DEPTH_MODE} infer={infer_ms:.0f}ms  "
-                f"fwd_clearance={payload['forward_clearance']:.2f}  "
-                f"raw[min/med/max]={payload['depth_stats']['min']:.1f}/"
-                f"{payload['depth_stats']['median']:.1f}/{payload['depth_stats']['max']:.1f}",
-            ]
-            panel = render(frame_bgr, proximity, bars, telem)
-        return res, payload, panel, map_updated
+        # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
+        return res, None, None, map_updated
 
     def _map_payload(self, res, meta):
         """Serialize MapStore.topdown_summary() to a JSON-able TOPIC_MAP payload.
@@ -509,7 +306,6 @@ class Pipeline:
             "n_blacklisted": len(self.planner._blacklist), "blacklist": self.planner.blacklist_points(),
             "blacklist_permanent": self.planner.blacklist_permanent(),
             "pos_y": None, "clearance_ring": None,
-            "top_clear": self._last_top_clear,   # depth top-band openness (autopilot bump-up over low walls)
             "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
             "ground": self.ground.summary(raster=self.GROUND_RASTER),
@@ -689,11 +485,10 @@ class Pipeline:
 # Live loop (frame bus) and offline loop (recorded mp4)
 # ==============================================================================
 def _show_and_quit(panel, pipe, map_updated, show):
-    """Render windows and return True if the user pressed 'q'."""
+    """Render the top-down map window and return True if the user pressed 'q'. (`panel` is always
+    None since the DA-V2 depth panel was removed; kept in the signature for call-site symmetry.)"""
     if not show:
         return False
-    if panel is not None:
-        cv2.imshow(DEPTH_WINDOW, panel)
     if map_updated:
         cv2.imshow(MAP_WINDOW, pipe.mapstore.render_topdown(size=600, point_px=2, min_count=1))
     return (cv2.waitKey(1) & 0xFF) == ord("q")
@@ -717,8 +512,8 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
     apevent_sub = frame_bus.StateSubscriber(ctrl_port, topics=[frame_bus.TOPIC_AUTOPILOT_EVENT])
     last_bump_seq = -1
     print(f"[perception] frame bus SUB :{frame_port} | state PUB :{pstate_port} "
-          f"(TOPIC_POSE/DEPTH/MAP/TARGET) | detection SUB :{obj_port}")
-    print(f"[perception] SLAM every frame ({pipe.slam.tracking_mode}); DA-V2 cap ~{pipe.cadence_hz:g} Hz")
+          f"(TOPIC_POSE/MAP/PLAN/TARGET) | detection SUB :{obj_port}")
+    print(f"[perception] SLAM every frame ({pipe.slam.tracking_mode}); depth removed (SLAM owns the GPU)")
     print("[perception] === READY === waiting for frames from io_bridge "
           "(focus a window, 'q' to quit).\n")
     try:
@@ -815,9 +610,9 @@ def _video_frames(path, stride, max_frames, proc_w, proc_h, object_frame_h=720):
 def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
                       out_dir=None, conf_thresh=1.5, publish=False,
                       detect=False, detect_every=5, debug_lift=False, log=False):
-    """M4 offline verification: drive the full pipeline from a recorded mp4, export the map.
+    """M4 offline verification: drive the full SLAM+map pipeline from a recorded mp4, export the map.
 
-    With `publish=True` it ALSO publishes TOPIC_POSE/DEPTH/MAP on the perception state bus,
+    With `publish=True` it ALSO publishes TOPIC_POSE/MAP/PLAN on the perception state bus,
     so `visualizer.py` can be exercised against a recording with no hardware/NDI. Default
     off so a plain export run stays self-contained and never collides with a live worker.
 
@@ -854,10 +649,10 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     if publish:
         state_pub = frame_bus.StatePublisher(cfg["network"]["perception_state_port"])
         print(f"[perception] OFFLINE --publish: state bus PUB "
-              f":{state_pub.port} (TOPIC_POSE+DEPTH+MAP+TARGET) for visualizer.py")
+              f":{state_pub.port} (TOPIC_POSE+MAP+PLAN+TARGET) for visualizer.py")
     print(f"[perception] OFFLINE video={video.name} stride={stride} "
           f"max_frames={max_frames or 'all'} | exporting to {out_dir}")
-    print("[perception] === READY === processing recording (SLAM + depth + map).\n")
+    print("[perception] === READY === processing recording (SLAM + map).\n")
 
     n = 0
     t0 = time.time()
@@ -936,54 +731,36 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
 
 
 # ==============================================================================
-# Offline self-test (no bus / no sim) — proves the model + overlay work on hardware.
+# Offline self-test (no bus / no sim / no GPU) — proves the module builds after the depth removal.
 # ==============================================================================
 def run_self_test(cfg):
-    hf_id = cfg["models"]["depth_anything"]["hf_id"]
-    cadence_hz = float(cfg["perception"]["depth_cadence_hz"])
-    src = os.path.join(REPO, "test_assets", "frame_a.png")
-    assert os.path.exists(src), f"self-test asset missing: {src}"
-
-    bgr = cv2.imread(src, cv2.IMREAD_COLOR)
-    proc_w = cfg["perception"]["processing_width"]
-    proc_h = cfg["perception"]["processing_height"]
-    bgr = cv2.resize(bgr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-
-    depth = DepthEstimator(hf_id)
-    t0 = time.time()
-    depth_map = depth.infer(bgr)
-    infer_ms = (time.time() - t0) * 1000.0
-
-    meta = {"frame_id": 0, "mono_ts": time.monotonic(), "sim_time": 0.0, "controls": {}}
-    payload, proximity, bars = build_payload(meta, depth_map, infer_ms, cadence_hz)
-    print(f"[perception][self-test] {src}")
-    print(f"[perception][self-test] infer {infer_ms:.1f} ms | depth {depth_map.shape} "
-          f"| raw {payload['depth_stats']} | fwd_clear {payload['forward_clearance']}")
-    print(f"[perception][self-test] obstacle_bar {payload['obstacle_bar']}")
-
-    out = os.path.join(REPO, "test_assets", "perception_selftest.png")
-    cv2.imwrite(out, render(bgr, proximity, bars,
-                            [f"SELF-TEST infer={infer_ms:.0f}ms",
-                             f"fwd_clear={payload['forward_clearance']:.2f}"]))
-    print(f"[perception][self-test] overlay -> {out}")
+    """Smoke test after the DA-V2 depth removal (2026-07-07): the module imports cleanly and the
+    pure-numpy map-mode pieces (GroundGrid + FrontierPlanner) construct from config with NO depth
+    model and NO GPU. The full SLAM + map pipeline is exercised by the offline `--video` path."""
+    g = GroundGrid(cfg)
+    p = FrontierPlanner(cfg)
+    assert g is not None and p is not None
+    assert len(g) == 0 and p.committed_goal is None
+    print("[perception][self-test] depth removed; GroundGrid + FrontierPlanner construct OK (no GPU/no depth).")
+    print("[perception][self-test] full SLAM+map path -> use: perception_worker.py --video <mp4> --no-display")
     print("[perception][self-test] PASS")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cartographer perception_worker (P2): SLAM + DA-V2 depth")
+    parser = argparse.ArgumentParser(description="Cartographer perception_worker (P2): MASt3R-SLAM + map")
     parser.add_argument("--config", default=None)
     parser.add_argument("--no-display", action="store_true", help="headless: skip the OpenCV windows")
     parser.add_argument("--self-test", action="store_true",
-                        help="run depth once on a test asset, save an overlay, exit (no bus/sim/SLAM)")
+                        help="no-GPU smoke test: module + GroundGrid/FrontierPlanner build (depth removed)")
     parser.add_argument("--video", default=None,
-                        help="OFFLINE: drive the full SLAM+depth+map pipeline from this mp4, export the map")
+                        help="OFFLINE: drive the full SLAM+map pipeline from this mp4, export the map")
     parser.add_argument("--stride", type=int, default=3, help="offline: process every Nth source frame")
     parser.add_argument("--max-frames", type=int, default=0, help="offline: cap processed frames (0=all)")
     parser.add_argument("--conf-thresh", type=float, default=1.5,
                         help="per-point confidence cutoff for pointmaps fed into the map")
     parser.add_argument("--out", default=None, help="offline: output dir (default: OUTPUT/)")
     parser.add_argument("--publish", action="store_true",
-                        help="offline: also publish TOPIC_POSE/DEPTH/MAP/TARGET on the state bus "
+                        help="offline: also publish TOPIC_POSE/MAP/PLAN/TARGET on the state bus "
                              "(drives visualizer.py from a recording, no hardware)")
     parser.add_argument("--detect", action="store_true",
                         help="offline: also run Qwen target detection + 3D lift in-process "

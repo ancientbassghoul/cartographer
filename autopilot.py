@@ -129,7 +129,7 @@ def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan:
         "state": state, "event": event, "status": status,
         "pos": g("pos"), "heading": g("heading_deg"), "pos_y": g("pos_y"),
         "slam_ms": g("slam_ms"), "fwd_clear": g("forward_clearance_dist"),
-        "top_clear": g("top_clear"), "goal": g("goal"), "bearing_err": g("bearing_err"),
+        "goal": g("goal"), "bearing_err": g("bearing_err"),
         "goals": _timeline_goals(plan),
     }
 
@@ -687,18 +687,15 @@ class ExploreController:
         self.altitude_lock = bool(e.get("altitude_lock", True))
         self.alt_drift_floor = float(e.get("alt_drift_floor", 0.3))
         self.target_altitude_y = None        # cached lazily; PERSISTS across reset_leg (flight-level hold target)
-        # Depth inner-wall bump-up: when the forward clearance ray says "wall ahead" but the TOP band of the
-        # depth frame is open air (a LOW inner wall), rise a little and keep advancing to fly OVER it instead
-        # of stopping. Raising target_altitude_y makes the altitude lock hold the new height. The clearance
-        # ray is cast at the drone's height (map_store), so once the drone clears the low wall the ray opens.
-        # top_clear is a RELATIVE, self-calibrating depth signal (no baked height) -> leakage-safe. Bounded
-        # per leg so a truly tall wall / glass (which depth reads as open air) can't make it climb forever.
-        self.depth_bump_up = bool(e.get("depth_bump_up", True))
-        self.top_clear_thresh = float(e.get("top_clear_thresh", 0.6))  # top-band openness needed to bump up
-        self.bump_step = float(e.get("bump_step", 0.1))                # target-altitude raise per gentle pulse (SLAM units)
-        self.bump_pulse_s = float(e.get("bump_pulse_s", 0.2))          # duration of ONE gentle up-pulse (bounded impulse)
-        self.bump_max_per_leg = float(e.get("bump_max_per_leg", 0.3))  # cumulative rise budget per ADVANCE leg (anti-smash)
-        self._bump_accum = 0.0               # rise applied on the current leg (reset when a new leg is planned)
+        # Two-Phase Hybrid Ascent (Part 2): approach the ceiling with short SLAM-metered UP micro-pulses
+        # (near-zero momentum), then a single continuous hold to cleanly latch the flow CEILING detector.
+        # joy_vertical is a DISCRETE -1/0/+1 axis (io_bridge) so the "gradual" climb is keystroke pulses,
+        # not a throttle ramp. All general platform params (durations + a per-step gain floor) -> leakage-safe.
+        self.ascend_micro_pulse_s = float(e.get("ascend_micro_pulse_s", 0.3))  # Phase-1 UP pulse length
+        self.ascend_rest_s = float(e.get("ascend_rest_s", 0.5))                # Phase-1 rest between pulses (momentum bleed + pose read)
+        self.ascend_gain_eps = float(e.get("ascend_gain_eps", 0.05))           # per-cycle altitude-gain noise floor (SLAM units)
+        self.ascend_stall_cycles = int(e.get("ascend_stall_cycles", 2))        # consecutive flat cycles that confirm the ceiling
+        self.ascend_latch_hold_s = float(e.get("ascend_latch_hold_s", 2.0))    # Phase-2 continuous hold (> detector arm_blank + contact window)
         # Ram guard: "pushing forward but the SLAM pos isn't advancing toward the goal" = riding an unmapped
         # (invisible) collider. The forward-clearance ray can't see it (None when SLAM flickers; it also rises
         # with the drone as it climbs the wall) and the flow WALL needs a looming COLLAPSE that never comes on a
@@ -720,6 +717,14 @@ class ExploreController:
         # Backward push keeps reverse_throttle (already strong enough). General platform param (HARD RULE).
         self.parallax_push_throttle = float(e.get("parallax_push_throttle", 0.4))
         self.parallax_max_pushes = int(e.get("parallax_max_pushes", 8))
+        # Baseline nudge (Part 2): a one-shot horizontal translation after the ceiling tap + descend, to
+        # seed a SLAM translational baseline (parallax) BEFORE the first exploration yaw (pure rotation is
+        # the SLAM-killer). Reuses the parallax ring-pick + distance-quantized translate. General params.
+        self.baseline_nudge_dist = float(e.get("baseline_nudge_dist", 0.4))    # translate this far (SLAM units)
+        self.baseline_nudge_max_s = float(e.get("baseline_nudge_max_s", 2.0))  # SAFETY time cap on the nudge
+        # PERSISTS across reset_leg (like airborne_done): seed the baseline exactly once. True when there is
+        # no prelude (no_takeoff = a manual handover, SLAM already has a flown baseline).
+        self._baseline_seeded = bool(no_takeoff)
         self._push_count = 0                 # consecutive scout pushes this leg (anti-deadlock cap)
         self._push_dir = None                # "forward" | "backward" for the active PARALLAX_PUSH
         self._push_start_pos = None          # SLAM pos at the start of the current push (distance gauge)
@@ -754,7 +759,12 @@ class ExploreController:
         self._slam_resume = None    # SLAM streak/latest persist (health is flight-level); only the pending resume clears
         self._slam_stepback_count = 0   # per-hold step-back counter + timer clear on interruption
         self._slam_hold_start = None
-        self._bump_accum = 0.0      # bump-up budget is per-leg
+        # Two-Phase Hybrid Ascent runtime (lazy-init in the ASCEND handler when _ascend_phase is None).
+        self._ascend_phase = None       # "PULSE" | "REST" | "LATCH" within ASCEND (None => (re)initialize)
+        self._ascend_phase_t0 = None    # entry time of the current ascend sub-phase
+        self._ascend_prev_y = None      # last valid pos_y sample (for the per-cycle altitude gain dZ)
+        self._ascend_stall_count = 0    # consecutive flat-gain cycles (confirms the ceiling)
+        self._ascend_start_t = None     # ASCEND entry time (ascend_max_s safety cap)
         self._ram_accum = 0.0       # ram-guard accumulators are per-leg
         self._leg_best_dist = None
         self._ram_last_t = None
@@ -1108,16 +1118,70 @@ class ExploreController:
                 event = "airborne -> settle -> " + ("ascend to ceiling" if self.ascend_to_ceiling else "explore")
 
         elif st == "ASCEND":
-            # Climb until the flow CEILING fires (or a safety cap), so mapping runs at a consistent height.
-            active = dict(self.ascend_preset)
-            if ceiling_contact:
+            # TWO-PHASE HYBRID ASCENT (gentle, SLAM-metered) — a long continuous climb builds too much
+            # vertical momentum before the ceiling and smashes SLAM. Instead:
+            #   Phase 1 (micro-pulse approach): short UP pulses separated by rests. After each rest read
+            #     the live SLAM altitude gain dZ = prev_y - cur_y (+Y is DOWN so a RISING drone's pos_y
+            #     DECREASES). Keep pulsing while still climbing (dZ > eps). These 0.3s taps are too short
+            #     to ever latch the flow detector (its episode resets each command change) — by design.
+            #   Phase 2 (flow latch): once the gain flattens (dZ <= eps for `ascend_stall_cycles`), the
+            #     drone is flush at the ceiling with near-zero momentum -> a single CONTINUOUS UP hold,
+            #     long enough (> arm_blank_s + contact_seconds) to latch a CLEAN, low-velocity CEILING.
+            if self._ascend_phase is None:                 # lazy init on entry
+                self._ascend_phase, self._ascend_phase_t0 = "PULSE", now
+                self._ascend_prev_y, self._ascend_stall_count = None, 0
+                self._ascend_start_t = now
+            if (now - self._ascend_start_t) > self.ascend_max_s:
+                # Safety cap: never found a ceiling latch. NO SILENT FALLBACK — log + go descend anyway.
+                self._ascend_phase = None
                 self._settle_to = "DESCEND"
                 self._enter("SETTLE", now)
-                event = "CEILING reached -> settle -> descend a bit"
-            elif (now - self.t_state) > self.ascend_max_s:
-                self._settle_to = "DESCEND"
-                self._enter("SETTLE", now)
-                event = f"ascend cap ({self.ascend_max_s}s, no ceiling) -> settle -> descend a bit"
+                event = f"ascend cap ({self.ascend_max_s}s, no ceiling latch) -> settle -> descend a bit"
+            elif self._ascend_phase == "LATCH":
+                active = dict(self.ascend_preset)          # continuous UP; flow CEILING detector is authoritative
+                y = plan.get("pos_y") if plan.get("plan_valid") else None
+                if ceiling_contact:
+                    self._ascend_phase = None
+                    self._settle_to = "DESCEND"
+                    self._enter("SETTLE", now)
+                    event = "CEILING latched (flush, low-velocity) -> settle -> descend a bit"
+                elif (y is not None and self._ascend_prev_y is not None
+                      and (self._ascend_prev_y - y) > self.ascend_gain_eps):
+                    # Still climbing during the hold -> the Phase-1 stall was spurious -> resume micro-pulses.
+                    self._ascend_phase, self._ascend_phase_t0 = "PULSE", now
+                    self._ascend_stall_count, self._ascend_prev_y = 0, y
+                    event = "ascend LATCH but still climbing (spurious stall) -> back to micro-pulses"
+                elif (now - self._ascend_phase_t0) >= self.ascend_latch_hold_s:
+                    # Hold elapsed with no flow latch and no renewed climb -> demonstrably stalled at the top.
+                    self._ascend_phase = None
+                    self._settle_to = "DESCEND"
+                    self._enter("SETTLE", now)
+                    event = "ascend LATCH hold elapsed, no flow latch (stalled at top) -> settle -> descend"
+            elif self._ascend_phase == "PULSE":
+                active = dict(self.ascend_preset)          # a short UP micro-pulse (near-zero momentum)
+                if (now - self._ascend_phase_t0) >= self.ascend_micro_pulse_s:
+                    self._ascend_phase, self._ascend_phase_t0 = "REST", now
+            else:   # REST: neutral (momentum bleeds); at the end, sample the SLAM altitude gain this cycle
+                if (now - self._ascend_phase_t0) >= self.ascend_rest_s:
+                    valid = plan.get("plan_valid") and plan.get("pos_y") is not None and not self._slam_slow
+                    if not valid:
+                        # No trustworthy pose -> PAUSE (hold, don't guess); ascend_max_s is the backstop.
+                        self._ascend_phase_t0 = now
+                        event = "ascend: pose invalid/slow -> pause (hold) until SLAM recovers"
+                    else:
+                        y = float(plan["pos_y"])
+                        dz = None if self._ascend_prev_y is None else (self._ascend_prev_y - y)
+                        self._ascend_prev_y = y
+                        if dz is not None and dz <= self.ascend_gain_eps:
+                            self._ascend_stall_count += 1
+                        else:
+                            self._ascend_stall_count = 0
+                        if self._ascend_stall_count >= self.ascend_stall_cycles:
+                            self._ascend_phase, self._ascend_phase_t0 = "LATCH", now
+                            event = (f"ascend: height gain flattened (dZ<={self.ascend_gain_eps}) "
+                                     f"x{self._ascend_stall_count} -> Phase 2 continuous latch hold")
+                        else:
+                            self._ascend_phase, self._ascend_phase_t0 = "PULSE", now
 
         elif st == "DESCEND":
             # Brief DOWN nudge (playbook "descend" recipe — tune its duration in flight_playbook.json)
@@ -1127,9 +1191,53 @@ class ExploreController:
             active, ddone = self._player.fields(now)
             if ddone:
                 self._player = None
-                self._settle_to = "REPLAN"
+                # Seed a SLAM translational baseline (BASELINE_NUDGE) BEFORE the first exploration yaw,
+                # exactly once (prelude). A later interruption -> reset_leg -> REPLAN, never re-descends.
+                self._settle_to = "REPLAN" if self._baseline_seeded else "BASELINE_NUDGE"
                 self._enter("SETTLE", now)
-                event = "dropped a bit -> settle -> explore"
+                event = ("dropped a bit -> settle -> explore" if self._baseline_seeded
+                         else "dropped a bit -> settle -> seed SLAM baseline")
+
+        elif st == "BASELINE_NUDGE":
+            # One-shot open-loop horizontal translation after the ceiling tap, to give monocular SLAM the
+            # translational parallax it needs BEFORE the first exploration yaw (pure rotation is the known
+            # SLAM-killer here). Reuse the parallax machinery: pick the roomier body axis from the clearance
+            # ring, translate a bounded distance (distance-quantized off the live pose), guarded by clearance
+            # + a time cap. Boxed in both axes -> skip (logged). The time cap bounds it if the pose is stale.
+            ring = plan.get("clearance_ring")
+            pad = self.stop_clearance_dist + self.parallax_pad
+            if self._push_dir is None:            # first tick: choose the axis from the ring
+                fwd, back = self._ring_get(ring, 0.0), self._ring_get(ring, 180.0)
+                rel, room = max([(0.0, fwd), (180.0, back)],
+                                key=lambda kv: kv[1] if kv[1] is not None else -1.0)
+                if room is None or room <= pad:
+                    self._baseline_seeded = True
+                    self._settle_to = "REPLAN"
+                    self._enter("SETTLE", now)
+                    event = "baseline nudge: no room fwd/back -> skip -> settle -> replan"
+                else:
+                    self._push_dir = "forward" if rel == 0.0 else "backward"
+                    self._push_start_pos = plan.get("pos")
+            if self.state == "BASELINE_NUDGE":    # still nudging (didn't skip above)
+                if self._push_dir == "forward":
+                    active = {"trigger": self.parallax_push_throttle}   # brisk, decoupled from the ADVANCE crawl
+                    guard = self._ring_get(ring, 0.0)
+                else:
+                    active = dict(self.pb.recipe("back_off")[0])        # reverse magnitude, held continuously
+                    active.pop("duration_s", None)
+                    guard = self._ring_get(ring, 180.0)
+                traveled = self._dist(plan.get("pos"), self._push_start_pos)
+                far = traveled is not None and traveled >= self.baseline_nudge_dist
+                blocked = guard is not None and guard <= self.stop_clearance_dist
+                timeout = (now - self.t_state) >= self.baseline_nudge_max_s
+                if far or blocked or timeout:
+                    why = "dist" if far else "blocked" if blocked else "timer"
+                    dirn = self._push_dir
+                    self._push_dir = None
+                    self._baseline_seeded = True
+                    self._settle_to = "REPLAN"
+                    self._enter("SETTLE", now)
+                    event = f"baseline {dirn} nudge done ({why}) -> settle -> replan"
 
         elif st == "REPLAN":
             self._explore_started = True          # past the prelude -> status-gated recovery is now armed
@@ -1139,7 +1247,6 @@ class ExploreController:
                 event = "mission complete — no frontiers remain"
             elif plan.get("goal") is not None:
                 self.leg_goal = list(plan["goal"])
-                self._bump_accum = 0.0            # fresh bump-up budget for this leg
                 self._ram_accum = 0.0             # fresh ram-guard tracking for this leg
                 self._leg_best_dist = None
                 self._ram_last_t = None
@@ -1214,25 +1321,13 @@ class ExploreController:
                                              f"ADVANCE: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
                                              "hold to settle, then resume")
             if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
-                top_clear = plan.get("top_clear")
-                if (self.depth_bump_up and top_clear is not None and top_clear >= self.top_clear_thresh
-                        and self.target_altitude_y is not None and self._bump_accum < self.bump_max_per_leg):
-                    # The forward ray says a wall is close, but the TOP band of the depth frame is open air
-                    # -> a LOW inner wall we can fly OVER. Rise a little via a GENTLE, ceiling-safe up-PULSE
-                    # (state BUMP) instead of a sustained full-thrust climb (which smashed the ceiling), then
-                    # re-check the stand-off. Bounded per leg by bump_max_per_leg.
-                    self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward sub-leg before the bump
-                    self._enter("BUMP", now)
-                    event = (f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} but top clear "
-                             f"({top_clear:.2f} >= {self.top_clear_thresh:.2f}) -> gentle BUMP UP over low wall")
-                else:
-                    # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
-                    # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
-                    # the next frontier. No reverse/back-off: we're already at a safe stand-off.
-                    self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
-                    self._register_bump(plan)     # advance-blocked stop -> a bump toward the committed goal
-                    self._enter("SETTLE", now)
-                    event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
+                # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
+                # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
+                # the next frontier. No reverse/back-off: we're already at a safe stand-off.
+                self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
+                self._register_bump(plan)     # advance-blocked stop -> a bump toward the committed goal
+                self._enter("SETTLE", now)
+                event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
             elif wall_contact:
                 # A COLLISION invalidates the command history (unknown post-impact orientation) -> drop it.
                 self.command_history.clear()
@@ -1286,27 +1381,6 @@ class ExploreController:
             if bdone:
                 self._enter("SETTLE", now)
                 event = "backed off -> settle"
-
-        elif st == "BUMP":
-            # GENTLE, ceiling-safe up-pulse to clear a LOW inner wall (replaces the old sustained full-thrust
-            # climb that smashed the ceiling). Command UP only for `bump_pulse_s` (a bounded impulse), then
-            # raise the altitude-lock target by `bump_step` and rest (SETTLE) so momentum dies before we
-            # re-check the stand-off in ADVANCE. BUMP maps to CMD_UP so the flow CEILING detector is armed;
-            # a ceiling contact (or `top_clear` dropping on the ADVANCE re-check) ends bumping this leg.
-            if ceiling_contact:
-                self._bump_accum = self.bump_max_per_leg   # stop bumping this leg -> next stand-off will SETTLE
-                self._settle_to = "REPLAN"
-                self._enter("SETTLE", now)
-                event = "BUMP: CEILING contact -> stop bumping -> settle"
-            elif (now - self.t_state) >= self.bump_pulse_s:
-                self.target_altitude_y -= self.bump_step   # +Y is DOWN -> subtract to rise; lock holds the gain
-                self._bump_accum += self.bump_step
-                self._settle_to = "ADVANCE"                # rest, then re-check the stand-off (did we clear it?)
-                self._enter("SETTLE", now)
-                event = (f"BUMP: up-pulse done (+{self._bump_accum:.2f}/{self.bump_max_per_leg:.2f}) "
-                         "-> settle -> re-check")
-            else:
-                active = {"joy_vertical": self.ascend_preset["joy_vertical"]}   # -1 = up (gentle bounded pulse)
 
         elif st == "REVERSE_PROBE":
             # EXPERIMENT: sustained straight reverse (playbook "reverse_probe" recipe — tune its duration
@@ -1914,17 +1988,26 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if edges_ok else 'FAIL'}  explore edges (turn- left, quantize 70->90/50->45/"
           f"10->0, theta~0->reset->ADVANCE, goal-reached settle)")
 
-    # ---- Map mode: PRELUDE arm + takeoff + ASCEND-to-ceiling + descend (explore gets airborne + to height) ----
+    # ---- Map mode: PRELUDE arm + takeoff + TWO-PHASE ascent + descend + baseline nudge (airborne + to height) ----
     ascend = int(cfg["autonomy"]["ascend_cmd"])
     plan_goal = {"done": False, "goal": [1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 90.0}
     cp = ExploreController(cfg)                      # default: full prelude
+    cp.rest_between_s = 0.2                           # speed the settles up for the test
+    cp.ascend_micro_pulse_s, cp.ascend_rest_s = 0.1, 0.1
+    cp.ascend_stall_cycles, cp.ascend_latch_hold_s = 2, 0.3
+    cp.baseline_nudge_max_s = 0.3                     # end the baseline nudge by its time cap (pos held at 0)
     porder, saw_arm, saw_to_up, saw_asc_up, saw_desc = [], False, False, False, False
     asc_seen = 0
-    t = 0.0
-    for _ in range(int(13.0 / 0.05)):
+    t, fid = 0.0, 0
+    for _ in range(int(18.0 / 0.05)):
         cur = cp.state
-        fire_ceiling = (cur == "ASCEND" and asc_seen >= 4)   # let it ascend ~0.2s, then CEILING fires
-        active, _state, _ev = cp.step(t, plan_goal, False, ceiling_contact=fire_ceiling)
+        # Feed a valid pose that RISES (pos_y decreases) then flattens so Phase 1 hands to Phase 2; fire the
+        # flow CEILING only once we're in the Phase-2 LATCH hold (flush at the ceiling).
+        posy = -0.05 * min(asc_seen, 10) if cur == "ASCEND" else 0.0
+        fire_ceiling = (cur == "ASCEND" and cp._ascend_phase == "LATCH")
+        plan = dict(plan_goal, plan_valid=True, pos_y=posy, slam_ms=200.0, frame_id=fid,
+                    forward_clearance_dist=9.0, clearance_ring=[[0.0, 5.0], [180.0, 0.3]])
+        active, _state, _ev = cp.step(t, plan, False, ceiling_contact=fire_ceiling)
         if not porder or porder[-1] != cur:
             porder.append(cur)
         if cur == "ARM" and active.get("btnARMdown") is True:
@@ -1937,9 +2020,10 @@ def run_self_test(cfg):
                 saw_asc_up = True
         if cur == "DESCEND" and active.get("joy_vertical") == -ascend:
             saw_desc = True
-        t += 0.05
-    prelude_ok = (saw_arm and saw_to_up and saw_asc_up and saw_desc and cp.airborne_done
-                  and _is_subsequence(["ARM", "TAKEOFF", "ASCEND", "DESCEND", "REPLAN", "ORIENT"], porder))
+        t += 0.05; fid += 1
+    prelude_ok = (saw_arm and saw_to_up and saw_asc_up and saw_desc and cp.airborne_done and cp._baseline_seeded
+                  and _is_subsequence(["ARM", "TAKEOFF", "ASCEND", "DESCEND", "BASELINE_NUDGE", "REPLAN", "ORIENT"],
+                                      porder))
     # reset_leg AFTER airborne must NOT re-run the prelude (-> REPLAN); a grounded controller restarts at ARM.
     cp.reset_leg()
     no_rearm = (cp.state == "REPLAN")
@@ -1949,8 +2033,8 @@ def run_self_test(cfg):
     rearm_if_grounded = (cg.state == "ARM")
     prelude_ok = prelude_ok and no_rearm and rearm_if_grounded
     ok = ok and prelude_ok
-    print(f"[self-test] {'PASS' if prelude_ok else 'FAIL'}  explore PRELUDE arm+takeoff+ascend-to-ceiling+descend "
-          f"(ascend joy={ascend}, descend joy={-ascend}, no re-run once airborne)  visited {porder}")
+    print(f"[self-test] {'PASS' if prelude_ok else 'FAIL'}  explore PRELUDE arm+takeoff+two-phase-ascent+descend+baseline "
+          f"(ascend joy={ascend}, descend joy={-ascend}, seeded={cp._baseline_seeded}, no re-run once airborne)  visited {porder}")
 
     # ---- Map mode: CONTROL-SPACE SLAM-loss recovery (hold-on-LOST + rewind-on-STALE + parallax fallback) ----
     # (a) invert_history: reverse order, invert each maneuver (forward<->reverse, turn theta->-theta).
@@ -2159,57 +2243,88 @@ def run_self_test(cfg):
           f"(streak={slow_streak_ok and slow_reset_ok}, ADVANCE-slow->stepback={stepback_ok}, "
           f"cap={cap_ok}, empty->hold={empty_ok}, LOST-suppresses={lost_ok})")
 
-    # ---- F5 gentle + ceiling-safe bump-up: at a stand-off with the top band clear, a bounded UP-PULSE
-    #      (BUMP state) raises the altitude target and re-checks; ceiling contact aborts; capped per leg ----
-    pbump = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
-             "forward_clearance_dist": 0.3, "top_clear": 0.9, "pos_y": 0.0}
-    def _reach_advance(ctrl, plan):
-        t, f = 0.0, 0
-        for _ in range(60):
-            _a, s, _ = ctrl.step(t, dict(plan, frame_id=f, slam_ms=200.0, forward_clearance_dist=9.0),
-                                 False, status="OK"); t += 0.05; f += 1
-            if s == "ADVANCE":
-                return t, f
-        return t, f
-    cbu = ExploreController(cfg, no_takeoff=True)
-    cbu.rest_between_s, cbu.bump_pulse_s, cbu.ram_stall_s = 0.0, 0.1, 0.0   # speed up + isolate from ram guard
-    cbu.depth_bump_up, cbu.top_clear_thresh, cbu.bump_step, cbu.bump_max_per_leg = True, 0.6, 0.1, 0.25
-    cbu.target_altitude_y = 0.0
-    tb, fb = _reach_advance(cbu, pbump)
-    y0 = cbu.target_altitude_y
-    saw_bump = saw_up = saw_replan = False
-    for _ in range(300):   # BUMP pulses (up) -> settle -> re-check; budget caps -> stand-off stop -> REPLAN
-        a, s, _ = cbu.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0), False, status="OK"); tb += 0.05; fb += 1
-        if s == "BUMP":
-            saw_bump = True
-            if a.get("joy_vertical") == cbu.ascend_preset["joy_vertical"]:
-                saw_up = True
-        if s == "REPLAN":
-            saw_replan = True; break
-    raised = cbu.target_altitude_y < y0            # +Y is DOWN -> rising lowers the target
-    capped = cbu._bump_accum <= cbu.bump_max_per_leg + cbu.bump_step + 1e-9   # no runaway climb
-    bump_ok = saw_bump and saw_up and raised and saw_replan and capped
-
-    # ceiling contact DURING a bump aborts the climb (no smash)
-    cbc = ExploreController(cfg, no_takeoff=True)
-    cbc.rest_between_s, cbc.bump_pulse_s, cbc.ram_stall_s = 0.0, 0.5, 0.0
-    cbc.depth_bump_up, cbc.target_altitude_y = True, 0.0
-    tb, fb = _reach_advance(cbc, pbump)
-    cbc.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0), False, status="OK"); tb += 0.05; fb += 1   # enter BUMP
-    _a, s_c, _ = cbc.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0), False, ceiling_contact=True, status="OK")
-    ceiling_abort_ok = (cbc._bump_accum >= cbc.bump_max_per_leg)   # ceiling -> stop bumping this leg
-
-    # a LOW top-clear must NOT bump (a real tall wall ahead) -> normal stand-off stop
-    cbu2 = ExploreController(cfg, no_takeoff=True)
-    cbu2.ram_stall_s, cbu2.target_altitude_y = 0.0, 0.0
-    tb, fb = _reach_advance(cbu2, dict(pbump, top_clear=0.1))
-    _a, s2, _ = cbu2.step(tb, dict(pbump, frame_id=fb, slam_ms=200.0, top_clear=0.1), False, status="OK")
-    no_bump_ok = (s2 == "SETTLE")
-    bump_all_ok = bump_ok and ceiling_abort_ok and no_bump_ok
-    ok = ok and bump_all_ok
-    print(f"[self-test] {'PASS' if bump_all_ok else 'FAIL'}  gentle bump-up "
-          f"(pulse-up={saw_bump and saw_up}, raised+capped={raised and capped and saw_replan}, "
-          f"ceiling-aborts={ceiling_abort_ok}, low-top->no-bump={no_bump_ok})")
+    # ---- F5 TWO-PHASE HYBRID ASCENT: Phase-1 SLAM-metered UP micro-pulses (dZ gate) -> Phase-2 continuous
+    #      latch hold; ceiling_contact -> DESCEND; renewed climb during the hold reverts to Phase 1; an
+    #      invalid pose pauses and the ascend_max_s cap is the backstop; + BASELINE_NUDGE seeds the SLAM baseline.
+    UPV = cfg["autonomy"].get("explore", {}).get("ascend_cmd", -1)
+    def _ascend_plan(i, posy):
+        return {"plan_valid": True, "pos_y": posy, "slam_ms": 200.0, "frame_id": i,
+                "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0}
+    # (a) rise (pos_y DECREASES) then flatten -> Phase 1 pulses/rests, then Phase 2 latch, then CEILING->DESCEND
+    ca = ExploreController(cfg, no_takeoff=True)
+    ca.ascend_micro_pulse_s, ca.ascend_rest_s = 0.1, 0.1
+    ca.ascend_gain_eps, ca.ascend_stall_cycles, ca.ascend_latch_hold_s = 0.05, 2, 0.5
+    ca.ascend_max_s = 100.0
+    ca._enter("ASCEND", 0.0); ca._ascend_phase = None
+    saw_pulse_up = saw_rest = reached_latch = descended = False
+    for i in range(400):
+        t = i * 0.05
+        posy = -0.3 * min(t, 2.0)                     # climbing until t=2.0s, then flat at -0.6
+        ceil = (ca._ascend_phase == "LATCH")          # once flush + latching, the flow CEILING fires
+        a, s, _ = ca.step(t, _ascend_plan(i, posy), False, ceiling_contact=ceil, status="OK")
+        if s == "ASCEND" and ca._ascend_phase == "PULSE" and float(a.get("joy_vertical", 0) or 0) < 0:
+            saw_pulse_up = True
+        if s == "ASCEND" and ca._ascend_phase == "REST" and not a:
+            saw_rest = True
+        if ca._ascend_phase == "LATCH":
+            reached_latch = True
+        if s == "SETTLE" and ca._settle_to == "DESCEND":
+            descended = True; break
+    ascent_ok = saw_pulse_up and saw_rest and reached_latch and descended
+    # (b) Phase-2 revert: in LATCH but the pose shows renewed climb (dZ > eps) -> back to micro-pulses
+    cr = ExploreController(cfg, no_takeoff=True)
+    cr.ascend_gain_eps, cr.ascend_latch_hold_s, cr.ascend_max_s = 0.05, 1.0, 100.0
+    cr._enter("ASCEND", 0.0)
+    cr._ascend_phase, cr._ascend_phase_t0, cr._ascend_prev_y, cr._ascend_start_t = "LATCH", 0.0, 0.0, 0.0
+    cr.step(0.1, _ascend_plan(1, -0.2), False, ceiling_contact=False, status="OK")   # dropped 0.2 (>eps) -> rising
+    revert_ok = (cr._ascend_phase == "PULSE")
+    # (c) invalid pose pauses (no dZ) -> never latches -> the ascend_max_s cap sends it to DESCEND
+    cp = ExploreController(cfg, no_takeoff=True)
+    cp.ascend_micro_pulse_s, cp.ascend_rest_s, cp.ascend_max_s = 0.1, 0.1, 0.5
+    cp._enter("ASCEND", 0.0); cp._ascend_phase = None
+    cap_descended = never_latched = True
+    for i in range(40):
+        t = i * 0.05
+        a, s, _ = cp.step(t, {"plan_valid": False, "pos_y": None, "slam_ms": 200.0, "frame_id": i,
+                              "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0}, False, status="OK")
+        if cp._ascend_phase == "LATCH":
+            never_latched = False
+        if s == "SETTLE" and cp._settle_to == "DESCEND":
+            break
+    else:
+        cap_descended = False
+    pause_ok = cap_descended and never_latched
+    # (d) BASELINE_NUDGE: pick the roomier axis (forward) from the ring, translate baseline_nudge_dist -> REPLAN
+    cbn = ExploreController(cfg, no_takeoff=True)
+    cbn.baseline_nudge_dist, cbn.baseline_nudge_max_s, cbn._baseline_seeded = 0.4, 5.0, False
+    cbn._enter("BASELINE_NUDGE", 0.0); cbn._push_dir = None
+    ring = [[0.0, 5.0], [90.0, 5.0], [180.0, 0.3], [-90.0, 5.0]]      # forward roomy, back blocked
+    saw_translate = nudge_replan = False
+    t, f = 0.0, 0
+    for i in range(300):
+        px = min(0.5, 0.01 * i)                                       # creep forward so `traveled` grows
+        pl = {"plan_valid": True, "pos": [px, 0.0], "clearance_ring": ring, "slam_ms": 200.0,
+              "frame_id": f, "goal": [9.0, 0.0], "bearing_err": 0.0, "forward_clearance_dist": 5.0, "pos_y": 0.0}
+        a, s, _ = cbn.step(t, pl, False, status="OK")
+        if s == "BASELINE_NUDGE" and float(a.get("trigger", 0) or 0) > 0:
+            saw_translate = True
+        if s == "SETTLE" and cbn._settle_to == "REPLAN" and cbn._baseline_seeded:
+            nudge_replan = True; break
+        t += 0.05; f += 1
+    nudge_ok = saw_translate and nudge_replan
+    # (e) boxed in both axes -> skip the nudge (logged), still seed + go REPLAN
+    cbs = ExploreController(cfg, no_takeoff=True)
+    cbs._baseline_seeded = False
+    cbs._enter("BASELINE_NUDGE", 0.0); cbs._push_dir = None
+    _a, s_skip, _ = cbs.step(0.0, {"plan_valid": True, "pos": [0.0, 0.0], "clearance_ring": [[0.0, 0.2], [180.0, 0.2]],
+                                   "slam_ms": 200.0, "frame_id": 0, "goal": [9.0, 0.0], "bearing_err": 0.0,
+                                   "forward_clearance_dist": 0.2, "pos_y": 0.0}, False, status="OK")
+    skip_ok = (s_skip == "SETTLE" and cbs._settle_to == "REPLAN" and cbs._baseline_seeded)
+    ascent_all_ok = ascent_ok and revert_ok and pause_ok and nudge_ok and skip_ok
+    ok = ok and ascent_all_ok
+    print(f"[self-test] {'PASS' if ascent_all_ok else 'FAIL'}  two-phase ascent + baseline nudge "
+          f"(phase1->phase2->ceiling={ascent_ok}, revert-on-climb={revert_ok}, invalid-pause->cap={pause_ok}, "
+          f"baseline-translate={nudge_ok}, boxed->skip={skip_ok})")
 
     # ---- F6 no-spin startup: empty history + SLAM never tracked -> WARMUP hold (not the fallback sweep) ----
     cw = ExploreController(cfg, no_takeoff=True)          # _explore_started True (no_takeoff)

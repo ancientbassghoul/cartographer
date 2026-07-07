@@ -23,15 +23,14 @@ perception:
   target_processing_fps: 10             # sub-sample 30 -> 10 into the GPU workers
   processing_width: 512                 # transport resolution; 16:9 preserved (NEVER squash)
   processing_height: 288
-  depth_cadence_hz: 3                    # Depth Anything V2 runs slower than SLAM tracking
+  # (depth_cadence_hz REMOVED 2026-07-07 — DA-V2 depth disabled; SLAM owns the GPU alone.)
   object_cadence_hz: 0.5                 # Qwen target detection (separate process); slow, start conservative
   object_frame_height: 720               # hi-res frame height for Qwen grounding (width keeps aspect; no upscale beyond source)
   capture_key: "space"                   # io_bridge: grab the current FULL-RES drone frame -> capture_dir (benchmark frames)
   capture_dir: "test_assets/captures"    # where 'space' snapshots are written (full-res PNG; sort into Nasrallah/Rifle/None)
 
 models:
-  depth_anything:
-    hf_id: "depth-anything/Depth-Anything-V2-Base-hf"   # via transformers AutoModelForDepthEstimation
+  # (depth_anything REMOVED 2026-07-07 — DA-V2 depth inference disabled; the wall stand-off uses the SLAM raycast.)
   owlv2:                                # OWLv2 image-guided (cascade verifier + standalone OWLV2 mode)
     hf_id: "google/owlv2-base-patch16-ensemble"  # image-guided one-shot detection
     score_thresh: 0.9                   # standalone OWLV2 mode: top box >= this (scores NOT calibrated)
@@ -135,10 +134,26 @@ autonomy:
     clearance_max_range: 10.0    # cap the ray length (SLAM units); beyond this is treated as "open"
     stop_clearance_dist: 0.6     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
     # NOTE: the settle pause between maneuvers/legs is rules.rest_between_s in flight_playbook.json (tune it there).
-    # --- prelude (autopilot: arm -> takeoff -> [ascend to ceiling -> descend a bit] -> explore) ---
+    # --- prelude (autopilot: arm -> takeoff -> [TWO-PHASE ascend to ceiling -> descend -> baseline nudge] -> explore) ---
     ascend_to_ceiling: true      # after takeoff, climb until the flow CEILING fires, then drop a bit, so mapping runs at a consistent height near the ceiling
-    ascend_max_s: 15.0           # SAFETY: stop ascending after this even if no ceiling is detected, then proceed (general, not a room answer)
+    ascend_max_s: 25.0           # SAFETY: stop ascending after this even if no ceiling latches, then proceed (general, not a room answer)
+    # TWO-PHASE HYBRID ASCENT (gentle, SLAM-metered): a long continuous climb builds too much vertical momentum
+    # and smashes SLAM at the ceiling. Phase 1 = short UP micro-pulses (joy_vertical is a DISCRETE -1/0/+1 axis
+    # so "gradual" = keystroke pulses, not a throttle); after each rest read the live SLAM altitude gain
+    # dZ = prev_pos_y - cur_pos_y (+Y is DOWN, so RISING => pos_y DECREASES) and keep pulsing while dZ > eps.
+    # Phase 2 = once the gain flattens (dZ <= eps for stall_cycles), hold UP continuously long enough to latch
+    # the flow CEILING detector cleanly at near-zero velocity. All general platform params (durations + a
+    # per-step gain floor), NOT a room answer -> leakage-safe.
+    ascend_micro_pulse_s: 0.1    # Phase-1: duration of ONE UP micro-pulse (bounded keystroke, near-zero momentum)
+    ascend_rest_s: 1.0           # Phase-1: rest after each pulse (momentum bleed + a clean pose to read dZ)
+    ascend_gain_eps: 0.05        # per-cycle altitude-gain noise floor (SLAM units); dZ <= this counts as "not climbing"
+    ascend_stall_cycles: 2       # consecutive flat-gain cycles that confirm the ceiling (rejects a 1-frame SLAM hiccup)
+    ascend_latch_hold_s: 2.0     # Phase-2: continuous UP hold; MUST exceed the detector's arm_blank_s + contact_seconds (~1.2s) to latch
     # NOTE: the post-ceiling descent is the "descend" recipe in flight_playbook.json — tune its key-press duration there.
+    # Baseline nudge: after the descend, a one-shot horizontal translation to seed a SLAM translational baseline
+    # (parallax) BEFORE the first exploration yaw (pure rotation is the SLAM-killer). Reuses the parallax ring-pick.
+    baseline_nudge_dist: 0.4     # translate this far to seed parallax (SLAM units)
+    baseline_nudge_max_s: 2.0    # SAFETY time cap on the baseline nudge
     # --- executor (autopilot run_explore) ---
     # The engine is a "fly toward your aim" scheme: yaw moves an aim crosshair, forward thrust flies
     # toward it, and a sustained yaw HOLD (then 'c' reset) rotates the body. A turn's ANGLE = how long
@@ -188,18 +203,9 @@ autonomy:
     #     NOT a baked room value); the floor/threshold are general margins. World frame is +Y DOWN. ---
     altitude_lock: true          # actively hold altitude during ADVANCE using the live SLAM Y (TOPIC_PLAN pos_y)
     alt_drift_floor: 0.3         # only correct once sunk MORE than this below the cached target (SLAM units; deadband, anti-chatter)
-    # --- depth inner-wall bump-up: at a forward-clearance stand-off, if the TOP band of the depth frame is
-    #     OPEN air (a LOW inner wall), rise a little and keep advancing to fly OVER it instead of stopping. A
-    #     GENTLE, ceiling-safe UP-PULSE (state BUMP, mapped to CMD_UP so the flow CEILING detector is armed):
-    #     pulse up briefly, rest, re-check the stand-off; a ceiling contact or the top band no longer being
-    #     clear ends bumping. Raising the altitude-lock target holds the gain; the clearance ray is cast at the
-    #     drone's height, so once it clears the low wall the ray opens. top_clear is RELATIVE self-calibrating
-    #     (no baked height) -> leakage-safe; bounded per leg so a tall wall/glass can't climb into the ceiling. ---
-    depth_bump_up: true          # enable the top-band-clear bump-up over low inner walls
-    top_clear_thresh: 0.6        # top-band openness (0-1, 1 = open air above) required to bump up at a stand-off
-    bump_step: 0.1               # altitude-lock target raise (SLAM units) per gentle up-pulse
-    bump_pulse_s: 0.2            # duration of ONE up-pulse (a bounded impulse; then rest + re-check -- NOT sustained thrust)
-    bump_max_per_leg: 0.3        # cumulative rise budget per ADVANCE leg (anti-smash: caps a mis-fire's total climb)
+    # (Depth inner-wall bump-up REMOVED 2026-07-07 — the sim can't crash, so the depth-map height patches are
+    #  gone. DA-V2 depth is disabled entirely to free the GPU SLAM shares. Altitude is held only by the
+    #  SLAM-pose altitude lock above + re-tapped at the ceiling by the two-phase ascent.)
     # --- ram guard: "forward-commanded but the SLAM pos isn't advancing toward the goal" = riding an invisible
     #     collider (the forward-clearance ray can't stop it -- None when SLAM flickers, and it rises with the
     #     drone as it climbs the wall; the flow WALL needs a looming COLLAPSE that never comes on a slow ram).

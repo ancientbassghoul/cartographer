@@ -10,14 +10,16 @@ default :5603) and composes a single OpenCV window from three topics published b
                    list of occupied grid cells + colors + the trajectory, already in pixel
                    coords (see MapStore.topdown_summary). Each message is a full snapshot, so
                    joining late just means catching up on the next keyframe.
-  * TOPIC_DEPTH -> the coarse proximity grid + forward-obstacle bar + forward_clearance.
   * TOPIC_POSE  -> SLAM mode, tracking_mode, keyframe/voxel counts, reloc events.
+  * TOPIC_PLAN  -> the frontier goal + SLAM-raycast forward clearance (drawn on the map).
   * TOPIC_TARGET-> the lifted 3D target position + uncertainty (drawn as a marker on the map
                    and summarized in the status strip).
 
+(DA-V2 depth / TOPIC_DEPTH was removed 2026-07-07; the depth slot shows a DISABLED placeholder.)
+
 It also (optionally) subscribes to the frame bus (`frame_bus_port`, default :5601) to show the
-live input frame next to the depth view — the frame bus is conflated PUB/SUB, so an extra
-subscriber is free and never steals frames from the perception worker.
+live input frame — the frame bus is conflated PUB/SUB, so an extra subscriber is free and never
+steals frames from the perception worker.
 
 This process owns no GPU and no SLAM; it is pure display. NO SILENT FALLBACKS (per CLAUDE.md):
 `tracking_mode` and reloc events are surfaced prominently in the status strip — a degraded or
@@ -25,8 +27,8 @@ non-default SLAM state is always visible, never hidden. If nothing has been rece
 panels say so rather than faking content.
 
 Layout:  [ status strip                         ]
-         [ input frame ] [                        ]
-         [ depth+bar   ] [   top-down map + traj  ]
+         [ input frame    ] [                     ]
+         [ depth DISABLED ] [   top-down map + traj  ]
 """
 
 import argparse
@@ -46,7 +48,7 @@ WINDOW = "Cartographer — live dashboard"
 PANEL_W, PANEL_H = 416, 234   # the two 16:9 left-column panels (input + depth)
 GAP = 12
 MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left column
-STATUS_H = 48                 # two lines: SLAM/depth state + target estimate
+STATUS_H = 48                 # two lines: SLAM state + target estimate
 RELOC_FLASH_S = 2.0           # keep the RELOC banner up this long after the event
 
 
@@ -74,28 +76,13 @@ def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
 
 
 def render_depth_panel(depth, w=PANEL_W, h=PANEL_H):
-    if not depth:
-        return _placeholder(w, h, "depth: waiting...")
-    grid = np.asarray(depth.get("depth_grid", []), np.float32)
-    if grid.size == 0:
-        return _placeholder(w, h, "depth: empty grid")
-    u8 = np.clip(grid * 255.0, 0, 255).astype(np.uint8)
-    color = cv2.applyColorMap(u8, cv2.COLORMAP_INFERNO)         # bright = near
-    color = cv2.resize(color, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    # Forward-obstacle bar across the bottom (green=clear -> red=near), mirroring the worker.
-    bars = depth.get("obstacle_bar") or []
-    bar_h = max(22, h // 5)
-    cv2.rectangle(color, (0, h - bar_h), (w, h), (0, 0, 0), -1)
-    if bars:
-        edges = np.linspace(0, w, len(bars) + 1, dtype=int)
-        for i, near in enumerate(bars):
-            bh = int(near * (bar_h - 4))
-            c = (0, int(255 * (1 - near)), int(255 * near))
-            cv2.rectangle(color, (edges[i] + 1, h - 2 - bh), (edges[i + 1] - 1, h - 2), c, -1)
-    cv2.putText(color, f"depth (bright=near)  fwd_clear={depth.get('forward_clearance')}",
-                (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-    return color
+    """DA-V2 depth was removed (2026-07-07): this slot now shows an explicit DISABLED placeholder
+    (NO SILENT FALLBACK — an empty panel must read as intentional, not a hung/waiting feed). The
+    autopilot's wall stand-off uses the SLAM raycast (forward_clearance_dist), drawn on the map."""
+    panel = _placeholder(w, h, "DEPTH DISABLED")
+    cv2.putText(panel, "(SLAM raycast clearance -> map)", (6, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)
+    return panel
 
 
 def _world_to_px(x, z, m, size):
@@ -281,7 +268,8 @@ def render_map_panel(m, size=MAP_SIZE, target=None):
 
 
 def render_status(pose, depth, width, reloc_active, target=None):
-    # Two-line strip: SLAM/depth state on top, the target estimate below.
+    # Two-line strip: SLAM state on top, the target estimate below. (`depth` retained for signature
+    # symmetry; DA-V2 depth was removed so it is always None — the SLAM raycast clearance is on the map.)
     strip = np.full((STATUS_H, width, 3), 45, np.uint8)
     if pose is None:
         cv2.putText(strip, "waiting for perception_worker on the state bus ...", (8, 20),
@@ -290,8 +278,6 @@ def render_status(pose, depth, width, reloc_active, target=None):
     tm = pose.get("tracking_mode")
     txt = (f"tracking={tm}  SLAM={pose.get('mode')}  kf={pose.get('n_keyframes')}  "
            f"vox={pose.get('n_voxels')}  slam={pose.get('slam_ms')}ms")
-    if depth:
-        txt += f"  fwd_clear={depth.get('forward_clearance')}  depth={depth.get('infer_ms')}ms"
     # Default tracking mode = green; anything else = orange (a fallback must never be silent).
     col = (0, 255, 0) if tm == "MASt3R" else (0, 165, 255)
     cv2.putText(strip, txt, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
@@ -324,7 +310,7 @@ class Dashboard:
     """Holds the latest payload per topic + the latest frame, and composes the window.
 
     The map panel is cached and only re-rendered when a new TOPIC_MAP snapshot arrives
-    (~once per keyframe); the cheap depth/frame panels redraw every tick.
+    (~once per keyframe); the cheap frame + depth-placeholder panels redraw every tick.
     """
 
     def __init__(self):
@@ -347,8 +333,6 @@ class Dashboard:
                 self.cam_track.append(cc)
             if payload.get("reloc_event"):
                 self._last_reloc = time.monotonic()
-        elif topic == "depth":
-            self.depth = payload
         elif topic == "map":
             self.map = payload
             self._map_img = None  # invalidate cache
@@ -390,10 +374,10 @@ class Dashboard:
 def run(cfg, show_frame=True):
     pstate_port = cfg["network"]["perception_state_port"]
     frame_port = cfg["network"]["frame_bus_port"]
-    state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/depth/map)
+    state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/map/plan/target)
     frame_sub = frame_bus.FrameSubscriber(frame_port) if show_frame else None
 
-    print(f"[visualizer] state bus SUB :{pstate_port} (pose+depth+map+target+plan)"
+    print(f"[visualizer] state bus SUB :{pstate_port} (pose+map+plan+target)"
           + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF"))
     print("[visualizer] === READY === waiting for perception_worker ('q' to quit).\n")
 
