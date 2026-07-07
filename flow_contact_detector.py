@@ -11,6 +11,10 @@ mechanism — a self-calibrating COLLAPSE of the relevant flow signal while the 
     free-forward level to ~0 — forward progress has stopped. This ONE signal unifies both wall flavors:
     a textureless wall freezes the image (mag→0) and a textured wall shows a slow vertical climb; either
     way the radial looming dies. (Validated: expansion ramped to 3.7/8.7 then collapsed at the walls.)
+  * BACKWALL (while REVERSE is commanded): the mirror of WALL. Reversing makes features CONTRACT inward
+    (expansion goes negative); the contraction magnitude (-expansion) collapses to ~0 when the drone stops
+    — it has backed into something behind it. Same collapse logic, opposite sign. Frame-based, so it works
+    even when SLAM is dead (exactly when a reverse-into-wall jam happens). Detection-only for now (logged).
 
 ================================ HARD RULE ================================
 NO MANUAL-FLIGHT DATA LEAKAGE (cartographer/CLAUDE.md "CRITICAL AUTONOMY STANDARD"). Detection is
@@ -48,8 +52,9 @@ from learn_to_fly import farneback_scalars, make_radial_field, load_key_edges, b
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
-CMD_UP = "up"            # ascent commanded  -> tests for CEILING (signal = |dy_med|)
-CMD_FWD = "forward"      # forward commanded -> tests for WALL    (signal = expansion)
+CMD_UP = "up"            # ascent commanded  -> tests for CEILING  (signal = |dy_med|)
+CMD_FWD = "forward"      # forward commanded -> tests for WALL      (signal = +expansion, looming)
+CMD_BACK = "backward"    # reverse commanded -> tests for BACKWALL  (signal = -expansion, contraction)
 
 
 def load_config(path=None):
@@ -77,10 +82,10 @@ class FlowVerdict:
     contact: bool = False              # CONTACT reached (latched within the current command episode)
 
     def label(self) -> str:
-        if self.command not in (CMD_UP, CMD_FWD):
+        if self.command not in (CMD_UP, CMD_FWD, CMD_BACK):
             return "NOT-COMMANDED"      # nothing to test for -> idle
         if self.contact:
-            return self.kind            # CEILING or WALL
+            return self.kind            # CEILING or WALL or BACKWALL
         if self.signal is None:
             return "PRE-FLOW"           # commanded, but no flow computed yet (first frame of episode)
         if self.blanking:
@@ -89,7 +94,7 @@ class FlowVerdict:
             return "PRE-MOTION"         # TAKEOFF only: never moved yet (countdown / first climb)
         if self.collapse_cond:
             return f"{self.kind}-WATCH({self.contact_held:.2f}s)"
-        return "RISING" if self.command == CMD_UP else "LOOMING"
+        return {CMD_UP: "RISING", CMD_FWD: "LOOMING", CMD_BACK: "CONTRACTING"}[self.command]
 
 
 # ==============================================================================
@@ -120,6 +125,7 @@ class FlowContactDetector:
         self._airborne = False
         self._ref_up = 0.0
         self._ref_fwd = 0.0
+        self._ref_back = 0.0     # reverse contraction (-expansion) running-max, for the BACKWALL detector
         # per-PUSH (episode) state — reset on each command change
         self._cmd = None
         self._ep_t0 = None
@@ -132,6 +138,8 @@ class FlowContactDetector:
             return "CEILING", self.dy_noise_floor, "_ref_up"
         if command == CMD_FWD:
             return "WALL", self.exp_noise_floor, "_ref_fwd"
+        if command == CMD_BACK:
+            return "BACKWALL", self.exp_noise_floor, "_ref_back"
         return None, None, None
 
     def _reset_episode(self, t, command):
@@ -147,6 +155,7 @@ class FlowContactDetector:
         self._airborne = False
         self._ref_up = 0.0
         self._ref_fwd = 0.0
+        self._ref_back = 0.0
 
     def reset_forward_ref(self):
         """Recalibrate the WALL (forward-looming) reference for a NEW forward leg, so each exploration
@@ -154,6 +163,15 @@ class FlowContactDetector:
         (which makes a fresh open-space push read as 'collapsed'). Keeps the airborne latch + ceiling
         ref. Call on each ADVANCE entry."""
         self._ref_fwd = 0.0
+        self._contact = False
+        self._contact_since = None
+
+    def reset_reverse_ref(self):
+        """Recalibrate the BACKWALL (reverse-contraction) reference for a NEW reverse maneuver, mirroring
+        reset_forward_ref. NOTE: unlike the forward ref we do NOT clear this per reverse episode in normal
+        use — `_ref_back` persists across reverse episodes (like `_ref_up`) so a reverse that STARTS already
+        blocked still has a reference to collapse against. Provided for an explicit recalibrate hook."""
+        self._ref_back = 0.0
         self._contact = False
         self._contact_since = None
 
@@ -179,9 +197,14 @@ class FlowContactDetector:
         self-calibrating collapse logic (see _update_signal)."""
         gray = self._prep_gray(frame)
         signal = None
-        if command in (CMD_UP, CMD_FWD) and self._prev_gray is not None:
+        if command in (CMD_UP, CMD_FWD, CMD_BACK) and self._prev_gray is not None:
             sc = farneback_scalars(self._prev_gray, gray, self._rux, self._ruy)
-            signal = abs(sc["dy_med"]) if command == CMD_UP else sc["expansion"]
+            if command == CMD_UP:
+                signal = abs(sc["dy_med"])          # vertical flow magnitude (ascent -> ceiling collapse)
+            elif command == CMD_FWD:
+                signal = sc["expansion"]            # +radial looming (forward -> wall collapse)
+            else:                                   # CMD_BACK: reverse -> features contract inward -> expansion < 0
+                signal = -sc["expansion"]           # contraction magnitude (backward -> BACKWALL collapse)
         self._prev_gray = gray
         return self._update_signal(t, signal, command)
 
@@ -408,6 +431,12 @@ def run_self_test():
     case("WALL loom->freeze (collapse to 0)", rise_then_plateau(3.0, 15, 40, plateau=0.0), CMD_FWD, True)
     # 5. WALL textured slow-climb: residual tiny expansion below the floor -> still fires.
     case("WALL loom->slow-climb (resid 0.01)", rise_then_plateau(3.0, 15, 40, plateau=0.01), CMD_FWD, True)
+    # 4b/5b. BACKWALL (mirror of WALL): the fed signal is the contraction magnitude (-expansion); a
+    #        ramp-then-collapse while REVERSE is commanded fires BACKWALL, and a fresh reverse that keeps
+    #        contracting (no collapse) stays quiet.
+    case("BACKWALL contract->freeze (collapse to 0)", rise_then_plateau(3.0, 15, 40, plateau=0.0), CMD_BACK, True)
+    case("BACKWALL continuous contract (no back-wall)", ramp(3.0, 10) + [3.0] * 60, CMD_BACK, False)
+    case("BACKWALL below noise floor (never arms)", rise_then_plateau(0.03, 15, 40), CMD_BACK, False)
     # 6. Continuous motion, no collapse -> quiet.
     case("CEILING continuous rise (no ceiling)", ramp(1.0, 10) + [1.0] * 60, CMD_UP, False)
     # 7. DEAD-ZONE: 12 frames of ~0 (inertia) then ramp up and KEEP rising -> must NOT fire.
@@ -452,6 +481,17 @@ def run_self_test():
     good = had_ref and det._ref_fwd == 0.0 and det._airborne
     ok = ok and good
     print(f"[self-test] {'PASS' if good else 'FAIL'}  reset_forward_ref clears WALL ref, keeps airborne latch")
+
+    # 14. BACKWALL ref persists across reverse episodes (like the ceiling ref), so a reverse that STARTS
+    #     already blocked (signal ~0 from frame 0) still fires — the mirror of the frozen-start case.
+    det = _mk()
+    _feed_signal(det, rise_then_plateau(3.0, 15, 40), CMD_BACK)  # free reverse -> airborne + ref_back learned
+    _feed_signal(det, [0.0] * 5, None)                          # release reverse (episode ends; contact clears)
+    fired = _feed_signal(det, [0.0] * 50, CMD_BACK)             # re-reverse, already jammed against a back wall
+    good = fired is not None
+    ok = ok and good
+    print(f"[self-test] {'PASS' if good else 'FAIL'}  jammed-reverse via persistent ref -> BACKWALL: "
+          f"{'FIRED@f'+str(fired) if good else 'no-fire (BUG)'}")
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

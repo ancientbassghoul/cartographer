@@ -37,6 +37,7 @@ TOPIC_DETECTION = b"detection"   # object_worker -> perception/UI: target bbox/c
 TOPIC_TARGET = b"target"    # perception_worker -> UI/report: {"targets":[{position,uncertainty,..}],"n_targets":N} (object may appear >1x)
 TOPIC_STATUS = b"status"
 TOPIC_CONTROL = b"control"  # autopilot (P5) -> io_bridge: desired control vector, applied ONLY while autonomy_active
+TOPIC_AUTOPILOT_EVENT = b"apevent"   # autopilot (P5) -> perception: discrete flight events (bump pulse for the 2-bump blacklist)
 
 
 def _addr(port: int) -> str:

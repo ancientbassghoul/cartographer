@@ -1,9 +1,80 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated 2026-07-06 (session 2: reworked the glass fix + shipped 3 more flight fixes — all
-self-test-verified, NOT yet re-flown. NEXT UP = build the F8 flight-replay debug tool in a FRESH session,
-then re-fly. The drone-won't-TURN issue further down is STILL open; we blacklist unreachable goals instead.)
-Resume from THIS file._
+_Last updated 2026-07-06 (session 4: REPLACED the time-based unreachable-goal watchdog with an EVENT-DRIVEN
+2-BUMP blacklist + added reverse (BACKWALL) contact DETECTION-ONLY. All self-tests + an E2E ZMQ pulse test
+PASS; NOT yet re-flown. NEXT UP = re-fly to confirm the glass goals go red at their 2nd bump, THEN build the
+reverse-recovery reaction fresh — see the ⏭ block below.) Resume from THIS file._
+
+**✅ SESSION 4 (2026-07-06) — EVENT-DRIVEN 2-BUMP BLACKLIST (replaces the broken time watchdog) + reverse
+BACKWALL detection-only (self-test + E2E-verified, NOT re-flown).** Debugged flight `20260706_165548`: the
+drone sat 9 min at the glass wall never blacklisting the unreachable beyond-glass goals, then froze in a
+reverse-into-wall loop.
+- **ROOT CAUSE (corrected):** the old `frontier_planner._watchdog` was a time-accumulator GATED on
+  `slam_ms < slam_slow_ms`. In the pocket SLAM ran hot (1800–4200 ms) yet the drone kept flying on valid
+  poses, so the accrual clock stayed frozen and never fired (goal was stationary at `[-2.1,-4.8]` for 143 s
+  with zero accrual). **Lesson: time-accumulation proxies gated on SLAM health go BLIND exactly in the heavy
+  glass/wall pockets.** Earlier "goal-hopping" / "confinement-watchdog" theories were both wrong (verified
+  against the timeline).
+- **FIX — event-driven 2-bump rule.** The autopilot reports each DISCRETE advance-blocked stop as a "bump"
+  pulse (`TOPIC_AUTOPILOT_EVENT`, new); TWO bumps on the SAME goal region (within `goal_assoc_dist`) ⇒
+  `FrontierPlanner.note_wall_hit` PERMANENTLY blacklists it + drops the commitment. A bump on a different
+  goal resets the counter. Immune to SLAM-clock health (counts hard physical stops).
+  - **Bump source = ALL THREE stops** (flow-WALL + ram-guard + standoff): the flow-WALL detector fired only
+    3× in the whole flight (ram-guard/standoff were ~40×), so flow-only would blacklist just 1 of 4 dead
+    goals. With all three, each dead goal dies at its 2nd encounter (would've been ~17:00:33 / 17:02:09 /
+    17:04:13 / 17:05:28 instead of never).
+  - **Kinematic bump-latch** (autopilot `_bump_armed`/`_last_bump_anchor`): one continuous contact = one
+    bump. Disarms on a bump; RE-ARMS on a published reverse command OR displacement > `goal_reach_dist`
+    (0.4) from the anchor (Option 2). Verified: the 4 legit pairs travelled 0.58–1.06 u (re-arm) while the
+    standoff STUTTERS sat at 0 displacement (stay disarmed). SLAM-freeze-safe (frozen pose → no re-arm).
+  - **Wiring:** `frame_bus.TOPIC_AUTOPILOT_EVENT`; autopilot publishes `{bump_goal,seq}` on the control port
+    (5606) after `step()`; perception SUBs it (`apevent_sub`), dedups by seq, feeds `note_wall_hit`
+    UNCONDITIONALLY (never SLAM-gated). Removed `_watchdog` + `goal_stagnation_s` (net −1 knob; threshold=2
+    hardcoded). Removed the now/slam_ms watchdog plumbing from `select()`/`_plan_payload`.
+- **Reverse BACKWALL detection (DETECTION-ONLY this session).** `flow_contact_detector` gained `CMD_BACK`
+  (`signal = -expansion`, the contraction-collapse mirror of WALL; `_ref_back` persists like `_ref_up`).
+  The autopilot now derives the detector command from the ACTUAL published control vector (`_detector_command`:
+  reverse→BACK / trigger→FWD / joy_vertical<0→UP), replacing the static `_EXPLORE_STATE_CMD` map, so BACKWALL
+  arms across every reverse state (REWIND/REVERSE_PROBE/BACKOFF/backward-parallax). On a BACKWALL contact it
+  LOGS `BACKWALL contact` (one line per onset) — **no control reaction yet.**
+- **Tests:** `frontier_planner`/`flow_contact_detector`/`autopilot`/`ground_grid --self-test` ALL PASS (new:
+  2-bump same-region→permanent + goal-change reset; BACKWALL collapse; `_detector_command`; the latch
+  one-pulse/stutter/re-arm). Plus an in-process **E2E ZMQ pulse test** (bump#1→arm, dup-seq→ignored,
+  bump#2→permanent-blacklist+drop-commitment→reselect drops the goal). Config: −`goal_stagnation_s`.
+- **⏭ NEXT — (1) RE-FLY** `autopilot.py --explore --log`: confirm each beyond-glass goal goes RED (permanent)
+  at its **2nd** advance-blocked stop (~2 encounters, not 9 min), the planner repositions OUT of the pocket,
+  the log shows `BLACKLIST PERMANENT (2 advance-blocked bumps)`, and a reverse into a wall LOGS `BACKWALL
+  contact`. **(2) THEN build the reverse-bump REACTION fresh** (deferred, user's call): on a BACKWALL contact
+  → give up → clear history → push **FORWARD** (camera view; confirmed there is NO left/right strafe-recovery
+  code — recovery only uses `trigger`/`reverse`) → recovery spin; AND fix the REWIND-restart bug so the spin
+  is reachable + STUCK terminates the reverse loop (`_step_stale` rebuilds a fresh rewind on every
+  HOLD_LOST↔PLAN-STALE flap, resetting `_fallback_attempts`, so the fallback sweep is never reached). Plan
+  file: `read-cartographer-progress-md-...` (Part 3, DEFERRED).
+
+**✅ SESSION 3 (2026-07-06) — F8 FLIGHT-REPLAY DEBUG TOOL BUILT (self-test-verified; awaiting the first real
+flight to feed it).** Two audiences, ONE data source, exactly as speced.
+- **Part A — structured JSONL timeline.** `AutopilotLog` (`autopilot.py`) now also opens
+  `OUTPUT/diag/<ts>_timeline.jsonl` on `--log` and has a no-op-when-disabled `timeline(record)` sink.
+  `run_explore` emits ONE compact record per explore step (`_timeline_step_record`: t_wall/t_mono/rec_frame,
+  state/event/status, pos/heading/pos_y/slam_ms/fwd_clear/top_clear/goal/bearing_err + `goals` tagged
+  active/blacklist_soft/blacklist_permanent by zipping `blacklist`×`blacklist_permanent`). **Map = a single
+  static backdrop (user's call):** we do NOT replay the map growing — only the newest GroundGrid summary is
+  kept and emitted ONCE at shutdown (`_downsample_map`, flat int `cls` grid ≤2500 cells ~5 KB, `t_mono=0`),
+  so the drone + goal states animate over the final room outline. All `--log`-gated (`if log:`); zero
+  flight-behavior change.
+- **Part B — `flight_replay.py` (new, stdlib only).** `python flight_replay.py <ts>_timeline.jsonl [-o …]
+  [--open] [--slam-slow-ms 1000]` → a SELF-CONTAINED animated HTML (Canvas + `<input range>` scrubber +
+  play/pause/speed; side panel = event log auto-scrolled to the cursor + slam_ms readout & sparkline
+  green<1000/red≥). Top-down scene: occupancy outline / fading path trail / drone dot+heading arrow / goals
+  gold(active, ringed)-orange(soft)-red-✕(permanent), all updating as you scrub. **Direct O(1) array indexing**
+  (slider index → `STEPS[i]`, no binary search) and an **explicit Y-flip normalization** helper (`fit()`+`P()`,
+  equal-aspect) — both per the user's critique.
+- **Tests:** `flight_replay.py --self-test` (synth timeline → HTML; asserts record count preserved, step/map
+  split, goal state timeline active→soft→permanent, slam spike + scene code embedded) — ALL PASS.
+  `autopilot.py --self-test` — ALL PASS incl. a new **F8 timeline** case (disabled sink is a no-op; the record/
+  map builders produce the right shape). Sample to eyeball: `OUTPUT/diag/SAMPLE_timeline.{jsonl,html}` (open
+  the HTML in a browser).
+- **⏭ NEXT — re-fly F4–F7 with `--log`, then open `<ts>_timeline.html` (and `Read` the JSONL) to debug.**
 
 **✅ SESSION 2 (2026-07-06) — CORRECTED GLASS MODEL + 3 flight fixes (self-tested, NOT yet re-flown).**
 A live flight showed the session-1 "glass-stuck" watchdog was built on a WRONG glass model. **User's

@@ -423,7 +423,7 @@ class Pipeline:
             # Map mode: republish the explore plan (goal/bearing/done + ground layer) on a timer.
             if (now_mono - self.last_plan_pub) >= self.PLAN_PUB_INTERVAL:
                 state_pub.publish(frame_bus.TOPIC_PLAN,
-                                  self._plan_payload(res, meta, heading_deg, slam_ms, now_mono))
+                                  self._plan_payload(res, meta, heading_deg, slam_ms))
                 self.last_plan_pub = now_mono
 
         # --- DA-V2 depth, throttled to the slower cadence ---
@@ -488,16 +488,15 @@ class Pipeline:
         }
 
     # ------------------------------------------------------------- map mode planner
-    def _plan_payload(self, res, meta, heading_deg, slam_ms=None, now_mono=None):
+    def _plan_payload(self, res, meta, heading_deg, slam_ms=None):
         """TOPIC_PLAN payload: drone pose (X-Z + heading), the chosen frontier goal + bearing, the
         done flag, and a compact ground-grid raster for the visualizer. NO SILENT FALLBACK: if SLAM
         is not TRACKING (or pose/heading missing) the plan is published with plan_valid=false and NO
         goal, so the autopilot holds instead of chasing a stale target. `slam_ms` (this frame's SLAM
         build time) rides on EVERY plan — even when invalid — so the autopilot's SLAM settle gate can
         watch it (a healthy solve is sub-second; a choke spikes it) independent of tracking state.
-        `now_mono` (monotonic clock) drives the planner's progress-stall unreachable-goal watchdog."""
-        if now_mono is None:
-            now_mono = time.monotonic()
+        Unreachable-goal blacklisting is EVENT-DRIVEN (planner.note_wall_hit, fed by the autopilot's
+        advance-blocked bump pulses in run()) — NOT computed here per-frame."""
         cc = res.camera_center
         pos = [float(cc[0]), float(cc[2])] if cc is not None else None
         valid = (res.mode == "TRACKING") and pos is not None and heading_deg is not None
@@ -561,18 +560,8 @@ class Pipeline:
         reachable = self.planner.any_reachable(fr)
         farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64), margin=self.reposition_inset)
                     if (not reachable and not self.planner.verifying) else None)
-        # now_mono + slam_ms drive the distance-stagnation watchdog: it permanently blacklists a committed
-        # goal whose best distance never improves for stagnation_s of SLAM-healthy time (a glass collider or a
-        # rammed wall behind the goal). It ticks only on this VALID branch, so a SLAM loss naturally pauses it.
-        goal, n_frontiers, done = self.planner.select(
-            fr, pos, heading_deg, farthest, now_mono, slam_ms=slam_ms)
-        if self.planner.last_blacklist is not None:
-            perm = any(self.planner._d(e["goal"], self.planner.last_blacklist) <= self.planner.blacklist_radius
-                       and e["permanent"] for e in self.planner._blacklist)
-            print(f"[perception] planner: goal {self.planner.last_blacklist} UNREACHABLE (no distance progress "
-                  f"for ~{self.planner.stagnation_s:.0f}s of SLAM-healthy time; glass collider or wall behind goal) "
-                  f"-> BLACKLIST {'PERMANENT' if perm else 'soft'} ({len(self.planner._blacklist)} total) -> reselecting",
-                  flush=True)
+        # Goal selection (blacklisting is event-driven via note_wall_hit in run(), NOT a per-select timer).
+        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, farthest)
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()
         payload["blacklist_permanent"] = self.planner.blacklist_permanent()
@@ -714,6 +703,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
     frame_port = cfg["network"]["frame_bus_port"]
     pstate_port = cfg["network"]["perception_state_port"]
     obj_port = cfg["network"]["object_state_port"]
+    ctrl_port = cfg["network"]["autonomy_control_port"]
     pipe = Pipeline(cfg, conf_thresh=conf_thresh, debug_lift=debug_lift)
     if log:
         pipe.enable_diag()
@@ -721,6 +711,11 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
     state_pub = frame_bus.StatePublisher(pstate_port)  # binds; fail-fast if taken
     # SUB to object_worker's detections (lazy connect — fine whether or not it's running yet).
     det_sub = frame_bus.StateSubscriber(obj_port, topics=[frame_bus.TOPIC_DETECTION])
+    # SUB to the autopilot's advance-blocked BUMP pulses (event-driven 2-bump blacklist). Lazy connect;
+    # deduped by seq so a republished pulse is applied once. Feeds planner.note_wall_hit UNCONDITIONALLY
+    # (never gated on SLAM health — the whole point of the event-driven design).
+    apevent_sub = frame_bus.StateSubscriber(ctrl_port, topics=[frame_bus.TOPIC_AUTOPILOT_EVENT])
+    last_bump_seq = -1
     print(f"[perception] frame bus SUB :{frame_port} | state PUB :{pstate_port} "
           f"(TOPIC_POSE/DEPTH/MAP/TARGET) | detection SUB :{obj_port}")
     print(f"[perception] SLAM every frame ({pipe.slam.tracking_mode}); DA-V2 cap ~{pipe.cadence_hz:g} Hz")
@@ -734,6 +729,22 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
                     break
                 continue
             frame, meta = got
+
+            # Drain autopilot BUMP pulses -> event-driven 2-bump blacklist (before pipe.step publishes the
+            # next plan, so a fresh blacklist is reflected immediately). Deduped by seq.
+            ap = apevent_sub.recv(timeout_ms=0)
+            while ap is not None:
+                ev = ap[1]
+                seq, bg = ev.get("seq"), ev.get("bump_goal")
+                if bg is not None and seq is not None and seq != last_bump_seq:
+                    last_bump_seq = seq
+                    pipe.planner.note_wall_hit(bg)
+                    if pipe.planner.last_blacklist is not None:
+                        print(f"[perception] planner: goal {pipe.planner.last_blacklist} UNREACHABLE "
+                              f"(2 advance-blocked bumps; glass collider or wall behind goal) -> BLACKLIST "
+                              f"PERMANENT ({len(pipe.planner._blacklist)} total) -> reselecting", flush=True)
+                ap = apevent_sub.recv(timeout_ms=0)
+
             _, _, panel, map_updated = pipe.step(frame, meta, state_pub, show)
 
             # Drain any target detections and lift them into the map.
@@ -762,6 +773,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
         frame_sub.close()
         state_pub.close()
         det_sub.close()
+        apevent_sub.close()
         if show:
             try:
                 cv2.destroyAllWindows()

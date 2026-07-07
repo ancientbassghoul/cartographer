@@ -97,21 +97,18 @@ autonomy:
     goal_behind_floor: 0.15      # utility multiplier floor for a frontier behind the drone (cos(turn) floored to this)
     goal_switch_factor: 1.5      # only abandon the committed goal if another frontier's utility beats it by this factor
     goal_assoc_dist: 1.0         # associate the committed goal with a live frontier centroid within this (SLAM units)
-    # --- unreachable-goal DISTANCE-STAGNATION watchdog: there is NO path planner (the drone flies a STRAIGHT
-    #     line to the goal bearing), so a goal behind an invisible GLASS collider (SLAM sees THROUGH it, stays
-    #     healthy, the ray reads clear -> the drone bounces on the collider = a treadmill) OR behind an opaque
-    #     wall it rams (SLAM dies, recovers, re-commits, rams again) is never reachable -> an endless loop. One
-    #     robust timer catches BOTH: accrue SLAM-HEALTHY time in which the best-ever Euclidean distance toward
-    #     the committed goal fails to improve by goal_progress_eps; at goal_stagnation_s the goal is declared
-    #     UNREACHABLE and PERMANENTLY blacklisted (+ reposition to the far corner). No aim/clearance/thrust
-    #     gates -- a goal that simply never gets closer is unreachable however the sensors read. Ticks only on
-    #     VALID (TRACKING) frames, so a full SLAM loss pauses it; a slam_ms CHOKE (unstable pose) also pauses.
-    #     General params + LIVE-computed points -- nothing here encodes this room's geometry.
-    goal_stagnation_s: 60.0      # SLAM-healthy seconds with NO distance progress toward a committed goal -> permanent blacklist.
-                                 #   Generous so the slow flight + noisy yaw/stabilization scouting don't clip a reachable goal.
-    goal_progress_eps: 0.2       # min closing distance (SLAM units) that counts as progress (~0.5*goal_reach_dist); resets the
-                                 #   stagnation clock. Also the cross-round soft-vs-PERMANENT test. Keep DEFINITIVE (>= ~0.05) so
-                                 #   SLAM noise / a different approach angle can't fake progress.
+    # --- unreachable-goal EVENT-DRIVEN 2-BUMP blacklist: there is NO path planner (the drone flies a STRAIGHT
+    #     line to the goal bearing), so a goal behind an invisible GLASS collider (a treadmill) OR behind an
+    #     opaque wall is never reachable -> an endless loop. We do NOT time-accumulate stagnation (a prior
+    #     watchdog gated its clock on SLAM-healthy frames and so went BLIND exactly in the heavy glass/wall
+    #     pockets where SLAM runs hot yet the drone still flies on valid poses). Instead the autopilot reports
+    #     each DISCRETE advance-blocked stop (flow WALL / ram-guard / clearance stand-off) as a "bump" pulse
+    #     (TOPIC_AUTOPILOT_EVENT); TWO bumps on the SAME goal region (within goal_assoc_dist) PERMANENTLY
+    #     blacklist it. Event-driven, so it is immune to SLAM-clock health. A kinematic latch in the autopilot
+    #     (re-arm on a reverse command OR displacement > goal_reach_dist) makes one continuous contact = one
+    #     bump. The 2-bump threshold is a hardcoded constant (no knob); LIVE-computed points, no room geometry.
+    goal_progress_eps: 0.2       # min closing distance (SLAM units) counted as progress; the round-blacklist
+                                 #   soft-vs-PERMANENT promotion test. Keep DEFINITIVE (>= ~0.05).
     goal_blacklist_radius: 1.0   # a frontier within this of a dead goal is "the same" region (defaults to goal_assoc_dist)
     # --- done verification / reposition: fly ONCE to the farthest known free corner -- to re-scan for
     #     uncharted territory before declaring done AND to relocate to a fresh vantage when every goal is

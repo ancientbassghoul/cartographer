@@ -42,7 +42,7 @@ import yaml
 
 import frame_bus
 from diag_log import DiagLog, NullLog
-from flow_contact_detector import FlowContactDetector, detector_from_cfg, FlowVerdict, CMD_UP, CMD_FWD
+from flow_contact_detector import FlowContactDetector, detector_from_cfg, FlowVerdict, CMD_UP, CMD_FWD, CMD_BACK
 from flight_playbook import FlightPlaybook, RecipePlayer
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +100,65 @@ def _verdict_line(tag: str, v: FlowVerdict) -> str:
             f"airborne={int(v.airborne)} blank={int(v.blanking)} held={v.contact_held:.2f}s -> {v.label()}")
 
 
+def _timeline_goals(plan: dict) -> list:
+    """Goal markers for a replay step: the live goal (tagged `active`) + each blacklisted point tagged
+    `blacklist_soft`/`blacklist_permanent`. Zips plan['blacklist'] points with plan['blacklist_permanent']
+    flags (the same arrays the visualizer rings), so the HTML viewer can flip a goal gold->orange->red."""
+    goals = []
+    goal = plan.get("goal")
+    if goal is not None:
+        goals.append({"xz": [round(float(goal[0]), 4), round(float(goal[1]), 4)], "state": "active"})
+    bl = plan.get("blacklist") or []
+    perm = plan.get("blacklist_permanent") or []
+    for i, pt in enumerate(bl):
+        if pt is None:
+            continue
+        is_perm = bool(perm[i]) if i < len(perm) else False
+        goals.append({"xz": [round(float(pt[0]), 4), round(float(pt[1]), 4)],
+                      "state": "blacklist_permanent" if is_perm else "blacklist_soft"})
+    return goals
+
+
+def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict) -> dict:
+    """One structured replay record per explore step. Pulls the pose/goal/slam fields straight off the
+    plan payload (perception_worker._plan_payload) plus the controller's own state/event/status."""
+    g = plan.get
+    return {
+        "t_wall": t_wall, "t_mono": round(float(t_mono), 3),
+        "rec_frame": (int(rec_frame) if rec_frame is not None else None),
+        "state": state, "event": event, "status": status,
+        "pos": g("pos"), "heading": g("heading_deg"), "pos_y": g("pos_y"),
+        "slam_ms": g("slam_ms"), "fwd_clear": g("forward_clearance_dist"),
+        "top_clear": g("top_clear"), "goal": g("goal"), "bearing_err": g("bearing_err"),
+        "goals": _timeline_goals(plan),
+    }
+
+
+def _downsample_map(ground: dict, max_cells: int = 2500):
+    """A compact copy of the GroundGrid summary for the replay JSONL: same WORLD bounds, but the flat
+    row-major `cls` grid subsampled by an integer stride so rows*cols <= max_cells (keeps the JSONL small;
+    the viewer only draws the newest map under the cursor). Returns None for an empty/degenerate grid."""
+    if not ground or not ground.get("bounds"):
+        return None
+    rows, cols = int(ground.get("rows", 0)), int(ground.get("cols", 0))
+    cls = ground.get("cls") or []
+    if rows <= 0 or cols <= 0 or len(cls) < rows * cols:
+        return None
+    stride = 1
+    while (math.ceil(rows / stride) * math.ceil(cols / stride)) > max_cells:
+        stride += 1
+    if stride == 1:
+        return {"bounds": ground["bounds"], "rows": rows, "cols": cols, "cls": list(cls)}
+    out = []
+    for r in range(0, rows, stride):
+        base = r * cols
+        for c in range(0, cols, stride):
+            out.append(cls[base + c])
+    out_rows = len(range(0, rows, stride))
+    out_cols = len(range(0, cols, stride))
+    return {"bounds": ground["bounds"], "rows": out_rows, "cols": out_cols, "cls": out}
+
+
 class AutopilotLog:
     """Optional `--log` sink: tees verdict lines to OUTPUT/diag/<ts>_autopilot.log, writes a structured
     verdict CSV (<ts>_autopilot.csv) AND a COMMAND CSV (<ts>_autopilot_cmd.csv) of every control vector
@@ -112,6 +171,7 @@ class AutopilotLog:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self._txt = None
+        self._jsonl = None
         self.csv = NullLog()
         self.cmd_csv = NullLog()
         if enabled:
@@ -122,7 +182,13 @@ class AutopilotLog:
             self.cmd_csv = DiagLog("autopilot_cmd", self.CMD_FIELDS, ts=ts)
             txt_path = os.path.join(d, f"{ts}_autopilot.log")
             self._txt = open(txt_path, "w", encoding="utf-8")
+            # Structured replay timeline (F8): one JSON record per explore step (pose/goal/state/slam)
+            # + a periodic map record — the machine-readable log I read instead of the giant text log,
+            # and the data source for flight_replay.py's animated HTML.
+            jsonl_path = os.path.join(d, f"{ts}_timeline.jsonl")
+            self._jsonl = open(jsonl_path, "w", encoding="utf-8")
             print(f"[diag] autopilot text log -> {txt_path}", flush=True)
+            print(f"[diag] flight replay timeline -> {jsonl_path}", flush=True)
 
     def line(self, text: str):
         if self._txt is not None:
@@ -131,6 +197,12 @@ class AutopilotLog:
             stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             self._txt.write(f"{stamp} {text}\n")
             self._txt.flush()
+
+    def timeline(self, record: dict):
+        """Write one JSON record (a replay timeline step) + flush. No-op when logging is disabled."""
+        if self._jsonl is not None:
+            self._jsonl.write(json.dumps(record) + "\n")
+            self._jsonl.flush()
 
     def cmd(self, rec_frame, seq, step, source, fields):
         self.cmd_csv.row(rec_frame=("" if rec_frame is None else int(rec_frame)),
@@ -151,6 +223,8 @@ class AutopilotLog:
     def close(self):
         if self._txt is not None:
             self._txt.close()
+        if self._jsonl is not None:
+            self._jsonl.close()
         self.csv.close()
         self.cmd_csv.close()
 
@@ -684,6 +758,13 @@ class ExploreController:
         self._ram_accum = 0.0       # ram-guard accumulators are per-leg
         self._leg_best_dist = None
         self._ram_last_t = None
+        # 2-bump blacklist latch (kinematic): an advance-blocked stop (flow WALL / ram-guard / stand-off)
+        # emits ONE bump pulse to the planner, then DISARMS until the drone physically disengages (run_explore
+        # re-arms on a published reverse command OR displacement > goal_reach_dist from the anchor). This
+        # guarantees a single continuous contact counts as exactly one bump, immune to state-machine flicker.
+        self._bump_armed = True
+        self._last_bump_anchor = None   # [x,z] where the last counted bump fired (displacement re-arm gauge)
+        self._bump_pulse = None         # pending bump goal for run_explore to publish, then clear
         # An interruption (autonomy off = a manual takeover) invalidates the command history: the drone may
         # have been moved by hand, so the recorded maneuvers no longer map to the trajectory. Drop it.
         self.command_history.clear()
@@ -879,6 +960,35 @@ class ExploreController:
     def _enter(self, state, now):
         self.state = state
         self.t_state = now
+
+    # ------------------------------------------------- 2-bump blacklist latch (kinematic)
+    def _register_bump(self, plan):
+        """Latch-gated bump for the event-driven 2-bump blacklist: on an advance-blocked stop (flow WALL /
+        ram-guard / clearance stand-off) toward the committed goal, stash ONE bump pulse for run_explore to
+        publish, then DISARM + record the stop position as the re-arm anchor. Suppressed while already
+        disarmed (a stuttering state machine can't multiply-count one continuous contact)."""
+        if not self._bump_armed or self.leg_goal is None:
+            return
+        self._bump_pulse = list(self.leg_goal)
+        self._bump_armed = False
+        pos = plan.get("pos")
+        self._last_bump_anchor = list(pos) if pos is not None else None
+
+    def rearm_bump_if_disengaged(self, active, plan):
+        """Re-arm the bump latch once the drone has DISENGAGED from the last bump anchor — EITHER a backward
+        control vector is actively published (retreat) OR it has moved > goal_reach_dist from the anchor.
+        SLAM-freeze-safe: a frozen pose stalls displacement at 0, so a jammed drone never falsely re-arms."""
+        if self._bump_armed or self._last_bump_anchor is None:
+            return
+        moved = self._dist(plan.get("pos"), self._last_bump_anchor)
+        backward = float((active or {}).get("reverse", 0.0) or 0.0) > 0.0
+        if backward or (moved is not None and moved > self.goal_reach_dist):
+            self._bump_armed = True
+
+    def take_bump_pulse(self):
+        """Pop the pending bump goal (or None). run_explore publishes it on TOPIC_AUTOPILOT_EVENT."""
+        g, self._bump_pulse = self._bump_pulse, None
+        return g
 
     @staticmethod
     def _dist(a, b):
@@ -1120,11 +1230,13 @@ class ExploreController:
                     # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
                     # the next frontier. No reverse/back-off: we're already at a safe stand-off.
                     self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
+                    self._register_bump(plan)     # advance-blocked stop -> a bump toward the committed goal
                     self._enter("SETTLE", now)
                     event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
             elif wall_contact:
                 # A COLLISION invalidates the command history (unknown post-impact orientation) -> drop it.
                 self.command_history.clear()
+                self._register_bump(plan)         # advance-blocked stop -> a bump toward the committed goal
                 if self.reverse_probe_on_wall:
                     # EXPERIMENT: instead of a tiny back-off, settle then fly straight BACKWARD (camera
                     # still facing the wall, seeing familiar features) to test whether reverse keeps SLAM
@@ -1156,6 +1268,7 @@ class ExploreController:
                 self._ram_accum += dt
                 if self.ram_stall_s > 0 and reached is not None and self._ram_accum >= self.ram_stall_s:
                     self._log_move("forward", fwd_val, fwd_dur)
+                    self._register_bump(plan)     # advance-blocked stop -> a bump toward the committed goal
                     self._enter("SETTLE", now)
                     event = (f"ram guard: forward-commanded but not advancing {self._ram_accum:.1f}s "
                              f"(d={reached:.2f}) -> stop leg -> settle -> replan")
@@ -1197,9 +1310,9 @@ class ExploreController:
 
         elif st == "REVERSE_PROBE":
             # EXPERIMENT: sustained straight reverse (playbook "reverse_probe" recipe — tune its duration
-            # there). The detector is idle here (unmapped in _EXPLORE_STATE_CMD): no contact test while
-            # reversing for now. Then settle -> replan, and watch whether the plan stayed OK + the path
-            # kept growing backward through the reverse (PASS) vs PLAN-STALE during it (FAIL).
+            # there). The BACKWALL detector now arms here (the command is derived from the reverse control
+            # vector) but is DETECTION-ONLY this session: it logs a back-wall contact, takes no action. Then
+            # settle -> replan, and watch whether the plan stayed OK + the path kept growing (PASS) vs STALE.
             if self._player is None:
                 self._player = self.pb.player("reverse_probe")
             active, rdone = self._player.fields(now)
@@ -1215,7 +1328,8 @@ class ExploreController:
             # rays pick the roomier body axis (forward vs backward) from the CURRENT post-turn ring; if
             # boxed in both ways we skip and just turn again. Distance-quantized (translate ~parallax_push_dist
             # SLAM units, measured live from the pose), guarded by the live clearance, with a SAFETY time cap.
-            # Detector idle (unmapped in _EXPLORE_STATE_CMD); open-loop, so a stale pose mid-push rides the cap.
+            # The detector arms per the actual push direction (WALL fwd / BACKWALL back) but open-loop control
+            # here doesn't react to it; a stale pose mid-push rides the cap.
             ring = plan.get("clearance_ring")
             pad = self.stop_clearance_dist + self.parallax_pad
             if self._push_dir is None:        # first tick: choose the axis from the post-turn ring
@@ -1274,13 +1388,24 @@ class ExploreController:
         return active, self.state, event
 
 
-# Which flow event the detector should test for, by the state we're IN: takeoff + ascend command UP
-# (airborne latch / CEILING), ADVANCE commands FWD (WALL); everything else idles. REVERSE_PROBE is
-# intentionally absent (detector idle): no contact test while reversing — back-wall detection is future work.
-_EXPLORE_STATE_CMD = {"TAKEOFF": CMD_UP, "ASCEND": CMD_UP, "ADVANCE": CMD_FWD, "BUMP": CMD_UP}
+# Which flow event the detector tests for is derived from the ACTUALLY-commanded control vector (the command
+# held during the just-elapsed frame interval), NOT a static state map — so it arms the right detector for
+# UP (CEILING), FORWARD (WALL), or BACKWARD (BACKWALL) across every state, including a bidirectional REWIND
+# whose direction a state map couldn't know. Priority reverse > forward > up: an ADVANCE with an altitude-lock
+# up-inject still reads as FORWARD (its primary motion). Yaw-only / neutral / DOWN -> None (idle).
+def _detector_command(active):
+    if not active:
+        return None
+    if float(active.get("reverse", 0.0) or 0.0) > 0.0:
+        return CMD_BACK
+    if float(active.get("trigger", 0.0) or 0.0) > 0.0:
+        return CMD_FWD
+    if float(active.get("joy_vertical", 0.0) or 0.0) < 0.0:   # -1 = up (camera Y down)
+        return CMD_UP
+    return None
+
 
 # Recovery states (SLAM-loss). The step() top snaps out of these to a brake+REPLAN when the plan returns OK.
-# None are in _EXPLORE_STATE_CMD, so the flow detector idles during recovery (open-loop control-space).
 _RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK", "WARMUP"}
 
 
@@ -1313,6 +1438,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
           "REQUIRES perception_worker running (it publishes the frontier plan).")
 
     seq = 0
+    bump_seq = 0          # dedup id for TOPIC_AUTOPILOT_EVENT bump pulses (perception drops repeats)
     last_pub = last_log = 0.0
     last_plan = None
     last_plan_t = time.monotonic()
@@ -1324,6 +1450,10 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     last_cmd_key = None
     last_label = None
     prev_ctrl_state = None
+    prev_active = {}      # last published control vector -> derives the detector command for THIS frame
+    backwall_active = False   # BACKWALL contact edge tracker (log once per onset)
+    last_ground = None    # newest GroundGrid summary; the final room outline is emitted ONCE at shutdown as
+                          # a static backdrop (we don't replay the map growing — only the pose + goals matter)
 
     def log_cmd(active, source):
         nonlocal last_cmd_key
@@ -1381,6 +1511,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                     announced_wait = True
                 was_enabled = False
                 ctrl.reset_leg()
+                prev_active, backwall_active = {}, False   # no command held while paused
                 if frame is not None:
                     detector.update(now, frame, None)   # keep prev_gray fresh
                 publish({}, "WAIT")
@@ -1401,12 +1532,12 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 last_status = status
             plan_for_step = last_plan if last_plan is not None else {}
 
-            # ---- flow contact detection (command derived from the state we're IN) ----
+            # ---- flow contact detection (command derived from the ACTUAL last-published control vector) ----
             wall_contact = ceiling_contact = False
             if frame is not None:
-                command = _EXPLORE_STATE_CMD.get(ctrl.state)   # TAKEOFF/ASCEND->UP, ADVANCE->FWD, else None
+                command = _detector_command(prev_active)   # UP (CEILING) / FWD (WALL) / BACK (BACKWALL) / None
                 v = detector.update(now, frame, command)
-                if command in (CMD_FWD, CMD_UP):
+                if command in (CMD_FWD, CMD_UP, CMD_BACK):
                     if v.label() != last_label or (now - last_log) >= 0.5:
                         line = f"{_rec_prefix(last_rec_frame)} {_verdict_line(f'[autopilot][explore][{ctrl.state}]', v)}"
                         print(line, flush=True)
@@ -1417,22 +1548,61 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                         wall_contact = True
                     if v.contact and v.kind == "CEILING" and command == CMD_UP:
                         ceiling_contact = True
+                    # BACKWALL is DETECTION-ONLY this session (no control reaction yet). Log its onset once so
+                    # the next flight captures the reverse-into-wall signal (NO SILENT FALLBACK: operator sees it).
+                    now_backwall = bool(v.contact and v.kind == "BACKWALL" and command == CMD_BACK)
+                    if now_backwall and not backwall_active:
+                        line = (f"{_rec_prefix(last_rec_frame)} [autopilot][explore][{ctrl.state}] BACKWALL "
+                                f"contact (reverse into a wall; detection-only — no reaction yet)")
+                        print(line, flush=True)
+                        diag.line(line)
+                    backwall_active = now_backwall
+                else:
+                    backwall_active = False
 
             # ---- step the controller + publish ----
             active, state, event = ctrl.step(now, plan_for_step, wall_contact, ceiling_contact, status=status)
             if state == "ADVANCE" and prev_ctrl_state != "ADVANCE":
                 detector.reset_forward_ref()   # each leg recalibrates its own free-forward looming
             prev_ctrl_state = state
+            prev_active = active               # command for the NEXT frame's detector + the bump re-arm test
+            # 2-bump latch: re-arm once the drone has disengaged (backward cmd OR moved > goal_reach_dist),
+            # then publish any pending bump pulse for the planner's event-driven blacklist.
+            ctrl.rearm_bump_if_disengaged(active, plan_for_step)
+            bump_goal = ctrl.take_bump_pulse()
+            if bump_goal is not None:
+                pub.publish(frame_bus.TOPIC_AUTOPILOT_EVENT, {"bump_goal": bump_goal, "seq": bump_seq})
+                bline = f"{_rec_prefix(last_rec_frame)} [autopilot][explore] BUMP pulse #{bump_seq} goal={bump_goal} (advance-blocked -> planner)"
+                print(bline, flush=True)
+                diag.line(bline)
+                bump_seq += 1
             if event:
                 line = f"{_rec_prefix(last_rec_frame)} [autopilot][explore] {state}: {event}"
                 print(line, flush=True)
                 diag.line(line)
             publish(active, state)
+
+            # ---- F8 replay timeline (purely additive; --log-gated via the no-op sink) ----
+            # ONE record per step (pose + goal states); the room outline is NOT streamed — we keep only the
+            # newest ground summary and emit it once at shutdown as a static backdrop for the whole replay.
+            if log:
+                t_wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                diag.timeline(_timeline_step_record(t_wall, now, last_rec_frame, state, event,
+                                                    status, plan_for_step))
+                g = plan_for_step.get("ground")
+                if g and g.get("bounds"):
+                    last_ground = g
     except KeyboardInterrupt:
         print("\n[autopilot][explore] interrupted — sending a final HOLD (neutral).")
     finally:
         pub.publish(frame_bus.TOPIC_CONTROL, _full_vector({}, seq, time.monotonic(), "HOLD"))
         time.sleep(0.05)
+        # Emit the final room outline ONCE, at t_mono=0 so it's the static backdrop under every step (the
+        # viewer draws the newest map at/under the cursor). The drone + goal states animate over it.
+        if log and last_ground is not None:
+            m = _downsample_map(last_ground)
+            if m is not None:
+                diag.timeline({"t_mono": 0.0, "map": m})
         diag.close()
         pub.close()
         sub.close()
@@ -1465,6 +1635,29 @@ def _is_subsequence(needle, hay):
 def run_self_test(cfg):
     import flow_contact_detector
     ok = flow_contact_detector.run_self_test()
+
+    # F8 replay timeline: the JSONL sink is --log-gated, so a disabled AutopilotLog must swallow
+    # .timeline()/.line() as no-ops (no file, no crash) — the path taken when self-test/dry constructs run.
+    dl = AutopilotLog(False)
+    try:
+        dl.timeline({"state": "ADVANCE", "goals": []})
+        dl.line("noop")
+        tl_noop = (dl._jsonl is None and dl._txt is None)
+    finally:
+        dl.close()
+    # And the pure record builders produce the expected shape (goal state tagging + map downsample).
+    plan = {"pos": [0.1, 0.2], "heading_deg": 45.0, "goal": [1.0, 2.0], "bearing_err": 3.0,
+            "blacklist": [[9.0, 9.0]], "blacklist_permanent": [True]}
+    rec = _timeline_step_record("00:00:01.000", 1.234, 7, "ADVANCE", "leg", "OK", plan)
+    ds = _downsample_map({"bounds": [0, 4, 0, 4], "rows": 2, "cols": 2, "cls": [0, 1, 2, 3]})
+    tl_rec = (rec["state"] == "ADVANCE" and rec["pos"] == [0.1, 0.2] and len(rec["goals"]) == 2
+              and rec["goals"][0]["state"] == "active"
+              and rec["goals"][1]["state"] == "blacklist_permanent"
+              and ds["rows"] == 2 and ds["cls"] == [0, 1, 2, 3])
+    good = tl_noop and tl_rec
+    ok = ok and good
+    print(f"[self-test] {'PASS' if good else 'FAIL'}  F8 timeline (disabled sink no-op={tl_noop}, "
+          f"record/map builders={tl_rec})")
 
     # Playbook RecipePlayer sanity: step the (multi-step) arm recipe forward in time and confirm it
     # drives btnARMdown at some point and then completes. (One fields() call advances at most one step,
@@ -1569,7 +1762,7 @@ def run_self_test(cfg):
     # ---- Map mode: reverse-probe EXPERIMENT (flag on) — clamp leg turn to ONE step; WALL -> reverse probe ----
     # With reverse_probe_on_wall: a big bearing err is clamped to ONE turn_step (SLAM stays alive at the
     # wall), and a WALL hit goes ADVANCE -> SETTLE -> REVERSE_PROBE (sustained reverse) -> SETTLE -> REPLAN
-    # (NOT back_off). The detector is idle in REVERSE_PROBE (unmapped in _EXPLORE_STATE_CMD).
+    # (NOT back_off). The BACKWALL detector arms in REVERSE_PROBE (detection-only) but takes no action here.
     cre = ExploreController(cfg, no_takeoff=True)
     cre.reverse_probe_on_wall = True
     plan_e = {"done": False, "goal": [1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 135.0}  # would be +135 (3 steps) unclamped
@@ -2058,6 +2251,38 @@ def run_self_test(cfg):
     ok = ok and ram_ok
     print(f"[self-test] {'PASS' if ram_ok else 'FAIL'}  ram guard "
           f"(stuck-collider->stop={ram_stopped}, advancing->no-trip={not tripped})")
+
+    # ---- 2-bump blacklist plumbing: _detector_command + the kinematic bump latch ----
+    dc_ok = (_detector_command({"reverse": 0.4}) == CMD_BACK
+             and _detector_command({"trigger": 0.1}) == CMD_FWD
+             and _detector_command({"trigger": 0.1, "joy_vertical": -1}) == CMD_FWD   # altlock ADVANCE -> FWD
+             and _detector_command({"joy_vertical": -1}) == CMD_UP
+             and _detector_command({"joy_vertical": 1}) is None                       # DESCEND (down) -> idle
+             and _detector_command({"yaw": 1.0}) is None and _detector_command({}) is None)
+    ok = ok and dc_ok
+    print(f"[self-test] {'PASS' if dc_ok else 'FAIL'}  _detector_command maps reverse->BACK / fwd->FWD / up->UP")
+
+    # The ram-guard stop above (cr) fired exactly ONE bump pulse toward the leg goal and disarmed the latch.
+    latch_armed_once = (cr._bump_pulse == [9.0, 0.0] and cr._bump_armed is False
+                        and cr._last_bump_anchor is not None)
+    cr.take_bump_pulse()                                     # publish consumes it
+    cr._register_bump({"pos": [0.0, 0.0]})                   # a stutter while still disarmed -> NO new pulse
+    stutter_ok = cr._bump_pulse is None
+    cr.rearm_bump_if_disengaged({}, {"pos": [0.0, 0.0]})     # same spot, no reverse -> stays disarmed
+    still_disarmed = cr._bump_armed is False
+    cr.rearm_bump_if_disengaged({}, {"pos": [cr.goal_reach_dist + 0.2, 0.0]})   # moved away -> re-arm
+    rearmed_by_move = cr._bump_armed is True
+    cr._register_bump({"pos": [9.0, 0.0]})                   # a genuine 2nd encounter -> a fresh pulse
+    second_pulse_ok = cr._bump_pulse == [9.0, 0.0]
+    crb = ExploreController(cfg, no_takeoff=True); crb.leg_goal = [5.0, 0.0]
+    crb._register_bump({"pos": [0.0, 0.0]}); popped = crb.take_bump_pulse()
+    crb.rearm_bump_if_disengaged({"reverse": 0.3}, {"pos": [0.0, 0.0]})   # reverse cmd re-arms at 0 displacement
+    rearmed_by_reverse = crb._bump_armed is True and popped == [5.0, 0.0]
+    latch_ok = (latch_armed_once and stutter_ok and still_disarmed and rearmed_by_move
+                and second_pulse_ok and rearmed_by_reverse)
+    ok = ok and latch_ok
+    print(f"[self-test] {'PASS' if latch_ok else 'FAIL'}  2-bump latch "
+          f"(one pulse/contact, stutter-suppressed, re-arm on move|reverse)")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

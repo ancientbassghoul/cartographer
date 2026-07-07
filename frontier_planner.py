@@ -14,23 +14,20 @@ Chooses the next frontier the drone should fly to, from `ground_grid.GroundGrid.
     the caller exactly once on the transition, cached here as a STATIC target — never re-evaluated while
     verifying, so it can't oscillate between equidistant corners) to look for uncharted territory; only
     declare `done` if, after reaching that corner, there are STILL no frontiers.
-  * UNREACHABLE-GOAL BLACKLIST (progress-stall, PERMANENT round-based) — there is NO path planner: the
-    drone flies a STRAIGHT LINE toward the goal bearing, so a goal behind glass / a wall / a corner can
-    never be reached and its frontier is never consumed (the loop the operator hit at the glass window). A
-    per-committed-goal progress watchdog measures the BEST (closest) distance achieved; while the drone is
-    roughly AIMED at the goal yet that best distance fails to improve by `progress_eps` for `stall_s`, the
-    goal is declared unreachable, its region is BLACKLISTED, and the planner reselects. The blacklist is
-    POSITION-UNCONDITIONED: once blacklisted a goal STAYS excluded — it is not silently re-enabled by the
-    drone merely moving away (that position-conditioning was the ping-pong: goal A blacklisted, drone
-    starts toward B, moving off the give-up spot re-whitelisted A, drone turns back, wedges, repeat). A
-    blacklisted goal is whitelisted only when we have "been over all other goals" — every live frontier is
-    excluded — at which point the planner REPOSITIONS to the farthest free corner and, on arrival, clears
-    the round's soft blacklist so the goals get one retry from a genuinely new vantage. CONVERGENCE: a goal
-    blacklisted AGAIN in a later round WITHOUT ever having gotten closer (best-distance never improved past
-    its prior best) is promoted to PERMANENT and never whitelisted again — so each truly-dead goal gets at
-    most ~2 real attempts, then drops out for good (no endless A->B->A cycle). This is NOT a repeat-counter:
-    healthy far goals (re-committed every replan, approached over many legs / parallax-scout steps) keep
-    improving best-distance and are never blacklisted.
+  * UNREACHABLE-GOAL BLACKLIST (EVENT-DRIVEN 2-BUMP, PERMANENT) — there is NO path planner: the drone
+    flies a STRAIGHT LINE toward the goal bearing, so a goal behind glass / a wall / a corner can never be
+    reached and its frontier is never consumed (the loop the operator hit at the glass window). The autopilot
+    reports each DISCRETE advance-blocked stop (optical-flow WALL contact, ram-guard, or clearance stand-off)
+    as a "bump" pulse via `note_wall_hit(goal)`; TWO bumps on the SAME goal region (within `assoc_dist`) ⇒ the
+    goal is unreachable ⇒ PERMANENTLY blacklisted, the commitment dropped, and the planner reselects. A bump
+    on a DIFFERENT goal resets the counter (so only consecutive same-region bumps accumulate). This is
+    event-driven ON PURPOSE: a prior time-accumulation watchdog gated its clock on SLAM-healthy frames and so
+    went BLIND exactly in the heavy glass/wall pockets (SLAM runs hot while the drone still flies on valid
+    poses), never firing. Counting hard physical stops sidesteps SLAM-clock health entirely. A kinematic latch
+    in the autopilot (displacement-or-retreat re-arm) guarantees one continuous contact counts as ONE bump.
+    The blacklist store is POSITION-UNCONDITIONED and PERMANENT: once blacklisted a goal STAYS excluded (the
+    round-based whitelist/reposition machinery below remains for the all-frontiers-excluded reposition, but
+    2-bump entries are permanent and never whitelisted).
 
 Transport-agnostic (mirrors ground_grid.py / map_store.py): plain values in, plain values out. No ZMQ,
 no torch, no SLAM. HARD RULE (CLAUDE.md): every knob is a GENERAL planner param and every blacklist POINT
@@ -65,25 +62,23 @@ class FrontierPlanner:
         self.goal_reach_dist = float(g("goal_reach_dist", 0.4))  # verify-corner "reached" test
         self.verify_done = bool(g("verify_done", True))
         self.verify_min_dist = float(g("verify_min_dist", 0.6))  # skip verify if the far corner is already here
-        # --- unreachable-goal DISTANCE-STAGNATION watchdog (general params + LIVE-computed points) ---
-        # A committed goal is blacklisted when the best-ever Euclidean distance toward it fails to improve by
-        # progress_eps for `stagnation_s` of SLAM-HEALTHY time. This single stagnation timer catches BOTH an
-        # invisible GLASS collider (SLAM stays healthy + the path reads clear, but the drone can't get closer —
-        # an invisible treadmill) AND an opaque wall the drone rams then re-commits (the pos plateaus at the
-        # wall across ram/recover cycles). No aim/clear/advancing gates: nothing about clearance or thrust can
-        # hide a goal that simply never gets closer. Ticks only on VALID (TRACKING) frames (perception skips
-        # select() otherwise), so a full SLAM loss naturally pauses it; a slam_ms CHOKE also pauses (unstable
-        # pose). The window is generous so slow flight + noisy scout maneuvers don't clip a reachable goal.
-        self.stagnation_s = float(g("goal_stagnation_s", 60.0))   # SLAM-healthy seconds of no progress -> blacklist
-        self.progress_eps = float(g("goal_progress_eps", 0.2))    # min closing distance that counts as progress
-        self.slam_slow_ms = float(g("slam_slow_ms", 1000.0))      # SLAM build time >= this = choking -> PAUSE (don't accrue)
+        # --- unreachable-goal EVENT-DRIVEN 2-BUMP blacklist (general params + LIVE-computed points) ---
+        # There is NO path planner: the drone flies a STRAIGHT line to the goal bearing, so a goal behind an
+        # invisible GLASS collider (the drone rides an invisible treadmill) or behind an opaque wall is never
+        # reachable. We do NOT time-accumulate stagnation (a prior watchdog gated accrual on SLAM-healthy time,
+        # so it went BLIND exactly in the heavy glass/wall pockets where SLAM runs hot yet the drone still flies
+        # on valid poses). Instead the autopilot reports each DISCRETE advance-blocked stop (flow WALL / ram
+        # guard / clearance stand-off) as a "bump" pulse; TWO bumps on the SAME goal region ⇒ the goal is
+        # unreachable ⇒ PERMANENTLY blacklisted. Event-driven, so it is immune to the SLAM-clock health that
+        # defeated the timer. A kinematic latch in the autopilot ensures one continuous contact = one bump.
+        self.progress_eps = float(g("goal_progress_eps", 0.2))    # min closing distance counted as progress (round-blacklist promotion)
         self.blacklist_radius = float(g("goal_blacklist_radius", self.assoc_dist))  # "same region" as a dead goal
         self.committed_goal = None     # [x, z] currently committed, or None
         self.verifying = False         # True while flying to the cached far corner to confirm "done"
         self.verify_target = None      # frozen [x, z] of the corner during verification (NEVER recomputed)
-        self._best_dist = None         # closest distance achieved toward the current committed goal
-        self._stagnation_accum = 0.0   # accumulated SLAM-healthy seconds with no progress toward the goal
-        self._last_now = None          # previous watchdog timestamp (for dt); None until first tick
+        self._best_dist = None         # closest distance achieved toward the current committed goal (round-blacklist memory)
+        self._last_wall_hit_goal = None  # [x, z] of the goal the last counted bump was against, or None
+        self._wall_hit_count = 0         # consecutive advance-blocked bumps on _last_wall_hit_goal (>=2 -> blacklist)
         # Position-UNCONDITIONED dead-goal regions. Each: {goal:[x,z], best_ever:float, permanent:bool,
         # active:bool}. `active` = excluded THIS round (cleared by _whitelist_round on the reposition
         # arrival); `permanent` = excluded forever (a goal re-blacklisted with no cross-round progress).
@@ -143,37 +138,33 @@ class FrontierPlanner:
         'dead for good' region distinctly from a 'dead this round' one."""
         return [bool(e["permanent"]) for e in self._blacklist]
 
-    # --------------------------------------------------- distance-stagnation watchdog
+    # --------------------------------------------------- event-driven 2-bump blacklist
     def _reset_progress(self):
         self._best_dist = None
-        self._stagnation_accum = 0.0
 
-    def _watchdog(self, pos, now, slam_ms):
-        """Per-committed-goal DISTANCE-STAGNATION watchdog. Tracks the best-ever distance toward the goal and
-        accrues SLAM-healthy time in which that best distance fails to improve by `progress_eps`; at
-        `stagnation_s` the goal is declared UNREACHABLE and PERMANENTLY blacklisted (the drone spent the whole
-        window unable to get closer -> a glass collider or a rammed wall behind the goal). Only ticks on VALID
-        frames (perception skips select() when not TRACKING), so a full SLAM loss pauses it; a slam_ms CHOKE
-        (unstable pose) also PAUSES accrual. Real progress RESETS the clock. No aim/clear/thrust gates — a
-        goal that simply never gets closer is unreachable however the sensors read."""
-        # dt since the last tick (clamped so a publish gap / first tick can't dump a huge chunk of time).
-        dt = 0.0 if self._last_now is None else max(0.0, min(now - self._last_now, 1.0)) if now is not None else 0.0
-        self._last_now = now
-        if self.committed_goal is None or now is None:
-            return
-        d = self._d(pos, self.committed_goal)
-        if self._best_dist is None or d <= self._best_dist - self.progress_eps:
-            self._best_dist = d                    # real progress toward the goal -> reset the stagnation clock
-            self._stagnation_accum = 0.0
-            return
-        # No progress. Accrue wall-clock time only while SLAM is HEALTHY (a choke gives an unstable pose we
-        # must not trust); a full loss doesn't tick here at all. No other gates.
-        if slam_ms is None or slam_ms < self.slam_slow_ms:
-            self._stagnation_accum += dt
-        if self._stagnation_accum >= self.stagnation_s:
-            self._blacklist_goal(self.committed_goal, permanent=True)
-            self.committed_goal = None
-            self._reset_progress()
+    def note_wall_hit(self, goal):
+        """Register ONE advance-blocked "bump" (flow WALL / ram-guard / stand-off) against `goal`, reported by
+        the autopilot. Consecutive bumps on the SAME goal region (within `assoc_dist`) accumulate; a bump on a
+        DIFFERENT goal resets the counter (so only genuinely-repeated same-goal contacts count). The SECOND bump
+        declares the goal UNREACHABLE and PERMANENTLY blacklists it, drops the commitment, and resets the
+        counter (the next select() reselects around the dead region). Event-driven — no timer, no SLAM-health
+        gate. The autopilot's kinematic latch guarantees a single continuous contact is only one bump, so this
+        never fires on state-machine flicker. Sets `last_blacklist` (the [x,z] just blacklisted, else None) so
+        the caller can log it once."""
+        self.last_blacklist = None
+        g = [float(goal[0]), float(goal[1])]
+        if self._last_wall_hit_goal is not None and self._d(g, self._last_wall_hit_goal) <= self.assoc_dist:
+            self._wall_hit_count += 1
+        else:
+            self._wall_hit_count = 1
+            self._last_wall_hit_goal = g
+        if self._wall_hit_count >= 2:
+            self._blacklist_goal(g, permanent=True)
+            if self.committed_goal is not None and self._d(self.committed_goal, g) <= self.blacklist_radius:
+                self.committed_goal = None         # drop the dead commitment -> next select() reselects
+                self._reset_progress()
+            self._wall_hit_count = 0
+            self._last_wall_hit_goal = None
 
     def _commit(self, goal):
         """Commit to `goal`, restarting progress tracking only when it is a genuinely DIFFERENT region
@@ -225,14 +216,13 @@ class FrontierPlanner:
         self._commit(goal)
         return self.committed_goal
 
-    def select(self, frontiers, pos, heading_deg=None, farthest_free=None, now=None, slam_ms=None):
-        """Returns (goal [x,z] | None, n_frontiers, done). `now` (monotonic) + `slam_ms` drive the
-        distance-stagnation watchdog (blacklists a committed goal that never gets closer for `stagnation_s` of
-        SLAM-healthy time; inert when `now` is None). `farthest_free` is consulted ONLY on the transition into
-        verification/reposition (and the caller only computes it when no frontier is reachable)."""
+    def select(self, frontiers, pos, heading_deg=None, farthest_free=None):
+        """Returns (goal [x,z] | None, n_frontiers, done). Unreachable-goal blacklisting is event-driven now
+        (`note_wall_hit`, fed by the autopilot's advance-blocked stops) — NOT a per-select timer. `farthest_free`
+        is consulted ONLY on the transition into verification/reposition (and the caller only computes it when
+        no frontier is reachable)."""
         pos = (float(pos[0]), float(pos[1]))
         self.last_blacklist = None
-        self._watchdog(pos, now, slam_ms)          # may blacklist + clear the commitment
 
         goal = self._select_reachable(frontiers, pos, heading_deg)
         if goal is not None:
@@ -339,64 +329,41 @@ def run_self_test():
     _, _, d_off = FrontierPlanner(None, verify_done=False).select([], [0.0, 0.0], farthest_free=[5.0, 0.0])
     check("(c4) no corner / too-near / disabled -> done", d_none and d_near and d_off)
 
-    # ---- unreachable-goal DISTANCE-STAGNATION blacklist (glass collider OR rammed opaque wall) ----
-    # A committed goal is PERMANENTLY blacklisted when its best-ever distance fails to improve by progress_eps
-    # for stagnation_s of SLAM-HEALTHY time. No aim/clear/thrust gates. `stag(...)` is a select at a fixed
-    # stand-off; ticks are ~1 s apart (dt clamps to 1 s). SLAM-slow ticks PAUSE (don't accrue).
+    # ---- unreachable-goal EVENT-DRIVEN 2-BUMP blacklist (glass collider / rammed opaque wall) ----
+    # The autopilot reports each advance-blocked stop via note_wall_hit(goal); TWO bumps on the SAME goal
+    # region PERMANENTLY blacklist it. A bump on a DIFFERENT goal resets the counter. No timer, no SLAM gate.
     W = {"center": [0.0, 3.0], "size": 8}          # a goal we can never reach (behind glass / a wall)
 
-    def stag(planner, at, t, slam=200.0, head=0.0, goal=W):
-        return planner.select([goal], at, heading_deg=head, now=float(t), slam_ms=slam)
-
-    # (d) a HEALTHY far goal that keeps CLOSING is never blacklisted (progress resets the clock every tick).
+    # (d) a SINGLE bump never blacklists (a lone contact could be transient); the counter just arms at 1.
     p = FrontierPlanner(None)
-    far = {"center": [0.0, 80.0], "size": 10}
-    p.select([far], [0.0, 0.0], heading_deg=0.0, now=0.0)           # commit
-    for t in range(1, 70):                                          # 69 s > stagnation_s, but closing 1 unit/step
-        gg, _, _ = stag(p, [0.0, float(t)], t, goal=far)
-    check("(d) healthy far goal (closing) never blacklists", len(p._blacklist) == 0 and close(gg, [0.0, 80.0]))
+    p.select([W], [0.0, 0.0], heading_deg=0.0)     # commit W
+    p.note_wall_hit([0.0, 3.0])
+    check("(d) one bump does NOT blacklist (armed at 1)",
+          len(p._blacklist) == 0 and p._wall_hit_count == 1 and p.committed_goal is not None)
 
-    # (e) a STAGNATING goal is PERMANENTLY blacklisted once the accumulated no-progress time reaches
-    #     stagnation_s — but not before. (Held at a fixed stand-off; best distance never improves.)
-    pe = FrontierPlanner(None)                                     # kept for (g) — position-UNconditioned check
-    pe.select([W], [0.0, 0.0], heading_deg=0.0, now=0.0)           # commit W
-    stag(pe, [0.0, 2.4], 0.5)                                      # approach to the stand-off -> best=0.6
-    S = int(pe.stagnation_s)
-    for t in range(1, S - 3):                                      # well under stagnation_s (dt clamps to 1/tick)
-        stag(pe, [0.0, 2.4], float(t))
-    before = len(pe._blacklist) == 0 and pe.committed_goal is not None
-    for t in range(S - 3, S + 4):                                  # cross stagnation_s
-        stag(pe, [0.0, 2.4], float(t))
-    check("(e) stagnating goal PERMANENT-blacklists at stagnation_s (not before)",
-          before and len(pe._blacklist) == 1 and pe._blacklist[0]["permanent"] is True
-          and close(pe._blacklist[0]["goal"], [0.0, 3.0]))
+    # (e) the SECOND bump on the same goal region (within assoc_dist, so centroid drift still counts)
+    #     PERMANENTLY blacklists it, drops the commitment, and resets the counter.
+    pe = FrontierPlanner(None)                                     # reused by (g)
+    pe.select([W], [0.0, 0.0], heading_deg=0.0)                    # commit W
+    pe.note_wall_hit([0.0, 3.0])
+    pe.note_wall_hit([0.0, 2.95])                                  # same region (< assoc_dist) -> 2nd bump
+    check("(e) two same-region bumps PERMANENT-blacklist + clear commitment + reset count",
+          len(pe._blacklist) == 1 and pe._blacklist[0]["permanent"] is True
+          and close(pe._blacklist[0]["goal"], [0.0, 2.95]) and pe.committed_goal is None
+          and pe._wall_hit_count == 0)
 
-    # (f) SLAM-CHOKE PAUSE: a stagnating goal with slam_ms >= slam_slow_ms EVERY tick never accrues -> never
-    #     blacklisted, even over a long window (unstable pose must not be trusted).
+    # (f) GOAL-CHANGE RESET: a bump on a goal > assoc_dist away resets the counter, so alternating bumps on
+    #     two far-apart goals never reach 2 (only consecutive same-region contacts accumulate).
     p = FrontierPlanner(None)
-    p.select([W], [0.0, 0.0], heading_deg=0.0, now=0.0)
-    for t in range(1, int(p.stagnation_s) + 10):
-        stag(p, [0.0, 2.4], float(t), slam=1500.0)                # SLAM choking every tick -> PAUSE
-    check("(f) SLAM-choke every tick PAUSES the clock (never blacklists)",
-          len(p._blacklist) == 0 and p.committed_goal is not None)
+    p.note_wall_hit([0.0, 3.0])                                    # goal A -> count 1
+    p.note_wall_hit([9.0, 9.0])                                    # goal B (far) -> reset, count 1 on B
+    p.note_wall_hit([0.0, 3.0])                                    # back to A -> reset, count 1 on A
+    check("(f) a different-goal bump RESETS the counter (no blacklist)",
+          len(p._blacklist) == 0 and p._wall_hit_count == 1 and close(p._last_wall_hit_goal, [0.0, 3.0]))
 
-    # (g) POSITION-UNCONDITIONED (the ping-pong fix): the goal blacklisted in (e) stays excluded no matter
-    #     where the drone moves — moving away does NOT silently re-whitelist it. (reuses pe.)
-    check("(g) blacklist stays excluded regardless of vantage (no re-whitelist by moving)",
+    # (g) POSITION-UNCONDITIONED + PERMANENT: the goal blacklisted in (e) stays excluded from any vantage.
+    check("(g) blacklist stays excluded regardless of vantage",
           pe._excluded([0.0, 3.0]) and not pe.any_reachable([W]))
-
-    # (h) OPAQUE-WALL RAM loop: the drone rams, SLAM dies (loss = no tick), recovers TRACKING at the same
-    #     wall stand-off, rams again — best distance plateaus. Accrual happens on the healthy stretches
-    #     (loss gaps just don't tick), so it still reaches stagnation_s and blacklists.
-    pr = FrontierPlanner(None)
-    pr.select([W], [0.0, 0.0], heading_deg=0.0, now=0.0)
-    stag(pr, [0.0, 2.4], 0.5)                                      # first approach -> best=0.6
-    t = 1.0
-    for _cycle in range(int(pr.stagnation_s) + 5):                # healthy ticks at the wall; big time gaps between
-        stag(pr, [0.0, 2.4], t)                                   # (loss gap) then a fresh healthy tick — dt clamps to 1
-        t += 3.0                                                  # 3 s of wall-clock but only 1 s credited (clamp)
-    check("(h) opaque-wall ram/recover (plateau on healthy stretches) still blacklists",
-          len(pr._blacklist) == 1 and pr._blacklist[0]["permanent"] is True)
 
     # (k) CROSS-ROUND CONVERGENCE (soft re-blacklist path): a SOFT goal re-blacklisted in a later round
     #     WITHOUT ever having gotten closer is promoted to PERMANENT (survives a whitelist); but if a new
@@ -426,10 +393,10 @@ def run_self_test():
     p = FrontierPlanner(None)
     p._best_dist = 0.6
     p._blacklist_goal([0.0, 3.0])                     # W soft-excluded
-    g_v, n_v, done_v = p.select([W], [0.0, 2.4], heading_deg=0.0, farthest_free=[5.0, 5.0], now=0.0)
+    g_v, n_v, done_v = p.select([W], [0.0, 2.4], heading_deg=0.0, farthest_free=[5.0, 5.0])
     check("(i) all-excluded -> reposition via far corner, frontiers still reported, not done",
           close(g_v, [5.0, 5.0]) and n_v == 1 and not done_v and p.verifying)
-    g_r, n_r, done_r = p.select([W], [5.0, 5.0], heading_deg=0.0, now=1.0)   # reached the corner
+    g_r, n_r, done_r = p.select([W], [5.0, 5.0], heading_deg=0.0)   # reached the corner
     check("(i) reached corner -> whitelist the round + retry the frontier (not done)",
           close(g_r, [0.0, 3.0]) and n_r == 1 and not done_r and not p.verifying)
 
