@@ -1,6 +1,7 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-08** (session 8). Resume from THIS file._
+_Last updated **2026-07-09** (session 9 — planning). Resume from THIS file. Next build:
+`plans/replan-deadstall-sweep-and-slam-tracker.md` (item 2)._
 
 **Status:** Phase-1 (manual map + target localization) done & hardware-verified. Phase-2 autonomous
 **Map-mode explorer** (`autopilot.py --explore`) flies live — clean session-8 flight
@@ -20,9 +21,16 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 _Session-8 work is DONE + flight-confirmed (`20260708_195009`) — see the Documentation session-8 entry.
 Two items remain, both designed, neither built:_
 
-- **Item 2 — kill the REPLAN dead-stall** (`autopilot.py:1378` idles forever on `goal=None && !done`):
-  a bounded, visible recovery (reposition/parallax nudge) or a logged declare-done instead of infinite
-  idle. Also revisit standoff-as-bump (space/displace before counting).
+- **Item 2 — kill the REPLAN dead-stall** — DESIGNED (session 9), NOT built. Full plan:
+  **`plans/replan-deadstall-sweep-and-slam-tracker.md`**. Diagnosed on `20260708_195009`: the planner
+  returned `goal=None && !done` and the controller idled forever (`autopilot.py:1401-1403`) — the
+  done-verification stage silently never fired (the `farthest_free`/`verify_min_dist` "too near" gate
+  failed). Fix: replace the fragile verify with a deterministic **bounding-box diagonal sweep** (fly to
+  the opposite corner, inset 1 u/axis with per-axis midpoint-clamp on narrow axes; new
+  `ground_grid.sweep_corner`) that either surfaces new frontiers en route or declares a visible **DONE**
+  (just print it — no Phase-3 handoff yet). Same plan also **moves `[SLAM_TRACKER]` out of the terminal
+  into the replay HTML** (teal, distinct color). Operator note: room is only *mildly* mapped — deep
+  interior coverage is the Part-3 next-phase idea below, not this fix.
 - **Item 1 — per-replan height recalibration (`CALIBRATING_HEIGHT`).** 60 s cooldown from the last
   calibration; keep running altitude statistics; reject a calibration that taps a low ceiling object
   (new `pos_y` well below the live median) → nudge forward and retry. Design in
@@ -31,9 +39,16 @@ Two items remain, both designed, neither built:_
 ---
 
 ## Future (backlog)
-- **REPLAN dead-stall (item 2)** — no infinite idle when the planner returns no goal.
+- **REPLAN dead-stall (item 2)** — no infinite idle when the planner returns no goal. Designed:
+  `plans/replan-deadstall-sweep-and-slam-tracker.md` (bbox diagonal sweep + SLAM_TRACKER → replay HTML).
 - **Per-goal height calibration (item 1)** — `plans/glass-corner-blacklist-and-height-calib.md`.
 - **Glass-corner blacklist escape (Bug A+B)** — built session 7, still needs a clean live confirm.
+- **Phase-2b — dense low-altitude interior mapping, then detection.** Operator idea: map the inner
+  room near ground level so the target can be found there later. Recommendation (see item-2 plan
+  Part 3): a low-altitude interior traverse is worth it for denser geometry, but a *blind SLAM-off*
+  flight drifts (no pose feedback). For detection, prefer **(a) offline cascade on the recorded
+  map-mode footage** (reuses map-mode poses; no GPU contention — start here) or **(b) a temporally
+  interleaved Scan mode** (SLAM navigate → pause → detect → resume), NOT a pure SLAM-off pass.
 - Deferred: Scan mode (360° cascade with SLAM/GPU temporal separation); a glass-window altitude
   descend-probe; Phase-3 report polish + GUI.
 
@@ -166,11 +181,13 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   4's **event-driven 2-bump** rule finally holds.
 
 ### Open issues
-- **REPLAN dead-stall (item 2, NOT fixed).** When the planner returns `goal=None && !done`, the
-  controller idles in REPLAN forever (`autopilot.py:1378`) — seen on `20260708_135719` after every
-  reachable goal got blacklisted. Needs a bounded, visible recovery. (Turns themselves are fine — see
-  session 8.) The older "heading decided only at REPLAN, no mid-leg re-aim" is a separate, milder
-  concern.
+- **REPLAN dead-stall (item 2, NOT fixed — DESIGNED session 9).** When the planner returns
+  `goal=None && !done`, the controller idles in REPLAN forever (`autopilot.py:1401-1403`) — re-seen on
+  the clean `20260708_195009` flight (planner ran out of reachable frontiers; the done-verification
+  gate silently never fired). Fix designed in `plans/replan-deadstall-sweep-and-slam-tracker.md`:
+  bounding-box diagonal sweep → visible DONE, plus a fail-visible bounded-idle backstop. (Turns
+  themselves are fine — see session 8.) The older "heading decided only at REPLAN, no mid-leg re-aim"
+  is a separate, milder concern.
 - **Deferred:** Scan mode; a glass-window altitude descend-probe; Phase-3 report polish + GUI.
 
 ---
