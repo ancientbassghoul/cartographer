@@ -62,6 +62,10 @@ class FrontierPlanner:
         self.goal_reach_dist = float(g("goal_reach_dist", 0.4))  # verify-corner "reached" test
         self.verify_done = bool(g("verify_done", True))
         self.verify_min_dist = float(g("verify_min_dist", 0.6))  # skip verify if the far corner is already here
+        # Proportional inset of the verify/reposition corner toward the drone: cache the target pulled this
+        # fraction of the way back along the drone->corner line, for a vantage kept off tight corner walls.
+        # RELATIVE (self-calibrating to the LIVE drone->corner distance), not a room-specific coordinate.
+        self.verify_pull_frac = float(g("verify_pull_frac", 0.25))
         # --- unreachable-goal EVENT-DRIVEN 2-BUMP blacklist (general params + LIVE-computed points) ---
         # There is NO path planner: the drone flies a STRAIGHT line to the goal bearing, so a goal behind an
         # invisible GLASS collider (the drone rides an invisible treadmill) or behind an opaque wall is never
@@ -86,10 +90,27 @@ class FrontierPlanner:
         # `best_ever` = the closest distance ever achieved toward the region (persists across rounds).
         self._blacklist = []
         self.last_blacklist = None     # [x,z] blacklisted on THIS select() call (caller logs it once), else None
+        # Optional map-validated clearance inset applied to a chosen frontier goal BEFORE commitment
+        # (set via set_clearance_fn). fn(goal, pos) -> adjusted FREE [x,z] | None. `clearance_ok` is a
+        # visible telemetry flag: False when the inset could not find a FREE buffered cell (NO silent
+        # fallback — we commit the raw goal but flag it).
+        self._clearance_fn = None
+        self.clearance_ok = True
 
     @staticmethod
     def _d(a, b):
         return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def set_clearance_fn(self, fn):
+        """Inject a map-validated clearance inset `fn(goal, pos) -> adjusted [x,z] | None`, applied to a
+        chosen frontier goal before commitment so the committed (and published) goal keeps a clearance
+        buffer off obstacles/corners. `None` means no buffered FREE cell was found."""
+        self._clearance_fn = fn
+
+    def is_excluded(self, center):
+        """Public wrapper over `_excluded` so callers (e.g. the perception worker computing a blacklist-aware
+        `farthest_free`) can query the dead-goal regions without reaching into a private method."""
+        return self._excluded(center)
 
     # ---------------------------------------------------------------- blacklist
     def _excluded(self, center):
@@ -234,6 +255,18 @@ class FrontierPlanner:
         self.verifying = False                         # something to chase -> not done, not verifying
         self.verify_target = None
         goal = self._choose(reachable, pos, heading_deg)
+        # Map-validated clearance inset: pull a goal that hugs an obstacle/corner back along the drone->goal
+        # axis to a FREE buffered cell before we commit (so committed == published; bump association holds).
+        if self._clearance_fn is not None:
+            adjusted = self._clearance_fn(goal, pos)
+            if adjusted is not None:
+                goal = (float(adjusted[0]), float(adjusted[1]))
+                self.clearance_ok = True
+            else:
+                # NO SILENT FALLBACK: no FREE buffered cell on the segment -> commit the raw goal but flag it.
+                self.clearance_ok = False
+                print(f"[planner] clearance inset found no FREE buffered cell for goal {goal} "
+                      f"(pos {pos}) -> committing raw goal, clearance_ok=False", flush=True)
         self._commit(goal)
         return self.committed_goal
 
@@ -257,6 +290,12 @@ class FrontierPlanner:
         self._reset_progress()
         if not self.verify_done:
             return None, len(frontiers), True
+        if self.verifying and self.verify_target is not None and self._excluded(self.verify_target):
+            # ESCAPE (Bug A): the event-driven 2-bump rule just blacklisted the region we were flying toward.
+            # Abandon this dead corner and fall through to the transition block, which re-caches a FRESH
+            # blacklist-aware `farthest_free` (or declares done if no non-excluded free space remains).
+            self.verifying = False
+            self.verify_target = None
         if self.verifying:
             if self.verify_target is None or self._d(pos, self.verify_target) <= self.goal_reach_dist:
                 self.verifying = False
@@ -268,10 +307,17 @@ class FrontierPlanner:
                         return g, len(frontiers), False
                 return None, len(frontiers), True      # no live frontiers -> verification complete = done
             return list(self.verify_target), len(frontiers), False
-        # Transition INTO reposition/verify: cache the (inset) far corner EXACTLY ONCE (caller computed it).
-        if farthest_free is not None and self._d(pos, farthest_free) > self.verify_min_dist:
+        # Transition INTO reposition/verify: cache the (inset) far corner EXACTLY ONCE (caller computed it,
+        # blacklist-aware). Guard with `_excluded` too (belt-and-suspenders) so a dead corner is never
+        # chased even if the caller forgets to pass an `exclude` predicate.
+        if (farthest_free is not None and not self._excluded(farthest_free)
+                and self._d(pos, farthest_free) > self.verify_min_dist):
             self.verifying = True
-            self.verify_target = [float(farthest_free[0]), float(farthest_free[1])]
+            # Pull the corner `verify_pull_frac` of the way back toward the drone (proportional, relative to
+            # the LIVE drone->corner distance) for a vantage kept off the tight corner walls.
+            f = self.verify_pull_frac
+            self.verify_target = [float(pos[0] + (farthest_free[0] - pos[0]) * (1.0 - f)),
+                                  float(pos[1] + (farthest_free[1] - pos[1]) * (1.0 - f))]
             return list(self.verify_target), len(frontiers), False
         # No corner worth repositioning to (no free space beyond verify_min_dist). If frontiers exist (all
         # excluded) whitelist + retry IN PLACE — but NOT on the same tick we just blacklisted one: let the
@@ -322,20 +368,21 @@ def run_self_test():
     check("(b) commitment yields to a much-better frontier", close(g3, [0.0, 0.4]))
 
     # (c) done verification: empty frontiers + a distant far corner -> go there (done=False); reaching
-    #     it with still-empty frontiers -> done=True.
+    #     it with still-empty frontiers -> done=True. The cached target is the corner pulled 25%
+    #     (verify_pull_frac) back toward the drone: [0,0] + 0.75*([5,0]-[0,0]) = [3.75, 0].
     p = FrontierPlanner(None)
     g, n, done = p.select([], [0.0, 0.0], farthest_free=[5.0, 0.0])
-    check("(c) empty -> verify far corner, not done", close(g, [5.0, 0.0]) and not done and p.verifying)
-    g, n, done = p.select([], [5.0, 0.0])                          # reached the corner, still empty
+    check("(c) empty -> verify far corner (25% inset), not done", close(g, [3.75, 0.0]) and not done and p.verifying)
+    g, n, done = p.select([], [3.75, 0.0])                         # reached the (inset) corner, still empty
     check("(c) reached corner + empty -> done", g is None and done and not p.verifying)
 
     # (c2) STATIC target: while verifying, a moving drone (and a different farthest_free passed in) must
-    #      keep returning the SAME cached corner — no oscillation.
+    #      keep returning the SAME cached (inset) corner — no oscillation.
     p = FrontierPlanner(None)
-    p.select([], [0.0, 0.0], farthest_free=[5.0, 0.0])            # cache [5,0]
+    p.select([], [0.0, 0.0], farthest_free=[5.0, 0.0])            # cache the inset of [5,0] -> [3.75,0]
     g_a, _, _ = p.select([], [1.0, 0.0], farthest_free=[9.0, 9.0])
     g_b, _, _ = p.select([], [2.0, 2.0], farthest_free=[-9.0, -9.0])
-    check("(c2) verify target stays frozen as the drone moves", close(g_a, [5.0, 0.0]) and close(g_b, [5.0, 0.0]))
+    check("(c2) verify target stays frozen as the drone moves", close(g_a, [3.75, 0.0]) and close(g_b, [3.75, 0.0]))
 
     # (c3) frontiers reappearing mid-verify -> resume selection, no premature done.
     p = FrontierPlanner(None)
@@ -420,11 +467,61 @@ def run_self_test():
     p._best_dist = 0.6
     p._blacklist_goal([0.0, 3.0])                     # W soft-excluded
     g_v, n_v, done_v = p.select([W], [0.0, 2.4], heading_deg=0.0, farthest_free=[5.0, 5.0])
-    check("(i) all-excluded -> reposition via far corner, frontiers still reported, not done",
-          close(g_v, [5.0, 5.0]) and n_v == 1 and not done_v and p.verifying)
-    g_r, n_r, done_r = p.select([W], [5.0, 5.0], heading_deg=0.0)   # reached the corner
+    # inset of [5,5] from [0,2.4]: [0+5*0.75, 2.4+2.6*0.75] = [3.75, 4.35]
+    check("(i) all-excluded -> reposition via far corner (25% inset), frontiers still reported, not done",
+          close(g_v, [3.75, 4.35]) and n_v == 1 and not done_v and p.verifying)
+    g_r, n_r, done_r = p.select([W], [3.75, 4.35], heading_deg=0.0)   # reached the (inset) corner
     check("(i) reached corner -> whitelist the round + retry the frontier (not done)",
           close(g_r, [0.0, 3.0]) and n_r == 1 and not done_r and not p.verifying)
+
+    # (A3) 25% proportional pull: the cached verify_target sits verify_pull_frac of the way back from the
+    #      passed corner toward the drone — i.e. 25% closer to pos than the raw corner.
+    p = FrontierPlanner(None)
+    pos0, corner = [1.0, 1.0], [9.0, 5.0]
+    g_pull, _, _ = p.select([], pos0, farthest_free=corner)
+    d_corner = math.hypot(corner[0] - pos0[0], corner[1] - pos0[1])
+    d_target = math.hypot(g_pull[0] - pos0[0], g_pull[1] - pos0[1])
+    check("(A3) verify target is pulled 25% closer to the drone than the raw corner",
+          abs(d_target - 0.75 * d_corner) < 1e-6)
+
+    # (A1) Bug A guard: a farthest_free that falls in a blacklisted region is NOT cached as a verify target
+    #      (the transition gate _excluded-checks it); with no other corner, verification declares done.
+    p = FrontierPlanner(None)
+    p._blacklist_goal([5.0, 0.0], permanent=True)                  # dead region at the only corner
+    g_x, _, done_x = p.select([], [0.0, 0.0], farthest_free=[5.0, 0.0])
+    check("(A1) excluded far corner is NOT chased -> not verifying, done",
+          g_x is None and done_x and not p.verifying)
+
+    # (A2) Bug A ESCAPE: while verifying toward a corner, two bumps on that (inset) target blacklist it;
+    #      the next select ABANDONS the dead corner and re-caches a FRESH blacklist-aware corner elsewhere.
+    p = FrontierPlanner(None)
+    g0, _, _ = p.select([], [0.0, 0.0], farthest_free=[5.0, 0.0])  # cache inset [3.75,0]; drone verifies toward it
+    p.note_wall_hit(g0); p.note_wall_hit(g0)                       # 2 bumps on the verify target -> blacklist it
+    # caller now recomputes a blacklist-aware farthest_free (a DIFFERENT corner clear of the dead one)
+    new_corner = [-6.0, 0.0]
+    g_esc, _, done_esc = p.select([], [0.0, 0.0], farthest_free=new_corner)
+    check("(A2) escape: blacklisted verify target abandoned -> re-cache a new corner",
+          p.verifying and not done_esc and close(g_esc, [-4.5, 0.0])   # inset of [-6,0] from [0,0]
+          and p._excluded([3.75, 0.0]))
+    # …and if NO non-excluded corner remains, the escape declares done instead of looping forever.
+    p2 = FrontierPlanner(None)
+    g1, _, _ = p2.select([], [0.0, 0.0], farthest_free=[5.0, 0.0])
+    p2.note_wall_hit(g1); p2.note_wall_hit(g1)
+    _, _, done_none = p2.select([], [0.0, 0.0], farthest_free=None)  # blacklist-aware recompute found nothing
+    check("(A2) escape with no corner left -> done", done_none and not p2.verifying)
+
+    # (opt) clearance inset: a chosen frontier goal is run through the injected clearance_fn before commit,
+    #       so committed==published; a None return commits the RAW goal and flags clearance_ok=False.
+    p = FrontierPlanner(None)
+    p.set_clearance_fn(lambda goal, pos: [0.0, 2.0])              # pretend the map pulls it back to [0,2]
+    g_c, _, _ = p.select([A], [0.0, 0.0], heading_deg=0.0)        # A center [0,3]
+    check("(opt) clearance inset moves the committed goal + clearance_ok stays True",
+          close(g_c, [0.0, 2.0]) and close(p.committed_goal, [0.0, 2.0]) and p.clearance_ok is True)
+    p = FrontierPlanner(None)
+    p.set_clearance_fn(lambda goal, pos: None)                   # no FREE buffered cell on the segment
+    g_c2, _, _ = p.select([A], [0.0, 0.0], heading_deg=0.0)
+    check("(opt) clearance inset None -> commit raw goal + clearance_ok=False (visible, no silent fallback)",
+          close(g_c2, [0.0, 3.0]) and p.clearance_ok is False)
 
     print(f"\n[frontier_planner][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

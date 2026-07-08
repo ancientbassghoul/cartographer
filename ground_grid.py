@@ -212,7 +212,7 @@ class GroundGrid:
         out.sort(key=lambda d: d["size"], reverse=True)
         return out
 
-    def farthest_free(self, pos, margin=0.0):
+    def farthest_free(self, pos, margin=0.0, exclude=None):
         """World [X, Z] of the FREE (confirmed-empty) cell farthest (Euclidean) from `pos`, or None if
         no free cells. The planner uses this for done-verification / reposition: when no frontiers are
         reachable, the farthest known free point is the best place to fly to look for uncharted territory.
@@ -221,7 +221,13 @@ class GroundGrid:
         target sits ALMOST in the corner rather than hard against the wall — otherwise the raw farthest
         free cell is inside the forward stand-off shell and the drone (which stops `stop_clearance_dist`
         short of walls) can never reach it. A general stand-off-scale value (like `stop_clearance_dist` /
-        `goal_reach_dist`), NOT a room answer."""
+        `goal_reach_dist`), NOT a room answer.
+
+        `exclude(world_xy) -> bool` (optional) skips FREE cells inside a dead-goal (blacklisted) region, so
+        the reposition/verify target ESCAPES a corner the drone keeps bumping instead of re-picking it
+        forever (Bug A). We scan candidates farthest-first and return the first non-excluded one, so the
+        common case (farthest corner is fine) costs a single predicate call. Returns None when EVERY free
+        cell is excluded — the caller (`select`) then correctly declares done."""
         c = self.classify_dense()
         free = c["free"]
         if free.size == 0 or not free.any():
@@ -230,8 +236,15 @@ class GroundGrid:
         X = (cc + c["ix0"] + 0.5) * self.cell      # cell-center world coords (matches frontiers())
         Z = (rr + c["iz0"] + 0.5) * self.cell
         d2 = (X - float(pos[0])) ** 2 + (Z - float(pos[1])) ** 2
-        i = int(np.argmax(d2))
-        fx, fz = float(X[i]), float(Z[i])
+        fx = fz = None
+        for i in np.argsort(d2)[::-1]:             # farthest-first; stop at the first non-excluded cell
+            px, pz = float(X[i]), float(Z[i])
+            if exclude is not None and exclude([px, pz]):
+                continue
+            fx, fz = px, pz
+            break
+        if fx is None:
+            return None                            # every FREE cell is blacklisted -> done
         if margin > 0.0:
             dist = math.hypot(fx - float(pos[0]), fz - float(pos[1]))
             if dist > 1e-9:
@@ -239,6 +252,46 @@ class GroundGrid:
                 fx -= (fx - float(pos[0])) * pull
                 fz -= (fz - float(pos[1])) * pull
         return [fx, fz]
+
+    def inset_to_clearance(self, goal, pos, buffer):
+        """Pull `goal` back along the goal->pos axis to the first point that is map-validated FREE AND has
+        `buffer` (SLAM units) of clearance from any occupied cell. Returns the adjusted [X, Z], the
+        unchanged `goal` if it already clears, or None if no FREE buffered point exists on the segment.
+
+        A frontier centroid sits on the FREE/unobserved boundary, so it can land right against an
+        obstacle/corner and stall the drone. Insetting keeps the committed goal reachable. `buffer` is a
+        general stand-off-scale distance validated against the LIVE map (OCC dilated by ceil(buffer/cell)
+        cells), never a precomputed coordinate."""
+        c = self.classify_dense()
+        free, occ = c["free"], c["occ"]
+        if free.size == 0 or not free.any():
+            return None
+        ix0, iz0 = c["ix0"], c["iz0"]
+        h, w = free.shape
+        rad = int(math.ceil(buffer / self.cell)) if buffer > 0.0 else 0
+        near_occ = (ndimage.binary_dilation(occ, iterations=rad) if rad > 0 and occ.any()
+                    else np.zeros_like(free))
+
+        def _ok(wx, wz):
+            ix = int(math.floor(wx / self.cell)) - ix0     # array is [iz-iz0, ix-ix0] (row=Z, col=X)
+            iz = int(math.floor(wz / self.cell)) - iz0
+            if ix < 0 or iz < 0 or ix >= w or iz >= h:
+                return False
+            return bool(free[iz, ix]) and not bool(near_occ[iz, ix])
+
+        gx, gz = float(goal[0]), float(goal[1])
+        px, pz = float(pos[0]), float(pos[1])
+        if _ok(gx, gz):
+            return [gx, gz]
+        dist = math.hypot(gx - px, gz - pz)
+        if dist < 1e-9:
+            return None
+        step = 0.5 * self.cell                             # sub-cell stride so no cell is skipped
+        for k in range(1, int(dist / step) + 1):
+            t = (k * step) / dist                          # fraction from goal toward pos
+            if _ok(gx + (px - gx) * t, gz + (pz - gz) * t):
+                return [gx + (px - gx) * t, gz + (pz - gz) * t]
+        return None
 
     # ------------------------------------------------------------------ bus summary
     def summary(self, raster: int = 160):
@@ -409,6 +462,27 @@ def run_self_test():
     d_in = math.hypot(ff_in[0] - cam[0], ff_in[1] - cam[2])
     check("farthest_free(margin) pulls the target inward by ~margin",
           ff_in is not None and abs((d_raw - d_in) - 0.3) < 1e-6)
+
+    # farthest_free(exclude): blacklisting the raw farthest cell's region forces a DIFFERENT free cell
+    # (the Bug-A escape-recompute); excluding everything returns None so the planner declares done.
+    ex_r = 0.5
+    ff_ex = gg.farthest_free([cam[0], cam[2]], exclude=lambda p: math.hypot(p[0] - ff[0], p[1] - ff[1]) <= ex_r)
+    check("farthest_free(exclude) skips the blacklisted region -> a different free cell",
+          ff_ex is not None and cls_at(ff_ex[0], ff_ex[1]) == "FREE"
+          and math.hypot(ff_ex[0] - ff[0], ff_ex[1] - ff[1]) > ex_r)
+    check("farthest_free(exclude-all) is None", gg.farthest_free([cam[0], cam[2]], exclude=lambda p: True) is None)
+
+    # inset_to_clearance: an already-clear FREE goal is unchanged; a wall-hugging goal is pulled back along
+    # the goal->pos axis to a FREE buffered cell; an impossibly large buffer yields None (no such cell).
+    free_goal = [0.0, 1.0]
+    same = gg.inset_to_clearance(free_goal, [cam[0], cam[2]], buffer=0.05)
+    check("inset_to_clearance leaves an already-clear FREE goal unchanged",
+          same is not None and abs(same[0] - free_goal[0]) < 1e-9 and abs(same[1] - free_goal[1]) < 1e-9)
+    inset = gg.inset_to_clearance([0.0, 2.0], [cam[0], cam[2]], buffer=gg.obstacle_inflation * gg.cell)
+    check("inset_to_clearance pulls a wall-hugging goal back to a FREE buffered cell",
+          inset is not None and cls_at(inset[0], inset[1]) == "FREE")
+    check("inset_to_clearance returns None under an impossibly large buffer",
+          gg.inset_to_clearance([0.0, 2.0], [cam[0], cam[2]], buffer=100.0) is None)
 
     # Summary raster is well-formed and label-preserving in size.
     s = gg.summary(raster=64)

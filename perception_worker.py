@@ -121,6 +121,14 @@ class Pipeline:
         self.planner = FrontierPlanner(cfg)
         e = explore_cfg(cfg)
         self.goal_reach_dist = float(e.get("goal_reach_dist", 0.4))
+        # Map-validated clearance buffer: a chosen frontier goal (which sits on the free/unknown boundary)
+        # can hug an obstacle/corner and stall the drone. Pull it back along the drone->goal axis to a FREE
+        # cell with this much clearance before committing. A general stand-off-scale distance validated
+        # against the LIVE map every replan — never a precomputed coordinate. Default tracks the obstacle
+        # inflation width so the buffered goal sits at least one inflation ring off known obstacles.
+        self.goal_clearance_buffer = float(e.get("goal_clearance_buffer", self.ground.obstacle_inflation * self.ground.cell))
+        self.planner.set_clearance_fn(
+            lambda goal, pos: self.ground.inset_to_clearance(goal, pos, self.goal_clearance_buffer))
         # Pull the reposition/verify far-corner target inward by this margin so it is REACHABLE (the raw
         # farthest free cell sits against the wall, inside the stand-off shell). General stand-off scale.
         # It must be coordinated with the autopilot's forward stand-off: the drone stops
@@ -357,22 +365,27 @@ class Pipeline:
                     bd, best = diff, dd
             return best
         self._last_ring_fb = (_ring_fb(0.0), _ring_fb(180.0))
-        # Goal selection + done verification. `farthest_free` is computed ONLY on the transition into
-        # verification (no frontiers AND not already verifying) so it is evaluated exactly once per
-        # done-attempt and stays a STATIC target (no oscillating between equidistant corners).
+        # Goal selection + done verification. `farthest_free` (the reposition target) is needed whenever
+        # NOTHING is reachable — no frontiers at all OR every live frontier blacklisted (the glass-loop
+        # escape). Flying to the far corner moves the drone to a fresh vantage; on arrival the planner
+        # clears the round's soft blacklist so those goals get one retry from there. Pulled inward
+        # (`reposition_inset`) to be reachable.
         fr = self.ground.frontiers()
-        # `farthest_free` (the reposition target) is needed whenever NOTHING is reachable — that's no
-        # frontiers at all OR every live frontier blacklisted (the glass-loop escape). Flying to the far
-        # corner moves the drone to a fresh vantage; on arrival the planner clears the round's soft
-        # blacklist so those goals get one retry from there. Pulled inward (`reposition_inset`) to be reachable.
+        # Compute it on EVERY not-reachable tick (not just the verify transition): when the 2-bump rule
+        # blacklists the corner we're verifying toward, `select` escapes it and must have a FRESH,
+        # blacklist-aware corner in hand that same tick — else it would prematurely declare done. `select`
+        # still caches the target ONCE, so the corner stays STATIC during verify despite recomputing here.
+        # `exclude` makes `farthest_free` skip dead-goal regions so the escape lands on a NEW corner (Bug A).
         reachable = self.planner.any_reachable(fr)
-        farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64), margin=self.reposition_inset)
-                    if (not reachable and not self.planner.verifying) else None)
+        farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64),
+                                              margin=self.reposition_inset, exclude=self.planner.is_excluded)
+                    if not reachable else None)
         # Goal selection (blacklisting is event-driven via note_wall_hit in run(), NOT a per-select timer).
         goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, farthest)
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()
         payload["blacklist_permanent"] = self.planner.blacklist_permanent()
+        payload["goal_clearance_ok"] = bool(self.planner.clearance_ok)   # visible flag: clearance inset succeeded
         if self.planner.verifying and not self._verify_logged:
             print(f"[perception] planner: no frontiers -> VERIFYING via far corner {self.planner.verify_target}",
                   flush=True)
