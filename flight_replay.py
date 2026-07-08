@@ -223,21 +223,30 @@ function drawMap(tMono) {
   }
 }
 
-const GOAL_COL = { active: '#d9b400', blacklist_soft: '#e07b1a', blacklist_permanent: '#d33' };
+// active = the goal the CONTROLLER is committed to (leg_goal); plan_pick = perception's async frontier
+// pick when it differs (drawn faint/hollow so it never masquerades as the goal the drone is flying to).
+const GOAL_COL = { active: '#d9b400', plan_pick: '#8a7d3a', blacklist_soft: '#e07b1a', blacklist_permanent: '#d33' };
+const PLAN_LOST = { 'PLAN-LOST': 1, 'PLAN-STALE': 1, 'NO-PLAN': 1 };   // plan not usable -> grey the goal
 function drawGoals(step) {
   const gs = step.goals || [];
+  const lost = !!PLAN_LOST[step.status];              // no live plan this frame
   for (const g of gs) {
     if (!g.xz) continue;
     const [px, py] = P(g.xz[0], g.xz[1]);
-    const col = GOAL_COL[g.state] || '#888';
-    if (g.state === 'blacklist_permanent') {          // red X
+    const col = lost ? '#888' : (GOAL_COL[g.state] || '#888');   // grey when the plan is lost
+    if (!lost && g.state === 'blacklist_permanent') { // red X
       sctx.strokeStyle = col; sctx.lineWidth = 2;
       sctx.beginPath(); sctx.moveTo(px-6, py-6); sctx.lineTo(px+6, py+6);
       sctx.moveTo(px+6, py-6); sctx.lineTo(px-6, py+6); sctx.stroke();
+    } else if (!lost && g.state === 'plan_pick') {    // faint hollow ring: perception's live pick
+      sctx.strokeStyle = col; sctx.lineWidth = 1.5;
+      sctx.setLineDash([3, 3]);
+      sctx.beginPath(); sctx.arc(px, py, 5, 0, 2*Math.PI); sctx.stroke();
+      sctx.setLineDash([]);
     } else {
       sctx.fillStyle = col;
       sctx.beginPath(); sctx.arc(px, py, 5, 0, 2*Math.PI); sctx.fill();
-      if (g.state === 'active') {                     // ring the current goal
+      if (g.state === 'active') {                     // ring the current committed goal
         sctx.strokeStyle = col; sctx.lineWidth = 2;
         sctx.beginPath(); sctx.arc(px, py, 9, 0, 2*Math.PI); sctx.stroke();
       }
@@ -294,13 +303,25 @@ function updatePanel(idx) {
     `${s.t_wall || ''}  t=${fmt(s.t_mono, 2)}s  #${idx+1}/${STEPS.length}` +
     (s.rec_frame != null ? `  frame ${s.rec_frame}` : '');
   const hud = document.getElementById('hud');
+  // pose/heading come from the SLAM plan (~2 Hz); when it's been held a while the pose is STALE (a real
+  // turn looks motionless). Grey the held pose + show its age/frame so it never reads as a stuck drone.
+  const stale = (s.plan_age_s != null && s.plan_age_s > 0.6);
+  const po = stale ? ' style="opacity:.5"' : '';
+  // goal fields: `goal` = the committed leg_goal (what "reached" is measured against); plan_goal = the
+  // planner's async pick (shown only when it differs, so the mismatch is explicit, not a phantom change).
+  const gsame = (s.goal && s.plan_goal && Math.abs(s.goal[0]-s.plan_goal[0])<1e-6 && Math.abs(s.goal[1]-s.plan_goal[1])<1e-6);
+  const planPick = (s.plan_goal && !gsame)
+    ? ` <span class="k">plan_pick</span> [${fmt(s.plan_goal[0])}, ${fmt(s.plan_goal[1])}]` : '';
   hud.innerHTML =
     `<span class="k">state</span> ${s.state}  <span class="k">status</span> ${s.status||'—'}<br>` +
-    `<span class="k">pos</span> ${s.pos?('['+fmt(s.pos[0])+', '+fmt(s.pos[1])+']'):'—'} ` +
-    `<span class="k">hdg</span> ${fmt(s.heading,1)}&deg;<br>` +
-    `<span class="k">y</span> ${fmt(s.pos_y)} <span class="k">bearing_err</span> ${fmt(s.bearing_err,1)}&deg;<br>` +
+    `<span${po}><span class="k">pos</span> ${s.pos?('['+fmt(s.pos[0])+', '+fmt(s.pos[1])+']'):'—'} ` +
+    `<span class="k">hdg</span> ${fmt(s.heading,1)}&deg;</span>` +
+    `  <span class="k">plan_age</span> ${fmt(s.plan_age_s,2)}s` +
+    `${stale?' <span class="bad">STALE</span>':''} <span class="k">fid</span> ${s.frame_id!=null?s.frame_id:'—'}<br>` +
+    `<span class="k">y</span> ${fmt(s.pos_y)} <span class="k">plan_berr</span> ${fmt(s.plan_bearing_err,1)}&deg; ` +
     `<span class="k">fwd_clear</span> ${fmt(s.fwd_clear)}<br>` +
-    `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'}<br>` +
+    `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'} ` +
+    `<span class="k">d</span> ${fmt(s.dist_to_goal)}${planPick}<br>` +
     // 2-bump blacklist counter: how close the CURRENT goal region is to being retired (2 = blacklist).
     `<span class="k">bump</span> ${(s.wall_hit_count!=null?s.wall_hit_count:0)}/2` +
     ` ${s.wall_hit_goal?('@['+fmt(s.wall_hit_goal[0])+', '+fmt(s.wall_hit_goal[1])+']'):''}`;
@@ -444,13 +465,15 @@ def _self_test():
          "goals": [{"xz": [1.0, 1.0], "state": "active"}]},
         {"t_wall": "00:00:01.000", "t_mono": 1.0, "rec_frame": 5, "state": "ADVANCE",
          "event": "leg start", "status": "OK", "pos": [0.3, 0.3], "heading": 45.0, "pos_y": -1.0,
-         "slam_ms": 480.0, "fwd_clear": 1.0, "goal": [1.0, 1.0], "bearing_err": 2.0,
-         "goals": [{"xz": [1.0, 1.0], "state": "active"}], "cmd": {"trigger": 0.2},
-         "speed": 0.42, "nominal_speed": 0.45},
+         "slam_ms": 480.0, "fwd_clear": 1.0, "goal": [1.0, 1.0], "plan_bearing_err": 2.0,
+         "plan_goal": [2.5, 0.5], "dist_to_goal": 0.99, "plan_age_s": 0.2, "frame_id": 5,
+         "goals": [{"xz": [1.0, 1.0], "state": "active"}, {"xz": [2.5, 0.5], "state": "plan_pick"}],
+         "cmd": {"trigger": 0.2}, "speed": 0.42, "nominal_speed": 0.45},
         {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
          "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
          "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "goal": [1.0, 1.0],
-         "bearing_err": 2.0, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_soft"}],
+         "plan_bearing_err": 2.0, "plan_age_s": 1.5, "frame_id": 8,
+         "goals": [{"xz": [1.0, 1.0], "state": "blacklist_soft"}],
          "wall_hit_count": 1, "wall_hit_goal": [1.0, 1.0],
          "missed_bump": "flow WALL contact (latch disarmed — drone hasn't disengaged since the last bump)"},
         {"t_wall": "00:00:03.000", "t_mono": 3.0, "rec_frame": 15, "state": "REPLAN",
@@ -515,6 +538,14 @@ def _self_test():
               and "DIST &rarr; GOAL (SLAM units)" in html and "SPEED (world, u/s)" in html)
         print(f"[self-test] {'PASS' if c7 else 'FAIL'}  raw telemetry panel (translation/cmd/dist/speed/delta) wired")
         ok = ok and c7
+
+        # NEW: committed-goal vs plan-pick separation + staleness exposure survived + the render code is present
+        c8 = (by_frame[5].get("plan_goal") == [2.5, 0.5] and by_frame[5].get("dist_to_goal") == 0.99
+              and by_frame[5].get("plan_age_s") == 0.2 and by_frame[5].get("frame_id") == 5
+              and any(g.get("state") == "plan_pick" for g in by_frame[5].get("goals", []))
+              and "plan_pick" in html and "plan_age" in html and "STALE" in html and "plan_berr" in html)
+        print(f"[self-test] {'PASS' if c8 else 'FAIL'}  committed-goal vs plan_pick + staleness (plan_age/frame_id/STALE) render")
+        ok = ok and c8
 
     print(f"[self-test] {'ALL PASS' if ok else 'FAILURES'} (flight_replay)")
     return ok

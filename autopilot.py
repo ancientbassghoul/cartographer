@@ -100,14 +100,23 @@ def _verdict_line(tag: str, v: FlowVerdict) -> str:
             f"airborne={int(v.airborne)} blank={int(v.blanking)} held={v.contact_held:.2f}s -> {v.label()}")
 
 
-def _timeline_goals(plan: dict) -> list:
-    """Goal markers for a replay step: the live goal (tagged `active`) + each blacklisted point tagged
-    `blacklist_soft`/`blacklist_permanent`. Zips plan['blacklist'] points with plan['blacklist_permanent']
-    flags (the same arrays the visualizer rings), so the HTML viewer can flip a goal gold->orange->red."""
+def _timeline_goals(plan: dict, leg_goal=None) -> list:
+    """Goal markers for a replay step: the goal the CONTROLLER is committed to (`leg_goal`, tagged
+    `active` — this is what "goal reached" is measured against) + perception's live frontier pick tagged
+    `plan_pick` when it differs (perception re-picks ~2 Hz while the controller strong-commits) + each
+    blacklisted point tagged `blacklist_soft`/`blacklist_permanent`. Zips plan['blacklist'] with
+    plan['blacklist_permanent'] (the same arrays the visualizer rings) so the viewer can flip a goal
+    gold->orange->red. The `active` marker is the committed leg_goal, NOT perception's async goal, so the
+    marker no longer jumps to a goal the drone isn't flying to."""
     goals = []
-    goal = plan.get("goal")
-    if goal is not None:
-        goals.append({"xz": [round(float(goal[0]), 4), round(float(goal[1]), 4)], "state": "active"})
+    if leg_goal is not None:
+        goals.append({"xz": [round(float(leg_goal[0]), 4), round(float(leg_goal[1]), 4)], "state": "active"})
+    plan_goal = plan.get("goal")
+    if plan_goal is not None and (leg_goal is None
+                                  or abs(plan_goal[0] - leg_goal[0]) > 1e-6
+                                  or abs(plan_goal[1] - leg_goal[1]) > 1e-6):
+        goals.append({"xz": [round(float(plan_goal[0]), 4), round(float(plan_goal[1]), 4)],
+                      "state": "plan_pick"})
     bl = plan.get("blacklist") or []
     perm = plan.get("blacklist_permanent") or []
     for i, pt in enumerate(bl):
@@ -119,19 +128,33 @@ def _timeline_goals(plan: dict) -> list:
     return goals
 
 
-def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict, cmd=None) -> dict:
-    """One structured replay record per explore step. Pulls the pose/goal/slam fields straight off the
-    plan payload (perception_worker._plan_payload) plus the controller's own state/event/status and the
-    literal `cmd` control dict published to the sim this frame ({} = hover/neutral)."""
+def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict, cmd=None,
+                          leg_goal=None, plan_age_s=None) -> dict:
+    """One structured replay record per explore step. Pose/heading/slam come straight off the plan payload
+    (perception_worker._plan_payload, published ~2 Hz on a SLAM-paced pose), but the GOAL fields reflect
+    what the CONTROLLER is actually doing: `goal` is the committed `leg_goal` (what "goal reached" is
+    measured against), `plan_goal` is perception's async frontier pick, and `dist_to_goal` makes reach
+    self-evident. `plan_age_s` + `frame_id` expose staleness — held-stale pose/heading (age grows,
+    frame_id repeats) is why a real turn can look motionless in the log. `cmd` is the literal control dict
+    sent to the sim this frame ({} = hover/neutral)."""
     g = plan.get
+    pos = g("pos")
+    dist_to_goal = None
+    if pos is not None and leg_goal is not None:
+        dist_to_goal = round(math.hypot(pos[0] - leg_goal[0], pos[1] - leg_goal[1]), 4)
     return {
         "t_wall": t_wall, "t_mono": round(float(t_mono), 3),
         "rec_frame": (int(rec_frame) if rec_frame is not None else None),
         "state": state, "event": event, "status": status,
-        "pos": g("pos"), "heading": g("heading_deg"), "pos_y": g("pos_y"),
+        "pos": pos, "heading": g("heading_deg"), "pos_y": g("pos_y"),
         "slam_ms": g("slam_ms"), "fwd_clear": g("forward_clearance_dist"),
-        "goal": g("goal"), "bearing_err": g("bearing_err"),
-        "goals": _timeline_goals(plan),
+        # GOAL = the controller's committed leg_goal (acted-on); plan_goal = perception's async pick.
+        "goal": ([round(float(leg_goal[0]), 4), round(float(leg_goal[1]), 4)] if leg_goal is not None else None),
+        "plan_goal": g("goal"), "dist_to_goal": dist_to_goal, "plan_bearing_err": g("bearing_err"),
+        # Staleness: age of the plan snapshot these pose/heading/slam values came from + its SLAM frame id.
+        "plan_age_s": (round(float(plan_age_s), 2) if plan_age_s is not None else None),
+        "frame_id": g("frame_id"),
+        "goals": _timeline_goals(plan, leg_goal),
         # 2-bump blacklist observability: the live counter + the planner's transient bump-outcome event
         # (goal-change reset / blacklist), so the replay shows the mechanism the flight log used to hide.
         "wall_hit_count": g("wall_hit_count"), "wall_hit_goal": g("wall_hit_goal"),
@@ -690,6 +713,12 @@ class ExploreController:
         # and kills SLAM. Primary forward stop; the flow wall_contact stays as the glass/unmapped fallback.
         self.stop_on_clearance = bool(e.get("stop_on_clearance", True))
         self.stop_clearance_dist = float(e.get("stop_clearance_dist", 0.6))
+        # On a clearance stand-off stop, play the small back_off recipe before settling. Its reverse pulse
+        # re-arms the 2-bump latch (rearm_bump_if_disengaged fires on a backward command), so a wall the
+        # drone gets pinned against by the stand-off can still accrue a SECOND bump and be blacklisted —
+        # otherwise the tight REPLAN->ORIENT(0)->ADVANCE->standoff loop never reverses/displaces and the
+        # counter is stuck at 1 (Bug B). Also seeds SLAM parallax. Set False to restore the direct settle.
+        self.backoff_on_standoff = bool(e.get("backoff_on_standoff", True))
         # Altitude lock: hold the LIVE-cached mapping height during long ADVANCE pushes (forward pitch sinks
         # the drone into inner walls). target_altitude_y is cached live from the first valid post-prelude
         # pose (self-calibrating, NOT a baked value); world frame is +Y DOWN so a sink = LARGER y.
@@ -1420,12 +1449,20 @@ class ExploreController:
                            f"(guard now armed at {self.ram_speed_frac:.0%} of it)")
             if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
                 # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
-                # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
-                # the next frontier. No reverse/back-off: we're already at a safe stand-off.
+                # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> REPLAN picks the next
+                # frontier. A small back_off follows (default) so the reverse re-arms the 2-bump latch (a
+                # stand-off pin can then blacklist an unreachable wall) and seeds SLAM parallax; back_off
+                # itself routes to SETTLE. `backoff_on_standoff=False` restores the direct settle.
                 self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
                 self._register_bump(plan, "clearance stand-off")  # advance-blocked stop -> bump toward committed goal
-                self._enter("SETTLE", now)
-                event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
+                if self.backoff_on_standoff:
+                    self._player = self.pb.player("back_off")
+                    self._enter("BACKOFF", now)
+                    event = (f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> "
+                             "back off (re-arm bump latch) -> settle")
+                else:
+                    self._enter("SETTLE", now)
+                    event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
             elif wall_contact:
                 # A COLLISION invalidates the command history (unknown post-impact orientation) -> drop it.
                 self.command_history.clear()
@@ -1637,6 +1674,12 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     prev_ctrl_state = None
     prev_active = {}      # last published control vector -> derives the detector command for THIS frame
     backwall_active = False   # BACKWALL contact edge tracker (log once per onset)
+    # SLAM_TRACKER: last pose we surfaced to the terminal (frame_id/pos/heading/wall-time) so each fresh
+    # perception pose can be logged synchronously with its dx/dy/dYaw + staleness gap. See the drain below.
+    _slam_fid = None
+    _slam_pos = None
+    _slam_hd = None
+    _slam_t = None
     last_ground = None    # newest GroundGrid summary; the final room outline is emitted ONCE at shutdown as
                           # a static backdrop (we don't replay the map growing — only the pose + goals matter)
 
@@ -1682,6 +1725,34 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 if pe:
                     pending_planner_event = pe
                 p = plan_sub.recv(timeout_ms=0)
+
+            # ---- SLAM_TRACKER: surface every FRESH pose the controller accepts from the perception process,
+            # synchronously, into THIS terminal + the autopilot .log — so the async ~2 Hz SLAM ticks
+            # interleave chronologically with the [autopilot][explore] STATE: boundaries (no more silent
+            # ~700 ms staleness gaps where the visualizer snaps but the log says nothing). Gated on a NEW
+            # frame_id so it fires once per perception publish, not every loop tick. Tracking-aware. ----
+            if last_plan is not None:
+                _fid = last_plan.get("frame_id")
+                if _fid is not None and _fid != _slam_fid:
+                    _pos, _hd = last_plan.get("pos"), last_plan.get("heading_deg")
+                    _mode = last_plan.get("mode") or ("TRACKING" if last_plan.get("plan_valid") else "LOST")
+                    if _pos is not None and _slam_pos is not None and _hd is not None and _slam_hd is not None:
+                        _dyaw = ((_hd - _slam_hd + 180.0) % 360.0) - 180.0
+                        _delta = f"dx: {_pos[0] - _slam_pos[0]:+.2f}m, dy: {_pos[1] - _slam_pos[1]:+.2f}m, dYaw: {_dyaw:+.1f}°"
+                    else:
+                        _delta = "dx: —, dy: —, dYaw: —"   # no prior/current TRACKING pose to diff
+                    _gap = f"{(now - _slam_t) * 1000.0:.0f}ms" if _slam_t is not None else "—"
+                    _sms = last_plan.get("slam_ms")
+                    _build = f" (build {_sms:.0f}ms)" if isinstance(_sms, (int, float)) else ""
+                    sline = (f"{_rec_prefix(last_rec_frame)} [SLAM_TRACKER] Pose update accepted "
+                             f"({_delta}) [{_mode}] - SLAM Latency: {_gap}{_build}")
+                    print(sline, flush=True)
+                    diag.line(sline)
+                    _slam_fid, _slam_t = _fid, now
+                    if _pos is not None:
+                        _slam_pos = _pos
+                    if _hd is not None:
+                        _slam_hd = _hd
 
             # ---- autonomy gate (mirror run_mission: only fly while io_bridge reports AUTO) ----
             if meta is not None:
@@ -1793,7 +1864,8 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             if log:
                 t_wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 rec = _timeline_step_record(t_wall, now, last_rec_frame, state, event,
-                                            status, plan_for_step, cmd=active)
+                                            status, plan_for_step, cmd=active,
+                                            leg_goal=ctrl.leg_goal, plan_age_s=(now - last_plan_t))
                 # The transient planner_event was captured during the drain (the freshest plan may have
                 # already cleared it) and the un-counted contact from the controller — stitch both onto THIS
                 # step's record so the replay marks the exact frame of each.
@@ -1862,22 +1934,39 @@ def run_self_test(cfg):
         tl_noop = (dl._jsonl is None and dl._txt is None)
     finally:
         dl.close()
-    # And the pure record builders produce the expected shape (goal state tagging + map downsample).
+    # And the pure record builders produce the expected shape. GOAL fields reflect the CONTROLLER's
+    # committed leg_goal (not perception's async plan goal); staleness fields are exposed.
     plan = {"pos": [0.1, 0.2], "heading_deg": 45.0, "goal": [1.0, 2.0], "bearing_err": 3.0,
-            "blacklist": [[9.0, 9.0]], "blacklist_permanent": [True]}
+            "frame_id": 42, "blacklist": [[9.0, 9.0]], "blacklist_permanent": [True]}
+    # (a) committed leg_goal == perception's goal: single `active` marker, no `plan_pick`.
     rec = _timeline_step_record("00:00:01.000", 1.234, 7, "ADVANCE", "leg", "OK", plan,
-                                cmd={"trigger": 0.2})
-    rec_hover = _timeline_step_record("00:00:01.000", 1.234, 7, "SETTLE", None, "OK", plan, cmd={})
+                                cmd={"trigger": 0.2}, leg_goal=[1.0, 2.0], plan_age_s=0.3)
+    rec_hover = _timeline_step_record("00:00:01.000", 1.234, 7, "SETTLE", None, "OK", plan, cmd={},
+                                      leg_goal=[1.0, 2.0], plan_age_s=0.3)
+    # (b) committed leg_goal DIFFERS from perception's pick: `active`=leg_goal + faint `plan_pick`.
+    rec_split = _timeline_step_record("00:00:01.000", 1.234, 7, "ADVANCE", None, "OK", plan,
+                                      cmd={"trigger": 0.2}, leg_goal=[5.0, 5.0], plan_age_s=1.9)
     ds = _downsample_map({"bounds": [0, 4, 0, 4], "rows": 2, "cols": 2, "cls": [0, 1, 2, 3]})
-    tl_rec = (rec["state"] == "ADVANCE" and rec["pos"] == [0.1, 0.2] and len(rec["goals"]) == 2
-              and rec["goals"][0]["state"] == "active"
-              and rec["goals"][1]["state"] == "blacklist_permanent"
+    import math as _m
+    goal_fields_ok = (rec["goal"] == [1.0, 2.0] and rec["plan_goal"] == [1.0, 2.0]
+                      and rec["plan_bearing_err"] == 3.0 and rec["frame_id"] == 42
+                      and rec["plan_age_s"] == 0.3
+                      and abs(rec["dist_to_goal"] - _m.hypot(0.9, 1.8)) < 1e-3)
+    markers_ok = (len(rec["goals"]) == 2 and rec["goals"][0]["state"] == "active"
+                  and rec["goals"][0]["xz"] == [1.0, 2.0]
+                  and rec["goals"][1]["state"] == "blacklist_permanent"
+                  # committed != plan pick -> active(leg_goal) + plan_pick + blacklist = 3 markers
+                  and len(rec_split["goals"]) == 3
+                  and rec_split["goals"][0]["state"] == "active" and rec_split["goals"][0]["xz"] == [5.0, 5.0]
+                  and rec_split["goals"][1]["state"] == "plan_pick" and rec_split["goals"][1]["xz"] == [1.0, 2.0])
+    tl_rec = (rec["state"] == "ADVANCE" and rec["pos"] == [0.1, 0.2]
               and rec["cmd"] == {"trigger": 0.2} and rec_hover["cmd"] == {}   # {} hover preserved
+              and goal_fields_ok and markers_ok
               and ds["rows"] == 2 and ds["cls"] == [0, 1, 2, 3])
     good = tl_noop and tl_rec
     ok = ok and good
     print(f"[self-test] {'PASS' if good else 'FAIL'}  F8 timeline (disabled sink no-op={tl_noop}, "
-          f"record/map builders={tl_rec})")
+          f"record/map builders={tl_rec}, goal=leg_goal={goal_fields_ok}, markers={markers_ok})")
 
     # Playbook RecipePlayer sanity: step the (multi-step) arm recipe forward in time and confirm it
     # drives btnARMdown at some point and then completes. (One fields() call advances at most one step,
@@ -1952,7 +2041,7 @@ def run_self_test(cfg):
     # ---- Map mode: ExploreController full leg (ORIENT[open-loop turn]->ADVANCE->BACKOFF->SETTLE->REPLAN->DONE) ----
     ctrl = ExploreController(cfg, no_takeoff=True)   # skip the prelude; this test covers the frontier loop
     ctrl.reverse_probe_on_wall = False               # this test covers the default back_off wall path
-    goal = [1.0, 0.0]
+    goal = [3.0, 0.0]                                 # beyond goal_reach_dist so the WALL path (not goal-reached) runs
     order = []
     rec = lambda sts: [order.append(s) for s in sts if not order or order[-1] != s]
     t = 100.0
@@ -2011,24 +2100,44 @@ def run_self_test(cfg):
           f"WALL->SETTLE->REVERSE_PROBE(reverse>0)->SETTLE->REPLAN, no back_off)  visited {eorder}")
 
     # ---- Map mode: forward-clearance STAND-OFF (primary forward stop; SLAM-preserving) ----
-    # A mapped wall ahead within stop_clearance_dist stops the ADVANCE leg WITHOUT a wall_contact, routing
-    # to SETTLE -> REPLAN (no back_off / reverse). A large or None clearance keeps advancing (lean on the
-    # flow detector). NB the clearance check is FIRST in ADVANCE, so it acts before the image ever freezes.
+    # A mapped wall ahead within stop_clearance_dist stops the ADVANCE leg WITHOUT a wall_contact. With the
+    # default backoff_on_standoff=True it routes ADVANCE -> BACKOFF (a small reverse that re-arms the 2-bump
+    # latch so a stand-off pin can still blacklist an unreachable wall — Bug B) -> SETTLE; with the flag OFF
+    # it settles directly. A large or None clearance keeps advancing. NB the clearance check is FIRST in
+    # ADVANCE, so it acts before the image ever freezes.
     cs = ExploreController(cfg, no_takeoff=True)
     cs_on = cs.stop_on_clearance                          # config default true
     big = {"done": False, "goal": [3.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0, "forward_clearance_dist": 5.0}
     t, a, s, _ = _drive(cs, big, False, 0.6, 100.0)       # far clearance -> still advancing
     adv_big = (s == "ADVANCE" and float(a.get("trigger", 0)) > 0)
     near = dict(big, forward_clearance_dist=cs.stop_clearance_dist - 0.05)
-    _, _, s2, st_stop = _drive(cs, near, False, 0.1, t)   # clearance under the margin -> stand-off stop
-    stop_settle = (s2 == "SETTLE") and ("BACKOFF" not in st_stop) and ("REVERSE_PROBE" not in st_stop)
+    # default (backoff_on_standoff=True): standoff -> BACKOFF (reverse>0) -> SETTLE, no REVERSE_PROBE.
+    bo_states, saw_rev_bo, tt = [], False, t
+    for _ in range(40):                                   # ~2s: BACKOFF(0.3s) -> SETTLE
+        a2, s2, _ev = cs.step(tt, near, False, False, status="OK")
+        if not bo_states or bo_states[-1] != s2:
+            bo_states.append(s2)
+        if float((a2 or {}).get("reverse", 0.0) or 0.0) > 0.0:
+            saw_rev_bo = True
+        tt += 0.05
+    backoff_path = (cs.backoff_on_standoff and s == "ADVANCE" and saw_rev_bo
+                    and ("REVERSE_PROBE" not in bo_states)
+                    and _is_subsequence(["BACKOFF", "SETTLE"], bo_states))
+    # backoff_on_standoff=False: standoff settles directly (old behavior), no BACKOFF / reverse.
+    cfg_off = {**cfg, "autonomy": {**cfg["autonomy"],
+                                   "explore": {**(cfg["autonomy"].get("explore") or {}), "backoff_on_standoff": False}}}
+    cs_off = ExploreController(cfg_off, no_takeoff=True)
+    toff, _, _, _ = _drive(cs_off, big, False, 0.6, 100.0)
+    _, _, s_off, st_off = _drive(cs_off, near, False, 0.2, toff)
+    direct_settle = (not cs_off.backoff_on_standoff and s_off == "SETTLE"
+                     and "BACKOFF" not in st_off and "REVERSE_PROBE" not in st_off)
     cn = ExploreController(cfg, no_takeoff=True)
     _, an, sn, _ = _drive(cn, dict(big, forward_clearance_dist=None), False, 0.6, 0.0)  # None -> keep advancing
     adv_none = (sn == "ADVANCE" and float(an.get("trigger", 0)) > 0)
-    clr_ok = (cs_on and adv_big and stop_settle and adv_none)
+    clr_ok = (cs_on and adv_big and backoff_path and direct_settle and adv_none)
     ok = ok and clr_ok
     print(f"[self-test] {'PASS' if clr_ok else 'FAIL'}  explore CLEARANCE-STOP (far->advance, "
-          f"<{cs.stop_clearance_dist:g}->standoff settle (no backoff/reverse), None->advance)")
+          f"<{cs.stop_clearance_dist:g}->BACKOFF(reverse re-arm)->settle | flag-off->direct settle, None->advance)")
 
     # ---- forward_throttle override: the config knob sets the ADVANCE/parallax forward trigger ----
     ft_cfg = (cfg["autonomy"].get("explore") or {}).get("forward_throttle", None)
@@ -2204,7 +2313,7 @@ def run_self_test(cfg):
     stale = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None}
     t, _, _, st_st = _drive(cw, stale, False, 1.0, 0.0, status="PLAN-STALE")
     rewind_ok = ("REWIND" in st_st)
-    _, _, so, st_ok = _drive(cw, {"plan_valid": True, "goal": [1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+    _, _, so, st_ok = _drive(cw, {"plan_valid": True, "goal": [3.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
                                   "slam_ms": 120.0, "frame_id": 1},
                              False, cw.rest_between_s + 0.6, t, status="OK")
     # recovery-exit now HOLDs for SLAM to settle before braking (strengthen the solve) -> SETTLE -> replan.
@@ -2559,11 +2668,19 @@ def run_self_test(cfg):
     crb._register_bump({"pos": [0.0, 0.0]}); popped, popped_reason = crb.take_bump_pulse()
     crb.rearm_bump_if_disengaged({"reverse": 0.3}, {"pos": [0.0, 0.0]})   # reverse cmd re-arms at 0 displacement
     rearmed_by_reverse = crb._bump_armed is True and popped == [5.0, 0.0]
+    # STANDOFF coupling (Bug B): a stand-off bump then the back_off reverse re-arms the latch, so a SECOND
+    # stand-off contact at ~the same pinned pose emits a FRESH pulse — this is what lets the planner's
+    # 2-bump rule reach 2 at a clearance stand-off (where the drone never reverses/displaces on its own).
+    cso = ExploreController(cfg, no_takeoff=True); cso.leg_goal = [4.0, 0.0]
+    cso._register_bump({"pos": [3.4, 0.0]}, "clearance stand-off"); p1_so, _ = cso.take_bump_pulse()
+    cso.rearm_bump_if_disengaged({"reverse": 0.7}, {"pos": [3.4, 0.0]})   # the back_off maneuver's reverse re-arms
+    cso._register_bump({"pos": [3.42, 0.0]}, "clearance stand-off")       # 2nd standoff pin -> fresh pulse, not missed
+    standoff_latch_ok = (p1_so == [4.0, 0.0] and cso._bump_pulse == [4.0, 0.0] and cso._bump_armed is False)
     latch_ok = (latch_armed_once and reason_ok and stutter_ok and still_disarmed and rearmed_by_move
-                and second_pulse_ok and rearmed_by_reverse)
+                and second_pulse_ok and rearmed_by_reverse and standoff_latch_ok)
     ok = ok and latch_ok
     print(f"[self-test] {'PASS' if latch_ok else 'FAIL'}  2-bump latch "
-          f"(one pulse/contact, stutter-suppressed, re-arm on move|reverse)")
+          f"(one pulse/contact, stutter-suppressed, re-arm on move|reverse, standoff back-off re-arm)")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

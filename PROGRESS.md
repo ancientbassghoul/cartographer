@@ -1,36 +1,86 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-08** (session 6). Resume from THIS file._
+_Last updated **2026-07-08** (session 8). Resume from THIS file._
 
 **Status:** Phase-1 (manual map + target localization) done & hardware-verified. Phase-2 autonomous
-**Map-mode explorer** (`autopilot.py --explore`) flies live: SLAM-safe turns, forward-clearance
-stand-off, two-phase gentle ceiling ascent, and (session 6) a self-calibrating ram guard that no
-longer false-blacklists reachable goals. Rich flight-replay debugger (per-bump blacklist trace +
-per-frame raw telemetry).
+**Map-mode explorer** (`autopilot.py --explore`) flies live — clean session-8 flight
+(`20260708_195009`). Session 8 confirmed **turns work** (the earlier "no-op" was a stale-heading logging
+artifact), made the flight log **trustworthy** (logs the controller's committed goal + data staleness),
+and added **`[SLAM_TRACKER]`** telemetry so the async ~2 Hz SLAM ticks are visible in the terminal. Next:
+item 2 (REPLAN dead-stall) then item 1 (height calibration).
 
-**NEXT (in order):**
-1. **Fix the glass-corner blacklist bugs** — at a glass/collider wall the drone chases an unreachable
-   far corner forever: the verify/reposition target bypasses the blacklist (Bug A) and the 2-bump latch
-   can't re-arm at a stand-off (Bug B). Design in `plans/glass-corner-blacklist-and-height-calib.md`.
-2. **Part 3 — per-goal height recalibration** (`CALIBRATING_HEIGHT`) — getting urgent. Same plan file.
-
----
-
-## Next up — planned, NOT built
-Full designs in **`plans/glass-corner-blacklist-and-height-calib.md`**.
-
-1. **Glass-corner blacklist bugs (do FIRST).** At a glass/collider wall the drone chases an unreachable
-   far corner forever. **Bug A:** the verify/reposition target (`farthest_free`) bypasses the blacklist
-   — `select()` never `_excluded()`-checks it, so "blacklisting" it is a no-op and the goal never
-   changes. **Bug B:** the 2-bump latch can't re-arm at a clearance stand-off (never reverses / never
-   moves > `goal_reach_dist`), so standoff contacts stay MISSED and the counter never reaches 2.
-2. **Part 3 — per-goal `CALIBRATING_HEIGHT`** (getting urgent). Re-tap the ceiling + re-null
-   `target_altitude_y` ONLY on a genuine goal change at REPLAN (not PLAN-LOST); reuse ASCEND/DESCEND
-   via a `_post_ascend` return field; gate with `calibrate_on_goal_change`.
+This file is three-fold: **Next** (resume-after-clear pointer), **Future** (the concise backlog → plan
+files), and **Documentation** (the terse "we tried X, it failed because Y" narrative + the reference
+blocks). Keep the Documentation half narrative — detailed designs live in `plans/*.md`.
 
 ---
 
-## Session log (newest first)
+## Next (resume after a context clear)
+
+_Session-8 work is DONE + flight-confirmed (`20260708_195009`) — see the Documentation session-8 entry.
+Two items remain, both designed, neither built:_
+
+- **Item 2 — kill the REPLAN dead-stall** (`autopilot.py:1378` idles forever on `goal=None && !done`):
+  a bounded, visible recovery (reposition/parallax nudge) or a logged declare-done instead of infinite
+  idle. Also revisit standoff-as-bump (space/displace before counting).
+- **Item 1 — per-replan height recalibration (`CALIBRATING_HEIGHT`).** 60 s cooldown from the last
+  calibration; keep running altitude statistics; reject a calibration that taps a low ceiling object
+  (new `pos_y` well below the live median) → nudge forward and retry. Design in
+  `plans/glass-corner-blacklist-and-height-calib.md` (extended with the session-8 asks).
+
+---
+
+## Future (backlog)
+- **REPLAN dead-stall (item 2)** — no infinite idle when the planner returns no goal.
+- **Per-goal height calibration (item 1)** — `plans/glass-corner-blacklist-and-height-calib.md`.
+- **Glass-corner blacklist escape (Bug A+B)** — built session 7, still needs a clean live confirm.
+- Deferred: Scan mode (360° cascade with SLAM/GPU temporal separation); a glass-window altitude
+  descend-probe; Phase-3 report polish + GUI.
+
+---
+
+## Documentation (what we tried)
+
+### Session 8 (2026-07-08) — "turns are broken" was a logging lie; made the flight log trustworthy
+First flight (`20260708_135719`): the heading changed ~0° during every ORIENT turn, and travel bearing
+matched reported heading on every leg, so we *concluded the body wasn't rotating*. We instrumented the
+turn (log-bomb "TRYING TO TURN") and re-flew (`20260708_154431`). **The operator watched the drone
+physically TURN — the conclusion was wrong.** Root cause: `heading` is the SLAM pose heading, published
+~2 Hz and barely resolvable during pure rotation, so a whole ~1 s turn completes inside one perception
+interval — the log repeats the same heading, then jumps ~45° one update later (heading sweeps the full
+±180° over the flight). The **real bug was the LOGGING:** the timeline logged perception's async plan
+(goal/heading/pos), not the controller's acted-on state — so a "goal reached (d=0.55)" printed next to a
+shown goal 3.65 u away (the shown goal was perception's newer pick; the drone reached its committed
+`leg_goal`), and a goal "changed" mid-advance simply because a fresh plan replaced the held snapshot.
+**Fixes:** (1) the timeline now logs the committed `leg_goal` as `goal` (+ `dist_to_goal`), keeps
+perception's pick as `plan_goal`, and exposes staleness (`plan_age_s`, `frame_id`); `flight_replay`
+renders the committed goal and greys held-stale pose. (2) a synchronous **`[SLAM_TRACKER]`** line prints
+every fresh pose the autopilot accepts (`dx/dy/dYaw [mode] - SLAM Latency`) so the ~2 Hz SLAM ticks are no
+longer dark between state logs. (3) small eases: SLAM-settle 3→6, reach 0.4→1.0, clearance 0.6→1.0,
+plan-lost grey goal marker. A follow-up flight (`20260708_195009`) flew cleanly with the corrected,
+readable telemetry. **Lesson: a held-stale ~2 Hz pose logged every ~33 Hz loop tick makes a fast maneuver
+look motionless — log what the controller ACTS ON, and always expose data age.**
+
+Also **diagnosed but NOT fixed** (queued as item 2): a "blacklist with nothing blocking" that ends in a
+dead stall — the forward-clearance stand-off (fwd_clear≈0.5 < 0.6) counts as a blacklist *bump*, two in
+~2 s retire a reachable goal, and once every reachable goal is blacklisted the planner returns
+`goal=None, done=False` and the drone idles in REPLAN forever (`autopilot.py:1378`).
+
+### Session 7 (2026-07-08) — glass-corner blacklist escape (Bug A+B) + frontier clearance buffer  [built; flew in the session-8 flights, glass-corner escape not yet specifically re-confirmed]
+A glass corner still trapped the drone forever: it fired standoff stops "like crazy" yet never retired
+the goal. Two coupled bugs. **Bug A** — when no frontier was reachable the planner flew to `farthest_free`
+as a fixed verify target that NEVER consulted the blacklist, and `farthest_free` is a plain geometric
+argmax, so it re-picked the SAME dead corner; the 2-bump blacklist fired but was a no-op. Fix: made
+`farthest_free` blacklist-aware (an `exclude` predicate skips dead regions), and `select()` now abandons
+a verify target the moment its region gets blacklisted, re-caching a fresh corner or declaring done — and
+caches that corner pulled 25 % back toward the drone for a vantage off the wall. **Bug B** — once SLAM
+mapped the wall, the clearance stand-off stopped ADVANCE and went straight to SETTLE, so the drone never
+reversed/displaced and the bump latch never re-armed (counter stuck at 1). Fix: a small `back_off` on the
+standoff stop (gated `backoff_on_standoff`) whose reverse re-arms the latch (and seeds SLAM parallax), so
+a second standoff counts and the corner reaches 2 bumps. **Also** added a general goal-stalling guard: a
+committed frontier goal is pulled back along the drone→goal axis to a map-validated FREE cell with a
+clearance buffer (`inset_to_clearance`), publishing a visible `goal_clearance_ok` flag (no silent
+fallback). All module self-tests green; **live re-fly still pending.**
 
 ### Session 6 (2026-07-08) — blacklist/telemetry observability + self-calibrating ram guard
 We couldn't tell WHY goals were being blacklisted. We added per-bump logging (PLANNER / MISSED-BUMP +
@@ -61,13 +111,8 @@ for SLAM.
     because the detector only latches within one uninterrupted pulse.)
 - **Baseline nudge** — after the ceiling tap + descend, a short horizontal translation seeds a SLAM
   translational baseline before the first turn (pure rotation is the known SLAM-killer).
-- **Deferred — Part 3** (per-goal `CALIBRATING_HEIGHT`) — see the **Next up** section near the top.
-- **Tests:** autopilot / flow / frontier / ground_grid / perception self-tests PASS (new two-phase-
-  ascent + baseline-nudge cases; prelude is now ARM→TAKEOFF→ASCEND→DESCEND→BASELINE_NUDGE→REPLAN). An
-  offline SLAM+map run maps cleanly with depth gone.
-- **⏭ NEXT — RE-FLY** `autopilot.py --explore --log`: the ascent should climb in gentle steps and
-  latch the ceiling without a smash; a baseline translation should precede the first turn; the
-  dashboard should read "DEPTH DISABLED". Tune the ascent pulse/rest/gain + baseline distance live.
+- **Deferred — Part 3** (per-goal `CALIBRATING_HEIGHT`) — now item 1 in Next/Future.
+- **Tests:** autopilot / flow / frontier / ground_grid / perception self-tests PASS.
 
 ### Session 4 (2026-07-06) — event-driven 2-bump blacklist (replaced a broken time-watchdog)
 Symptom: at a glass wall the drone sat ~9 min never blacklisting the unreachable beyond-glass goals.
@@ -78,8 +123,7 @@ Symptom: at a glass wall the drone sat ~9 min never blacklisting the unreachable
 - **Fix — event-driven 2-bump rule:** the autopilot reports each discrete advance-blocked stop as a
   "bump"; TWO bumps on the same goal region permanently blacklist it (a bump elsewhere resets the
   count). Immune to SLAM-clock health; a kinematic latch makes one continuous contact = one bump.
-- Also added reverse **BACKWALL** contact detection (detection-only; logs a reverse-into-wall). Tests
-  + an in-process ZMQ pulse test PASS.
+- Also added reverse **BACKWALL** contact detection (detection-only; logs a reverse-into-wall).
 
 ### Session 3 (2026-07-06) — flight-replay debug tool
 Built `flight_replay.py`: the autopilot writes a structured per-step `*_timeline.jsonl` on `--log`,
@@ -103,11 +147,12 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   forward. Validated on real flights.
 - **Turns vs SLAM:** closed-loop-on-heading thrashed (heading goes stale mid-spin); a "pulsed" yaw was
   wrong (yaw latches). Settled on **open-loop quantized turns clamped to ≤45°** (a small turn doesn't
-  kill SLAM; the per-leg replan is the outer correction).
+  kill SLAM; the per-leg replan is the outer correction). **[Session 8: verified these turns DO rotate
+  the body — a live re-fly showed the drone turning; the earlier "no-op" reading was the SLAM heading
+  lagging in the log (~2 Hz, pure rotation), not the drone.]**
 - **Ramming a wall kills monocular SLAM** (no parallax freezes the image); reversing a dead track
-  can't revive it (a reverse-probe experiment failed — kept only as a glass/unmapped fallback). →
-  the **forward-clearance stand-off** (SLAM raycast, `stop_clearance_dist: 0.6`, flown) is the primary
-  wall stop; the flow WALL detector is the fallback.
+  can't revive it. → the **forward-clearance stand-off** (SLAM raycast) is the primary wall stop; the
+  flow WALL detector is the fallback.
 - **Frontier planner** (`frontier_planner.py`): utility selection + strong commitment + done-
   verification (fly to the farthest free corner, then declare done) — fixed goal thrash and false
   "mission complete".
@@ -116,21 +161,17 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   bounded ≤45° fallback sweep → STUCK.
 - **The unreachable-goal saga:** a goal behind glass / a wall is never consumed, so the planner
   re-hands it forever. The handling went through several dead ends — a position-conditioned watchdog
-  (caused an A→B→A **ping-pong** because moving re-whitelisted a dead goal), a round-based permanent
-  blacklist, then a distance-stagnation timer — each failing because it inferred "unreachable" from a
-  proxy that went blind in the glass pocket. Session 4's **event-driven 2-bump** rule finally holds.
+  (an A→B→A **ping-pong**), a round-based permanent blacklist, then a distance-stagnation timer — each
+  failing because it inferred "unreachable" from a proxy that went blind in the glass pocket. Session
+  4's **event-driven 2-bump** rule finally holds.
 
----
-
-## Open issues
-- **⚠️ Drone flies straight past an off-axis goal, won't turn (diagnosed, NOT fixed).** The heading is
-  decided only at REPLAN, and REPLAN only runs at leg-end; ADVANCE flies open-loop with **no mid-leg
-  re-aim**, so in open space it runs the full leg (`leg_max_s`) drifting off the goal before it
-  re-plans. Fix direction (mid-leg re-aim vs shorter leg cap vs closed-loop heading) **not chosen —
-  get the user's decision before building.**
-- **Deferred:** Scan mode (360° cascade with SLAM/GPU temporal separation); a glass-window altitude
-  descend-probe; Phase-3 report polish + GUI. (Part 3 height recalibration + the blacklist fix are in
-  the **Next up** section near the top.)
+### Open issues
+- **REPLAN dead-stall (item 2, NOT fixed).** When the planner returns `goal=None && !done`, the
+  controller idles in REPLAN forever (`autopilot.py:1378`) — seen on `20260708_135719` after every
+  reachable goal got blacklisted. Needs a bounded, visible recovery. (Turns themselves are fine — see
+  session 8.) The older "heading decided only at REPLAN, no mid-leg re-aim" is a separate, milder
+  concern.
+- **Deferred:** Scan mode; a glass-window altitude descend-probe; Phase-3 report polish + GUI.
 
 ---
 
@@ -169,9 +210,8 @@ multi-target estimate. Offline E2E confirmed.
 - `ExploreController`: **ARM → TAKEOFF → ASCEND (two-phase) → DESCEND → BASELINE_NUDGE →** leg loop
   **REPLAN → ORIENT (open-loop ≤45° turn) → ADVANCE (forward until the clearance stand-off / flow
   WALL / self-calibrating ram guard) → SETTLE**; control-space **recovery** on SLAM loss; **STUCK**
-  hold; event-driven 2-bump blacklist for unreachable goals. **Ram guard is self-calibrating**: fires
-  only when live world speed drops below 33 % of the drone's own nominal free-flight speed (measured
-  live 1 s into the first ADVANCE) — no absolute threshold, so it no longer false-fires on the crawl.
+  hold; event-driven 2-bump blacklist for unreachable goals. **Ram guard is self-calibrating**; the
+  clearance stand-off is the primary wall stop. (The ORIENT open-loop turn works — session-8 re-fly.)
 - `flight_playbook.json` + `RecipePlayer` — control recipes as data (the tunable durations).
 
 ---
@@ -180,11 +220,13 @@ multi-target estimate. Offline E2E confirmed.
 
 ### Drone control mechanic
 Yaw is a **"fly toward your aim"** scheme: yaw moves an aim crosshair, forward thrust flies toward it;
-a **SUSTAINED yaw hold then `c` (reset)** rotates the body — turn ANGLE = hold duration (a brief pulse
-does nothing). Calibrated turn ≈ 90° at yaw 1.0 for ~1.625 s (a true 90° is ~1.85–2.0 s, so turns
-slightly under-rotate). io_bridge applies autopilot values directly (no ramp); yaw latches until `c`.
-`joy_vertical` is a **DISCRETE −1/0/+1 axis** (up/down = full thrust, can't be throttled); trigger &
-reverse ARE continuous 0–1. The only Unity telemetry back is `time` — everything else is vision.
+a **SUSTAINED yaw hold then `c` (reset)** rotates the body (turn ANGLE = hold duration) — **confirmed
+live in session 8** (the drone visibly turns). NB: the SLAM *heading* in the log lags the turn badly
+(pose is ~2 Hz and monocular SLAM barely resolves pure rotation), so a real turn looks motionless in the
+timeline until the drone translates — do NOT read that as "the drone didn't turn". io_bridge applies
+autopilot values directly (no ramp); yaw latches until `c`. `joy_vertical` is a **DISCRETE −1/0/+1 axis**
+(up/down = full thrust, can't be throttled); trigger & reverse ARE continuous 0–1. The only Unity
+telemetry back is `time` — everything else is vision. Calibration: ~90° at yaw 1.0 for ~1.625 s.
 
 ### Environment & build
 - Tree: `D:\EXTEND\C2_SIM\XLAB\` → `XLAB\` (read-only sim: Xlab.exe, Sample_Drone_Interface.py,
@@ -230,5 +272,9 @@ reverse ARE continuous 0–1. The only Unity telemetry back is `time` — everyt
 Phase 1: models on GPU ✅ · io_bridge + bus ✅ · SLAM + map + dashboard ✅ · target cascade + 3D
 localize ✅. Phase 2: mission runner flew live ✅ · Map-mode explorer flies (SLAM-safe turns,
 clearance stand-off, control-space recovery, event-driven 2-bump blacklist, two-phase ascent,
-self-calibrating ram guard) ✅ · rich flight-replay debugger ✅. Deferred: glass-corner blacklist
-bugs, per-goal height calibration, Scan mode, GUI.
+self-calibrating ram guard) ✅ · rich flight-replay debugger ✅ · glass-corner blacklist escape (Bug
+A+B) + frontier clearance buffer 🛠️ built, flew in the session-8 flights. **Session 8: confirmed turns
+work (the "no-op" was a stale-heading logging artifact) + made the flight log trustworthy (committed goal
++ data staleness) + `[SLAM_TRACKER]` telemetry + reach/clearance/SLAM-settle eases + a plan-lost grey
+marker; a clean flight (`20260708_195009`) followed. REPLAN stall fix (item 2) and per-goal height
+calibration (item 1) queued.**

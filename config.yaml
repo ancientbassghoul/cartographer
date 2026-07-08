@@ -90,7 +90,9 @@ autonomy:
     # AHEAD, NEAR frontiers (a frontier behind the drone is floored low, so it's a last resort -> no
     # behind-me flips). STRONG COMMITMENT keeps the chosen goal until reached/gone or clearly beaten, so it
     # stops abandoning a good far goal. General planner params (the map/frontiers are LIVE; HARD RULE).
-    goal_reach_dist: 0.4         # a goal is "reached" when the drone is within this distance of it (X-Z)
+    goal_reach_dist: 1.0         # a goal is "reached" when the drone is within this distance of it (X-Z)
+                                 #   (eased 0.4->1.0 in session 8: stop approaching a goal ~1 SLAM-unit out so the
+                                 #   FOV doesn't fill entirely with unclear wall texture -> fewer futile wall rams)
     replan_period_s: 0.5         # how often perception republishes TOPIC_PLAN
     goal_dist_weight: 0.5        # distance penalty in the frontier utility (higher = prefer nearer frontiers)
     goal_behind_floor: 0.15      # utility multiplier floor for a frontier behind the drone (cos(turn) floored to this)
@@ -109,17 +111,28 @@ autonomy:
     goal_progress_eps: 0.2       # min closing distance (SLAM units) counted as progress; the round-blacklist
                                  #   soft-vs-PERMANENT promotion test. Keep DEFINITIVE (>= ~0.05).
     goal_blacklist_radius: 1.0   # a frontier within this of a dead goal is "the same" region (defaults to goal_assoc_dist)
+    # Map-validated clearance buffer: a chosen frontier goal (which sits on the FREE/unobserved boundary)
+    # can hug an obstacle/corner and stall the drone; the planner pulls it back along the drone->goal axis
+    # to a FREE cell with this much clearance (SLAM units) before committing. General stand-off scale
+    # (~one obstacle_inflation ring = obstacle_inflation * ground_cell_size), validated against the LIVE
+    # map every replan — NOT a room answer. Publishes goal_clearance_ok=false (visible) if no FREE buffered
+    # cell exists on the segment (NO SILENT FALLBACK: it commits the raw goal but flags it).
+    goal_clearance_buffer: 0.2
+    verify_pull_frac: 0.25       # cache the verify/reposition corner pulled this FRACTION back toward the drone
+                                 #   (proportional to the LIVE drone->corner distance -> a vantage off tight corner
+                                 #   walls; self-calibrating, NOT a room answer). Composes with reposition_inset.
     # --- done verification / reposition: fly ONCE to the farthest known free corner -- to re-scan for
     #     uncharted territory before declaring done AND to relocate to a fresh vantage when every goal is
     #     blacklisted (on arrival the round's soft blacklist clears so goals get one retry). The corner is
     #     cached ONCE as a static target -> no oscillation. ---
     verify_done: true            # enable the farthest-corner verification / reposition trip
     verify_min_dist: 0.6         # skip the trip (declare done) if the farthest free corner is already within this
-    reposition_inset: 0.8        # pull the far-corner target inward by this (SLAM units) so it is REACHABLE
+    reposition_inset: 1.2        # pull the far-corner target inward by this (SLAM units) so it is REACHABLE
                                  #   (general stand-off scale, NOT a room answer). MUST sit in the reachable band
-                                 #   stop_clearance_dist <= inset <= stop_clearance_dist + goal_reach_dist (here
-                                 #   [0.60, 1.00]): below it, the drone hits its wall stand-off before reaching the
-                                 #   target; above it, the target is short of the corner. Perception clamps + warns.
+                                 #   stop_clearance_dist <= inset <= stop_clearance_dist + goal_reach_dist (with
+                                 #   session-8 values [1.00, 2.00]): below it, the drone hits its wall stand-off
+                                 #   before reaching the target; above it, the target is short of the corner.
+                                 #   Perception clamps + warns.
     # --- forward clearance (raycast stand-off; primary forward stop) ---
     # Perception casts a small FAN of ground-plane rays into the voxel map it built (along the LIVE
     # heading) and publishes the nearest hit distance as TOPIC_PLAN forward_clearance_dist; the autopilot
@@ -132,7 +145,11 @@ autonomy:
     clearance_skip: 0.25         # ignore mapped points within this of the camera (matches the target-lift skip)
     clearance_min_count: 2       # a voxel needs >= this many observations to count as a wall (ignore single-hit noise)
     clearance_max_range: 10.0    # cap the ray length (SLAM units); beyond this is treated as "open"
-    stop_clearance_dist: 0.6     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
+    stop_clearance_dist: 1.0     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
+                                 #   (raised 0.6->1.0 in session 8: stop before the wall fills the FOV -> keeps SLAM richer)
+    backoff_on_standoff: true    # after a clearance stand-off stop, play the small back_off recipe (reverse pulse) before
+                                 #   settling: it re-arms the 2-bump latch so a stand-off pin can still blacklist an
+                                 #   unreachable wall (Bug B) + seeds SLAM parallax. false = direct settle (old behavior).
     # NOTE: the settle pause between maneuvers/legs is rules.rest_between_s in flight_playbook.json (tune it there).
     # --- prelude (autopilot: arm -> takeoff -> [TWO-PHASE ascend to ceiling -> descend -> baseline nudge] -> explore) ---
     ascend_to_ceiling: true      # after takeoff, climb until the flow CEILING fires, then drop a bit, so mapping runs at a consistent height near the ceiling
@@ -192,7 +209,8 @@ autonomy:
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are
     #     COMPUTE characteristics (tunable), NOT this room's geometry. ---
     slam_slow_ms: 1000.0         # a frame build >= this = SLAM choking -> stop moving and hold
-    slam_settle_frames: 3        # "stable" only after >2 consecutive FRESH frames each built under slam_slow_ms
+    slam_settle_frames: 6        # "stable" only after >5 consecutive FRESH frames each built under slam_slow_ms
+                                 #   (raised 3->6 in session 8 to give SLAM more margin before resuming flight)
     # SLAM-settle REWIND step-back: if SLAM stays slow in a HOLD (plan still OK), stepping one entry back
     # through the rewind queue re-exposes known-good geometry to help the solve re-lock (the user's
     # "back up until it settles" idea). Re-arm needs another full run of slow frames; capped per hold.
