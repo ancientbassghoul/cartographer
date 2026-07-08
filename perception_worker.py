@@ -155,6 +155,7 @@ class Pipeline:
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
         self._verify_logged = False      # one-shot log when the planner enters done-verification
+        self.last_planner_event = None   # transient bump-outcome summary set by run()'s bump drain; ride ONE plan
 
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
         self.diag_perf = NullLog()    # per-frame SLAM/loop timing
@@ -285,6 +286,12 @@ class Pipeline:
         }
 
     # ------------------------------------------------------------- map mode planner
+    def _consume_planner_event(self):
+        """Pop the transient bump-outcome summary (set by the run() bump drain) so it rides EXACTLY ONE
+        plan then clears — a discrete event marker for the timeline, not a persistent field."""
+        ev, self.last_planner_event = self.last_planner_event, None
+        return ev
+
     def _plan_payload(self, res, meta, heading_deg, slam_ms=None):
         """TOPIC_PLAN payload: drone pose (X-Z + heading), the chosen frontier goal + bearing, the
         done flag, and a compact ground-grid raster for the visualizer. NO SILENT FALLBACK: if SLAM
@@ -305,6 +312,11 @@ class Pipeline:
             "n_frontiers": 0, "done": False, "forward_clearance_dist": None,
             "n_blacklisted": len(self.planner._blacklist), "blacklist": self.planner.blacklist_points(),
             "blacklist_permanent": self.planner.blacklist_permanent(),
+            # Live 2-bump counter (rides EVERY plan, valid or not, so the autopilot timeline always has it) +
+            # a TRANSIENT planner_event: the last bump receipt's summary, emitted on the FIRST plan after that
+            # bump then cleared, so the goal-change reset / blacklist shows as a discrete timeline event.
+            "wall_hit_count": self.planner.wall_hit_count, "wall_hit_goal": self.planner.wall_hit_goal,
+            "planner_event": self._consume_planner_event(),
             "pos_y": None, "clearance_ring": None,
             "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
@@ -533,11 +545,24 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
                 seq, bg = ev.get("seq"), ev.get("bump_goal")
                 if bg is not None and seq is not None and seq != last_bump_seq:
                     last_bump_seq = seq
-                    pipe.planner.note_wall_hit(bg)
-                    if pipe.planner.last_blacklist is not None:
-                        print(f"[perception] planner: goal {pipe.planner.last_blacklist} UNREACHABLE "
-                              f"(2 advance-blocked bumps; glass collider or wall behind goal) -> BLACKLIST "
-                              f"PERMANENT ({len(pipe.planner._blacklist)} total) -> reselecting", flush=True)
+                    out = pipe.planner.note_wall_hit(bg)
+                    # Log EVERY bump receipt (not just blacklists) so the counter's climb AND its resets are
+                    # visible in perception stdout — a goal-change reset is the mechanism that defeats the
+                    # blacklist, and it was previously silent. `pipe.last_planner_event` rides the next
+                    # TOPIC_PLAN so the autopilot timeline captures the same transition.
+                    g = [round(out["goal"][0], 3), round(out["goal"][1], 3)]
+                    if out["action"] == "blacklist":
+                        msg = (f"BUMP goal={g} count=2/2 -> BLACKLIST PERMANENT "
+                               f"({len(pipe.planner._blacklist)} total) -> reselecting")
+                    elif out["action"] == "reset":
+                        pg = [round(out["prev_goal"][0], 3), round(out["prev_goal"][1], 3)]
+                        msg = f"BUMP goal={g} count=1/2 (RESET from prev goal {pg} -> counter defeated)"
+                    elif out["action"] == "arm":
+                        msg = f"BUMP goal={g} count=1/2 (armed; one more same-goal bump blacklists)"
+                    else:  # increment (reached 1 already, now higher but < threshold — unreachable in a 2-gate)
+                        msg = f"BUMP goal={g} count={out['count']}/2 (increment)"
+                    pipe.last_planner_event = msg
+                    print(f"[perception] planner: {msg}", flush=True)
                 ap = apevent_sub.recv(timeout_ms=0)
 
             _, _, panel, map_updated = pipe.step(frame, meta, state_pub, show)

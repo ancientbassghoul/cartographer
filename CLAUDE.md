@@ -8,6 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Add log lines freely when diagnosing issues — the user is happy to re-run and share output.
 - Never commit unless the user explicitly asks.
 
+### PROGRESS.md — the resume/handoff file
+
+`PROGRESS.md` is the single file to read first on resume and to keep current. It is three-fold: (1) a detailed memory note so Claude re-loads the project's large context after a clear; (2) short-term instructions to resume in-flight work; and (3) a record the user draws on to describe his path with this task (e.g. a presentation).
+
+Because of (3), keep the **documentation** parts (the session log / what's been tried) VERY concise and narrative — "We wanted X. We tried Y. It failed because Z. So we tried W." — never the boring implementation details. The **up-next** part may be as detailed as needed; but once an up-next item is done or abandoned, translate it INTO the concise "tried that" one-liner style and move it to the documentation part. Detailed designs live in `plans/*.md` (referenced from PROGRESS.md), not inline.
+
 ### CRITICAL CODING STANDARD: NO SILENT FALLBACKS
 
 You are strictly forbidden from implementing silent fallbacks, hidden try-except downgrades, or automatic failover mechanisms anywhere in this codebase. If a model, pipeline component, or hardware context fails to initialize or execute, the system must either fail-fast (crash with an explicit error) or explicitly update a visible state flag that is logged and exposed to the UI.

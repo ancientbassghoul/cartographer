@@ -98,12 +98,23 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
            border-left: 1px solid #333; }
   #hud { padding: 8px 10px; font-size: 12px; border-bottom: 1px solid #333; line-height: 1.5; }
   #hud .k { color: #888; }
+  #telemetry { padding: 8px 10px; font-size: 12px; border-bottom: 1px solid #333; line-height: 1.6; }
+  #telemetry .grp { color: #6cf; font-size: 10px; letter-spacing: 0.5px; margin-top: 4px; }
+  #telemetry .grp:first-child { margin-top: 0; }
+  #telemetry .k { color: #888; }
+  #telemetry .v { color: #ddd; }
+  #telemetry .cmd { color: #7fd97f; }
+  #telemetry .warn { color: #e0a020; }
+  #telemetry .bad { color: #ff5b5b; }
   #slamwrap { padding: 8px 10px; border-bottom: 1px solid #333; }
   #slamval { font-size: 12px; margin-bottom: 4px; }
   #events { flex: 1 1 auto; overflow-y: auto; padding: 6px 10px; font-size: 11px; line-height: 1.45; }
   #events .ev { white-space: pre-wrap; }
   #events .cur { color: #fff; }
   #events .old { color: #777; }
+  #events .plan { color: #c58bff; }          /* planner bump outcome (count / reset) */
+  #events .plan.bl { color: #ff5b5b; font-weight: bold; }  /* the blacklist decision */
+  #events .miss { color: #e0a020; }          /* a real contact that emitted no bump */
   .legend { font-size: 11px; color: #999; padding: 6px 10px; border-bottom: 1px solid #333; }
   .sw { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: middle; }
 </style>
@@ -135,6 +146,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span class="sw" style="background:#3aa0ff"></span>drone
     </div>
     <div id="hud"></div>
+    <div id="telemetry"></div>
     <div id="slamwrap">
       <div id="slamval"></div>
       <canvas id="slam" height="46"></canvas>
@@ -271,6 +283,7 @@ function render(idx) {
   drawGoals(step);
   drawDrone(step);
   updatePanel(idx);
+  updateTelemetry(idx);
   drawSlam(idx);
 }
 
@@ -287,18 +300,68 @@ function updatePanel(idx) {
     `<span class="k">hdg</span> ${fmt(s.heading,1)}&deg;<br>` +
     `<span class="k">y</span> ${fmt(s.pos_y)} <span class="k">bearing_err</span> ${fmt(s.bearing_err,1)}&deg;<br>` +
     `<span class="k">fwd_clear</span> ${fmt(s.fwd_clear)}<br>` +
-    `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'}`;
-  // event log up to the cursor
+    `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'}<br>` +
+    // 2-bump blacklist counter: how close the CURRENT goal region is to being retired (2 = blacklist).
+    `<span class="k">bump</span> ${(s.wall_hit_count!=null?s.wall_hit_count:0)}/2` +
+    ` ${s.wall_hit_goal?('@['+fmt(s.wall_hit_goal[0])+', '+fmt(s.wall_hit_goal[1])+']'):''}`;
+  // event log up to the cursor: state events + the planner's bump outcomes (PLANNER) + un-counted
+  // contacts (MISSED-BUMP), so the blacklist mechanism the flight log used to hide is now visible.
   const ev = document.getElementById('events');
   let html = '';
   for (let i = 0; i <= idx; i++) {
-    const e = STEPS[i].event;
-    if (!e) continue;
-    const cls = (i === idx) ? 'cur' : 'old';
-    html += `<div class="ev ${cls}">${STEPS[i].t_wall||''} ${STEPS[i].state}: ${e}</div>`;
+    const st = STEPS[i], cls = (i === idx) ? 'cur' : 'old', tw = st.t_wall || '';
+    if (st.event) html += `<div class="ev ${cls}">${tw} ${st.state}: ${st.event}</div>`;
+    if (st.planner_event) {
+      const bl = /BLACKLIST/.test(st.planner_event) ? ' bl' : '';
+      html += `<div class="ev ${cls} plan${bl}">${tw} PLANNER: ${st.planner_event}</div>`;
+    }
+    if (st.missed_bump) html += `<div class="ev ${cls} miss">${tw} MISSED-BUMP: ${st.missed_bump}</div>`;
   }
   ev.innerHTML = html;
   ev.scrollTop = ev.scrollHeight;
+}
+
+// Per-frame RAW spatial telemetry: translation [X,Y,Z], yaw, the literal command dict sent to the sim,
+// and step deltas (world displacement + distance closed to the goal) computed from consecutive frames.
+const dist2 = (a, b) => (a && b) ? Math.hypot(a[0]-b[0], a[1]-b[1]) : null;
+function updateTelemetry(idx) {
+  const s = STEPS[idx];
+  const prev = idx > 0 ? STEPS[idx-1] : null;
+  const X = s.pos ? s.pos[0] : null, Z = s.pos ? s.pos[1] : null, Y = s.pos_y;
+  // deltas (raw world step displacement + distance closed to the goal this step)
+  const dpos = (prev && prev.pos && s.pos) ? dist2(s.pos, prev.pos) : null;
+  const dg = s.goal ? dist2(s.pos, s.goal) : null;
+  const dgPrev = (prev && prev.goal && prev.pos) ? dist2(prev.pos, prev.goal) : null;
+  const dgClosed = (dg != null && dgPrev != null) ? (dgPrev - dg) : null;   // + = got closer
+  // raw command dict -> key:value string ({} = hover; undefined = not recorded in this log)
+  let cmdStr;
+  if (s.cmd === undefined) cmdStr = '<span class="k">— (not recorded)</span>';
+  else if (Object.keys(s.cmd).length === 0) cmdStr = '<span class="k">hover (neutral)</span>';
+  else cmdStr = Object.entries(s.cmd)
+        .map(([k, v]) => `<span class="k">${k}</span> <span class="cmd">${(typeof v === 'number') ? (+v).toFixed(2) : v}</span>`)
+        .join('  ');
+  const stCol = (s.status === 'OK' || s.status == null) ? 'v' : (s.status === 'PLAN-LOST' ? 'bad' : 'warn');
+  const t = document.getElementById('telemetry');
+  t.innerHTML =
+    `<div class="grp">RAW TRANSLATION (world, +Y DOWN)</div>` +
+    `<span class="k">X</span> <span class="v">${fmt(X,3)}</span>  ` +
+    `<span class="k">Y</span> <span class="v">${fmt(Y,3)}</span>  ` +
+    `<span class="k">Z</span> <span class="v">${fmt(Z,3)}</span>` +
+    `<div class="grp">RAW ORIENTATION</div>` +
+    `<span class="k">yaw</span> <span class="v">${fmt(s.heading,1)}&deg;</span>` +
+    `<div class="grp">RAW COMMAND (sent to sim)</div>${cmdStr}` +
+    `<div class="grp">DIST &rarr; GOAL (SLAM units)</div>` +
+    `<span class="v" style="font-size:14px">${fmt(dg,3)}</span>` +
+    `<div class="grp">SPEED (world, u/s)</div>` +
+    `<span class="k">live</span> <span class="v">${fmt(s.speed,3)}</span>  ` +
+    `<span class="k">nominal</span> <span class="v">${fmt(s.nominal_speed,3)}</span>  ` +
+    `<span class="k">ram&lt;33%</span> <span class="${(s.speed!=null&&s.nominal_speed!=null&&s.speed<0.33*s.nominal_speed)?'bad':'v'}">` +
+      `${(s.nominal_speed!=null)?(s.speed!=null?((s.speed<0.33*s.nominal_speed)?'STALLED':'ok'):'—'):'calibrating'}</span>` +
+    `<div class="grp">DELTA (this step)</div>` +
+    `<span class="k">&Delta;pos</span> <span class="v">${fmt(dpos,3)}</span>  ` +
+    `<span class="k">&Delta;goal</span> <span class="v">${fmt(dgClosed,3)}</span>` +
+    `<div class="grp">PLAN STATUS</div>` +
+    `<span class="${stCol}">${s.status || 'OK'}</span>`;
 }
 
 function drawSlam(idx) {
@@ -382,15 +445,20 @@ def _self_test():
         {"t_wall": "00:00:01.000", "t_mono": 1.0, "rec_frame": 5, "state": "ADVANCE",
          "event": "leg start", "status": "OK", "pos": [0.3, 0.3], "heading": 45.0, "pos_y": -1.0,
          "slam_ms": 480.0, "fwd_clear": 1.0, "goal": [1.0, 1.0], "bearing_err": 2.0,
-         "goals": [{"xz": [1.0, 1.0], "state": "active"}]},
+         "goals": [{"xz": [1.0, 1.0], "state": "active"}], "cmd": {"trigger": 0.2},
+         "speed": 0.42, "nominal_speed": 0.45},
         {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
          "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
          "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "goal": [1.0, 1.0],
-         "bearing_err": 2.0, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_soft"}]},
+         "bearing_err": 2.0, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_soft"}],
+         "wall_hit_count": 1, "wall_hit_goal": [1.0, 1.0],
+         "missed_bump": "flow WALL contact (latch disarmed — drone hasn't disengaged since the last bump)"},
         {"t_wall": "00:00:03.000", "t_mono": 3.0, "rec_frame": 15, "state": "REPLAN",
          "event": "goal UNREACHABLE -> permanent", "status": "OK", "pos": [0.6, 0.6], "heading": 45.0,
          "pos_y": -1.0, "slam_ms": 500.0, "fwd_clear": 0.5, "goal": None,
-         "bearing_err": None, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_permanent"}]},
+         "bearing_err": None, "goals": [{"xz": [1.0, 1.0], "state": "blacklist_permanent"}],
+         "wall_hit_count": 0, "wall_hit_goal": None,
+         "planner_event": "BUMP goal=[1.0, 1.0] count=2/2 -> BLACKLIST PERMANENT (1 total) -> reselecting"},
     ]
     ok = True
     with tempfile.TemporaryDirectory() as d:
@@ -430,6 +498,23 @@ def _self_test():
         c5 = ("2200" in html and "drawSlam" in html and "drawGoals" in html and "<canvas id=\"scene\"" in html)
         print(f"[self-test] {'PASS' if c5 else 'FAIL'}  HTML carries slam spike + scene/goal/slam draw code")
         ok = ok and c5
+
+        # the new blacklist-observability fields survived + the render code that surfaces them is present
+        by_frame = {r.get("rec_frame"): r for r in embedded if "state" in r}
+        c6 = (by_frame[10].get("wall_hit_count") == 1 and by_frame[10].get("missed_bump")
+              and "BLACKLIST" in (by_frame[15].get("planner_event") or "")
+              and "PLANNER:" in html and "MISSED-BUMP:" in html and "bump</span>" in html)
+        print(f"[self-test] {'PASS' if c6 else 'FAIL'}  bump counter + PLANNER/MISSED-BUMP fields render")
+        ok = ok and c6
+
+        # the raw per-frame telemetry panel (translation/yaw/command/delta/status) is wired in
+        c7 = (by_frame[5].get("cmd") == {"trigger": 0.2}
+              and by_frame[5].get("speed") == 0.42 and by_frame[5].get("nominal_speed") == 0.45
+              and "updateTelemetry" in html and "RAW TRANSLATION" in html and "RAW COMMAND" in html
+              and "DELTA (this step)" in html and 'id="telemetry"' in html
+              and "DIST &rarr; GOAL (SLAM units)" in html and "SPEED (world, u/s)" in html)
+        print(f"[self-test] {'PASS' if c7 else 'FAIL'}  raw telemetry panel (translation/cmd/dist/speed/delta) wired")
+        ok = ok and c7
 
     print(f"[self-test] {'ALL PASS' if ok else 'FAILURES'} (flight_replay)")
     return ok

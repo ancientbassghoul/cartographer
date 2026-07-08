@@ -79,6 +79,7 @@ class FrontierPlanner:
         self._best_dist = None         # closest distance achieved toward the current committed goal (round-blacklist memory)
         self._last_wall_hit_goal = None  # [x, z] of the goal the last counted bump was against, or None
         self._wall_hit_count = 0         # consecutive advance-blocked bumps on _last_wall_hit_goal (>=2 -> blacklist)
+        self.last_bump = None            # outcome dict of the most recent note_wall_hit (caller logs it once), else None
         # Position-UNCONDITIONED dead-goal regions. Each: {goal:[x,z], best_ever:float, permanent:bool,
         # active:bool}. `active` = excluded THIS round (cleared by _whitelist_round on the reposition
         # arrival); `permanent` = excluded forever (a goal re-blacklisted with no cross-round progress).
@@ -142,6 +143,16 @@ class FrontierPlanner:
     def _reset_progress(self):
         self._best_dist = None
 
+    @property
+    def wall_hit_count(self):
+        """Live bump count on the currently-tracked goal region (0 when idle, 1 after a first bump)."""
+        return self._wall_hit_count
+
+    @property
+    def wall_hit_goal(self):
+        """[x,z] the current bump counter is tracking (the last counted bump's goal), or None."""
+        return list(self._last_wall_hit_goal) if self._last_wall_hit_goal is not None else None
+
     def note_wall_hit(self, goal):
         """Register ONE advance-blocked "bump" (flow WALL / ram-guard / stand-off) against `goal`, reported by
         the autopilot. Consecutive bumps on the SAME goal region (within `assoc_dist`) accumulate; a bump on a
@@ -149,15 +160,21 @@ class FrontierPlanner:
         declares the goal UNREACHABLE and PERMANENTLY blacklists it, drops the commitment, and resets the
         counter (the next select() reselects around the dead region). Event-driven — no timer, no SLAM-health
         gate. The autopilot's kinematic latch guarantees a single continuous contact is only one bump, so this
-        never fires on state-machine flicker. Sets `last_blacklist` (the [x,z] just blacklisted, else None) so
-        the caller can log it once."""
+        never fires on state-machine flicker. Sets `last_blacklist` (the [x,z] just blacklisted, else None) and
+        returns/stashes `last_bump`, an outcome dict {goal, count, threshold, action, prev_goal}, so the caller
+        can log EVERY bump (not just blacklists) — making the goal-change counter resets visible."""
         self.last_blacklist = None
         g = [float(goal[0]), float(goal[1])]
+        prev_goal = list(self._last_wall_hit_goal) if self._last_wall_hit_goal is not None else None
         if self._last_wall_hit_goal is not None and self._d(g, self._last_wall_hit_goal) <= self.assoc_dist:
             self._wall_hit_count += 1
+            action = "increment"
         else:
             self._wall_hit_count = 1
             self._last_wall_hit_goal = g
+            # "reset" only when a DIFFERENT prior goal was displaced; a first-ever bump just arms the counter.
+            action = "reset" if prev_goal is not None else "arm"
+        count_at_hit = self._wall_hit_count      # count reached BY this bump (before any blacklist zeroing)
         if self._wall_hit_count >= 2:
             self._blacklist_goal(g, permanent=True)
             if self.committed_goal is not None and self._d(self.committed_goal, g) <= self.blacklist_radius:
@@ -165,6 +182,10 @@ class FrontierPlanner:
                 self._reset_progress()
             self._wall_hit_count = 0
             self._last_wall_hit_goal = None
+            action = "blacklist"
+        self.last_bump = {"goal": g, "count": count_at_hit, "threshold": 2,
+                          "action": action, "prev_goal": prev_goal}
+        return self.last_bump
 
     def _commit(self, goal):
         """Commit to `goal`, restarting progress tracking only when it is a genuinely DIFFERENT region
@@ -337,29 +358,34 @@ def run_self_test():
     # (d) a SINGLE bump never blacklists (a lone contact could be transient); the counter just arms at 1.
     p = FrontierPlanner(None)
     p.select([W], [0.0, 0.0], heading_deg=0.0)     # commit W
-    p.note_wall_hit([0.0, 3.0])
+    b_d = p.note_wall_hit([0.0, 3.0])
     check("(d) one bump does NOT blacklist (armed at 1)",
-          len(p._blacklist) == 0 and p._wall_hit_count == 1 and p.committed_goal is not None)
+          len(p._blacklist) == 0 and p._wall_hit_count == 1 and p.committed_goal is not None
+          and p.wall_hit_count == 1 and close(p.wall_hit_goal, [0.0, 3.0])
+          and b_d == p.last_bump and b_d["action"] == "arm" and b_d["count"] == 1
+          and b_d["prev_goal"] is None)
 
     # (e) the SECOND bump on the same goal region (within assoc_dist, so centroid drift still counts)
     #     PERMANENTLY blacklists it, drops the commitment, and resets the counter.
     pe = FrontierPlanner(None)                                     # reused by (g)
     pe.select([W], [0.0, 0.0], heading_deg=0.0)                    # commit W
     pe.note_wall_hit([0.0, 3.0])
-    pe.note_wall_hit([0.0, 2.95])                                  # same region (< assoc_dist) -> 2nd bump
+    b_e = pe.note_wall_hit([0.0, 2.95])                            # same region (< assoc_dist) -> 2nd bump
     check("(e) two same-region bumps PERMANENT-blacklist + clear commitment + reset count",
           len(pe._blacklist) == 1 and pe._blacklist[0]["permanent"] is True
           and close(pe._blacklist[0]["goal"], [0.0, 2.95]) and pe.committed_goal is None
-          and pe._wall_hit_count == 0)
+          and pe._wall_hit_count == 0 and pe.wall_hit_goal is None
+          and b_e["action"] == "blacklist" and b_e["count"] == 2)
 
     # (f) GOAL-CHANGE RESET: a bump on a goal > assoc_dist away resets the counter, so alternating bumps on
     #     two far-apart goals never reach 2 (only consecutive same-region contacts accumulate).
     p = FrontierPlanner(None)
     p.note_wall_hit([0.0, 3.0])                                    # goal A -> count 1
     p.note_wall_hit([9.0, 9.0])                                    # goal B (far) -> reset, count 1 on B
-    p.note_wall_hit([0.0, 3.0])                                    # back to A -> reset, count 1 on A
+    b_f = p.note_wall_hit([0.0, 3.0])                              # back to A -> reset, count 1 on A
     check("(f) a different-goal bump RESETS the counter (no blacklist)",
-          len(p._blacklist) == 0 and p._wall_hit_count == 1 and close(p._last_wall_hit_goal, [0.0, 3.0]))
+          len(p._blacklist) == 0 and p._wall_hit_count == 1 and close(p._last_wall_hit_goal, [0.0, 3.0])
+          and b_f["action"] == "reset" and b_f["count"] == 1 and close(b_f["prev_goal"], [9.0, 9.0]))
 
     # (g) POSITION-UNCONDITIONED + PERMANENT: the goal blacklisted in (e) stays excluded from any vantage.
     check("(g) blacklist stays excluded regardless of vantage",

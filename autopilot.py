@@ -119,9 +119,10 @@ def _timeline_goals(plan: dict) -> list:
     return goals
 
 
-def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict) -> dict:
+def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict, cmd=None) -> dict:
     """One structured replay record per explore step. Pulls the pose/goal/slam fields straight off the
-    plan payload (perception_worker._plan_payload) plus the controller's own state/event/status."""
+    plan payload (perception_worker._plan_payload) plus the controller's own state/event/status and the
+    literal `cmd` control dict published to the sim this frame ({} = hover/neutral)."""
     g = plan.get
     return {
         "t_wall": t_wall, "t_mono": round(float(t_mono), 3),
@@ -131,6 +132,14 @@ def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan:
         "slam_ms": g("slam_ms"), "fwd_clear": g("forward_clearance_dist"),
         "goal": g("goal"), "bearing_err": g("bearing_err"),
         "goals": _timeline_goals(plan),
+        # 2-bump blacklist observability: the live counter + the planner's transient bump-outcome event
+        # (goal-change reset / blacklist), so the replay shows the mechanism the flight log used to hide.
+        "wall_hit_count": g("wall_hit_count"), "wall_hit_goal": g("wall_hit_goal"),
+        "planner_event": g("planner_event"),
+        # Raw command actually sent to the sim this frame (the joystick-bridge output) — pristine
+        # per-frame telemetry so a crawl (forward trigger set but pose barely moving) is self-evident.
+        # {} is preserved (hover/neutral); None only when no command was supplied (old logs omit the key).
+        "cmd": (dict(cmd) if cmd is not None else None),
     }
 
 
@@ -701,11 +710,26 @@ class ExploreController:
         # with the drone as it climbs the wall) and the flow WALL needs a looming COLLAPSE that never comes on a
         # slow ram. So detect it in POS space: accrue forward-advancing time without progress; stop the leg
         # before the ram kills SLAM. Repeated re-commits then hit the F4 60 s stagnation blacklist.
-        self.ram_stall_s = float(e.get("ram_stall_s", 3.0))            # advancing-but-not-progressing seconds -> stop the leg
-        self.ram_progress_eps = float(e.get("ram_progress_eps", 0.15)) # min leg-distance improvement that counts as advancing
-        self._ram_accum = 0.0                # accrued forward-advancing time with no leg progress
-        self._leg_best_dist = None           # best distance to leg_goal this ADVANCE leg
-        self._ram_last_t = None              # last advancing-tick time (for a clamped dt)
+        # The ram decision is SELF-CALIBRATING (no baked absolute, per the no-leakage rule): measure the
+        # drone's OWN free-flight world speed live (1s into the first ADVANCE, sampled up to sample_s or
+        # until a SLAM event), then fire only when the live windowed speed drops below `ram_speed_frac` of
+        # that nominal. This distinguishes a legitimately SLOW crawl in open space (speed ~= nominal) from a
+        # drone physically pinned on an invisible collider (speed -> 0), which the old absolute goal-closing
+        # threshold (0.15 u / 3 s ~= 0.05 u/s) could not — it false-fired on the platform's normal crawl.
+        self.ram_stall_s = float(e.get("ram_stall_s", 3.0))            # below-nominal seconds -> stop the leg
+        self.ram_speed_frac = float(e.get("ram_speed_frac", 0.33))     # fire when speed < frac * nominal
+        self.ram_speed_window_s = float(e.get("ram_speed_window_s", 1.0))   # rolling window for the live speed
+        self.ram_calib_skip_s = float(e.get("ram_calib_skip_s", 1.0))       # skip the first Ns of the first ADVANCE
+        self.ram_calib_sample_s = float(e.get("ram_calib_sample_s", 5.0))   # then sample nominal for up to Ns
+        self.ram_calib_min_sample_s = float(e.get("ram_calib_min_sample_s", 1.0))  # min clean span to accept a nominal
+        self.ram_calib_min_speed = float(e.get("ram_calib_min_speed", 1e-3))       # reject a degenerate ~0 nominal (stuck calib window)
+        self._nominal_speed = None           # LIVE-calibrated free-flight speed (FLIGHT-level; persists across legs)
+        self._ram_speed_win = collections.deque()   # rolling (t, x, z) for the timestamp-based windowed speed
+        self._ram_speed = None               # last computed live windowed speed (for logging / telemetry)
+        self._calib_start_t = None           # first-ADVANCE entry time (calibration clock origin)
+        self._calib_samples = []             # collected windowed-speed samples during calibration
+        self._ram_accum = 0.0                # accrued below-nominal (stalled) time
+        self._ram_last_t = None              # last stalled-tick time (for a clamped dt)
         # Parallax scouting: a goal needing MORE than one turn_step is reached as turn -> short translate
         # (forward/back per the rays, for SLAM parallax) -> settle -> turn again -> ... -> aim -> advance.
         self.parallax_scout = bool(e.get("parallax_scout", True))
@@ -765,9 +789,15 @@ class ExploreController:
         self._ascend_prev_y = None      # last valid pos_y sample (for the per-cycle altitude gain dZ)
         self._ascend_stall_count = 0    # consecutive flat-gain cycles (confirms the ceiling)
         self._ascend_start_t = None     # ASCEND entry time (ascend_max_s safety cap)
-        self._ram_accum = 0.0       # ram-guard accumulators are per-leg
-        self._leg_best_dist = None
+        self._ram_accum = 0.0       # ram-guard stall accumulator is per-leg
         self._ram_last_t = None
+        self._ram_speed_win.clear() # a time gap across an interruption must not read as a false slowdown
+        self._ram_speed = None
+        # A finalized nominal free-flight speed PERSISTS (flight-level, like target_altitude_y); only an
+        # in-progress calibration is discarded on a hard interruption -> it restarts on the next clean ADVANCE.
+        if self._nominal_speed is None:
+            self._calib_samples = []
+            self._calib_start_t = None
         # 2-bump blacklist latch (kinematic): an advance-blocked stop (flow WALL / ram-guard / stand-off)
         # emits ONE bump pulse to the planner, then DISARMS until the drone physically disengages (run_explore
         # re-arms on a published reverse command OR displacement > goal_reach_dist from the anchor). This
@@ -775,6 +805,9 @@ class ExploreController:
         self._bump_armed = True
         self._last_bump_anchor = None   # [x,z] where the last counted bump fired (displacement re-arm gauge)
         self._bump_pulse = None         # pending bump goal for run_explore to publish, then clear
+        self._bump_reason = None        # why the pending bump fired (standoff / wall-contact / ram-guard), for the log
+        self._missed_bump = None        # a real advance-blocked contact that did NOT emit a pulse (latch disarmed /
+        #                                 parallax-blocked path) -> run_explore logs a MISSED-BUMP marker
         # An interruption (autonomy off = a manual takeover) invalidates the command history: the drone may
         # have been moved by hand, so the recorded maneuvers no longer map to the trajectory. Drop it.
         self.command_history.clear()
@@ -971,18 +1004,78 @@ class ExploreController:
         self.state = state
         self.t_state = now
 
+    # ------------------------------------------------- ram guard: self-calibrated speed
+    def _finalize_or_discard_calib(self):
+        """At a sampling break (SLAM event / leg change) or a full clean sample: accept the mean of the
+        collected windowed-speed samples as the nominal free-flight speed IF they span >=
+        `ram_calib_min_sample_s`, else discard so calibration restarts on the next continuous ADVANCE run.
+        Idempotent once a nominal is set."""
+        s = self._calib_samples
+        if self._nominal_speed is None and s and (s[-1][0] - s[0][0]) >= self.ram_calib_min_sample_s:
+            mean = sum(v for _, v in s) / len(s)
+            if mean >= self.ram_calib_min_speed:      # reject a degenerate ~0 nominal (drone was stuck the whole window)
+                self._nominal_speed = mean
+        self._calib_samples = []
+        self._calib_start_t = None
+
+    def _advance_speed(self, now, pos):
+        """Rolling live world speed (u/s) for the ram guard + the one-time nominal calibration.
+        REAL timestamps (span = now - oldest_t; never a fixed frame rate) so a SLAM frame-rate spike can't
+        corrupt the velocity, and the window is PRUNED to `ram_speed_window_s` BEFORE the speed is computed
+        so a stale sample left by an interrupted leg can't inflate the denominator into a false slowdown.
+        Returns the live speed (or None until the window refills)."""
+        win = self._ram_speed_win
+        if pos is None:
+            self._ram_speed = None
+            return None
+        # a time gap since the last sample (SLAM hold / leg change) breaks the continuous run
+        if win and (now - win[-1][0]) > self.ram_speed_window_s:
+            self._finalize_or_discard_calib()      # accept the partial nominal if clean enough, else discard
+            win.clear()
+            self._ram_accum = 0.0
+            self._ram_last_t = None
+        win.append((now, float(pos[0]), float(pos[1])))
+        cutoff = now - self.ram_speed_window_s
+        while len(win) > 1 and win[0][0] < cutoff:   # PRUNE before compute
+            win.popleft()
+        spd = None
+        span = now - win[0][0]
+        if len(win) >= 2 and span >= 0.5 * self.ram_speed_window_s and span > 0.0:
+            spd = math.hypot(pos[0] - win[0][1], pos[1] - win[0][2]) / span
+        self._ram_speed = spd
+        # one-time nominal calibration: 1s into the first continuous ADVANCE, sample up to sample_s
+        if self._nominal_speed is None:
+            if self._calib_start_t is None:
+                self._calib_start_t = now
+            elapsed = now - self._calib_start_t
+            if spd is not None and elapsed >= self.ram_calib_skip_s:
+                self._calib_samples.append((now, spd))
+                if elapsed >= self.ram_calib_skip_s + self.ram_calib_sample_s:
+                    self._finalize_or_discard_calib()   # a full clean sample -> accept the nominal
+        return spd
+
     # ------------------------------------------------- 2-bump blacklist latch (kinematic)
-    def _register_bump(self, plan):
+    def _register_bump(self, plan, reason="advance-blocked"):
         """Latch-gated bump for the event-driven 2-bump blacklist: on an advance-blocked stop (flow WALL /
         ram-guard / clearance stand-off) toward the committed goal, stash ONE bump pulse for run_explore to
         publish, then DISARM + record the stop position as the re-arm anchor. Suppressed while already
-        disarmed (a stuttering state machine can't multiply-count one continuous contact)."""
-        if not self._bump_armed or self.leg_goal is None:
+        disarmed (a stuttering state machine can't multiply-count one continuous contact) — a suppressed real
+        contact stashes a MISSED-BUMP marker (`self._missed_bump`) so run_explore can log the un-counted hit."""
+        if self.leg_goal is None:
+            return
+        if not self._bump_armed:
+            self._missed_bump = f"{reason} (latch disarmed — drone hasn't disengaged since the last bump)"
             return
         self._bump_pulse = list(self.leg_goal)
+        self._bump_reason = reason
         self._bump_armed = False
         pos = plan.get("pos")
         self._last_bump_anchor = list(pos) if pos is not None else None
+
+    def take_missed_bump(self):
+        """Pop the pending MISSED-BUMP marker (a real contact that emitted no pulse), or None."""
+        m, self._missed_bump = self._missed_bump, None
+        return m
 
     def rearm_bump_if_disengaged(self, active, plan):
         """Re-arm the bump latch once the drone has DISENGAGED from the last bump anchor — EITHER a backward
@@ -996,9 +1089,11 @@ class ExploreController:
             self._bump_armed = True
 
     def take_bump_pulse(self):
-        """Pop the pending bump goal (or None). run_explore publishes it on TOPIC_AUTOPILOT_EVENT."""
-        g, self._bump_pulse = self._bump_pulse, None
-        return g
+        """Pop the pending (bump goal, reason) or (None, None). run_explore publishes it on
+        TOPIC_AUTOPILOT_EVENT and logs the reason (which advance-blocked stop fired the bump)."""
+        g, r = self._bump_pulse, self._bump_reason
+        self._bump_pulse = self._bump_reason = None
+        return g, r
 
     @staticmethod
     def _dist(a, b):
@@ -1247,9 +1342,11 @@ class ExploreController:
                 event = "mission complete — no frontiers remain"
             elif plan.get("goal") is not None:
                 self.leg_goal = list(plan["goal"])
-                self._ram_accum = 0.0             # fresh ram-guard tracking for this leg
-                self._leg_best_dist = None
+                self._ram_accum = 0.0             # fresh ram-guard stall tracking for this leg
                 self._ram_last_t = None
+                self._ram_speed_win.clear()      # a new leg breaks the speed run; window must not span the gap
+                self._ram_speed = None
+                self._finalize_or_discard_calib()  # a leg boundary ends a sampling run: accept if clean, else restart
                 be = plan.get("bearing_err")
                 theta = self._quantize_turn(be)
                 if self.clamp_leg_turn:
@@ -1307,31 +1404,32 @@ class ExploreController:
             reached = self._dist(plan.get("pos"), self.leg_goal)
             clr = plan.get("forward_clearance_dist")
             fwd_dur, fwd_val = (now - self.t_state), float(self.forward_preset.get("trigger", 0.0))
-            # Ram-guard progress tracking: real closing toward the goal resets the ram timer.
-            if reached is not None and (self._leg_best_dist is None
-                                        or reached < self._leg_best_dist - self.ram_progress_eps):
-                self._leg_best_dist = reached
-                self._ram_accum = 0.0
             if self._slam_slow:
                 # SLAM started choking mid-leg -> STOP moving and let it settle before it loses the track.
                 # Log the clean sub-leg flown so far (also keeps translations in the rewind history), then hold
-                # and resume ADVANCE (leg_goal persists) once stable.
+                # and resume ADVANCE (leg_goal persists) once stable. (No speed sample on a choking frame.)
                 self._log_move("forward", fwd_val, fwd_dur)
                 return self._enter_slam_hold("ADVANCE", now,
                                              f"ADVANCE: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
                                              "hold to settle, then resume")
+            # Live self-calibrated world speed for the ram guard (updates the window + one-time nominal).
+            had_nominal = self._nominal_speed is not None
+            spd = self._advance_speed(now, plan.get("pos"))
+            calib_event = (None if had_nominal or self._nominal_speed is None else
+                           f"ram-calib: nominal free-flight speed = {self._nominal_speed:.3f} u/s "
+                           f"(guard now armed at {self.ram_speed_frac:.0%} of it)")
             if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
                 # PRIMARY forward stop: SLAM has mapped a wall ahead within the stand-off margin. Stop
                 # gently with the image still rich (SLAM ALIVE) BEFORE ramming -> settle -> REPLAN picks
                 # the next frontier. No reverse/back-off: we're already at a safe stand-off.
                 self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
-                self._register_bump(plan)     # advance-blocked stop -> a bump toward the committed goal
+                self._register_bump(plan, "clearance stand-off")  # advance-blocked stop -> bump toward committed goal
                 self._enter("SETTLE", now)
                 event = f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> settle"
             elif wall_contact:
                 # A COLLISION invalidates the command history (unknown post-impact orientation) -> drop it.
                 self.command_history.clear()
-                self._register_bump(plan)         # advance-blocked stop -> a bump toward the committed goal
+                self._register_bump(plan, "flow WALL contact")   # advance-blocked stop -> bump toward committed goal
                 if self.reverse_probe_on_wall:
                     # EXPERIMENT: instead of a tiny back-off, settle then fly straight BACKWARD (camera
                     # still facing the wall, seeing familiar features) to test whether reverse keeps SLAM
@@ -1354,20 +1452,28 @@ class ExploreController:
                 self._enter("BACKOFF", now)
                 event = f"LEG-TIMEOUT (>{self.leg_max_s}s) -> back off"
             else:
-                # Ram guard: accrue forward-advancing time (clamped dt, so an interleaved hold doesn't dump)
-                # and stop the leg once we've pushed forward `ram_stall_s` without any leg progress — the drone
-                # is riding an invisible collider the sensors can't stop it on. Hand back to REPLAN; a repeated
-                # re-commit then hits the F4 stagnation blacklist.
+                # Ram guard (SELF-CALIBRATING): accrue time while the live world speed is BELOW
+                # `ram_speed_frac` of the drone's own calibrated nominal free-flight speed; reset the clock
+                # whenever it recovers. Stop the leg after `ram_stall_s` continuously below-nominal — the drone
+                # is physically pinned (riding an invisible collider). A legitimately SLOW open-space crawl runs
+                # AT ~nominal and never trips this (the bug the old absolute goal-closing threshold caused).
+                # Inactive until the nominal is calibrated (fail-safe: never fire on an unknown baseline).
                 dt = 0.0 if self._ram_last_t is None else min(max(now - self._ram_last_t, 0.0), 0.5)
                 self._ram_last_t = now
-                self._ram_accum += dt
-                if self.ram_stall_s > 0 and reached is not None and self._ram_accum >= self.ram_stall_s:
+                stalled = (self._nominal_speed is not None and spd is not None
+                           and spd < self.ram_speed_frac * self._nominal_speed)
+                self._ram_accum = self._ram_accum + dt if stalled else 0.0
+                if (self.ram_stall_s > 0 and self._nominal_speed is not None
+                        and self._ram_accum >= self.ram_stall_s):
                     self._log_move("forward", fwd_val, fwd_dur)
-                    self._register_bump(plan)     # advance-blocked stop -> a bump toward the committed goal
+                    self._register_bump(plan, "ram guard")   # advance-blocked stop -> bump toward committed goal
                     self._enter("SETTLE", now)
-                    event = (f"ram guard: forward-commanded but not advancing {self._ram_accum:.1f}s "
+                    event = (f"ram guard: speed {spd:.3f} < {self.ram_speed_frac:.0%} of nominal "
+                             f"{self._nominal_speed:.3f} u/s for {self._ram_accum:.1f}s "
                              f"(d={reached:.2f}) -> stop leg -> settle -> replan")
                 else:
+                    if calib_event is not None:
+                        event = calib_event      # surface the one-time nominal calibration
                     active = dict(self.forward_preset)
                     # Altitude lock: counter the forward-push sink. World frame +Y is DOWN, so a drone that has
                     # sunk reads a LARGER pos_y than the cached target -> inject UP until it climbs back (deadband).
@@ -1447,6 +1553,11 @@ class ExploreController:
                         self._log_move("forward", self.parallax_push_throttle, now - self.t_state)
                     else:
                         self._log_move("reverse", self.reverse_throttle, now - self.t_state)
+                    # A push STOPPED BY AN OBSTACLE is a real advance-blocked contact, but this path does NOT
+                    # register a bump (behavior unchanged) -> mark it MISSED so the un-counted glass contacts
+                    # are visible. (Whether to actually emit a bump here is a deferred behavior decision.)
+                    if blocked and self.leg_goal is not None:
+                        self._missed_bump = f"parallax {dirn} push blocked by obstacle (this path emits no bump)"
                     self._push_dir = None
                     self._settle_to = "REPLAN"
                     self._enter("SETTLE", now)
@@ -1559,11 +1670,17 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 frame, meta = msg
                 if meta.get("rec_frame") is not None:
                     last_rec_frame = meta.get("rec_frame")
-            # drain the plan bus to the freshest message
+            # drain the plan bus to the freshest message. `planner_event` is TRANSIENT (perception clears it
+            # after one plan), so capture it DURING the drain — otherwise draining to the freshest could skip
+            # the event-carrying plan and lose the blacklist/reset marker.
+            pending_planner_event = None
             p = plan_sub.recv(timeout_ms=0)
             while p is not None:
                 last_plan = p[1]
                 last_plan_t = now
+                pe = last_plan.get("planner_event")
+                if pe:
+                    pending_planner_event = pe
                 p = plan_sub.recv(timeout_ms=0)
 
             # ---- autonomy gate (mirror run_mission: only fly while io_bridge reports AUTO) ----
@@ -1643,13 +1760,27 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             # 2-bump latch: re-arm once the drone has disengaged (backward cmd OR moved > goal_reach_dist),
             # then publish any pending bump pulse for the planner's event-driven blacklist.
             ctrl.rearm_bump_if_disengaged(active, plan_for_step)
-            bump_goal = ctrl.take_bump_pulse()
+            bump_goal, bump_reason = ctrl.take_bump_pulse()
             if bump_goal is not None:
                 pub.publish(frame_bus.TOPIC_AUTOPILOT_EVENT, {"bump_goal": bump_goal, "seq": bump_seq})
-                bline = f"{_rec_prefix(last_rec_frame)} [autopilot][explore] BUMP pulse #{bump_seq} goal={bump_goal} (advance-blocked -> planner)"
+                bline = (f"{_rec_prefix(last_rec_frame)} [autopilot][explore] BUMP pulse #{bump_seq} "
+                         f"goal={bump_goal} ({bump_reason} -> planner)")
                 print(bline, flush=True)
                 diag.line(bline)
                 bump_seq += 1
+            # A real advance-blocked contact that emitted NO pulse (latch disarmed / parallax-blocked path) —
+            # these are the un-counted glass contacts that let the 2-bump blacklist under-count. Surface them.
+            missed = ctrl.take_missed_bump()
+            if missed is not None:
+                mline = f"{_rec_prefix(last_rec_frame)} [autopilot][explore] MISSED-BUMP: {missed}"
+                print(mline, flush=True)
+                diag.line(mline)
+            # The planner's bump outcome (count climb / goal-change RESET / BLACKLIST), computed in the
+            # perception process, mirrored into the flight diag so the mechanism is no longer invisible.
+            if pending_planner_event is not None:
+                eline = f"{_rec_prefix(last_rec_frame)} [autopilot][explore] PLANNER: {pending_planner_event}"
+                print(eline, flush=True)
+                diag.line(eline)
             if event:
                 line = f"{_rec_prefix(last_rec_frame)} [autopilot][explore] {state}: {event}"
                 print(line, flush=True)
@@ -1661,8 +1792,20 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             # newest ground summary and emit it once at shutdown as a static backdrop for the whole replay.
             if log:
                 t_wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                diag.timeline(_timeline_step_record(t_wall, now, last_rec_frame, state, event,
-                                                    status, plan_for_step))
+                rec = _timeline_step_record(t_wall, now, last_rec_frame, state, event,
+                                            status, plan_for_step, cmd=active)
+                # The transient planner_event was captured during the drain (the freshest plan may have
+                # already cleared it) and the un-counted contact from the controller — stitch both onto THIS
+                # step's record so the replay marks the exact frame of each.
+                if pending_planner_event is not None:
+                    rec["planner_event"] = pending_planner_event
+                if missed is not None:
+                    rec["missed_bump"] = missed
+                # Live self-calibrated ram-guard speed telemetry (u/s) + the flight's calibrated nominal, so
+                # the replay panel shows exactly why the ram guard did or didn't fire (crawl vs true stall).
+                rec["speed"] = (round(ctrl._ram_speed, 4) if ctrl._ram_speed is not None else None)
+                rec["nominal_speed"] = (round(ctrl._nominal_speed, 4) if ctrl._nominal_speed is not None else None)
+                diag.timeline(rec)
                 g = plan_for_step.get("ground")
                 if g and g.get("bounds"):
                     last_ground = g
@@ -1722,11 +1865,14 @@ def run_self_test(cfg):
     # And the pure record builders produce the expected shape (goal state tagging + map downsample).
     plan = {"pos": [0.1, 0.2], "heading_deg": 45.0, "goal": [1.0, 2.0], "bearing_err": 3.0,
             "blacklist": [[9.0, 9.0]], "blacklist_permanent": [True]}
-    rec = _timeline_step_record("00:00:01.000", 1.234, 7, "ADVANCE", "leg", "OK", plan)
+    rec = _timeline_step_record("00:00:01.000", 1.234, 7, "ADVANCE", "leg", "OK", plan,
+                                cmd={"trigger": 0.2})
+    rec_hover = _timeline_step_record("00:00:01.000", 1.234, 7, "SETTLE", None, "OK", plan, cmd={})
     ds = _downsample_map({"bounds": [0, 4, 0, 4], "rows": 2, "cols": 2, "cls": [0, 1, 2, 3]})
     tl_rec = (rec["state"] == "ADVANCE" and rec["pos"] == [0.1, 0.2] and len(rec["goals"]) == 2
               and rec["goals"][0]["state"] == "active"
               and rec["goals"][1]["state"] == "blacklist_permanent"
+              and rec["cmd"] == {"trigger": 0.2} and rec_hover["cmd"] == {}   # {} hover preserved
               and ds["rows"] == 2 and ds["cls"] == [0, 1, 2, 3])
     good = tl_noop and tl_rec
     ok = ok and good
@@ -2341,31 +2487,48 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if startup_ok else 'FAIL'}  no-spin startup "
           f"(warmup-hold={warmup_ok}, marks-tracked={tracked_ok}, later-stale->fallback={fallback_ok})")
 
-    # ---- F7 ram guard: forward-commanded but SLAM pos not advancing for ram_stall_s -> stop the leg ----
+    # ---- F7 ram guard: SELF-CALIBRATING (fire on speed < 33% of the drone's own nominal free-flight speed).
+    # Small calib params so it calibrates fast; then (A) nominal is learned, (B) a STEADY CRAWL at nominal
+    # does NOT false-fire (the exact bug the old absolute goal-closing threshold caused), (C) a true STALL
+    # (frozen pos) DOES fire, (D) before calibration a frozen pose does not fire (guard inactive).
     cr = ExploreController(cfg, no_takeoff=True)
-    cr.ram_stall_s, cr.ram_progress_eps = 0.5, 0.15
-    pram = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
-            "forward_clearance_dist": 9.0, "pos_y": 0.0}   # clear path, but pos never changes (collider)
-    tr, fr, ram_stopped = 0.0, 0, False
-    for _ in range(160):
-        _a, s, ev = cr.step(tr, dict(pram, frame_id=fr, slam_ms=200.0), False, status="OK"); tr += 0.05; fr += 1
-        if ev and "ram guard" in ev:
-            ram_stopped = True; break
-    ram_ok = ram_stopped and cr.state == "SETTLE"
-    # a leg that IS advancing (pos closing) must NOT trip the ram guard
-    cr2 = ExploreController(cfg, no_takeoff=True)
-    cr2.ram_stall_s = 0.5
-    tr, fr, tripped = 0.0, 0, False
-    for i in range(40):
-        pos = [min(9.0, i * 0.3), 0.0]                   # steadily advancing toward the goal
-        _a, s, ev = cr2.step(tr, dict(pram, pos=pos, frame_id=fr, slam_ms=200.0), False, status="OK")
+    cr.ram_stall_s, cr.ram_speed_window_s = 0.5, 0.2
+    cr.ram_calib_skip_s, cr.ram_calib_sample_s, cr.ram_calib_min_sample_s = 0.2, 0.5, 0.2
+    cr.leg_max_s = 100.0
+    gram = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "bearing_err": 0.0,
+            "forward_clearance_dist": 9.0, "pos_y": 0.0}
+    tr, fr, x, frozen, crawl_fired, ram_fired = 0.0, 0, 0.0, False, False, False
+    for _ in range(600):
+        if not frozen and x < 1.2:
+            x = round(x + 0.02, 5)          # steady ~0.4 u/s crawl (advances until x=1.2, then FREEZE = true stall)
+        else:
+            frozen = True
+        _a, s, ev = cr.step(tr, dict(gram, pos=[x, 0.0], frame_id=fr, slam_ms=200.0), False, status="OK")
+        tr += 0.05; fr += 1
+        if ev and "ram guard" in ev and "stop leg" in ev:      # the FIRE event (not the calib note)
+            if frozen:
+                ram_fired = True; break
+            else:
+                crawl_fired = True; break     # a steady crawl tripped the guard -> the OLD bug
+    ramA = cr._nominal_speed is not None and cr._nominal_speed > 0.1       # (A) sane nominal calibrated
+    ramB = not crawl_fired                                                 # (B) the fix: crawl does NOT fire
+    ramC = ram_fired and cr.state == "SETTLE" and cr._bump_pulse == [9.0, 0.0]   # (C) true stall fires + bumps
+    # (D) frozen pos from the very start -> degenerate calib discarded -> nominal stays None -> guard never fires
+    crd = ExploreController(cfg, no_takeoff=True)
+    crd.ram_stall_s, crd.ram_speed_window_s = 0.5, 0.2
+    crd.ram_calib_skip_s, crd.ram_calib_sample_s, crd.ram_calib_min_sample_s = 0.2, 0.5, 0.2
+    crd.leg_max_s = 100.0
+    tr, fr, precalib_fired = 0.0, 0, False
+    for _ in range(80):
+        _a, s, ev = crd.step(tr, dict(gram, pos=[0.0, 0.0], frame_id=fr, slam_ms=200.0), False, status="OK")
         tr += 0.05; fr += 1
         if ev and "ram guard" in ev:
-            tripped = True; break
-    ram_ok = ram_ok and not tripped
+            precalib_fired = True; break
+    ramD = (not precalib_fired) and crd._nominal_speed is None
+    ram_ok = ramA and ramB and ramC and ramD
     ok = ok and ram_ok
-    print(f"[self-test] {'PASS' if ram_ok else 'FAIL'}  ram guard "
-          f"(stuck-collider->stop={ram_stopped}, advancing->no-trip={not tripped})")
+    print(f"[self-test] {'PASS' if ram_ok else 'FAIL'}  ram guard self-calibrating "
+          f"(nominal={ramA}, crawl-no-fire={ramB}, stall-fires={ramC}, pre-calib-no-fire={ramD})")
 
     # ---- 2-bump blacklist plumbing: _detector_command + the kinematic bump latch ----
     dc_ok = (_detector_command({"reverse": 0.4}) == CMD_BACK
@@ -2377,23 +2540,26 @@ def run_self_test(cfg):
     ok = ok and dc_ok
     print(f"[self-test] {'PASS' if dc_ok else 'FAIL'}  _detector_command maps reverse->BACK / fwd->FWD / up->UP")
 
-    # The ram-guard stop above (cr) fired exactly ONE bump pulse toward the leg goal and disarmed the latch.
+    # The ram-guard stop above (cr) fired exactly ONE bump pulse toward the leg goal and disarmed the latch,
+    # anchored at the stop position (wherever the drone was when it stalled).
+    anchor = list(cr._last_bump_anchor)
     latch_armed_once = (cr._bump_pulse == [9.0, 0.0] and cr._bump_armed is False
                         and cr._last_bump_anchor is not None)
-    cr.take_bump_pulse()                                     # publish consumes it
-    cr._register_bump({"pos": [0.0, 0.0]})                   # a stutter while still disarmed -> NO new pulse
-    stutter_ok = cr._bump_pulse is None
-    cr.rearm_bump_if_disengaged({}, {"pos": [0.0, 0.0]})     # same spot, no reverse -> stays disarmed
+    _, first_reason = cr.take_bump_pulse()                  # publish consumes it (carries the trigger reason)
+    reason_ok = first_reason == "ram guard"
+    cr._register_bump({"pos": anchor}, "flow WALL contact")  # a stutter while still disarmed -> NO new pulse
+    stutter_ok = cr._bump_pulse is None and cr.take_missed_bump() is not None   # but it IS marked MISSED-BUMP
+    cr.rearm_bump_if_disengaged({}, {"pos": anchor})        # same spot, no reverse -> stays disarmed
     still_disarmed = cr._bump_armed is False
-    cr.rearm_bump_if_disengaged({}, {"pos": [cr.goal_reach_dist + 0.2, 0.0]})   # moved away -> re-arm
+    cr.rearm_bump_if_disengaged({}, {"pos": [anchor[0] + cr.goal_reach_dist + 0.2, anchor[1]]})   # moved -> re-arm
     rearmed_by_move = cr._bump_armed is True
     cr._register_bump({"pos": [9.0, 0.0]})                   # a genuine 2nd encounter -> a fresh pulse
     second_pulse_ok = cr._bump_pulse == [9.0, 0.0]
     crb = ExploreController(cfg, no_takeoff=True); crb.leg_goal = [5.0, 0.0]
-    crb._register_bump({"pos": [0.0, 0.0]}); popped = crb.take_bump_pulse()
+    crb._register_bump({"pos": [0.0, 0.0]}); popped, popped_reason = crb.take_bump_pulse()
     crb.rearm_bump_if_disengaged({"reverse": 0.3}, {"pos": [0.0, 0.0]})   # reverse cmd re-arms at 0 displacement
     rearmed_by_reverse = crb._bump_armed is True and popped == [5.0, 0.0]
-    latch_ok = (latch_armed_once and stutter_ok and still_disarmed and rearmed_by_move
+    latch_ok = (latch_armed_once and reason_ok and stutter_ok and still_disarmed and rearmed_by_move
                 and second_pulse_ok and rearmed_by_reverse)
     ok = ok and latch_ok
     print(f"[self-test] {'PASS' if latch_ok else 'FAIL'}  2-bump latch "

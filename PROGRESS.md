@@ -1,42 +1,48 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-07** (session 5). Resume from THIS file._
+_Last updated **2026-07-08** (session 6). Resume from THIS file._
 
 **Status:** Phase-1 (manual map + target localization) done & hardware-verified. Phase-2 autonomous
-**Map-mode explorer** (`autopilot.py --explore`) flies live and stops before walls via the SLAM
-forward-clearance stand-off. Session 5's two-phase gentle ceiling ascent is in and behaving (gradual
-takeoff done).
+**Map-mode explorer** (`autopilot.py --explore`) flies live: SLAM-safe turns, forward-clearance
+stand-off, two-phase gentle ceiling ascent, and (session 6) a self-calibrating ram guard that no
+longer false-blacklists reachable goals. Rich flight-replay debugger (per-bump blacklist trace +
+per-frame raw telemetry).
 
 **NEXT (in order):**
-1. **Fix the goal-blacklist failure** — a flight shows the event-driven 2-bump blacklist failing
-   badly (unreachable goals not being retired). Debug from that flight next (fresh context).
-2. **Then Part 3 — per-goal height recalibration** (`CALIBRATING_HEIGHT`), designed below.
+1. **Fix the glass-corner blacklist bugs** — at a glass/collider wall the drone chases an unreachable
+   far corner forever: the verify/reposition target bypasses the blacklist (Bug A) and the 2-bump latch
+   can't re-arm at a stand-off (Bug B). Design in `plans/glass-corner-blacklist-and-height-calib.md`.
+2. **Part 3 — per-goal height recalibration** (`CALIBRATING_HEIGHT`) — getting urgent. Same plan file.
 
 ---
 
 ## Next up — planned, NOT built
+Full designs in **`plans/glass-corner-blacklist-and-height-calib.md`**.
 
-### 1. Fix the goal-blacklist mechanism (do this FIRST)
-The session-4 event-driven **2-bump blacklist** is not reliably retiring unreachable goals — a flight
-shows it failing spectacularly (to be analyzed in a fresh context). **This blocks Part 3:** the height
-recalibration is *triggered by goal changes*, and a broken blacklist means goals don't change
-correctly, so the blacklist must be fixed before building on top of it. Debug inputs: that flight's
-`OUTPUT/diag/<ts>_autopilot.{log,csv}` + `<ts>_timeline.html` (the session-3 replay tool).
-
-### 2. Part 3 — per-goal height recalibration (`CALIBRATING_HEIGHT`), designed
-- **Trigger:** ONLY when the committed frontier goal genuinely changes — at REPLAN, when
-  `dist(new goal, previous leg goal) > goal_assoc_dist`. The FIRST goal after the prelude does NOT
-  recalibrate (the prelude already tapped the ceiling). **NOT** tied to PLAN-LOST / PLAN-STALE.
-- **Action:** re-run the Part-2 two-phase ascend → descend to re-tap the ceiling, then **re-null
-  `target_altitude_y`** so the altitude lock re-latches from the fresh post-descend pose (undoing the
-  per-leg downward drift), then hand to ORIENT for the new goal.
-- **Reuse:** give ASCEND/DESCEND a `_post_ascend` return field so the same two states serve both the
-  prelude (→ BASELINE_NUDGE → REPLAN) and CALIBRATING_HEIGHT (→ ORIENT). Gate with a
-  `calibrate_on_goal_change` config flag. (Full design also in `plans/we-are-doing-a-hazy-quokka.md`.)
+1. **Glass-corner blacklist bugs (do FIRST).** At a glass/collider wall the drone chases an unreachable
+   far corner forever. **Bug A:** the verify/reposition target (`farthest_free`) bypasses the blacklist
+   — `select()` never `_excluded()`-checks it, so "blacklisting" it is a no-op and the goal never
+   changes. **Bug B:** the 2-bump latch can't re-arm at a clearance stand-off (never reverses / never
+   moves > `goal_reach_dist`), so standoff contacts stay MISSED and the counter never reaches 2.
+2. **Part 3 — per-goal `CALIBRATING_HEIGHT`** (getting urgent). Re-tap the ceiling + re-null
+   `target_altitude_y` ONLY on a genuine goal change at REPLAN (not PLAN-LOST); reuse ASCEND/DESCEND
+   via a `_post_ascend` return field; gate with `calibrate_on_goal_change`.
 
 ---
 
 ## Session log (newest first)
+
+### Session 6 (2026-07-08) — blacklist/telemetry observability + self-calibrating ram guard
+We couldn't tell WHY goals were being blacklisted. We added per-bump logging (PLANNER / MISSED-BUMP +
+a live 2-bump counter in the replay timeline) and a per-frame raw-telemetry panel to `flight_replay`
+(SLAM x/y/z, yaw, the literal command dict sent to the sim, Δpos, dist-to-goal, plan status). The logs
+proved the blacklists were FALSE: the ram guard demanded the drone close ~0.05 u/s toward the goal, but
+the drone crawls at ~0.02–0.04 u/s, so in OPEN space (clear ahead, healthy SLAM) it kept firing
+"invisible collider" and two such false stops retired a reachable goal. **Fix — self-calibrating ram
+guard:** measure the drone's OWN nominal free-flight speed live (1 s into the first ADVANCE, sampled
+≤5 s or until a SLAM event), then fire only when the live windowed speed drops below 33 % of nominal.
+Re-flew: no ram-guard false positives. Deferred: the glass-corner blacklist bugs + Part 3 height
+calibration (see the plan file).
 
 ### Session 5 (2026-07-07) — dropped depth-map height logic; two-phase gentle ceiling ascent
 Because the sim can't physically crash, we removed all depth-based height keeping and freed the GPU
@@ -162,8 +168,10 @@ multi-target estimate. Offline E2E confirmed.
   goal = frontier planner pick; `plan_valid=false` when SLAM not TRACKING.
 - `ExploreController`: **ARM → TAKEOFF → ASCEND (two-phase) → DESCEND → BASELINE_NUDGE →** leg loop
   **REPLAN → ORIENT (open-loop ≤45° turn) → ADVANCE (forward until the clearance stand-off / flow
-  WALL) → SETTLE**; control-space **recovery** on SLAM loss; **STUCK** hold; event-driven 2-bump
-  blacklist for unreachable goals.
+  WALL / self-calibrating ram guard) → SETTLE**; control-space **recovery** on SLAM loss; **STUCK**
+  hold; event-driven 2-bump blacklist for unreachable goals. **Ram guard is self-calibrating**: fires
+  only when live world speed drops below 33 % of the drone's own nominal free-flight speed (measured
+  live 1 s into the first ADVANCE) — no absolute threshold, so it no longer false-fires on the crawl.
 - `flight_playbook.json` + `RecipePlayer` — control recipes as data (the tunable durations).
 
 ---
@@ -221,5 +229,6 @@ reverse ARE continuous 0–1. The only Unity telemetry back is `time` — everyt
 ## Milestones
 Phase 1: models on GPU ✅ · io_bridge + bus ✅ · SLAM + map + dashboard ✅ · target cascade + 3D
 localize ✅. Phase 2: mission runner flew live ✅ · Map-mode explorer flies (SLAM-safe turns,
-clearance stand-off, control-space recovery, event-driven 2-bump blacklist) ✅ · depth removed +
-two-phase ascent built, awaiting re-fly. Deferred: per-goal height calibration, Scan mode, GUI.
+clearance stand-off, control-space recovery, event-driven 2-bump blacklist, two-phase ascent,
+self-calibrating ram guard) ✅ · rich flight-replay debugger ✅. Deferred: glass-corner blacklist
+bugs, per-goal height calibration, Scan mode, GUI.
