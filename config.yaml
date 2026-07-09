@@ -118,21 +118,24 @@ autonomy:
     # map every replan — NOT a room answer. Publishes goal_clearance_ok=false (visible) if no FREE buffered
     # cell exists on the segment (NO SILENT FALLBACK: it commits the raw goal but flags it).
     goal_clearance_buffer: 0.2
-    verify_pull_frac: 0.25       # cache the verify/reposition corner pulled this FRACTION back toward the drone
-                                 #   (proportional to the LIVE drone->corner distance -> a vantage off tight corner
-                                 #   walls; self-calibrating, NOT a room answer). Composes with reposition_inset.
-    # --- done verification / reposition: fly ONCE to the farthest known free corner -- to re-scan for
-    #     uncharted territory before declaring done AND to relocate to a fresh vantage when every goal is
-    #     blacklisted (on arrival the round's soft blacklist clears so goals get one retry). The corner is
-    #     cached ONCE as a static target -> no oscillation. ---
-    verify_done: true            # enable the farthest-corner verification / reposition trip
-    verify_min_dist: 0.6         # skip the trip (declare done) if the farthest free corner is already within this
-    reposition_inset: 1.2        # pull the far-corner target inward by this (SLAM units) so it is REACHABLE
-                                 #   (general stand-off scale, NOT a room answer). MUST sit in the reachable band
-                                 #   stop_clearance_dist <= inset <= stop_clearance_dist + goal_reach_dist (with
+    # --- done verification / reposition via DIAGONAL SWEEP: when NO frontier is reachable, fly ONCE to the
+    #     opposite corner of the known bounding box (ground_grid.sweep_corner) -- a deterministic full-room
+    #     traverse that re-scans for uncharted territory before declaring done AND relocates to a fresh
+    #     vantage when every goal is blacklisted (on arrival the round's soft blacklist clears so goals get
+    #     one retry). The corner is cached ONCE as a static target -> no oscillation. Replaces the old
+    #     fragile farthest-free / verify_min_dist "too near" gate that could silently return no goal. ---
+    verify_done: true            # enable the diagonal-sweep done-verification / reposition trip
+    reposition_inset: 1.2        # inset the sweep corner inward from the bbox edge by this (SLAM units) so it is
+                                 #   REACHABLE (general stand-off scale, NOT a room answer). MUST sit in the reachable
+                                 #   band stop_clearance_dist <= inset <= stop_clearance_dist + goal_reach_dist (with
                                  #   session-8 values [1.00, 2.00]): below it, the drone hits its wall stand-off
                                  #   before reaching the target; above it, the target is short of the corner.
-                                 #   Perception clamps + warns.
+                                 #   Perception clamps + warns. A bbox axis narrower than 2*inset targets that
+                                 #   axis's midpoint instead (ground_grid.sweep_corner), so corridors don't overshoot.
+    no_goal_idle_s: 12.0         # REPLAN idle backstop: if the planner returns no goal AND not done for longer than
+                                 #   this (only a startup transient with the sweep planner), raise a VISIBLE log +
+                                 #   telemetry flag instead of idling dark forever (NO SILENT FALLBACK). General
+                                 #   robustness timeout, NOT a room answer.
     # --- forward clearance (raycast stand-off; primary forward stop) ---
     # Perception casts a small FAN of ground-plane rays into the voxel map it built (along the LIVE
     # heading) and publishes the nearest hit distance as TOPIC_PLAN forward_clearance_dist; the autopilot
@@ -171,6 +174,15 @@ autonomy:
     # (parallax) BEFORE the first exploration yaw (pure rotation is the SLAM-killer). Reuses the parallax ring-pick.
     baseline_nudge_dist: 0.4     # translate this far to seed parallax (SLAM units)
     baseline_nudge_max_s: 2.0    # SAFETY time cap on the baseline nudge
+    # Per-goal HEIGHT RE-CALIBRATION (item 1): on a GENUINE goal change, re-run the two-phase ascend->descend
+    # to re-tap the ceiling and re-latch the mapping altitude (undoing per-leg downward drift). All GENERAL /
+    # LIVE-relative params (the low-object test is vs the LIVE running median of taps) -> no room-answer leak.
+    calibrate_on_goal_change: true   # enable CALIBRATING_HEIGHT on a genuine goal change (needs ascend_to_ceiling)
+    calib_cooldown_s: 60.0           # min seconds between ceiling taps (also skips the first post-prelude goal)
+    calib_goal_change_dist: 1.0      # the goal must move MORE than this (SLAM units) to trigger a re-tap
+    calib_low_object_margin: 0.3     # a tap this far BELOW the live median ceiling (+Y DOWN => larger pos_y) = a low object
+    calib_min_taps_for_median: 2     # need >= this many accepted taps before the low-object median gates
+    calib_max_retries: 2             # forward-nudge + re-ascend attempts per calibration before accepting a low tap (logged)
     # --- executor (autopilot run_explore) ---
     # The engine is a "fly toward your aim" scheme: yaw moves an aim crosshair, forward thrust flies
     # toward it, and a sustained yaw HOLD (then 'c' reset) rotates the body. A turn's ANGLE = how long

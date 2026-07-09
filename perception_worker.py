@@ -162,7 +162,7 @@ class Pipeline:
         self._last_clearance = None       # last published forward_clearance_dist (for the report line)
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
-        self._verify_logged = False      # one-shot log when the planner enters done-verification
+        self._sweep_logged = False       # one-shot log when the planner enters the diagonal-sweep done-check
         self.last_planner_event = None   # transient bump-outcome summary set by run()'s bump drain; ride ONE plan
 
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
@@ -365,35 +365,32 @@ class Pipeline:
                     bd, best = diff, dd
             return best
         self._last_ring_fb = (_ring_fb(0.0), _ring_fb(180.0))
-        # Goal selection + done verification. `farthest_free` (the reposition target) is needed whenever
-        # NOTHING is reachable — no frontiers at all OR every live frontier blacklisted (the glass-loop
-        # escape). Flying to the far corner moves the drone to a fresh vantage; on arrival the planner
-        # clears the round's soft blacklist so those goals get one retry from there. Pulled inward
-        # (`reposition_inset`) to be reachable.
+        # Goal selection + diagonal-sweep done verification. `sweep_corner` (the opposite-corner traverse
+        # target) is needed whenever NOTHING is reachable — no frontiers at all OR every live frontier
+        # blacklisted (the glass-loop escape). Flying the diagonal crosses the room to a fresh vantage; on
+        # arrival the planner clears the round's soft blacklist so those goals get one retry. Inset from the
+        # bbox edge by `reposition_inset` so the corner stays reachable inside the forward stand-off shell.
         fr = self.ground.frontiers()
-        # Compute it on EVERY not-reachable tick (not just the verify transition): when the 2-bump rule
-        # blacklists the corner we're verifying toward, `select` escapes it and must have a FRESH,
-        # blacklist-aware corner in hand that same tick — else it would prematurely declare done. `select`
-        # still caches the target ONCE, so the corner stays STATIC during verify despite recomputing here.
-        # `exclude` makes `farthest_free` skip dead-goal regions so the escape lands on a NEW corner (Bug A).
+        # Compute it on EVERY not-reachable tick (not just the transition): when the 2-bump rule blacklists
+        # the corner we're sweeping toward, `select` escapes it and needs a corner in hand that same tick.
+        # `select` still caches the target ONCE, so it stays STATIC during the sweep despite recomputing here.
         reachable = self.planner.any_reachable(fr)
-        farthest = (self.ground.farthest_free(np.asarray(pos, dtype=np.float64),
-                                              margin=self.reposition_inset, exclude=self.planner.is_excluded)
-                    if not reachable else None)
+        sweep = (self.ground.sweep_corner(np.asarray(pos, dtype=np.float64), inset=self.reposition_inset)
+                 if not reachable else None)
         # Goal selection (blacklisting is event-driven via note_wall_hit in run(), NOT a per-select timer).
-        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, farthest)
+        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, sweep)
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()
         payload["blacklist_permanent"] = self.planner.blacklist_permanent()
         payload["goal_clearance_ok"] = bool(self.planner.clearance_ok)   # visible flag: clearance inset succeeded
-        if self.planner.verifying and not self._verify_logged:
-            print(f"[perception] planner: no frontiers -> VERIFYING via far corner {self.planner.verify_target}",
+        if self.planner.sweeping and not self._sweep_logged:
+            print(f"[perception] planner: no reachable frontier -> SWEEPING to corner {self.planner.sweep_target}",
                   flush=True)
-            self._verify_logged = True
-        elif not self.planner.verifying and self._verify_logged:
-            print(f"[perception] planner: verification {'COMPLETE -> done' if done else 'cleared -> frontiers found'}",
+            self._sweep_logged = True
+        elif not self.planner.sweeping and self._sweep_logged:
+            print(f"[perception] planner: sweep {'COMPLETE -> done' if done else 'cleared -> frontiers found'}",
                   flush=True)
-            self._verify_logged = False
+            self._sweep_logged = False
         payload["n_frontiers"], payload["done"] = n_frontiers, done
         if goal is not None:
             payload["goal"] = [round(float(goal[0]), 4), round(float(goal[1]), 4)]

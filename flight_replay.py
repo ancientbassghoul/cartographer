@@ -115,6 +115,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #events .plan { color: #c58bff; }          /* planner bump outcome (count / reset) */
   #events .plan.bl { color: #ff5b5b; font-weight: bold; }  /* the blacklist decision */
   #events .miss { color: #e0a020; }          /* a real contact that emitted no bump */
+  #events .slam { color: #2fd4d4; }          /* SLAM_TRACKER: per-pose accept (dx/dy/dYaw + latency) */
   .legend { font-size: 11px; color: #999; padding: 6px 10px; border-bottom: 1px solid #333; }
   .sw { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: middle; }
 </style>
@@ -158,9 +159,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 const RECORDS = __DATA__;
 const SLAM_SLOW_MS = __SLAM_SLOW_MS__;
 
-// Split records into step records (the timeline) and map records (occupancy snapshots).
-const STEPS = RECORDS.filter(r => r.state !== undefined);
-const MAPS  = RECORDS.filter(r => r.map !== undefined);
+// Split records into step records (the timeline), map records (occupancy snapshots), and SLAM_TRACKER
+// per-pose accepts (ev_kind:"slam") — the latter interleave into the event log by t_mono, coloured teal.
+const STEPS  = RECORDS.filter(r => r.state !== undefined);
+const MAPS   = RECORDS.filter(r => r.map !== undefined);
+const SLAMEV = RECORDS.filter(r => r.ev_kind === 'slam');   // chronological (written in order)
 
 // ---- static world extent (fit once so scrubbing never jumps the view) ----
 function computeExtent() {
@@ -328,17 +331,25 @@ function updatePanel(idx) {
   // event log up to the cursor: state events + the planner's bump outcomes (PLANNER) + un-counted
   // contacts (MISSED-BUMP), so the blacklist mechanism the flight log used to hide is now visible.
   const ev = document.getElementById('events');
-  let html = '';
+  const tCur = STEPS[idx] ? STEPS[idx].t_mono : Infinity;
+  const entries = [];
   for (let i = 0; i <= idx; i++) {
     const st = STEPS[i], cls = (i === idx) ? 'cur' : 'old', tw = st.t_wall || '';
-    if (st.event) html += `<div class="ev ${cls}">${tw} ${st.state}: ${st.event}</div>`;
+    if (st.event) entries.push({t: st.t_mono, html: `<div class="ev ${cls}">${tw} ${st.state}: ${st.event}</div>`});
     if (st.planner_event) {
       const bl = /BLACKLIST/.test(st.planner_event) ? ' bl' : '';
-      html += `<div class="ev ${cls} plan${bl}">${tw} PLANNER: ${st.planner_event}</div>`;
+      entries.push({t: st.t_mono, html: `<div class="ev ${cls} plan${bl}">${tw} PLANNER: ${st.planner_event}</div>`});
     }
-    if (st.missed_bump) html += `<div class="ev ${cls} miss">${tw} MISSED-BUMP: ${st.missed_bump}</div>`;
+    if (st.missed_bump) entries.push({t: st.t_mono, html: `<div class="ev ${cls} miss">${tw} MISSED-BUMP: ${st.missed_bump}</div>`});
   }
-  ev.innerHTML = html;
+  // Interleave SLAM_TRACKER accepts up to the cursor time (teal), so the ~2 Hz pose ticks sit between
+  // the state events chronologically instead of scrolling past in the terminal.
+  for (const sv of SLAMEV) {
+    if (sv.t_mono > tCur) break;
+    entries.push({t: sv.t_mono, html: `<div class="ev slam">${sv.t_wall || ''} ${sv.slam}</div>`});
+  }
+  entries.sort((a, b) => a.t - b.t);
+  ev.innerHTML = entries.map(e => e.html).join('');
   ev.scrollTop = ev.scrollHeight;
 }
 
@@ -469,6 +480,9 @@ def _self_test():
          "plan_goal": [2.5, 0.5], "dist_to_goal": 0.99, "plan_age_s": 0.2, "frame_id": 5,
          "goals": [{"xz": [1.0, 1.0], "state": "active"}, {"xz": [2.5, 0.5], "state": "plan_pick"}],
          "cmd": {"trigger": 0.2}, "speed": 0.42, "nominal_speed": 0.45},
+        {"t_wall": "00:00:01.500", "t_mono": 1.5, "ev_kind": "slam", "frame_id": 6, "slam_ms": 700.0,
+         "slam": "[SLAM_TRACKER] Pose update accepted (dx: +0.10m, dy: +0.03m, dYaw: -0.3°) "
+                 "[TRACKING] - SLAM Latency: 700ms (build 500ms)"},
         {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
          "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
          "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "goal": [1.0, 1.0],
@@ -521,6 +535,12 @@ def _self_test():
         c5 = ("2200" in html and "drawSlam" in html and "drawGoals" in html and "<canvas id=\"scene\"" in html)
         print(f"[self-test] {'PASS' if c5 else 'FAIL'}  HTML carries slam spike + scene/goal/slam draw code")
         ok = ok and c5
+
+        # SLAM_TRACKER ev_kind:"slam" records are carried + the teal interleave render path is present
+        n_slam = sum(1 for r in embedded if r.get("ev_kind") == "slam")
+        c_slam = (n_slam == 1 and "SLAM_TRACKER" in html and "SLAMEV" in html and "#events .slam" in html)
+        print(f"[self-test] {'PASS' if c_slam else 'FAIL'}  SLAM_TRACKER record carried ({n_slam}) + teal event-log render path present")
+        ok = ok and c_slam
 
         # the new blacklist-observability fields survived + the render code that surfaces them is present
         by_frame = {r.get("rec_frame"): r for r in embedded if "state" in r}

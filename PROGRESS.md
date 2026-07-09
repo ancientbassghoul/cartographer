@@ -1,7 +1,10 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-09** (session 9 — planning). Resume from THIS file. Next build:
-`plans/replan-deadstall-sweep-and-slam-tracker.md` (item 2)._
+_Last updated **2026-07-09** (session 9 build + session-10 planning). Resume from THIS file. Session-9
+items (diagonal sweep, SLAM_TRACKER→HTML, height re-calib) BUILT and **flew OK** (`20260709_091706`,
+recoveries fine). **Next build = APPROVED plan `plans/all-corners-sweep-and-slam-parallax.md`**:
+all-corners verification tour + post-mission floor-dock postlude. (Two ideas deferred there: SLAM-loss
+investigation, parallax-strafe on turns.)_
 
 **Status:** Phase-1 (manual map + target localization) done & hardware-verified. Phase-2 autonomous
 **Map-mode explorer** (`autopilot.py --explore`) flies live — clean session-8 flight
@@ -18,30 +21,45 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_Session-8 work is DONE + flight-confirmed (`20260708_195009`) — see the Documentation session-8 entry.
-Two items remain, both designed, neither built:_
+_**NEXT BUILD (session 10, APPROVED) → `plans/all-corners-sweep-and-slam-parallax.md`:** (A) expand
+done-verification into an ALL-CORNERS tour (opposite → farthest-unvisited → last; corners ignore the
+frontier blacklist, retired only by reach or a fresh 2-bump), and (B) a post-mission floor-dock postlude
+`RETURN_TO_ORIGIN → DOCK_FLOOR (gentle PULSED descent) → LOW_STANDOFF → DONE` (adds a new FLOOR flow
+detector). Motivated by `DEBUG_IMAGES/mission_complete__mapping_so_so.png` (off-path corners reconstruct
+weakly). Deferred there: SLAM-loss investigation + a parallax-strafe on turns._
 
-- **Item 2 — kill the REPLAN dead-stall** — DESIGNED (session 9), NOT built. Full plan:
-  **`plans/replan-deadstall-sweep-and-slam-tracker.md`**. Diagnosed on `20260708_195009`: the planner
-  returned `goal=None && !done` and the controller idled forever (`autopilot.py:1401-1403`) — the
-  done-verification stage silently never fired (the `farthest_free`/`verify_min_dist` "too near" gate
-  failed). Fix: replace the fragile verify with a deterministic **bounding-box diagonal sweep** (fly to
-  the opposite corner, inset 1 u/axis with per-axis midpoint-clamp on narrow axes; new
-  `ground_grid.sweep_corner`) that either surfaces new frontiers en route or declares a visible **DONE**
-  (just print it — no Phase-3 handoff yet). Same plan also **moves `[SLAM_TRACKER]` out of the terminal
-  into the replay HTML** (teal, distinct color). Operator note: room is only *mildly* mapped — deep
-  interior coverage is the Part-3 next-phase idea below, not this fix.
-- **Item 1 — per-replan height recalibration (`CALIBRATING_HEIGHT`).** 60 s cooldown from the last
-  calibration; keep running altitude statistics; reject a calibration that taps a low ceiling object
-  (new `pos_y` well below the live median) → nudge forward and retry. Design in
-  `plans/glass-corner-blacklist-and-height-calib.md` (extended with the session-8 asks).
+_Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
+
+- **Item 2 — REPLAN dead-stall → diagonal sweep — BUILT (session 9), flew OK.**
+  Plan: **`plans/replan-deadstall-sweep-and-slam-tracker.md`**. Diagnosed on `20260708_195009`: the
+  planner returned `goal=None && !done` and the controller idled forever — the done-verification stage
+  silently never fired (the `farthest_free`/`verify_min_dist` "too near" gate failed). Fix (built):
+  deterministic **bounding-box diagonal sweep** — `ground_grid.sweep_corner` (opposite corner, inset per
+  axis with midpoint-clamp on narrow axes), `frontier_planner.select` reworked to sweep semantics
+  (`sweeping`/`sweep_target`; never a `goal=None/!done` resting state), perception passes the sweep
+  corner, and the autopilot gained a fail-visible bounded-idle backstop + a one-shot **EXPLORE COMPLETE**
+  DONE log. Also **moved `[SLAM_TRACKER]` from the terminal into the replay HTML** (teal `ev_kind:"slam"`
+  records). Operator note: room is only *mildly* mapped — deep interior coverage is the Part-3 next-phase
+  idea below, not this fix.
+- **Item 1 — per-replan height recalibration (`CALIBRATING_HEIGHT`) — BUILT (session 9), flew OK after two
+  live fixes.** Fires on a genuine goal change (moved > `calib_goal_change_dist`) gated by a 60 s cooldown
+  (also skips the first post-prelude goal); re-runs the two-phase ascend→descend, then orients to the same
+  goal. Keeps a LIVE running median of ceiling taps and rejects a low-object tap (`pos_y` well below the
+  median, +Y DOWN) → `CALIB_NUDGE` forward + re-ascend (bounded). **Two bugs found + fixed in live test:**
+  (1) a spent `_player` from the interrupted leg leaked into DESCEND (guard `if _player is None` skipped
+  the down-push) → `CALIBRATING_HEIGHT` now clears `_player` on entry, like the prelude's TAKEOFF; (2)
+  re-latching `target_altitude_y` right after the re-tap pegged the hold target AT the ceiling (descend
+  momentum hadn't dropped the drone yet) so the altitude lock fought it back UP → "glued to ceiling" — the
+  re-latch was REMOVED (the re-tap resets the physical altitude; the prelude target stays valid). See
+  `plans/glass-corner-blacklist-and-height-calib.md`.
 
 ---
 
 ## Future (backlog)
 - **REPLAN dead-stall (item 2)** — no infinite idle when the planner returns no goal. Designed:
   `plans/replan-deadstall-sweep-and-slam-tracker.md` (bbox diagonal sweep + SLAM_TRACKER → replay HTML).
-- **Per-goal height calibration (item 1)** — `plans/glass-corner-blacklist-and-height-calib.md`.
+- **Per-goal height calibration (item 1)** — BUILT session 9, live-fly pending
+  (`plans/glass-corner-blacklist-and-height-calib.md`).
 - **Glass-corner blacklist escape (Bug A+B)** — built session 7, still needs a clean live confirm.
 - **Phase-2b — dense low-altitude interior mapping, then detection.** Operator idea: map the inner
   room near ground level so the target can be found there later. Recommendation (see item-2 plan
@@ -55,6 +73,28 @@ Two items remain, both designed, neither built:_
 ---
 
 ## Documentation (what we tried)
+
+### Session 9 (2026-07-09) — killed the REPLAN dead-stall with a bbox diagonal sweep; SLAM_TRACKER → replay HTML  [built; self-test-green; live-fly pending]
+The clean session-8 flight still ended "doing nothing in a loop": the planner returned
+`goal=None, done=False` and the controller idled in REPLAN until SLAM drifted → HOLD_LOST. Root cause —
+the done-**verification** stage EXISTED but was silently bypassed: it only started when a fragile gate
+passed (`farthest_free` non-None, not excluded, **> verify_min_dist**), and when that gate failed
+`select()` fell through to a silent `return None, False` idle. So we replaced the whole fragile path with
+the operator's idea: a deterministic **diagonal sweep** — take the known bbox, fly to the corner
+OPPOSITE the one nearest the drone, inset ~1 u so it's reachable; if the traverse surfaces new frontiers
+resume exploring, else declare a visible **DONE**. Built as `ground_grid.sweep_corner` (per-axis inset
+with a **midpoint clamp** on axes narrower than 2·inset, so a corridor never overshoots its short axis
+out of bounds), a reworked `frontier_planner.select` (`sweeping`/`sweep_target`; guarantees it never
+rests on `goal=None/!done`), perception passing the corner, and an autopilot fail-visible **bounded-idle
+backstop** (`no_goal_idle_s`) + one-shot EXPLORE-COMPLETE log. Separately, per the operator's ask, the
+`[SLAM_TRACKER]` per-pose stream was **moved out of the terminal into the replay HTML** (teal
+`ev_kind:"slam"` records, interleaved by time). Also built **item 1 — per-goal height re-calibration**
+(`CALIBRATING_HEIGHT`): on a genuine goal change (past a 60 s cooldown) the drone re-taps the ceiling
+(reusing the two-phase ascend→descend), re-latches `target_altitude_y`, then orients to the goal; a tap
+well below the LIVE running median of taps is a low object → nudge forward + re-ascend (bounded). All
+offline self-tests green (planner/ground_grid/autopilot/flight_replay). **Lesson: a "verify then done"
+stage guarded by a fragile distance gate can silently choose to do NOTHING — make the terminal branch
+deterministic (a goal or a flagged done), never a bare no-op.**
 
 ### Session 8 (2026-07-08) — "turns are broken" was a logging lie; made the flight log trustworthy
 First flight (`20260708_135719`): the heading changed ~0° during every ORIENT turn, and travel bearing
@@ -181,13 +221,11 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   4's **event-driven 2-bump** rule finally holds.
 
 ### Open issues
-- **REPLAN dead-stall (item 2, NOT fixed — DESIGNED session 9).** When the planner returns
-  `goal=None && !done`, the controller idles in REPLAN forever (`autopilot.py:1401-1403`) — re-seen on
-  the clean `20260708_195009` flight (planner ran out of reachable frontiers; the done-verification
-  gate silently never fired). Fix designed in `plans/replan-deadstall-sweep-and-slam-tracker.md`:
-  bounding-box diagonal sweep → visible DONE, plus a fail-visible bounded-idle backstop. (Turns
-  themselves are fine — see session 8.) The older "heading decided only at REPLAN, no mid-leg re-aim"
-  is a separate, milder concern.
+- **REPLAN dead-stall (item 2) — FIXED in code (session 9), live-fly pending.** Was: `goal=None && !done`
+  idled REPLAN forever. Now a bbox **diagonal sweep** always yields a goal or a visible DONE, with a
+  fail-visible bounded-idle backstop (`plans/replan-deadstall-sweep-and-slam-tracker.md`). Needs a live
+  flight to confirm the sweep traverses and terminates as intended. (Turns are fine — session 8.) The
+  older "heading decided only at REPLAN, no mid-leg re-aim" is a separate, milder concern.
 - **Deferred:** Scan mode; a glass-window altitude descend-probe; Phase-3 report polish + GUI.
 
 ---
@@ -293,5 +331,8 @@ self-calibrating ram guard) ✅ · rich flight-replay debugger ✅ · glass-corn
 A+B) + frontier clearance buffer 🛠️ built, flew in the session-8 flights. **Session 8: confirmed turns
 work (the "no-op" was a stale-heading logging artifact) + made the flight log trustworthy (committed goal
 + data staleness) + `[SLAM_TRACKER]` telemetry + reach/clearance/SLAM-settle eases + a plan-lost grey
-marker; a clean flight (`20260708_195009`) followed. REPLAN stall fix (item 2) and per-goal height
-calibration (item 1) queued.**
+marker; a clean flight (`20260708_195009`) followed.** **Session 9: killed the REPLAN dead-stall with a
+bbox diagonal sweep (`ground_grid.sweep_corner` + reworked `frontier_planner.select` + autopilot
+bounded-idle backstop + visible EXPLORE-COMPLETE DONE), moved `[SLAM_TRACKER]` into the replay HTML
+(teal), and built per-goal height re-calibration (item 1 — `CALIBRATING_HEIGHT` on a goal change, low-
+object-tap reject) 🛠️ all built, self-test-green, live-fly pending.**

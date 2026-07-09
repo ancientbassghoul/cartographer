@@ -39,7 +39,19 @@ on a standoff-stop event rather than only on reverse/displacement.
 
 ---
 
-## 2. Part 3 — per-goal `CALIBRATING_HEIGHT` (semi-planned, getting urgent)
+## 2. Part 3 — per-goal `CALIBRATING_HEIGHT`  [BUILT session 9, self-test-green, live-fly pending]
+
+**Built as designed + the session-8 asks:** a `CALIBRATING_HEIGHT` state fires from REPLAN on a genuine
+goal change (`dist(leg_goal, _leg_goal_prev) > calib_goal_change_dist`) gated by a `calib_cooldown_s`
+(60 s, which also skips the first post-prelude goal). It re-runs the two-phase `ASCEND→DESCEND`, then
+DESCEND (when `_recalibrating`) nulls `target_altitude_y` and routes to `REPLAN`, which orients to the
+same committed goal (no re-trigger: same goal + fresh cooldown). Ceiling taps feed a LIVE running median
+(`_ceiling_taps`); a tap well BELOW it (`+Y DOWN` ⇒ larger `pos_y`, `> calib_low_object_margin`) is a LOW
+OBJECT → `CALIB_NUDGE` (forward push) → re-ascend, bounded by `calib_max_retries` (then accept with a
+visible WARN). Config under `autonomy.explore` (`calibrate_on_goal_change`, `calib_*`). Self-tested
+(routing + cooldown gate + low-object→nudge + median unit). ORIGINAL design notes below.
+
+
 
 Add a `CALIBRATING_HEIGHT` state triggered **only** when the frontier goal genuinely changes
 (`dist(leg_goal, _leg_goal_prev) > goal_assoc_dist` at REPLAN; the first post-prelude goal does NOT

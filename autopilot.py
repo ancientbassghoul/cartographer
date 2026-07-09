@@ -734,6 +734,22 @@ class ExploreController:
         self.ascend_gain_eps = float(e.get("ascend_gain_eps", 0.05))           # per-cycle altitude-gain noise floor (SLAM units)
         self.ascend_stall_cycles = int(e.get("ascend_stall_cycles", 2))        # consecutive flat cycles that confirm the ceiling
         self.ascend_latch_hold_s = float(e.get("ascend_latch_hold_s", 2.0))    # Phase-2 continuous hold (> detector arm_blank + contact window)
+        # Per-goal height re-calibration (CALIBRATING_HEIGHT, item 1): on a GENUINE goal change, re-run the
+        # two-phase ascend->descend to re-tap the ceiling and re-latch target_altitude_y (undoing per-leg
+        # downward drift). Gated: only when the goal moved > calib_goal_change_dist AND >= calib_cooldown_s
+        # since the last tap (so the first post-prelude goal + rapid re-plans don't re-tap). A tapped ceiling
+        # whose pos_y is well BELOW (spatially; +Y DOWN so a LARGER pos_y) the LIVE running median of accepted
+        # taps is a LOW OBJECT (a beam/light) -> nudge forward + re-ascend (bounded). All GENERAL params /
+        # LIVE-relative thresholds (the low-object test is vs the live median, self-calibrating) -> no room leak.
+        self.calibrate_on_goal_change = bool(e.get("calibrate_on_goal_change", True))
+        self.calib_cooldown_s = float(e.get("calib_cooldown_s", 60.0))          # min seconds between ceiling taps
+        self.calib_goal_change_dist = float(e.get("calib_goal_change_dist", 1.0))  # goal must move > this to re-calibrate
+        self.calib_low_object_margin = float(e.get("calib_low_object_margin", 0.3))  # tap this far below the live median -> low object
+        self.calib_min_taps_for_median = int(e.get("calib_min_taps_for_median", 2))  # need >= this many taps before the median gates
+        self.calib_max_retries = int(e.get("calib_max_retries", 2))            # nudge-forward re-ascend attempts per calibration
+        self._last_calib_t = None            # 'now' of the last ceiling tap (cooldown gauge); FLIGHT-level (persists)
+        self._leg_goal_prev = None           # last goal committed for ORIENT/calibration (goal-change gauge; persists)
+        self._ceiling_taps = collections.deque(maxlen=20)  # accepted tap pos_y -> LIVE running median (persists)
         # Ram guard: "pushing forward but the SLAM pos isn't advancing toward the goal" = riding an unmapped
         # (invisible) collider. The forward-clearance ray can't see it (None when SLAM flickers; it also rises
         # with the drone as it climbs the wall) and the flow WALL needs a looming COLLAPSE that never comes on a
@@ -782,6 +798,15 @@ class ExploreController:
         self._push_dir = None                # "forward" | "backward" for the active PARALLAX_PUSH
         self._push_start_pos = None          # SLAM pos at the start of the current push (distance gauge)
         self._after_orient = "ADVANCE"       # where ORIENT routes after the turn: ADVANCE (aimed) | PARALLAX_PUSH
+        # REPLAN idle backstop: with the diagonal-sweep planner a goal=None/!done plan is only a momentary
+        # startup tick before the first frontiers form. If it ever PERSISTS past this window, raise a
+        # visible log + telemetry flag (`no_goal_stall`) instead of idling dark forever (NO SILENT FALLBACK).
+        # A general robustness timeout (long enough to cover normal frontier formation), NOT a room answer.
+        self.no_goal_idle_s = float(e.get("no_goal_idle_s", 12.0))
+        self.no_goal_stall = False           # telemetry: True once the backstop fired (visible degraded flag)
+        self._no_goal_since = None           # 'now' when the current goal=None/!done idle began, else None
+        self._no_goal_warned = False         # one-shot guard for the backstop warning
+        self._done_logged = False            # one-shot guard for the EXPLORE COMPLETE annunciation
         _tr = self.pb.recipe("turn_right")
         _hold = next(s for s in _tr if "yaw" in s)                    # the yaw-hold step = the actual turn
         _creset = next((s for s in _tr if s.get("btnCdown")), None)   # the 'c' aim-reset step
@@ -841,12 +866,37 @@ class ExploreController:
         # have been moved by hand, so the recorded maneuvers no longer map to the trajectory. Drop it.
         self.command_history.clear()
         self.done = False
+        self.no_goal_stall = False
+        self._no_goal_since = None
+        self._no_goal_warned = False
+        self._done_logged = False
+        # Height re-calibration is per-attempt: an interruption abandons an in-progress re-tap (the flight-
+        # level cooldown/median/prev-goal PERSIST — they live in __init__, not here).
+        self._recalibrating = False
+        self._calib_retries = 0
+        self._last_low_delta = 0.0
 
     def _quantize_turn(self, be):
         """Quantize a bearing error (deg) to the nearest whole `turn_step_deg` aim change (signed)."""
         if be is None:
             return 0.0
         return round(be / self.turn_step_deg) * self.turn_step_deg
+
+    def _is_low_object_tap(self, y):
+        """True if a ceiling tap at pos_y `y` sits WELL BELOW the LIVE running median of accepted taps —
+        i.e. the drone tapped a low object (beam/light) rather than the true ceiling. World frame is +Y
+        DOWN, so 'spatially below' = a LARGER pos_y; reject when `y - median > calib_low_object_margin`.
+        Uses the LIVE median (self-calibrating, NOT a baked ceiling height); needs
+        `calib_min_taps_for_median` accepted taps first, else accept (no basis to reject). Stashes the
+        signed deviation in `_last_low_delta` for the log."""
+        self._last_low_delta = 0.0
+        if y is None or len(self._ceiling_taps) < self.calib_min_taps_for_median:
+            return False
+        s = sorted(self._ceiling_taps)
+        n = len(s)
+        med = s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+        self._last_low_delta = float(y) - med          # +Y DOWN: positive => spatially below the median
+        return self._last_low_delta > self.calib_low_object_margin
 
     def _turn_steps(self, theta):
         """Recipe steps for an OPEN-LOOP ~`theta` deg turn (sustained yaw hold scaled from the calibrated
@@ -1241,6 +1291,18 @@ class ExploreController:
                 self._enter("SETTLE", now)
                 event = "airborne -> settle -> " + ("ascend to ceiling" if self.ascend_to_ceiling else "explore")
 
+        elif st == "CALIBRATING_HEIGHT":
+            # Per-goal height re-calibration marker (item 1): re-run the SAME two-phase ASCEND->DESCEND to
+            # re-tap the ceiling + re-latch target_altitude_y; DESCEND then routes back to REPLAN (which
+            # orients to the already-committed goal). A distinct state so the re-tap is visible in the timeline.
+            # CLEAR the maneuver player (as the prelude's TAKEOFF does before ASCEND) — otherwise a spent
+            # player from the interrupted leg leaks into DESCEND, whose `if _player is None` guard then skips
+            # loading the descend recipe and the drone never pushes back down off the ceiling.
+            self._player = None
+            self._ascend_phase = None
+            self._enter("ASCEND", now)
+            event = "CALIBRATING_HEIGHT -> re-tap ceiling (two-phase ascent)"
+
         elif st == "ASCEND":
             # TWO-PHASE HYBRID ASCENT (gentle, SLAM-metered) — a long continuous climb builds too much
             # vertical momentum before the ceiling and smashes SLAM. Instead:
@@ -1258,6 +1320,7 @@ class ExploreController:
             if (now - self._ascend_start_t) > self.ascend_max_s:
                 # Safety cap: never found a ceiling latch. NO SILENT FALLBACK — log + go descend anyway.
                 self._ascend_phase = None
+                self._last_calib_t = now          # reset the re-calibration cooldown even without a clean tap
                 self._settle_to = "DESCEND"
                 self._enter("SETTLE", now)
                 event = f"ascend cap ({self.ascend_max_s}s, no ceiling latch) -> settle -> descend a bit"
@@ -1265,10 +1328,26 @@ class ExploreController:
                 active = dict(self.ascend_preset)          # continuous UP; flow CEILING detector is authoritative
                 y = plan.get("pos_y") if plan.get("plan_valid") else None
                 if ceiling_contact:
-                    self._ascend_phase = None
-                    self._settle_to = "DESCEND"
-                    self._enter("SETTLE", now)
-                    event = "CEILING latched (flush, low-velocity) -> settle -> descend a bit"
+                    reject = self._is_low_object_tap(y)
+                    if reject and self._calib_retries < self.calib_max_retries:
+                        # Tapped a LOW object (beam/light), not the true ceiling -> nudge forward past it and
+                        # re-ascend (bounded). Does NOT record the tap or reset the cooldown.
+                        self._calib_retries += 1
+                        self._ascend_phase = None
+                        self._push_start_pos = None
+                        self._enter("CALIB_NUDGE", now)
+                        event = (f"CEILING tap y={self._fmt(y)} sits {self._last_low_delta:+.2f} below the live "
+                                 f"median ceiling -> LOW OBJECT -> nudge forward + re-ascend "
+                                 f"(retry {self._calib_retries}/{self.calib_max_retries})")
+                    else:
+                        if y is not None:
+                            self._ceiling_taps.append(float(y))   # feed the LIVE running median
+                        self._last_calib_t = now
+                        self._ascend_phase = None
+                        self._settle_to = "DESCEND"
+                        self._enter("SETTLE", now)
+                        warn = " (accepted a LOW tap after max retries — VISIBLE WARN)" if reject else ""
+                        event = f"CEILING latched (flush, low-velocity){warn} -> settle -> descend a bit"
                 elif (y is not None and self._ascend_prev_y is not None
                       and (self._ascend_prev_y - y) > self.ascend_gain_eps):
                     # Still climbing during the hold -> the Phase-1 stall was spurious -> resume micro-pulses.
@@ -1278,6 +1357,7 @@ class ExploreController:
                 elif (now - self._ascend_phase_t0) >= self.ascend_latch_hold_s:
                     # Hold elapsed with no flow latch and no renewed climb -> demonstrably stalled at the top.
                     self._ascend_phase = None
+                    self._last_calib_t = now          # reset the re-calibration cooldown even without a clean tap
                     self._settle_to = "DESCEND"
                     self._enter("SETTLE", now)
                     event = "ascend LATCH hold elapsed, no flow latch (stalled at top) -> settle -> descend"
@@ -1307,6 +1387,26 @@ class ExploreController:
                         else:
                             self._ascend_phase, self._ascend_phase_t0 = "PULSE", now
 
+        elif st == "CALIB_NUDGE":
+            # A low-object ceiling tap: translate FORWARD a bounded distance to clear the hanging object,
+            # then re-ascend to seek the true ceiling. Guarded by forward clearance + a time cap (mirrors
+            # BASELINE_NUDGE). Boxed ahead / timed out -> re-ascend anyway (the retry cap bounds the loop).
+            ring = plan.get("clearance_ring")
+            if self._push_start_pos is None:
+                self._push_start_pos = plan.get("pos")
+            active = {"trigger": self.parallax_push_throttle}     # brisk forward push (decoupled from the ADVANCE crawl)
+            guard = self._ring_get(ring, 0.0)
+            traveled = self._dist(plan.get("pos"), self._push_start_pos)
+            far = traveled is not None and traveled >= self.baseline_nudge_dist
+            blocked = guard is not None and guard <= self.stop_clearance_dist
+            timeout = (now - self.t_state) >= self.baseline_nudge_max_s
+            if far or blocked or timeout:
+                why = "dist" if far else "blocked" if blocked else "timer"
+                self._push_start_pos = None
+                self._ascend_phase = None
+                self._enter("ASCEND", now)
+                event = f"calib nudge done ({why}) -> re-ascend for a higher (true) ceiling"
+
         elif st == "DESCEND":
             # Brief DOWN nudge (playbook "descend" recipe — tune its duration in flight_playbook.json)
             # so we sit a little below the ceiling while mapping.
@@ -1315,12 +1415,25 @@ class ExploreController:
             active, ddone = self._player.fields(now)
             if ddone:
                 self._player = None
-                # Seed a SLAM translational baseline (BASELINE_NUDGE) BEFORE the first exploration yaw,
-                # exactly once (prelude). A later interruption -> reset_leg -> REPLAN, never re-descends.
-                self._settle_to = "REPLAN" if self._baseline_seeded else "BASELINE_NUDGE"
-                self._enter("SETTLE", now)
-                event = ("dropped a bit -> settle -> explore" if self._baseline_seeded
-                         else "dropped a bit -> settle -> seed SLAM baseline")
+                if self._recalibrating:
+                    # Height re-calibration (item 1): back to explore, which orients to the already-committed
+                    # goal. The goal is unchanged + the cooldown just reset -> no immediate re-calibration.
+                    # Do NOT re-latch target_altitude_y here: the drone is still flush at the ceiling (the
+                    # descend momentum hasn't carried it down yet), so latching now would peg the hold target
+                    # AT the ceiling and the altitude lock would then fight the drone back UP into it (the
+                    # "glued to the ceiling" bug). The re-tap already resets the physical altitude via the
+                    # descend; the prelude-latched hold target stays valid (it never re-latches either).
+                    self._recalibrating = False
+                    self._settle_to = "REPLAN"
+                    self._enter("SETTLE", now)
+                    event = "height re-calibrated (re-tapped ceiling) -> settle -> replan (orient to goal)"
+                else:
+                    # Seed a SLAM translational baseline (BASELINE_NUDGE) BEFORE the first exploration yaw,
+                    # exactly once (prelude). A later interruption -> reset_leg -> REPLAN, never re-descends.
+                    self._settle_to = "REPLAN" if self._baseline_seeded else "BASELINE_NUDGE"
+                    self._enter("SETTLE", now)
+                    event = ("dropped a bit -> settle -> explore" if self._baseline_seeded
+                             else "dropped a bit -> settle -> seed SLAM baseline")
 
         elif st == "BASELINE_NUDGE":
             # One-shot open-loop horizontal translation after the ceiling tap, to give monocular SLAM the
@@ -1365,42 +1478,80 @@ class ExploreController:
 
         elif st == "REPLAN":
             self._explore_started = True          # past the prelude -> status-gated recovery is now armed
+            if plan.get("done") or plan.get("goal") is not None:
+                self._no_goal_since = None         # a live goal / done clears the idle backstop tracker
+                self._no_goal_warned = False
+                self.no_goal_stall = False
             if plan.get("done"):
                 self.done = True
                 self._enter("DONE", now)
-                event = "mission complete — no frontiers remain"
+                event = "mission complete — no reachable frontier remains"
             elif plan.get("goal") is not None:
                 self.leg_goal = list(plan["goal"])
-                self._ram_accum = 0.0             # fresh ram-guard stall tracking for this leg
-                self._ram_last_t = None
-                self._ram_speed_win.clear()      # a new leg breaks the speed run; window must not span the gap
-                self._ram_speed = None
-                self._finalize_or_discard_calib()  # a leg boundary ends a sampling run: accept if clean, else restart
-                be = plan.get("bearing_err")
-                theta = self._quantize_turn(be)
-                if self.clamp_leg_turn:
-                    # Cap to ONE turn_step (<=45 deg): SLAM survives a small open-loop turn (proven live);
-                    # the per-leg replan after each ADVANCE is the outer correction toward the goal.
-                    theta = max(-self.turn_step_deg, min(self.turn_step_deg, theta))
-                self._leg_theta = theta           # logged into command_history when the ORIENT turn is flown
-                # PARALLAX SCOUT: if the goal needs MORE than one turn_step, we won't be aimed after this
-                # turn — so after turning, do a short translation (for SLAM parallax) BEFORE turning again,
-                # instead of advancing toward an intermediate (off-goal) heading. Aimed within one step ->
-                # ADVANCE straight to the goal. ORIENT routes to whichever we pick here.
-                need_more = be is not None and abs(be) > self.turn_step_deg + 1e-6
-                if (self.parallax_scout and need_more and plan.get("clearance_ring")
-                        and self._push_count < self.parallax_max_pushes):
-                    self._after_orient = "PARALLAX_PUSH"
+                # Per-goal height re-calibration (item 1): on a GENUINE goal change (moved > calib_goal_change_dist)
+                # after the cooldown, re-tap the ceiling first to re-latch the mapping altitude for the new leg.
+                # The cooldown + first-goal guard (no prior tap time) keep it from firing on the first
+                # post-prelude goal or on rapid re-plans. It routes ASCEND->DESCEND->REPLAN, which then orients
+                # to THIS same (already-committed) goal — no re-trigger (same goal + fresh cooldown).
+                goal_moved = (self._leg_goal_prev is None
+                              or self._dist(self.leg_goal, self._leg_goal_prev) > self.calib_goal_change_dist)
+                cooldown_ok = (self._last_calib_t is not None
+                               and (now - self._last_calib_t) >= self.calib_cooldown_s)
+                if (self.calibrate_on_goal_change and self.ascend_to_ceiling
+                        and goal_moved and cooldown_ok and not self._recalibrating):
+                    self._recalibrating = True
+                    self._calib_retries = 0
+                    self._leg_goal_prev = list(self.leg_goal)   # post-calib REPLAN sees the SAME goal -> no re-trigger
+                    self._ascend_phase = None
+                    self._enter("CALIBRATING_HEIGHT", now)
+                    event = (f"goal changed (> {self.calib_goal_change_dist:.1f}u) + "
+                             f"{self.calib_cooldown_s:.0f}s cooldown elapsed -> CALIBRATING_HEIGHT "
+                             f"(re-tap ceiling) for goal {self.leg_goal}")
                 else:
-                    self._after_orient = "ADVANCE"   # aimed within one step, no ring, or cap hit -> straight advance
-                self._player = self._build_turn(theta)       # open-loop turn (or just 'c' if theta≈0)
-                self._enter("ORIENT", now)
-                event = (f"leg -> turn {theta:+.0f} deg (err {self._fmt(be)}) then "
-                         f"{'parallax push' if self._after_orient == 'PARALLAX_PUSH' else 'advance'} "
-                         f"toward goal {self.leg_goal}")
-            # else: no goal (and not done) with a HEALTHY plan -> just idle in REPLAN (frontiers forming /
-            # the planner's done-verification is choosing a corner). SLAM-loss recovery is status-driven
-            # now (PLAN-STALE/LOST), NOT triggered from here.
+                    self._recalibrating = False       # orienting to a goal (self-heals if a SLAM blip cut a re-tap short)
+                    self._leg_goal_prev = list(self.leg_goal)   # track for the next goal-change test
+                    self._ram_accum = 0.0             # fresh ram-guard stall tracking for this leg
+                    self._ram_last_t = None
+                    self._ram_speed_win.clear()      # a new leg breaks the speed run; window must not span the gap
+                    self._ram_speed = None
+                    self._finalize_or_discard_calib()  # a leg boundary ends a sampling run: accept if clean, else restart
+                    be = plan.get("bearing_err")
+                    theta = self._quantize_turn(be)
+                    if self.clamp_leg_turn:
+                        # Cap to ONE turn_step (<=45 deg): SLAM survives a small open-loop turn (proven live);
+                        # the per-leg replan after each ADVANCE is the outer correction toward the goal.
+                        theta = max(-self.turn_step_deg, min(self.turn_step_deg, theta))
+                    self._leg_theta = theta           # logged into command_history when the ORIENT turn is flown
+                    # PARALLAX SCOUT: if the goal needs MORE than one turn_step, we won't be aimed after this
+                    # turn — so after turning, do a short translation (for SLAM parallax) BEFORE turning again,
+                    # instead of advancing toward an intermediate (off-goal) heading. Aimed within one step ->
+                    # ADVANCE straight to the goal. ORIENT routes to whichever we pick here.
+                    need_more = be is not None and abs(be) > self.turn_step_deg + 1e-6
+                    if (self.parallax_scout and need_more and plan.get("clearance_ring")
+                            and self._push_count < self.parallax_max_pushes):
+                        self._after_orient = "PARALLAX_PUSH"
+                    else:
+                        self._after_orient = "ADVANCE"   # aimed within one step, no ring, or cap hit -> straight advance
+                    self._player = self._build_turn(theta)       # open-loop turn (or just 'c' if theta≈0)
+                    self._enter("ORIENT", now)
+                    event = (f"leg -> turn {theta:+.0f} deg (err {self._fmt(be)}) then "
+                             f"{'parallax push' if self._after_orient == 'PARALLAX_PUSH' else 'advance'} "
+                             f"toward goal {self.leg_goal}")
+            else:
+                # No goal AND not done with a HEALTHY plan. With the diagonal-sweep planner this is only a
+                # momentary startup tick before the first frontiers form (the planner now returns a sweep
+                # goal or done=True once the map exists). FAIL-VISIBLE BACKSTOP: never idle dark forever —
+                # if it persists past no_goal_idle_s, log once + raise a telemetry flag so the operator sees
+                # the degraded state (NO SILENT FALLBACK). SLAM-loss recovery stays status-driven (PLAN-
+                # STALE/LOST), not triggered from here.
+                if self._no_goal_since is None:
+                    self._no_goal_since = now
+                elif (now - self._no_goal_since) > self.no_goal_idle_s and not self._no_goal_warned:
+                    self._no_goal_warned = True
+                    self.no_goal_stall = True
+                    event = (f"REPLAN IDLE: planner returned no goal (and not done) for "
+                             f">{self.no_goal_idle_s:.0f}s — holding, VISIBLE-FLAGGED (no silent idle; "
+                             f"map may be too small to sweep / SLAM still forming)")
 
         elif st == "STUCK":
             # HOLD (neutral) after the fallback gave up. A valid goal (SLAM re-acquired + planning) resumes.
@@ -1606,7 +1757,14 @@ class ExploreController:
                 self._settle_to = None
                 self._enter(nxt, now)
 
-        # st == "DONE": active stays neutral (HOLD)
+        elif st == "DONE":
+            # Exploration complete: hold neutral (hover). One-shot VISIBLE annunciation (the operator asked
+            # for a plain DONE print; no Phase-3 handoff yet).
+            if not self._done_logged:
+                self._done_logged = True
+                event = ("EXPLORE COMPLETE — no reachable frontier and the diagonal sweep found nothing "
+                         f"new -> DONE (hover). frontiers={plan.get('n_frontiers')}")
+
         return active, self.state, event
 
 
@@ -1674,8 +1832,8 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     prev_ctrl_state = None
     prev_active = {}      # last published control vector -> derives the detector command for THIS frame
     backwall_active = False   # BACKWALL contact edge tracker (log once per onset)
-    # SLAM_TRACKER: last pose we surfaced to the terminal (frame_id/pos/heading/wall-time) so each fresh
-    # perception pose can be logged synchronously with its dx/dy/dYaw + staleness gap. See the drain below.
+    # SLAM_TRACKER: last pose we surfaced (frame_id/pos/heading/wall-time) so each fresh perception pose can
+    # be recorded to the replay timeline with its dx/dy/dYaw + staleness gap. See the drain below.
     _slam_fid = None
     _slam_pos = None
     _slam_hd = None
@@ -1726,11 +1884,11 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                     pending_planner_event = pe
                 p = plan_sub.recv(timeout_ms=0)
 
-            # ---- SLAM_TRACKER: surface every FRESH pose the controller accepts from the perception process,
-            # synchronously, into THIS terminal + the autopilot .log — so the async ~2 Hz SLAM ticks
-            # interleave chronologically with the [autopilot][explore] STATE: boundaries (no more silent
-            # ~700 ms staleness gaps where the visualizer snaps but the log says nothing). Gated on a NEW
-            # frame_id so it fires once per perception publish, not every loop tick. Tracking-aware. ----
+            # ---- SLAM_TRACKER: record every FRESH pose the controller accepts from the perception process
+            # into the REPLAY TIMELINE (flight_replay HTML event log) — NOT the live terminal/.log. One
+            # record per fresh frame_id, carrying dx/dy/dYaw + the staleness gap, so the async ~2 Hz SLAM
+            # ticks interleave chronologically with the [autopilot][explore] state events in the replay and
+            # render in a distinct colour. Keeps the live terminal readable (the operator's ask). ----
             if last_plan is not None:
                 _fid = last_plan.get("frame_id")
                 if _fid is not None and _fid != _slam_fid:
@@ -1744,10 +1902,15 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                     _gap = f"{(now - _slam_t) * 1000.0:.0f}ms" if _slam_t is not None else "—"
                     _sms = last_plan.get("slam_ms")
                     _build = f" (build {_sms:.0f}ms)" if isinstance(_sms, (int, float)) else ""
-                    sline = (f"{_rec_prefix(last_rec_frame)} [SLAM_TRACKER] Pose update accepted "
-                             f"({_delta}) [{_mode}] - SLAM Latency: {_gap}{_build}")
-                    print(sline, flush=True)
-                    diag.line(sline)
+                    diag.timeline({
+                        "t_wall": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        "t_mono": round(now, 3),
+                        "ev_kind": "slam",
+                        "slam": (f"[SLAM_TRACKER] Pose update accepted ({_delta}) [{_mode}] "
+                                 f"- SLAM Latency: {_gap}{_build}"),
+                        "frame_id": _fid,
+                        "slam_ms": _sms,
+                    })
                     _slam_fid, _slam_t = _fid, now
                     if _pos is not None:
                         _slam_pos = _pos
@@ -2290,6 +2453,75 @@ def run_self_test(cfg):
     ok = ok and prelude_ok
     print(f"[self-test] {'PASS' if prelude_ok else 'FAIL'}  explore PRELUDE arm+takeoff+two-phase-ascent+descend+baseline "
           f"(ascend joy={ascend}, descend joy={-ascend}, seeded={cp._baseline_seeded}, no re-run once airborne)  visited {porder}")
+
+    # ---- Map mode: per-goal HEIGHT RE-CALIBRATION (item 1) — CALIBRATING_HEIGHT on a genuine goal change ----
+    def _run_calib(cc, goal, t0, secs=16.0, prime_taps=None):
+        """Drive an airborne controller from REPLAN; feed a rising-then-flat pose during ASCEND and fire the
+        flow CEILING once in the Phase-2 LATCH. Returns (visited_states, saw_up)."""
+        cc.rest_between_s = 0.1
+        cc.ascend_micro_pulse_s, cc.ascend_rest_s = 0.1, 0.1
+        cc.ascend_stall_cycles, cc.ascend_latch_hold_s = 2, 0.3
+        cc.baseline_nudge_dist, cc.baseline_nudge_max_s = 0.3, 0.3
+        if prime_taps is not None:
+            cc._ceiling_taps = collections.deque(prime_taps, maxlen=20)
+        order, asc_seen, saw_up, saw_down = [], 0, False, False
+        t, fid = t0, 0
+        for _ in range(int(secs / 0.05)):
+            cur = cc.state
+            posy = (-0.05 * min(asc_seen, 10)) if cur == "ASCEND" else -1.0
+            fire = (cur == "ASCEND" and cc._ascend_phase == "LATCH")
+            pl = dict(goal, plan_valid=True, pos_y=posy, slam_ms=200.0, frame_id=fid,
+                      forward_clearance_dist=9.0, clearance_ring=[[0.0, 5.0], [180.0, 0.3]])
+            _active, state, _ev = cc.step(t, pl, False, ceiling_contact=fire)
+            if not order or order[-1] != cur:
+                order.append(cur)
+            if cur == "ASCEND":
+                asc_seen += 1
+                if _active.get("joy_vertical") == ascend:
+                    saw_up = True
+            if cur == "DESCEND" and _active.get("joy_vertical") == -ascend:
+                saw_down = True                          # the re-tap MUST push back down off the ceiling
+            if state == "ORIENT":
+                if not order or order[-1] != "ORIENT":
+                    order.append("ORIENT")
+                break
+            t += 0.05; fid += 1
+        return order, saw_up, saw_down
+
+    goal_far = {"done": False, "goal": [5.0, 5.0], "pos": [0.0, 0.0], "bearing_err": 0.0}
+
+    class _DonePlayer:                # a spent maneuver player left over from a prior leg (fields -> done)
+        def fields(self, now):
+            return {}, True
+    # (1) goal moved > calib_goal_change_dist AND cooldown elapsed -> re-tap the ceiling then orient. A STALE
+    #     `_player` from the interrupted leg must NOT leak into DESCEND (else the down-push is skipped): the
+    #     re-tap MUST still push back down off the ceiling (saw_down).
+    c1 = ExploreController(cfg, no_takeoff=True)
+    c1._last_calib_t, c1._leg_goal_prev = 0.0, [0.0, 0.0]     # a tap at t=0; drive from t=100 (> cooldown)
+    c1._player = _DonePlayer()                               # reproduce the stale-player condition
+    o1, up1, down1 = _run_calib(c1, goal_far, 100.0)
+    calib_route = (_is_subsequence(["REPLAN", "CALIBRATING_HEIGHT", "ASCEND", "DESCEND", "REPLAN", "ORIENT"], o1)
+                   and up1 and down1 and c1.target_altitude_y is not None and not c1._recalibrating)
+    # (2) goal moved but cooldown NOT elapsed -> straight to ORIENT (no re-tap).
+    c2 = ExploreController(cfg, no_takeoff=True)
+    c2._last_calib_t, c2._leg_goal_prev = 95.0, [0.0, 0.0]    # only 5s < cooldown at t=100
+    o2, _, _ = _run_calib(c2, goal_far, 100.0)
+    cooldown_gate = ("CALIBRATING_HEIGHT" not in o2 and "ASCEND" not in o2 and "ORIENT" in o2)
+    # (3) a LOW-OBJECT tap (pos_y well below the live median) -> nudge forward + re-ascend (CALIB_NUDGE).
+    c3 = ExploreController(cfg, no_takeoff=True)
+    c3._last_calib_t, c3._leg_goal_prev = 0.0, [0.0, 0.0]
+    o3, _, _ = _run_calib(c3, goal_far, 100.0, prime_taps=[-2.0, -2.0, -2.1])  # median ~-2.0; taps at ~-0.5 are "low"
+    low_object = ("CALIB_NUDGE" in o3 and c3._calib_retries >= 1)
+    # (unit) the low-object test is vs the LIVE median, needs >= min taps, and respects the +Y-DOWN sign.
+    cu = ExploreController(cfg, no_takeoff=True)
+    cu._ceiling_taps = collections.deque([-2.0, -2.0, -2.1], maxlen=20)
+    low_unit = (cu._is_low_object_tap(-1.5) and not cu._is_low_object_tap(-2.05)
+                and not ExploreController(cfg, no_takeoff=True)._is_low_object_tap(-1.5))
+    calib_ok = calib_route and cooldown_gate and low_object and low_unit
+    ok = ok and calib_ok
+    print(f"[self-test] {'PASS' if calib_ok else 'FAIL'}  explore HEIGHT RE-CALIB (goal-change->CALIBRATING_HEIGHT"
+          f"+re-tap-down={calib_route}, cooldown-gates={cooldown_gate}, low-object->CALIB_NUDGE={low_object}, "
+          f"median-unit={low_unit})  visited {o1}")
 
     # ---- Map mode: CONTROL-SPACE SLAM-loss recovery (hold-on-LOST + rewind-on-STALE + parallax fallback) ----
     # (a) invert_history: reverse order, invert each maneuver (forward<->reverse, turn theta->-theta).
