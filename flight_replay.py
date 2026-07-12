@@ -115,7 +115,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #events .plan { color: #c58bff; }          /* planner bump outcome (count / reset) */
   #events .plan.bl { color: #ff5b5b; font-weight: bold; }  /* the blacklist decision */
   #events .miss { color: #e0a020; }          /* a real contact that emitted no bump */
-  #events .slam { color: #2fd4d4; }          /* SLAM_TRACKER: per-pose accept (dx/dy/dYaw + latency) */
+  #events .slam_start  { color: #e8891a; }    /* SLAM_ENGINE  [START]  frame ingested (orange) */
+  #events .slam_finish { color: #33cc55; }    /* SLAM_TRACKER [FINISH] pose accepted + latency (green) */
   .legend { font-size: 11px; color: #999; padding: 6px 10px; border-bottom: 1px solid #333; }
   .sw { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: middle; }
 </style>
@@ -160,10 +161,12 @@ const RECORDS = __DATA__;
 const SLAM_SLOW_MS = __SLAM_SLOW_MS__;
 
 // Split records into step records (the timeline), map records (occupancy snapshots), and SLAM_TRACKER
-// per-pose accepts (ev_kind:"slam") — the latter interleave into the event log by t_mono, coloured teal.
+// paired SLAM logs (ev_kind:"slam_start"/"slam_finish") — the latter interleave into the event log by t_mono
+// as an orange START / green FINISH pair keyed on frame_id, so a latency spike (long START->FINISH span) and
+// multi-thread overlap (overlapping spans across frames) read at a glance.
 const STEPS  = RECORDS.filter(r => r.state !== undefined);
 const MAPS   = RECORDS.filter(r => r.map !== undefined);
-const SLAMEV = RECORDS.filter(r => r.ev_kind === 'slam');   // chronological (written in order)
+const SLAMEV = RECORDS.filter(r => r.ev_kind === 'slam_start' || r.ev_kind === 'slam_finish');  // chronological
 
 // ---- static world extent (fit once so scrubbing never jumps the view) ----
 function computeExtent() {
@@ -342,11 +345,12 @@ function updatePanel(idx) {
     }
     if (st.missed_bump) entries.push({t: st.t_mono, html: `<div class="ev ${cls} miss">${tw} MISSED-BUMP: ${st.missed_bump}</div>`});
   }
-  // Interleave SLAM_TRACKER accepts up to the cursor time (teal), so the ~2 Hz pose ticks sit between
-  // the state events chronologically instead of scrolling past in the terminal.
+  // Interleave the paired SLAM logs up to the cursor time (orange START / green FINISH), so the ~2 Hz
+  // pipeline spans sit between the state events chronologically instead of scrolling past in the terminal.
   for (const sv of SLAMEV) {
     if (sv.t_mono > tCur) break;
-    entries.push({t: sv.t_mono, html: `<div class="ev slam">${sv.t_wall || ''} ${sv.slam}</div>`});
+    // The paired-SLAM string carries its own bracketed wall-time, so t_wall is "" (no double timestamp).
+    entries.push({t: sv.t_mono, html: `<div class="ev ${sv.ev_kind}">${sv.t_wall ? sv.t_wall + ' ' : ''}${sv.slam}</div>`});
   }
   entries.sort((a, b) => a.t - b.t);
   ev.innerHTML = entries.map(e => e.html).join('');
@@ -480,9 +484,11 @@ def _self_test():
          "plan_goal": [2.5, 0.5], "dist_to_goal": 0.99, "plan_age_s": 0.2, "frame_id": 5,
          "goals": [{"xz": [1.0, 1.0], "state": "active"}, {"xz": [2.5, 0.5], "state": "plan_pick"}],
          "cmd": {"trigger": 0.2}, "speed": 0.42, "nominal_speed": 0.45},
-        {"t_wall": "00:00:01.500", "t_mono": 1.5, "ev_kind": "slam", "frame_id": 6, "slam_ms": 700.0,
-         "slam": "[SLAM_TRACKER] Pose update accepted (dx: +0.10m, dy: +0.03m, dYaw: -0.3°) "
-                 "[TRACKING] - SLAM Latency: 700ms (build 500ms)"},
+        {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
+         "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
+        {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
+         "slam": "[00:00:01.800]. SLAM had just finished working on the frame #6 from: [00:00:01.100]. "
+                 "The deltas are: (dx: +0.10 dy: +0.03) Latency: 700ms."},
         {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
          "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
          "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "goal": [1.0, 1.0],
@@ -536,10 +542,12 @@ def _self_test():
         print(f"[self-test] {'PASS' if c5 else 'FAIL'}  HTML carries slam spike + scene/goal/slam draw code")
         ok = ok and c5
 
-        # SLAM_TRACKER ev_kind:"slam" records are carried + the teal interleave render path is present
-        n_slam = sum(1 for r in embedded if r.get("ev_kind") == "slam")
-        c_slam = (n_slam == 1 and "SLAM_TRACKER" in html and "SLAMEV" in html and "#events .slam" in html)
-        print(f"[self-test] {'PASS' if c_slam else 'FAIL'}  SLAM_TRACKER record carried ({n_slam}) + teal event-log render path present")
+        # Paired SLAM logs (ev_kind:"slam_start"/"slam_finish") carried + the orange/green interleave render path
+        n_slam = sum(1 for r in embedded if r.get("ev_kind") in ("slam_start", "slam_finish"))
+        c_slam = (n_slam == 2 and "SLAM had currently began working" in html
+                  and "SLAM had just finished working" in html and "SLAMEV" in html
+                  and "#events .slam_start" in html and "#events .slam_finish" in html)
+        print(f"[self-test] {'PASS' if c_slam else 'FAIL'}  paired SLAM START/FINISH records carried ({n_slam}) + orange/green event-log render path present")
         ok = ok and c_slam
 
         # the new blacklist-observability fields survived + the render code that surfaces them is present

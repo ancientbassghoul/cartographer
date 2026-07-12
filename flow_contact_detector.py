@@ -7,6 +7,10 @@ mechanism — a self-calibrating COLLAPSE of the relevant flow signal while the 
 
   * CEILING (while ASCENT is commanded): vertical flow |dy_med| collapses from its live ascent level
     to ~0. (Validated on flight_20260627_214625: |dy_med| high during climbs, ~0 at the plateaus.)
+  * FLOOR (while DESCENT is commanded): the MIRROR of CEILING — the downward vertical flow |dy_med|
+    collapses from its live descent level to ~0 when the drone rests on the floor. Same signal + collapse
+    logic as CEILING (the sign of the motion doesn't matter to |dy_med|). NEW this session (unvalidated,
+    unlike CEILING/WALL); the autopilot's dock_max_s cap is the fail-safe. Used by the floor-dock postlude.
   * WALL (while FORWARD is commanded): the looming radial EXPANSION collapses from its live
     free-forward level to ~0 — forward progress has stopped. This ONE signal unifies both wall flavors:
     a textureless wall freezes the image (mag→0) and a textured wall shows a slow vertical climb; either
@@ -52,9 +56,10 @@ from learn_to_fly import farneback_scalars, make_radial_field, load_key_edges, b
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
-CMD_UP = "up"            # ascent commanded  -> tests for CEILING  (signal = |dy_med|)
-CMD_FWD = "forward"      # forward commanded -> tests for WALL      (signal = +expansion, looming)
-CMD_BACK = "backward"    # reverse commanded -> tests for BACKWALL  (signal = -expansion, contraction)
+CMD_UP = "up"            # ascent commanded   -> tests for CEILING  (signal = |dy_med|)
+CMD_FWD = "forward"      # forward commanded  -> tests for WALL      (signal = +expansion, looming)
+CMD_BACK = "backward"    # reverse commanded  -> tests for BACKWALL  (signal = -expansion, contraction)
+CMD_DOWN = "down"        # descent commanded  -> tests for FLOOR     (signal = |dy_med|; the MIRROR of CEILING)
 
 
 def load_config(path=None):
@@ -82,10 +87,10 @@ class FlowVerdict:
     contact: bool = False              # CONTACT reached (latched within the current command episode)
 
     def label(self) -> str:
-        if self.command not in (CMD_UP, CMD_FWD, CMD_BACK):
+        if self.command not in (CMD_UP, CMD_FWD, CMD_BACK, CMD_DOWN):
             return "NOT-COMMANDED"      # nothing to test for -> idle
         if self.contact:
-            return self.kind            # CEILING or WALL or BACKWALL
+            return self.kind            # CEILING or WALL or BACKWALL or FLOOR
         if self.signal is None:
             return "PRE-FLOW"           # commanded, but no flow computed yet (first frame of episode)
         if self.blanking:
@@ -94,7 +99,8 @@ class FlowVerdict:
             return "PRE-MOTION"         # TAKEOFF only: never moved yet (countdown / first climb)
         if self.collapse_cond:
             return f"{self.kind}-WATCH({self.contact_held:.2f}s)"
-        return {CMD_UP: "RISING", CMD_FWD: "LOOMING", CMD_BACK: "CONTRACTING"}[self.command]
+        return {CMD_UP: "RISING", CMD_FWD: "LOOMING", CMD_BACK: "CONTRACTING",
+                CMD_DOWN: "DESCENDING"}[self.command]
 
 
 # ==============================================================================
@@ -126,6 +132,7 @@ class FlowContactDetector:
         self._ref_up = 0.0
         self._ref_fwd = 0.0
         self._ref_back = 0.0     # reverse contraction (-expansion) running-max, for the BACKWALL detector
+        self._ref_down = 0.0     # descent vertical-flow (|dy_med|) running-max, for the FLOOR detector (mirror of _ref_up)
         # per-PUSH (episode) state — reset on each command change
         self._cmd = None
         self._ep_t0 = None
@@ -140,6 +147,8 @@ class FlowContactDetector:
             return "WALL", self.exp_noise_floor, "_ref_fwd"
         if command == CMD_BACK:
             return "BACKWALL", self.exp_noise_floor, "_ref_back"
+        if command == CMD_DOWN:
+            return "FLOOR", self.dy_noise_floor, "_ref_down"   # mirror of CEILING (vertical flow |dy_med|)
         return None, None, None
 
     def _reset_episode(self, t, command):
@@ -156,6 +165,7 @@ class FlowContactDetector:
         self._ref_up = 0.0
         self._ref_fwd = 0.0
         self._ref_back = 0.0
+        self._ref_down = 0.0
 
     def reset_forward_ref(self):
         """Recalibrate the WALL (forward-looming) reference for a NEW forward leg, so each exploration
@@ -197,10 +207,10 @@ class FlowContactDetector:
         self-calibrating collapse logic (see _update_signal)."""
         gray = self._prep_gray(frame)
         signal = None
-        if command in (CMD_UP, CMD_FWD, CMD_BACK) and self._prev_gray is not None:
+        if command in (CMD_UP, CMD_FWD, CMD_BACK, CMD_DOWN) and self._prev_gray is not None:
             sc = farneback_scalars(self._prev_gray, gray, self._rux, self._ruy)
-            if command == CMD_UP:
-                signal = abs(sc["dy_med"])          # vertical flow magnitude (ascent -> ceiling collapse)
+            if command in (CMD_UP, CMD_DOWN):
+                signal = abs(sc["dy_med"])          # vertical flow magnitude (ascent->CEILING / descent->FLOOR collapse)
             elif command == CMD_FWD:
                 signal = sc["expansion"]            # +radial looming (forward -> wall collapse)
             else:                                   # CMD_BACK: reverse -> features contract inward -> expansion < 0
@@ -437,6 +447,12 @@ def run_self_test():
     case("BACKWALL contract->freeze (collapse to 0)", rise_then_plateau(3.0, 15, 40, plateau=0.0), CMD_BACK, True)
     case("BACKWALL continuous contract (no back-wall)", ramp(3.0, 10) + [3.0] * 60, CMD_BACK, False)
     case("BACKWALL below noise floor (never arms)", rise_then_plateau(0.03, 15, 40), CMD_BACK, False)
+    # 4c/5c. FLOOR (mirror of CEILING): descending vertical flow |dy_med| ramps then collapses to ~0 at the
+    #        floor -> FLOOR fires; a fresh descent that keeps sinking (no collapse) stays quiet; below-floor
+    #        signal never arms.
+    case("FLOOR descend->rest-on-floor (collapse to 0)", rise_then_plateau(1.0, 15, 40), CMD_DOWN, True)
+    case("FLOOR continuous descend (no floor)", ramp(1.0, 10) + [1.0] * 60, CMD_DOWN, False)
+    case("FLOOR below noise floor (never arms)", rise_then_plateau(0.03, 15, 40), CMD_DOWN, False)
     # 6. Continuous motion, no collapse -> quiet.
     case("CEILING continuous rise (no ceiling)", ramp(1.0, 10) + [1.0] * 60, CMD_UP, False)
     # 7. DEAD-ZONE: 12 frames of ~0 (inertia) then ramp up and KEEP rising -> must NOT fire.

@@ -174,15 +174,38 @@ autonomy:
     # (parallax) BEFORE the first exploration yaw (pure rotation is the SLAM-killer). Reuses the parallax ring-pick.
     baseline_nudge_dist: 0.4     # translate this far to seed parallax (SLAM units)
     baseline_nudge_max_s: 2.0    # SAFETY time cap on the baseline nudge
-    # Per-goal HEIGHT RE-CALIBRATION (item 1): on a GENUINE goal change, re-run the two-phase ascend->descend
-    # to re-tap the ceiling and re-latch the mapping altitude (undoing per-leg downward drift). All GENERAL /
-    # LIVE-relative params (the low-object test is vs the LIVE running median of taps) -> no room-answer leak.
+    # Per-goal HEIGHT RE-CALIBRATION (item 1 + session-11 STATE-GATED fix): on a GENUINE goal change, re-run the
+    # two-phase ascend->descend, then JUDGE THE RESULT AFTER IT ENDS (CALIB_VERIFY) against a continuous rolling
+    # baseline of NORMAL flying altitude (frozen during any calibration). A settled height significantly below the
+    # baseline median => the calibration SANK the drone (poisoning the live-camera-Y occupancy slab) => climb to
+    # clean airspace (ASCEND_ESCAPE) -> slide 1u (CALIB_TRANSLATE) -> retry. All GENERAL / LIVE-relative params
+    # (margins vs the LIVE median, a settle window, a 1u displacement) -> no room-answer leak.
     calibrate_on_goal_change: true   # enable CALIBRATING_HEIGHT on a genuine goal change (needs ascend_to_ceiling)
     calib_cooldown_s: 60.0           # min seconds between ceiling taps (also skips the first post-prelude goal)
     calib_goal_change_dist: 1.0      # the goal must move MORE than this (SLAM units) to trigger a re-tap
-    calib_low_object_margin: 0.3     # a tap this far BELOW the live median ceiling (+Y DOWN => larger pos_y) = a low object
-    calib_min_taps_for_median: 2     # need >= this many accepted taps before the low-object median gates
-    calib_max_retries: 2             # forward-nudge + re-ascend attempts per calibration before accepting a low tap (logged)
+    calib_max_retries: 2             # climb+translate+re-run attempts per calibration before abandoning (logged)
+    # --- session-11 state-gated verification (CALIB_VERIFY + ASCEND_ESCAPE + CALIB_TRANSLATE) ---
+    mapping_alt_history_len: 200     # rolling baseline length: samples of NORMAL flying altitude (frozen during calib)
+    calib_min_baseline_samples: 10   # need >= this many baseline samples before CALIB_VERIFY can judge (else PASS)
+    calib_settle_gate_s: 1.0         # CALIB_VERIFY holds until a frame CAPTURED >= this after DESCEND issued (dynamics settle)
+    calib_low_height_margin: 0.3     # settled pos_y > median + this (+Y DOWN => lower) = a SANK calibration => FAIL
+    calib_verify_max_s: 5.0          # SAFETY: cap the settle-and-judge; persistent 'higher than median' => PASS (logged)
+    calib_retry_translate_dist: 1.0  # CALIB_TRANSLATE: clean horizontal slide (SLAM units) in high airspace before re-run
+    # --- POST-MISSION FLOOR-DOCK POSTLUDE (when the all-corners tour is exhausted, planner done=True):
+    #     RETURN_TO_ORIGIN -> DOCK_FLOOR (gentle PULSED descent) -> LOW_STANDOFF -> DONE. Instead of a
+    #     static hover at mapping height, fly home to the take-off origin (SLAM-frame [0,0]), descend
+    #     GENTLY to the floor, nudge up to a low stand-off, then stand by. All GENERAL platform/robustness
+    #     params (the origin is the SLAM [0,0]; the floor is detected LIVE by the flow FLOOR collapse) —
+    #     NOT a room answer. A continuous hold-down is FORBIDDEN (rapid downward accel chokes SLAM), so the
+    #     descent MIRRORS the two-phase ascent: DOWN micro-pulses metered by the SLAM descent gain, then a
+    #     continuous latch hold to catch a clean FLOOR. FLOOR detection is NEW/unvalidated -> dock_max_s caps it. ---
+    home_reach_dist: 1.0             # "reached the origin" test (SLAM units; defaults to goal_reach_dist)
+    home_max_s: 30.0                 # SAFETY: cap the homing; then dock HERE (logged, NO SILENT FALLBACK)
+    dock_pulse_s: 0.1               # Phase-1: DOWN micro-pulse length (near-zero momentum; mirrors ascend_micro_pulse_s)
+    dock_rest_s: 1.0                # Phase-1: rest after each DOWN pulse (momentum bleed + a clean pose to read dZ)
+    dock_max_s: 20.0                 # SAFETY: cap the descent even if no FLOOR latches, then proceed (logged)
+    floor_standoff_nudge: 0.5        # LOW_STANDOFF: UP-nudge duration (s) to clear the ground before standby
+    # (the descent reuses the ascend gain/stall/latch knobs: ascend_gain_eps / ascend_stall_cycles / ascend_latch_hold_s)
     # --- executor (autopilot run_explore) ---
     # The engine is a "fly toward your aim" scheme: yaw moves an aim crosshair, forward thrust flies
     # toward it, and a sustained yaw HOLD (then 'c' reset) rotates the body. A turn's ANGLE = how long

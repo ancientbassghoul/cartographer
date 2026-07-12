@@ -162,7 +162,8 @@ class Pipeline:
         self._last_clearance = None       # last published forward_clearance_dist (for the report line)
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
-        self._sweep_logged = False       # one-shot log when the planner enters the diagonal-sweep done-check
+        self._sweep_logged = False       # True while the planner is touring corners (one-shot per-corner log below)
+        self._sweep_target_logged = None # last corner [x,z] we logged (re-logs on each new tour corner)
         self.last_planner_event = None   # transient bump-outcome summary set by run()'s bump drain; ride ONE plan
 
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
@@ -327,6 +328,11 @@ class Pipeline:
             "planner_event": self._consume_planner_event(),
             "pos_y": None, "clearance_ring": None,
             "slam_ms": (round(float(slam_ms), 1) if slam_ms is not None else None),
+            # Camera-capture monotonic timestamp (io_bridge stamps meta["mono_ts"] = time.monotonic() at grab;
+            # same clock domain the autopilot issues commands on) — rides EVERY plan, valid or not. Serves BOTH
+            # the paired SLAM START/FINISH replay records (frame ingress = cap_ts, done = cap_ts + slam_ms) and
+            # the height-calibration settlement gate (a frame CAPTURED >= gate_s after DESCEND went out).
+            "cap_ts": meta.get("mono_ts"),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
             "ground": self.ground.summary(raster=self.GROUND_RASTER),
         }
@@ -365,32 +371,36 @@ class Pipeline:
                     bd, best = diff, dd
             return best
         self._last_ring_fb = (_ring_fb(0.0), _ring_fb(180.0))
-        # Goal selection + diagonal-sweep done verification. `sweep_corner` (the opposite-corner traverse
-        # target) is needed whenever NOTHING is reachable — no frontiers at all OR every live frontier
-        # blacklisted (the glass-loop escape). Flying the diagonal crosses the room to a fresh vantage; on
-        # arrival the planner clears the round's soft blacklist so those goals get one retry. Inset from the
-        # bbox edge by `reposition_inset` so the corner stays reachable inside the forward stand-off shell.
+        # Goal selection + ALL-CORNERS verification tour. The inset bbox corners (`bbox_corners`) are needed
+        # whenever NOTHING is reachable — no frontiers at all OR every live frontier blacklisted (the
+        # glass-loop escape). The planner TOURS them (opposite corner first, then farthest-unvisited, then
+        # last) so every room corner reconstructs densely; on arrival at each it clears the round's soft
+        # blacklist so those goals get one retry. Each corner is inset from the bbox edge by `reposition_inset`
+        # so it stays reachable inside the forward stand-off shell.
         fr = self.ground.frontiers()
-        # Compute it on EVERY not-reachable tick (not just the transition): when the 2-bump rule blacklists
-        # the corner we're sweeping toward, `select` escapes it and needs a corner in hand that same tick.
-        # `select` still caches the target ONCE, so it stays STATIC during the sweep despite recomputing here.
+        # Compute on EVERY not-reachable tick (not just the transition): when the 2-bump rule retires the
+        # corner we're touring toward, `select` needs the corner list in hand that same tick to advance.
+        # `select` still caches each corner target ONCE, so it stays STATIC while flying to it.
         reachable = self.planner.any_reachable(fr)
-        sweep = (self.ground.sweep_corner(np.asarray(pos, dtype=np.float64), inset=self.reposition_inset)
-                 if not reachable else None)
+        corners = (self.ground.bbox_corners(inset=self.reposition_inset) if not reachable else None)
         # Goal selection (blacklisting is event-driven via note_wall_hit in run(), NOT a per-select timer).
-        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, sweep)
+        goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, sweep_corners=corners)
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()
         payload["blacklist_permanent"] = self.planner.blacklist_permanent()
         payload["goal_clearance_ok"] = bool(self.planner.clearance_ok)   # visible flag: clearance inset succeeded
-        if self.planner.sweeping and not self._sweep_logged:
-            print(f"[perception] planner: no reachable frontier -> SWEEPING to corner {self.planner.sweep_target}",
-                  flush=True)
+        tgt = self.planner.sweep_target
+        if self.planner.sweeping and tgt is not None and tgt != self._sweep_target_logged:
+            n_left = sum(1 for c in (corners or []) if not self.planner._corner_visited(c))
+            print(f"[perception] planner: touring room corners -> SWEEPING to corner {tgt} "
+                  f"({len(self.planner._swept_corners)} visited, {n_left} left)", flush=True)
+            self._sweep_target_logged = list(tgt)
             self._sweep_logged = True
         elif not self.planner.sweeping and self._sweep_logged:
-            print(f"[perception] planner: sweep {'COMPLETE -> done' if done else 'cleared -> frontiers found'}",
+            print(f"[perception] planner: corner tour {'COMPLETE -> done' if done else 'cleared -> frontiers found'}",
                   flush=True)
             self._sweep_logged = False
+            self._sweep_target_logged = None
         payload["n_frontiers"], payload["done"] = n_frontiers, done
         if goal is not None:
             payload["goal"] = [round(float(goal[0]), 4), round(float(goal[1]), 4)]

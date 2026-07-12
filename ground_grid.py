@@ -253,47 +253,46 @@ class GroundGrid:
                 fz -= (fz - float(pos[1])) * pull
         return [fx, fz]
 
-    def sweep_corner(self, pos, inset=1.0):
-        """World [X, Z] diagonal-sweep target: the corner of the KNOWN bounding box OPPOSITE the one
-        nearest `pos`, inset toward the box center so it stays reachable. Used when no frontier is
-        reachable — a deterministic full-room traverse that either exposes new frontiers on the way or,
-        on arrival with none found, confirms exploration is done. Replaces the fragile
-        farthest_free / verify_min_dist path (which could silently pick a "too near" corner or none).
+    def bbox_corners(self, inset=1.0):
+        """The (up to) 4 inset corners of the KNOWN bounding box (FREE ∪ OCC), each pulled `inset` toward
+        the box center per axis so it stays reachable inside the forward stand-off shell. Used by the
+        ALL-CORNERS verification TOUR (session 10): the planner flies to each in turn so every corner of
+        the room reconstructs densely (not just the one main diagonal). Generalizes the old single
+        opposite-corner `sweep_corner`.
 
-        The bbox spans the KNOWN cells (FREE ∪ OCC). Each axis is inset INDEPENDENTLY:
-          * span >= 2*inset -> pull the opposite-corner coord `inset` toward the center (a wall stand-off,
-            so the drone's forward stand-off can still reach it).
-          * span <  2*inset -> the axis is too narrow for a dual-side stand-off (e.g. a corridor's short
-            axis); target its MIDPOINT (maximally clear of both walls). This avoids the overshoot bug
-            where `x_min + inset` on a 1.5 u span lands past `x_max`, throwing the target out of bounds
-            into unmapped territory.
-        Returns None only when BOTH axes are degenerate (`span < 2*inset` on X AND Z -> box too small to
-        sweep) or no cells are known. A corridor (one wide axis) still yields a valid target: inset along
-        the long axis, midpoint on the short one. `inset` is a general stand-off-scale param (like
-        `goal_reach_dist`), NOT a room answer."""
+        Per-axis logic (unchanged from the old sweep_corner):
+          * span >= 2*inset -> the two extremes pull `inset` toward center (a wall stand-off both sides).
+          * span <  2*inset -> the axis is too narrow for a dual-side stand-off (a corridor's short axis)
+            -> BOTH extremes collapse to the axis MIDPOINT (maximally clear of both walls; never the
+            overshoot where `x_min + inset` on a 1.5 u span lands past `x_max`).
+        Corners are emitted in canonical order (SW, SE, NW, NE) then DEDUPED, so a corridor (one narrow
+        axis) yields its 2 end-corners and a tiny box its 1 center. Returns [] when no cells are known.
+        `inset` is a general stand-off-scale param (like `goal_reach_dist`), NOT a room answer."""
         c = self.classify_dense()
         known = c["free"] | c["occ"]
         if known.size == 0 or not known.any():
-            return None
+            return []
         rr, cc = np.where(known)
         ix0, iz0 = c["ix0"], c["iz0"]
         x_min = (int(cc.min()) + ix0 + 0.5) * self.cell   # cell-center world coords (matches frontiers())
         x_max = (int(cc.max()) + ix0 + 0.5) * self.cell
         z_min = (int(rr.min()) + iz0 + 0.5) * self.cell
         z_max = (int(rr.max()) + iz0 + 0.5) * self.cell
-        deg_x = (x_max - x_min) < 2.0 * inset
-        deg_z = (z_max - z_min) < 2.0 * inset
-        if deg_x and deg_z:
-            return None                                   # box too small to sweep -> caller declares done
 
-        def axis_target(lo, hi, p, degenerate):
-            if degenerate:
-                return 0.5 * (lo + hi)                     # narrow axis -> midpoint (clear of both walls)
-            # opposite corner = the extreme FARTHER from p; inset it toward center.
-            return (lo + inset) if abs(p - lo) > abs(p - hi) else (hi - inset)
+        def axis_targets(lo, hi):
+            if (hi - lo) < 2.0 * inset:                    # too narrow for a dual-side stand-off -> midpoint
+                m = 0.5 * (lo + hi)
+                return m, m
+            return lo + inset, hi - inset
 
-        return [axis_target(x_min, x_max, float(pos[0]), deg_x),
-                axis_target(z_min, z_max, float(pos[1]), deg_z)]
+        xlo, xhi = axis_targets(x_min, x_max)
+        zlo, zhi = axis_targets(z_min, z_max)
+        ordered = [[xlo, zlo], [xhi, zlo], [xlo, zhi], [xhi, zhi]]   # SW, SE, NW, NE
+        out = []
+        for p in ordered:
+            if not any(abs(p[0] - q[0]) < 1e-9 and abs(p[1] - q[1]) < 1e-9 for q in out):
+                out.append([float(p[0]), float(p[1])])
+        return out
 
     def inset_to_clearance(self, goal, pos, buffer):
         """Pull `goal` back along the goal->pos axis to the first point that is map-validated FREE AND has
@@ -517,34 +516,39 @@ def run_self_test():
           and math.hypot(ff_ex[0] - ff[0], ff_ex[1] - ff[1]) > ex_r)
     check("farthest_free(exclude-all) is None", gg.farthest_free([cam[0], cam[2]], exclude=lambda p: True) is None)
 
-    # sweep_corner: opposite corner of the KNOWN bbox, inset toward center, with per-axis midpoint clamp
-    # on axes too narrow for a dual-side stand-off. Build controlled FREE rectangles via _lo (1u cells so
-    # cell-center world coords are trivial: x = (ix+0.5), z = (iz+0.5)).
+    # bbox_corners: the (up to) 4 inset corners of the KNOWN bbox (SW, SE, NW, NE), with per-axis midpoint
+    # clamp on axes too narrow for a dual-side stand-off, deduped. Build controlled FREE rectangles via _lo
+    # (1u cells so cell-center world coords are trivial: x = (ix+0.5), z = (iz+0.5)).
     def _free_rect(nx, nz, cell=1.0):
         g = GroundGrid(None, ground_cell_size=cell)
         for ix in range(nx):
             for iz in range(nz):
                 g._lo[(ix, iz)] = -5.0                  # well below free_thresh -> FREE
         return g
-    # (a) wide box (x:0.5..5.5, z:0.5..7.5): drone near the (x_min,z_min) corner -> opposite is
-    #     (x_max,z_max) inset 1u -> [4.5, 6.5]; drone near (x_max,z_min) -> [1.5, 6.5].
+
+    def has_corner(corners, pt):
+        return any(close(c, pt) for c in corners)
+
+    # (a) wide box (x:0.5..5.5, z:0.5..7.5), inset 1u: 4 corners SW[1.5,1.5] SE[4.5,1.5] NW[1.5,6.5]
+    #     NE[4.5,6.5], in canonical order.
     gs = _free_rect(6, 8)
-    check("sweep_corner opposite of near corner, inset 1u",
-          close(gs.sweep_corner([0.5, 0.5], inset=1.0), [4.5, 6.5]))
-    check("sweep_corner flips per axis with drone position",
-          close(gs.sweep_corner([5.5, 0.5], inset=1.0), [1.5, 6.5]))
+    corners = gs.bbox_corners(inset=1.0)
+    check("bbox_corners returns 4 inset corners of a wide box",
+          len(corners) == 4 and close(corners[0], [1.5, 1.5]) and close(corners[1], [4.5, 1.5])
+          and close(corners[2], [1.5, 6.5]) and close(corners[3], [4.5, 6.5]))
     # (b) CORRIDOR (x:0.5..1.5 span 1.0 < 2*inset; z:0.5..11.5 span 11.0): the narrow X clamps to its
-    #     MIDPOINT (1.0), NOT x_min+inset (which would overshoot); the wide Z insets normally. Target
-    #     stays strictly inside the bbox on both axes (the bug this guards against).
+    #     MIDPOINT (1.0) so SW==SE and NW==NE dedupe -> exactly the 2 end-corners [1.0,1.5] and [1.0,10.5],
+    #     both strictly inside the bbox (the overshoot bug this guards against).
     gc = _free_rect(2, 12)
-    sc = gc.sweep_corner([1.5, 0.5], inset=1.0)
-    check("sweep_corner corridor: narrow axis -> midpoint, wide axis -> inset",
-          close(sc, [1.0, 10.5]))
-    check("sweep_corner corridor: target stays inside the known bbox",
-          0.5 <= sc[0] <= 1.5 and 0.5 <= sc[1] <= 11.5)
-    # (c) both axes degenerate (1x1 known) -> None; empty grid -> None.
-    check("sweep_corner both-axes-degenerate -> None", _free_rect(1, 1).sweep_corner([0.0, 0.0]) is None)
-    check("sweep_corner empty grid -> None", GroundGrid(None).sweep_corner([0.0, 0.0]) is None)
+    cc2 = gc.bbox_corners(inset=1.0)
+    check("bbox_corners corridor: narrow axis -> midpoint, dedupes to 2 end-corners",
+          len(cc2) == 2 and has_corner(cc2, [1.0, 1.5]) and has_corner(cc2, [1.0, 10.5]))
+    check("bbox_corners corridor: end-corners stay inside the known bbox",
+          all(0.5 <= p[0] <= 1.5 and 0.5 <= p[1] <= 11.5 for p in cc2))
+    # (c) both axes degenerate (1x1 known) -> a single center corner; empty grid -> [].
+    check("bbox_corners both-axes-degenerate -> single center corner",
+          _free_rect(1, 1).bbox_corners() == [[0.5, 0.5]])
+    check("bbox_corners empty grid -> []", GroundGrid(None).bbox_corners() == [])
 
     # inset_to_clearance: an already-clear FREE goal is unchanged; a wall-hugging goal is pulled back along
     # the goal->pos axis to a FREE buffered cell; an impossibly large buffer yields None (no such cell).

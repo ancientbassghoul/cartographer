@@ -1,6 +1,8 @@
 # All-corners verification sweep + post-mission floor-dock postlude (+ SLAM/parallax backlog)
 
-_Session-10 plan. APPROVED, not yet built. Resume here. Referenced from PROGRESS.md._
+_Session-10 plan. **Parts A + B BUILT (session 10), all offline self-tests green, live-fly pending.**
+The two Deferred items (SLAM-loss investigation, parallax-strafe on turns) are NOT built. Referenced from
+PROGRESS.md._
 
 ## Context
 

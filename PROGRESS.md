@@ -1,10 +1,17 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-09** (session 9 build + session-10 planning). Resume from THIS file. Session-9
-items (diagonal sweep, SLAM_TRACKER→HTML, height re-calib) BUILT and **flew OK** (`20260709_091706`,
-recoveries fine). **Next build = APPROVED plan `plans/all-corners-sweep-and-slam-parallax.md`**:
-all-corners verification tour + post-mission floor-dock postlude. (Two ideas deferred there: SLAM-loss
-investigation, parallax-strafe on turns.)_
+_Last updated **2026-07-12** (session 11 built **+ FLEW**). Resume from THIS file. **Session-11 built,
+self-test-green, and had its FIRST LIVE FLIGHT (`20260712`)** (`plans/height-calib-state-gate-and-slam-debug.md`):
+(1) the STATE-GATED height-calibration fix (rolling flying-altitude baseline frozen during calib, judged
+AFTER the routine by a new `CALIB_VERIFY` → a sunk result climbs `ASCEND_ESCAPE` then slides 1u
+`CALIB_TRANSLATE` before retrying; retired the old ceiling-tap `CALIB_NUDGE`); (2) paired
+`slam_start`(orange)/`slam_finish`(green) SLAM logging in the REPLAY HTML; (3) `t_wall`/`t_mono` unify. The
+flight surfaced + fixed a SLAM-log **timestamp bug** (records read "from the future"), and we added a
+one-command **`fly.py`** launcher (graceful autopilot stop so the report keeps its map backdrop).
+**Height calibration is NOT fully out of the woods** — the operator is still dissecting this flight's log.
+**Next = operator restarts the machine (40-day uptime) + handles an errand, then resumes dissecting the
+last flight's log → expect follow-up questions here.** Session-10 items (all-corners tour + floor-dock
+postlude) still await their own clean live confirmation._
 
 **Status:** Phase-1 (manual map + target localization) done & hardware-verified. Phase-2 autonomous
 **Map-mode explorer** (`autopilot.py --explore`) flies live — clean session-8 flight
@@ -21,12 +28,64 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT BUILD (session 10, APPROVED) → `plans/all-corners-sweep-and-slam-parallax.md`:** (A) expand
-done-verification into an ALL-CORNERS tour (opposite → farthest-unvisited → last; corners ignore the
-frontier blacklist, retired only by reach or a fresh 2-bump), and (B) a post-mission floor-dock postlude
-`RETURN_TO_ORIGIN → DOCK_FLOOR (gentle PULSED descent) → LOW_STANDOFF → DONE` (adds a new FLOOR flow
-detector). Motivated by `DEBUG_IMAGES/mission_complete__mapping_so_so.png` (off-path corners reconstruct
-weakly). Deferred there: SLAM-loss investigation + a parallax-strafe on turns._
+_**NEXT = the operator is DISSECTING the last flight's log** (`20260712`, the first live run of the
+session-11 build) and will bring specific follow-up questions. He plans to restart the machine (40-day
+uptime) + run an errand first, then resume the analysis — so the immediate job here is to answer those
+questions, not to build. The session-11 build flew, but **height calibration is NOT confirmed good** —
+watch the real `CALIBRATING_HEIGHT → ASCEND → DESCEND → CALIB_VERIFY (→ ASCEND_ESCAPE → CALIB_TRANSLATE →
+retry)` behavior in the log and keep questioning it._
+
+_Running the stack is now one command: **`python fly.py`** (spawns perception `--no-display` + autopilot
+`--explore --log --stop-file` + visualizer + io_bridge in separate windows, then `Xlab.exe`; press `m` on
+io_bridge to hand over; press ENTER in the launcher to stop — it drops the stop-file so the autopilot exits
+CLEANLY, keeping the replay MAP backdrop, then auto-compiles + opens the report). The manual sequence still
+works (`Xlab.exe` → io_bridge → perception → visualizer → `autopilot.py --explore --log`, press `m`)._
+
+_**Session-11 build (flew `20260712`; all six module self-tests green):**_
+
+1. _**State-gated height-calibration fix — BUILT, flew, UNDER SCRUTINY.** A continuous rolling baseline
+   `_mapping_altitude_history` (ingested only in `MAPPING_ALT_STATES` at healthy SLAM, **frozen whenever
+   `_calib_active`**) is judged AFTER the routine by the new `CALIB_VERIFY` (holds neutral, settlement gate
+   on the plumbed `cap_ts`, None-guarded): settled `pos_y` significantly below the frozen median ⇒ FAIL ⇒
+   `ASCEND_ESCAPE` (climb) → `CALIB_TRANSLATE` (slide 1u) → re-`CALIBRATING_HEIGHT` (bounded by
+   `calib_max_retries`); PASS ⇒ "height OK" (unfreezes ingest). Retired the ceiling-tap median /
+   `_is_low_object_tap` / `CALIB_NUDGE`. **Not yet proven to fully solve the low-drone occupancy poisoning —
+   the operator is re-examining the flight.**_
+2. _**Paired SLAM logging → REPLAY HTML (terminals stay clean) — BUILT + timestamp-fixed live.** Two
+   records per fresh `frame_id`: `slam_start`(orange) positioned + labeled at the frame CAPTURE wall-time
+   (from `cap_ts` via the loop-top monotonic→wall offset) and `slam_finish`(green) positioned + labeled at
+   the log/`now` wall-time, stating the capture time + `Latency:` (= `slam_ms`) inline — so neither reads
+   ahead of its playback slot (the first-flight "from the future" bug). NB: the green↔orange span is the
+   FULL capture→controller latency; `Latency:` is only the SLAM solve, so the span is legitimately larger
+   than the number (the gap = transport + perception post-work + the 0.5s plan timer + controller cadence)._
+3. _**Timeline 1 ms skew — BUILT.** `now`/`now_wall` captured together at the loop top and used for both
+   the SLAM rows and the step row (benign single-frame poll effect; replay still sorts by `t_mono`)._
+
+_**Session-10 build — still needs its OWN clean live confirmation** (fold into a later flight): the
+all-corners TOUR (frontiers exhaust → visit opposite → farthest-unvisited → last corner) + the floor-dock
+postlude (home to origin → gentle pulsed descent, watch the NEW FLOOR latch, `dock_max_s` is the fail-safe
+→ `STANDBY AT LOW HEIGHT`). Then the two Deferred ideas in `plans/all-corners-sweep-and-slam-parallax.md`:
+(1) plan-lost-too-often investigation (SLAM choking?), (2) a parallax-strafe alongside each turn._
+
+_Session-10 items BELOW were BUILT + all offline self-tests green (ground_grid / frontier_planner /
+flow_contact_detector / autopilot / flight_replay / perception), live-fly pending:_
+
+- **Part A — all-corners verification TOUR — BUILT (session 10).** Generalized the single opposite-corner
+  sweep into a room-corner tour so every corner reconstructs densely (motivated by
+  `DEBUG_IMAGES/mission_complete__mapping_so_so.png`). `ground_grid.sweep_corner` → **`bbox_corners(inset)`**
+  (up to 4 inset corners, SW/SE/NW/NE, midpoint-collapse on narrow axes, deduped). `frontier_planner.select`
+  now takes a corner LIST and TOURS them farthest-first (opposite → farthest-unvisited → last) via
+  `_swept_corners` + `_pick_sweep_corner`; **corners IGNORE the frontier blacklist** (operator ask) and a
+  walled-off corner is retired by a fresh 2-bump in `note_wall_hit` (not `_excluded`). Perception passes
+  `bbox_corners` as `sweep_corners`.
+- **Part B — post-mission floor-dock postlude — BUILT (session 10).** When the tour is exhausted
+  (`done=True`) the drone no longer hovers at mapping height: **`RETURN_TO_ORIGIN → DOCK_FLOOR → LOW_STANDOFF
+  → DONE`**. Homing is a self-contained turn→advance mini-loop to SLAM-frame `[0,0]` (clearance stand-off +
+  altitude lock; `home_max_s` caps it → "dock here"). DOCK_FLOOR is a gentle **two-phase PULSED descent**
+  mirroring the ascent (DOWN micro-pulses metered by the SLAM descent gain, then a continuous latch hold) —
+  a continuous hold-down is forbidden (chokes SLAM). New **flow FLOOR detector** (`CMD_DOWN`, `|dy_med|`
+  collapse, mirror of CEILING); `dock_max_s` is the fail-safe since FLOOR is new/unvalidated. LOW_STANDOFF is
+  a short UP nudge; DONE logs `EXPLORE COMPLETE -> STANDBY AT LOW HEIGHT`.
 
 _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 
@@ -56,6 +115,10 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Future (backlog)
+- **Height calibration — BUILT + FLEW (session 11), NOT confirmed good** (`plans/height-calib-state-gate-and-slam-debug.md`):
+  state-gated `CALIB_VERIFY`/`ASCEND_ESCAPE`/`CALIB_TRANSLATE`. The operator is dissecting the `20260712`
+  flight log; expect follow-up questions on whether the low-drone occupancy poisoning is actually solved.
+- **Paired SLAM logging + timestamp fix — DONE (session 11)**; `fly.py` one-command launcher — DONE.
 - **REPLAN dead-stall (item 2)** — no infinite idle when the planner returns no goal. Designed:
   `plans/replan-deadstall-sweep-and-slam-tracker.md` (bbox diagonal sweep + SLAM_TRACKER → replay HTML).
 - **Per-goal height calibration (item 1)** — BUILT session 9, live-fly pending
@@ -73,6 +136,58 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Documentation (what we tried)
+
+### Session 11 (2026-07-12) — the height-calib bug was JUDGING TOO EARLY; state-gated it + paired SLAM spans  [built; self-test-green; FLEW 20260712, calib not yet confirmed]
+Session-10 flew, but a per-goal re-calibration on `20260709_122349` left the drone ~0.5u LOW: it re-tapped
+the ceiling, did its brief descend, but async SLAM only caught up mid-move and it sank to `pos_y=-1.768` in
+`PARALLAX_PUSH` (which doesn't hold altitude) — and because occupancy is built from a slab relative to the
+LIVE camera Y, a low drone clipped standoffs and blacklisted valid frontiers. The old defence (reject a
+ceiling tap below the running median of TAPS) was wrong twice over: too few taps to know "normal", and it
+judged AT the ceiling before the drone had settled. **So we stopped judging the tap and judged the RESULT
+after the routine ends.** A continuous rolling baseline of NORMAL flying altitude
+(`_mapping_altitude_history`, ingested only in steady mapping states at healthy SLAM, FROZEN during any
+calibration) is the reference; a new `CALIB_VERIFY` holds neutral after the descend, waits a settlement gate
+on the plumbed camera-capture timestamp (`cap_ts`, None-guarded so a dropped frame can't crash), then
+compares the SETTLED `pos_y` to the frozen median — significantly lower ⇒ the calibration sank the drone ⇒
+climb to clean airspace (`ASCEND_ESCAPE`) BEFORE sliding 1u sideways (`CALIB_TRANSLATE`, never translate
+while sunk) ⇒ retry; else "height OK" unfreezes ingest. Separately, to see WHY SLAM spikes, the autopilot now
+emits PAIRED `slam_start`(orange)/`slam_finish`(green) replay records keyed on `frame_id` — in the browser,
+terminals stay clean. The first live flight (`20260712_123815`) exposed a timestamp bug: each record sat at
+the frame's own `t_mono` but was LABELED with the ~0.6s-later processing wall-time, so the orange START read
+"from the future" during playback. Fixed to a dead-simple convention: START is positioned + labeled at the
+frame CAPTURE wall-time (derived from `cap_ts` via the loop-top monotonic→wall offset); FINISH is positioned
++ labeled at the log/`now` wall-time and states the capture time inline (`"… finished working on the frame
+#N from: [capture] … Latency: Nms."`) — so nothing reads ahead of its playback slot. (Follow-up Q from the
+operator: the green↔orange span (~2.4s) is much bigger than the `Latency:` number (~1.8s). Correct + by
+design — the span is the FULL capture→controller latency; `Latency:` is only the SLAM solve (`slam_ms`
+wraps just `slam.process`); the ~0.6s difference is transport + perception post-work + the 0.5s plan timer +
+the controller's loop cadence. The frame bus is conflated so there's no giant FIFO backlog.) We also added a
+one-command **`fly.py`** launcher that stops the autopilot GRACEFULLY via a stop-file sentinel (a parent
+can't Ctrl+C a separate-console child on Windows), so the report keeps its shutdown-emitted occupancy-map
+backdrop, then auto-compiles the replay. All six module self-tests green. **Height calibration flew but is
+NOT yet confirmed — the operator is still dissecting the flight. Lesson: a settling maneuver must be judged
+AFTER it settles, against a general "normal" baseline — not at the peak, and not against a handful of
+samples that can't define normal. And a replay record's shown time must be the time of WHERE it sits, not
+when it was written.**
+
+### Session 10 (2026-07-09) — all-corners verification tour + a post-mission floor-dock postlude  [built; self-test-green; live-fly pending]
+Session-9 flew fine but reconstruction was UNEVEN: the drone flew one main diagonal, so occupancy was
+dense on that line and thin at the two off-path corners (`DEBUG_IMAGES/mission_complete__mapping_so_so.png`).
+We wanted every corner mapped, and a graceful ending instead of a hover at ceiling height. So (A) we
+generalized the single opposite-corner "sweep" into an **all-corners TOUR** — `ground_grid.bbox_corners`
+returns the inset bbox corners and `frontier_planner.select` visits them farthest-first (opposite, then the
+far one of the rest, then the last), each cached statically while flying to it. Per the operator, **corner
+targets ignore the frontier blacklist** — a genuinely walled-off corner is retired by the SAME event-driven
+2-bump that retires unreachable frontiers (marked "visited" in `note_wall_hit`), which keeps termination
+without a stale filter suppressing a corner we simply haven't reached yet. And (B) a **floor-dock postlude**:
+on `done`, fly home to the take-off origin, then descend GENTLY to the floor and stand by low. The descent
+MIRRORS the two-phase ceiling ascent (DOWN micro-pulses metered by the live SLAM descent gain, then a
+continuous latch hold) — a continuous plunge would stretch the vertical features and choke SLAM right at the
+finish. This needed a NEW flow **FLOOR** detector (the exact mirror of CEILING: descending `|dy_med|`
+collapses to ~0 on floor contact); since it's unvalidated (unlike CEILING/WALL) a `dock_max_s` cap is the
+fail-safe. All six module self-tests green. **Lesson (caught in review): a homing branch that computes a
+fresh bearing needs its own angle-wrap — the self-test only exercised the at-origin path, so a missing
+`_wrap180` hid until we added a turn+advance homing test; always drive the branch that does the math.**
 
 ### Session 9 (2026-07-09) — killed the REPLAN dead-stall with a bbox diagonal sweep; SLAM_TRACKER → replay HTML  [built; self-test-green; live-fly pending]
 The clean session-8 flight still ended "doing nothing in a loop": the planner returned
@@ -221,12 +336,25 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   4's **event-driven 2-bump** rule finally holds.
 
 ### Open issues
+- **`CALIB_VERIFY`/`ASCEND_ESCAPE`/`CALIB_TRANSLATE` (session 11) — FLEW `20260712`, NOT confirmed good.**
+  The operator is dissecting this flight's log; whether the low-drone occupancy poisoning is actually solved
+  is still an open question (expect follow-up questions here). Watch the real per-goal re-calibration: the
+  drone should never settle low; a bad result should climb + slide 1u + retry, and occupancy should stay
+  clean. The settlement gate leans on the plumbed `cap_ts` (None-guarded).
+- **FLOOR detector is NEW + UNVALIDATED (session 10) — watch the first live dock closely.** Unlike
+  CEILING/WALL (flight-validated), the floor collapse (`CMD_DOWN`, descending `|dy_med|`→0) has never fired
+  on real footage. `dock_max_s` is the fail-safe (log + proceed to LOW_STANDOFF). If it never latches, the
+  de-risk fallback is a fixed pulsed-descent count instead of flow detection (`plans/all-corners-...md`).
+- **Corner tour termination relies on the fresh 2-bump (session 10), not `_excluded`** — corners ignore the
+  frontier blacklist by design, so a genuinely walled-off corner still ends the tour only via two bumps on
+  it. Confirm live that a truly unreachable corner retires (doesn't loop).
 - **REPLAN dead-stall (item 2) — FIXED in code (session 9), live-fly pending.** Was: `goal=None && !done`
-  idled REPLAN forever. Now a bbox **diagonal sweep** always yields a goal or a visible DONE, with a
-  fail-visible bounded-idle backstop (`plans/replan-deadstall-sweep-and-slam-tracker.md`). Needs a live
-  flight to confirm the sweep traverses and terminates as intended. (Turns are fine — session 8.) The
-  older "heading decided only at REPLAN, no mid-leg re-aim" is a separate, milder concern.
-- **Deferred:** Scan mode; a glass-window altitude descend-probe; Phase-3 report polish + GUI.
+  idled REPLAN forever. Now the corner tour always yields a goal or a visible DONE, with a fail-visible
+  bounded-idle backstop. (Turns are fine — session 8.) The older "heading decided only at REPLAN, no
+  mid-leg re-aim" is a separate, milder concern.
+- **Deferred (session-10 plan):** plan-lost-too-often investigation (SLAM choking?); a parallax-strafe
+  alongside each turn. **Earlier deferred:** Scan mode; a glass-window altitude descend-probe; Phase-3
+  report polish + GUI.
 
 ---
 
@@ -262,12 +390,19 @@ multi-target estimate. Offline E2E confirmed.
 - `ground_grid.py` — 2D grid + frontier extraction from SLAM points.
 - `perception` publishes **TOPIC_PLAN** (pose/heading/goal/bearing/done + forward clearance + ring);
   goal = frontier planner pick; `plan_valid=false` when SLAM not TRACKING.
-- `ExploreController`: **ARM → TAKEOFF → ASCEND (two-phase) → DESCEND → BASELINE_NUDGE →** leg loop
-  **REPLAN → ORIENT (open-loop ≤45° turn) → ADVANCE (forward until the clearance stand-off / flow
-  WALL / self-calibrating ram guard) → SETTLE**; control-space **recovery** on SLAM loss; **STUCK**
-  hold; event-driven 2-bump blacklist for unreachable goals. **Ram guard is self-calibrating**; the
-  clearance stand-off is the primary wall stop. (The ORIENT open-loop turn works — session-8 re-fly.)
+- `ExploreController`: **ARM → TAKEOFF → ASCEND (two-phase) → DESCEND → CALIB_VERIFY → BASELINE_NUDGE →**
+  leg loop **REPLAN → ORIENT (open-loop ≤45° turn) → ADVANCE (forward until the clearance stand-off / flow
+  WALL / self-calibrating ram guard) → SETTLE**; a per-goal **CALIBRATING_HEIGHT** re-tap routes ASCEND →
+  DESCEND → **CALIB_VERIFY** (state-gated judge vs the frozen flying-height baseline; a sunk result →
+  **ASCEND_ESCAPE → CALIB_TRANSLATE →** re-tap, session 11); on `done` the **floor-dock postlude
+  RETURN_TO_ORIGIN → DOCK_FLOOR (two-phase pulsed descent) → LOW_STANDOFF → DONE** (session 10);
+  control-space **recovery** on SLAM loss; **STUCK** hold; event-driven 2-bump blacklist for unreachable
+  goals. **Ram guard is self-calibrating**; the clearance stand-off is the primary wall stop. (The ORIENT
+  open-loop turn works — session-8 re-fly.)
 - `flight_playbook.json` + `RecipePlayer` — control recipes as data (the tunable durations).
+- `fly.py` — one-command stack launcher (perception + autopilot + visualizer + io_bridge + Xlab in separate
+  windows), a graceful stop-file shutdown so the autopilot flushes its replay map backdrop, then auto-compiles
+  + opens the flight report. The autopilot honours `--stop-file <path>` (polled `_FileStopEvent` → clean exit).
 
 ---
 
@@ -305,8 +440,12 @@ telemetry back is `time` — everything else is vision. Calibration: ~90° at ya
 
 ### Run procedure
 1. Designate target once: `venv\Scripts\python.exe make_target.py` → `target.yaml`.
-2. `Xlab.exe` → `python io_bridge.py` → `python perception_worker.py --no-display` →
-   `python visualizer.py` → `python autopilot.py --explore --log`; press `m` to hand over.
+2. **One command: `python fly.py`** — spawns perception `--no-display` + autopilot
+   `--explore --log --stop-file` + visualizer + io_bridge (separate windows) + `Xlab.exe`; press `m` on
+   io_bridge to hand over; press ENTER in the launcher to stop CLEANLY (drops the stop-file so the autopilot
+   flushes its replay map backdrop) → auto-compiles + opens the report. Manual equivalent: `Xlab.exe` →
+   `python io_bridge.py` → `python perception_worker.py --no-display` → `python visualizer.py` →
+   `python autopilot.py --explore --log`; press `m` to hand over.
 3. Offline self-tests: `autopilot.py --self-test`, `flow_contact_detector.py --self-test`,
    `frontier_planner.py --self-test`, `ground_grid.py --self-test`, `perception_worker.py --self-test`.
    Offline SLAM+map E2E: `perception_worker.py --video OUTPUT\flight_<ts>.mp4 --no-display`.
@@ -335,4 +474,15 @@ marker; a clean flight (`20260708_195009`) followed.** **Session 9: killed the R
 bbox diagonal sweep (`ground_grid.sweep_corner` + reworked `frontier_planner.select` + autopilot
 bounded-idle backstop + visible EXPLORE-COMPLETE DONE), moved `[SLAM_TRACKER]` into the replay HTML
 (teal), and built per-goal height re-calibration (item 1 — `CALIBRATING_HEIGHT` on a goal change, low-
-object-tap reject) 🛠️ all built, self-test-green, live-fly pending.**
+object-tap reject) 🛠️ all built, self-test-green, live-fly pending.** **Session 10: generalized the single
+sweep into an ALL-CORNERS TOUR (`ground_grid.bbox_corners` + multi-corner `frontier_planner.select`, corners
+ignore the blacklist / retired by a fresh 2-bump) + a post-mission floor-dock postlude (RETURN_TO_ORIGIN →
+DOCK_FLOOR two-phase pulsed descent → LOW_STANDOFF → DONE) with a new flow FLOOR detector 🛠️ all built,
+self-test-green, live-fly pending.** **Session 11: BUILT + FLEW (`20260712`) the three test-flight asks —
+a state-gated height-calibration fix (frozen-during-calib `_mapping_altitude_history` baseline + post-descend
+`CALIB_VERIFY` settlement gate on the plumbed `cap_ts` → `ASCEND_ESCAPE`/`CALIB_TRANSLATE` retry, retiring
+`CALIB_NUDGE`), paired `slam_start`/`slam_finish` SLAM logging in the replay HTML (capture-wall START / log-
+wall FINISH, timestamp bug found + fixed on this flight), and a `t_wall`/`t_mono` unify; plus a one-command
+`fly.py` launcher with a graceful stop-file shutdown 🛠️ all built + all six module self-tests green + flew;
+**height calibration NOT yet confirmed — operator dissecting the flight log.** Plan
+`plans/height-calib-state-gate-and-slam-debug.md`.**

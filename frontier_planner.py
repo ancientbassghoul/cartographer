@@ -10,12 +10,15 @@ Chooses the next frontier the drone should fly to, from `ground_grid.GroundGrid.
     cluster centroid drifts while the map grows) until it is reached / gone, UNLESS another frontier's
     utility clearly beats the committed one (by `switch_factor`). Stops the goal thrash where the planner
     abandoned a good far goal every replan.
-  * DONE VERIFICATION via DIAGONAL SWEEP — when no frontier is reachable, fly ONCE to the opposite corner
-    of the known bounding box (`ground_grid.sweep_corner`, computed by the caller and cached here as a
-    STATIC target — never re-evaluated while sweeping, so it can't oscillate) — a deterministic full-room
-    traverse. If new frontiers appear en route, resume selection; only declare `done` if, after reaching
-    that corner, there are STILL no reachable frontiers. Replaces the fragile farthest-free / "too near"
-    gate that could silently return no goal and dead-stall the controller.
+  * DONE VERIFICATION via an ALL-CORNERS TOUR — when no frontier is reachable, TOUR the inset corners of
+    the known bounding box (`ground_grid.bbox_corners`, computed by the caller). Corners are visited
+    farthest-first (opposite corner first, then the farthest-unvisited, then the last), each cached here as
+    a STATIC target while flying to it (never re-evaluated en route, so it can't oscillate) — a
+    deterministic full-room traverse that thickens the off-path corners. If new frontiers appear en route,
+    resume selection; only declare `done` once every corner has been reached/retired with STILL no
+    reachable frontier. Corner targets IGNORE the frontier blacklist (a walled-off corner is retired by a
+    fresh 2-bump, not `_excluded`). Replaces the fragile farthest-free / "too near" gate that could
+    silently return no goal and dead-stall the controller.
   * UNREACHABLE-GOAL BLACKLIST (EVENT-DRIVEN 2-BUMP, PERMANENT) — there is NO path planner: the drone
     flies a STRAIGHT LINE toward the goal bearing, so a goal behind glass / a wall / a corner can never be
     reached and its frontier is never consumed (the loop the operator hit at the glass window). The autopilot
@@ -51,8 +54,8 @@ def _wrap180(a):
 
 
 class FrontierPlanner:
-    """Stateful frontier goal chooser. `select(frontiers, pos, heading_deg, sweep_corner)` is called
-    once per replan with the LIVE frontier list; it owns the committed-goal + diagonal-sweep state."""
+    """Stateful frontier goal chooser. `select(frontiers, pos, heading_deg, sweep_corners)` is called
+    once per replan with the LIVE frontier list; it owns the committed-goal + all-corners-tour state."""
 
     def __init__(self, cfg: dict | None = None, **overrides):
         e = explore_cfg(cfg)
@@ -75,8 +78,10 @@ class FrontierPlanner:
         self.progress_eps = float(g("goal_progress_eps", 0.2))    # min closing distance counted as progress (round-blacklist promotion)
         self.blacklist_radius = float(g("goal_blacklist_radius", self.assoc_dist))  # "same region" as a dead goal
         self.committed_goal = None     # [x, z] currently committed, or None
-        self.sweeping = False          # True while flying the cached opposite-corner diagonal sweep
-        self.sweep_target = None       # frozen [x, z] of the sweep corner (cached ONCE, never recomputed)
+        self.sweeping = False          # True while flying toward a cached corner in the all-corners tour
+        self.sweep_target = None       # frozen [x, z] of the current corner (cached ONCE, never recomputed mid-leg)
+        self._swept_corners = []       # [x,z] of corners already reached/retired this flight (the tour's memory;
+        #                                persists for the flight, self-corrects if the bbox grows past assoc_dist)
         self._ever_had_frontiers = False  # True once any select() saw a non-empty frontier list (distinguishes
         #                                   a still-forming startup map from a genuinely-exhausted one)
         self._best_dist = None         # closest distance achieved toward the current committed goal (round-blacklist memory)
@@ -200,6 +205,16 @@ class FrontierPlanner:
             if self.committed_goal is not None and self._d(self.committed_goal, g) <= self.blacklist_radius:
                 self.committed_goal = None         # drop the dead commitment -> next select() reselects
                 self._reset_progress()
+            # Unreachable-CORNER retirement WITHOUT `_excluded` filtering: if this bump killed the corner
+            # we were touring toward, mark that corner VISITED (so _pick_sweep_corner skips it) and clear
+            # the sweep. A corner the drone actively fails to reach THIS tour is retired via the fresh
+            # 2-bump — never via a stale blacklist filter — preserving termination while corners still
+            # ignore `_excluded`.
+            if (self.sweeping and self.sweep_target is not None
+                    and self._d(self.sweep_target, g) <= self.assoc_dist):
+                self._mark_corner_visited(self.sweep_target)
+                self.sweeping = False
+                self.sweep_target = None
             self._wall_hit_count = 0
             self._last_wall_hit_goal = None
             action = "blacklist"
@@ -242,8 +257,29 @@ class FrontierPlanner:
 
     def any_reachable(self, frontiers):
         """True if at least one live frontier is NOT excluded (soft or permanent). The caller uses this to
-        decide whether to compute `sweep_corner` (the reposition target when every frontier is dead)."""
+        decide whether to compute `bbox_corners` (the corner tour target when every frontier is dead)."""
         return any(not self._excluded((float(f["center"][0]), float(f["center"][1]))) for f in frontiers)
+
+    # --------------------------------------------------- all-corners verification tour
+    def _corner_visited(self, c):
+        """True if corner `c` is within `assoc_dist` of a corner already reached/retired this flight."""
+        return any(self._d(c, v) <= self.assoc_dist for v in self._swept_corners)
+
+    def _mark_corner_visited(self, c):
+        """Record corner `c` as reached/retired (deduped by `assoc_dist`), so the tour advances past it."""
+        cc = [float(c[0]), float(c[1])]
+        if not self._corner_visited(cc):
+            self._swept_corners.append(cc)
+
+    def _pick_sweep_corner(self, corners, pos):
+        """The FARTHEST-from-`pos` corner that is not yet visited — and NOTHING ELSE. It MUST NOT consult
+        `_excluded`: corner targets are NEVER suppressed by old frontier blacklists (operator's explicit
+        requirement — a walled-off corner is retired by a fresh 2-bump in note_wall_hit, not a stale
+        filter). Farthest-first ⇒ opposite corner first, then the far one of the rest, then the last."""
+        cand = [c for c in (corners or []) if not self._corner_visited(c)]
+        if not cand:
+            return None
+        return max(cand, key=lambda c: self._d(c, pos))
 
     def _select_reachable(self, frontiers, pos, heading_deg):
         """Choose + commit among the currently non-excluded frontiers, clearing any verify state."""
@@ -269,14 +305,15 @@ class FrontierPlanner:
         self._commit(goal)
         return self.committed_goal
 
-    def select(self, frontiers, pos, heading_deg=None, sweep_corner=None):
+    def select(self, frontiers, pos, heading_deg=None, sweep_corners=None):
         """Returns (goal [x,z] | None, n_frontiers, done). Unreachable-goal blacklisting is event-driven
         (`note_wall_hit`, fed by the autopilot's advance-blocked stops) — NOT a per-select timer.
-        `sweep_corner` is the deterministic opposite-corner diagonal-sweep target
-        (`ground_grid.sweep_corner`), consulted ONLY on the transition into a sweep (the caller computes
-        it only when no frontier is reachable). This NEVER returns a `goal=None, done=False` resting
-        state — the only such case is a momentary startup tick before the first frontiers form (bounded by
-        the autopilot's idle backstop)."""
+        `sweep_corners` is the LIST of inset bbox corners (`ground_grid.bbox_corners`), consulted only
+        when no frontier is reachable (the caller computes it then): the planner TOURS them (farthest-first
+        ⇒ opposite, then farthest-unvisited, then last) so every room corner reconstructs densely. Each
+        corner target is cached STATICALLY while flying to it. This NEVER returns a `goal=None, done=False`
+        resting state — the only such case is a momentary startup tick before the first frontiers form
+        (bounded by the autopilot's idle backstop)."""
         pos = (float(pos[0]), float(pos[1]))
         self.last_blacklist = None
         if frontiers:
@@ -287,49 +324,53 @@ class FrontierPlanner:
             return goal, len(frontiers), False
 
         # --- nothing reachable: no frontiers exist, OR every live frontier is excluded ("been over all
-        # goals"). Fly a DETERMINISTIC DIAGONAL SWEEP to the opposite corner of the known bbox — a fresh
-        # vantage that crosses the room. This doubles as done-verification (empty frontiers) AND a
-        # REPOSITION-then-retry (all excluded) — on arrival the round's soft blacklist clears and surviving
-        # goals get one retry from there. Replaces the fragile farthest_free / verify_min_dist path.
+        # goals"). Run the ALL-CORNERS TOUR: fly to each inset bbox corner in turn (farthest-first) — a
+        # deterministic full-room traverse that thickens the off-path corners AND doubles as
+        # done-verification / reposition-retry (on arrival the round's soft blacklist clears + frontiers
+        # retry from the fresh vantage). Corner targets IGNORE the frontier blacklist (operator ask); a
+        # walled-off corner is retired by a fresh 2-bump in note_wall_hit, not `_excluded`.
         self.committed_goal = None
         self._reset_progress()
         if not self.verify_done:
             return None, len(frontiers), True
-        if self.sweeping and self.sweep_target is not None and self._excluded(self.sweep_target):
-            # ESCAPE (Bug A): the 2-bump rule just blacklisted the corner we were sweeping toward. Abandon it
-            # and fall through to re-cache a FRESH sweep corner (or declare done if none remains).
+
+        corners = sweep_corners or []
+        # Auto-mark any corner we are already sitting on (the start corner + any passed en route).
+        for c in corners:
+            if self._d(pos, c) <= self.goal_reach_dist:
+                self._mark_corner_visited(c)
+
+        if self.sweeping and self.sweep_target is not None:
+            if self._d(pos, self.sweep_target) > self.goal_reach_dist:
+                return list(self.sweep_target), len(frontiers), False   # still en route -> keep the static target
+            # Reached the current corner: mark it visited, drop the target, and retry frontiers from this
+            # fresh vantage before touring on.
+            self._mark_corner_visited(self.sweep_target)
             self.sweeping = False
             self.sweep_target = None
-        if self.sweeping:
-            if self.sweep_target is None or self._d(pos, self.sweep_target) <= self.goal_reach_dist:
-                # Reached the sweep corner. If frontiers exist they were all excluded -> whitelist the round
-                # + retry from this new vantage; otherwise the full traverse surfaced nothing new -> DONE.
-                self.sweeping = False
-                self.sweep_target = None
-                if frontiers:
-                    self._whitelist_round()
-                    g = self._select_reachable(frontiers, pos, heading_deg)
-                    if g is not None:
-                        return g, len(frontiers), False
-                return None, len(frontiers), True      # traverse complete, nothing reachable -> done
-            return list(self.sweep_target), len(frontiers), False
-        # Transition INTO the sweep: cache the opposite-corner target EXACTLY ONCE. No "too near" gate —
-        # the opposite corner is far by construction. Guard with `_excluded` so a corner that lands in a
-        # dead region is never chased.
-        if sweep_corner is not None and not self._excluded(sweep_corner):
+            if frontiers:
+                self._whitelist_round()
+                g = self._select_reachable(frontiers, pos, heading_deg)
+                if g is not None:
+                    return g, len(frontiers), False
+            # else fall through to pick the NEXT corner.
+
+        # Pick the next unvisited corner (farthest-first; corners ignore the blacklist) + cache it STATICALLY.
+        nxt = self._pick_sweep_corner(corners, pos)
+        if nxt is not None:
             self.sweeping = True
-            self.sweep_target = [float(sweep_corner[0]), float(sweep_corner[1])]
+            self.sweep_target = [float(nxt[0]), float(nxt[1])]
             return list(self.sweep_target), len(frontiers), False
-        # No usable sweep corner (degenerate/empty bbox, or the only corner is blacklisted). Try an
-        # in-place whitelist retry — but NOT on the same tick we just blacklisted one (let the exclusion
-        # stand a tick so we don't instantly re-commit the goal we just killed).
+
+        # No corner left to tour. One in-place whitelist retry — but NOT on the same tick we just
+        # blacklisted a goal (let the exclusion stand a tick so we don't instantly re-commit it).
         if frontiers and self.last_blacklist is None:
             self._whitelist_round()
             g = self._select_reachable(frontiers, pos, heading_deg)
             if g is not None:
                 return g, len(frontiers), False
-        if self._ever_had_frontiers:
-            return None, len(frontiers), True          # explored, nothing reachable/sweepable left -> done
+        if self._ever_had_frontiers or self._swept_corners:
+            return None, len(frontiers), True          # explored + toured, nothing left -> done
         return None, len(frontiers), False             # startup: map still forming -> transient idle
 
 
@@ -366,36 +407,43 @@ def run_self_test():
     g3, _, _ = p.select([A, c_big], [0.0, 0.0], heading_deg=0.0)
     check("(b) commitment yields to a much-better frontier", close(g3, [0.0, 0.4]))
 
-    # (c) done verification via DIAGONAL SWEEP: empty frontiers + a sweep corner -> fly there
-    #     (done=False), cached EXACTLY as given (no inset pull — the corner is already inset by
-    #     ground_grid.sweep_corner); reaching it with still-empty frontiers -> done=True.
+    # (c) done verification via the ALL-CORNERS TOUR: empty frontiers + a corner LIST -> tour them
+    #     farthest-first (opposite corner first), each cached EXACTLY as given (already inset by
+    #     ground_grid.bbox_corners); reaching the LAST corner with still-empty frontiers -> done=True.
     p = FrontierPlanner(None)
-    g, n, done = p.select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])
-    check("(c) empty -> sweep to corner, not done", close(g, [5.0, 0.0]) and not done and p.sweeping)
-    g, n, done = p.select([], [5.0, 0.0])                          # reached the sweep corner, still empty
-    check("(c) reached corner + empty -> done", g is None and done and not p.sweeping)
+    tour = [[0.0, 0.0], [5.0, 0.0], [0.0, 5.0], [5.0, 5.0]]
+    g, n, done = p.select([], [0.0, 0.0], sweep_corners=tour)      # at [0,0] -> farthest is [5,5]
+    check("(c) empty -> tour to farthest (opposite) corner, not done",
+          close(g, [5.0, 5.0]) and not done and p.sweeping)
+    g, _, done = p.select([], [5.0, 5.0], sweep_corners=tour)      # reached [5,5] -> next farthest-of-rest
+    check("(c) reached a corner -> advance to the next unvisited, not done",
+          g is not None and not close(g, [5.0, 5.0]) and not done)
+    g, _, done = p.select([], list(g), sweep_corners=tour)         # reach it -> the last unvisited corner
+    check("(c) tour advances to the last unvisited corner, not done", g is not None and not done)
+    _, _, done = p.select([], list(g), sweep_corners=tour)         # reached the last (all 4 visited) -> done
+    check("(c) all corners toured + empty -> done", done and not p.sweeping and len(p._swept_corners) == 4)
 
-    # (c2) STATIC target: while sweeping, a moving drone (and a different sweep_corner passed in) must
-    #      keep returning the SAME cached corner — no oscillation.
+    # (c2) STATIC target: while flying to a cached corner, a moving drone (and a different corner list
+    #      passed in) must keep returning the SAME cached corner — no oscillation.
     p = FrontierPlanner(None)
-    p.select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])            # cache [5,0]
-    g_a, _, _ = p.select([], [1.0, 0.0], sweep_corner=[9.0, 9.0])
-    g_b, _, _ = p.select([], [2.0, 2.0], sweep_corner=[-9.0, -9.0])
-    check("(c2) sweep target stays frozen as the drone moves", close(g_a, [5.0, 0.0]) and close(g_b, [5.0, 0.0]))
+    p.select([], [0.0, 0.0], sweep_corners=[[0.0, 0.0], [9.0, 9.0]])   # cache [9,9]
+    g_a, _, _ = p.select([], [1.0, 0.0], sweep_corners=[[0.0, 0.0], [3.0, 3.0]])
+    g_b, _, _ = p.select([], [2.0, 2.0], sweep_corners=[[-9.0, -9.0]])
+    check("(c2) corner target stays frozen as the drone moves", close(g_a, [9.0, 9.0]) and close(g_b, [9.0, 9.0]))
 
-    # (c3) frontiers reappearing mid-sweep -> resume selection, no premature done.
+    # (c3) frontiers reappearing mid-tour -> resume selection, no premature done.
     p = FrontierPlanner(None)
-    p.select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])
+    p.select([], [0.0, 0.0], sweep_corners=[[0.0, 0.0], [5.0, 0.0]])
     g, n, done = p.select([A], [1.0, 0.0], heading_deg=0.0)
-    check("(c3) frontier reappears mid-sweep -> resume, not done", g is not None and not done and not p.sweeping)
+    check("(c3) frontier reappears mid-tour -> resume, not done", g is not None and not done and not p.sweeping)
 
-    # (c4) verify_done=False -> done immediately; no sweep corner AFTER exploring -> done; no corner at
+    # (c4) verify_done=False -> done immediately; no corners AFTER exploring -> done; no corners at
     #      STARTUP (never had a frontier) -> a transient idle (goal=None, done=False), NOT a premature done.
-    _, _, d_off = FrontierPlanner(None, verify_done=False).select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])
+    _, _, d_off = FrontierPlanner(None, verify_done=False).select([], [0.0, 0.0], sweep_corners=[[5.0, 0.0]])
     p_end = FrontierPlanner(None); p_end._ever_had_frontiers = True
-    _, _, d_end = p_end.select([], [0.0, 0.0], sweep_corner=None)
-    _, _, d_startup = FrontierPlanner(None).select([], [0.0, 0.0], sweep_corner=None)
-    check("(c4) disabled -> done; exhausted+no-corner -> done; startup+no-corner -> idle (not done)",
+    _, _, d_end = p_end.select([], [0.0, 0.0], sweep_corners=None)
+    _, _, d_startup = FrontierPlanner(None).select([], [0.0, 0.0], sweep_corners=None)
+    check("(c4) disabled -> done; exhausted+no-corners -> done; startup+no-corners -> idle (not done)",
           d_off and d_end and not d_startup)
 
     # ---- unreachable-goal EVENT-DRIVEN 2-BUMP blacklist (glass collider / rammed opaque wall) ----
@@ -462,46 +510,48 @@ def run_self_test():
     check("(k) re-dead but progressed -> stays soft (best_ever updated, retryable)",
           p2._blacklist[0]["permanent"] is False and abs(p2._blacklist[0]["best_ever"] - 1.5) < 1e-9)
 
-    # (i) when EVERY live frontier is excluded, route to the diagonal-sweep corner (not a crash, not a
-    #     premature done); on ARRIVAL the round's soft blacklist clears and the frontier is retried.
+    # (i) when EVERY live frontier is excluded, route to the corner tour (not a crash, not a premature
+    #     done); on ARRIVAL the round's soft blacklist clears and the frontier is retried.
     p = FrontierPlanner(None)
     p._best_dist = 0.6
     p._blacklist_goal([0.0, 3.0])                     # W soft-excluded
-    g_v, n_v, done_v = p.select([W], [0.0, 2.4], heading_deg=0.0, sweep_corner=[5.0, 5.0])
-    check("(i) all-excluded -> sweep to corner (as given), frontiers still reported, not done",
+    g_v, n_v, done_v = p.select([W], [0.0, 2.4], heading_deg=0.0, sweep_corners=[[5.0, 5.0], [0.0, 0.0]])
+    check("(i) all-excluded -> tour to farthest corner (as given), frontiers still reported, not done",
           close(g_v, [5.0, 5.0]) and n_v == 1 and not done_v and p.sweeping)
-    g_r, n_r, done_r = p.select([W], [5.0, 5.0], heading_deg=0.0)   # reached the sweep corner
+    g_r, n_r, done_r = p.select([W], [5.0, 5.0], heading_deg=0.0, sweep_corners=[[5.0, 5.0], [0.0, 0.0]])
     check("(i) reached corner -> whitelist the round + retry the frontier (not done)",
           close(g_r, [0.0, 3.0]) and n_r == 1 and not done_r and not p.sweeping)
 
-    # (A3) NO extra inset: the cached sweep_target equals the passed corner exactly (ground_grid.sweep_corner
+    # (A3) NO extra inset: the cached corner target equals the passed corner exactly (ground_grid.bbox_corners
     #      already applies the stand-off inset; the planner must not double-inset it).
     p = FrontierPlanner(None)
-    g_pull, _, _ = p.select([], [1.0, 1.0], sweep_corner=[9.0, 5.0])
-    check("(A3) sweep target is the passed corner exactly (no extra pull)", close(g_pull, [9.0, 5.0]))
+    g_pull, _, _ = p.select([], [1.0, 1.0], sweep_corners=[[9.0, 5.0], [0.0, 0.0]])
+    check("(A3) corner target is the passed corner exactly (no extra pull)", close(g_pull, [9.0, 5.0]))
 
-    # (A1) Bug A guard: a sweep_corner that falls in a blacklisted region is NOT chased (the transition
-    #      gate _excluded-checks it); after exploring, with no other corner, this declares done (not idle).
+    # (A1) corners IGNORE the frontier blacklist: a corner sitting in a blacklisted region is STILL toured
+    #      (operator requirement) — corner retirement is via a fresh 2-bump, not `_excluded` filtering.
     p = FrontierPlanner(None); p._ever_had_frontiers = True
-    p._blacklist_goal([5.0, 0.0], permanent=True)                  # dead region at the only corner
-    g_x, _, done_x = p.select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])
-    check("(A1) excluded sweep corner is NOT chased -> not sweeping, done",
-          g_x is None and done_x and not p.sweeping)
+    p._blacklist_goal([5.0, 0.0], permanent=True)                  # dead region at a corner
+    g_x, _, done_x = p.select([], [0.0, 0.0], sweep_corners=[[0.0, 0.0], [5.0, 0.0]])
+    check("(A1) corner in a blacklisted region is STILL toured (corners ignore _excluded)",
+          close(g_x, [5.0, 0.0]) and not done_x and p.sweeping)
 
-    # (A2) Bug A ESCAPE: while sweeping toward a corner, two bumps on that target blacklist it; the next
-    #      select ABANDONS the dead corner and re-caches a FRESH blacklist-aware corner elsewhere.
+    # (A2) ESCAPE via corner retirement: while touring toward a corner, two bumps on that target retire it
+    #      (mark it visited + clear the sweep); the next select ADVANCES to a different unvisited corner.
     p = FrontierPlanner(None)
-    g0, _, _ = p.select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])   # cache [5,0]; drone sweeps toward it
-    p.note_wall_hit(g0); p.note_wall_hit(g0)                       # 2 bumps on the sweep target -> blacklist it
-    new_corner = [-6.0, 0.0]                                       # caller recomputes a corner clear of the dead one
-    g_esc, _, done_esc = p.select([], [0.0, 0.0], sweep_corner=new_corner)
-    check("(A2) escape: blacklisted sweep target abandoned -> re-cache a new corner",
-          p.sweeping and not done_esc and close(g_esc, [-6.0, 0.0]) and p._excluded([5.0, 0.0]))
-    # …and if NO non-excluded corner remains, the escape declares done instead of looping forever (explored).
+    tour_esc = [[0.0, 0.0], [5.0, 0.0], [-6.0, 0.0]]
+    g0, _, _ = p.select([], [0.0, 0.0], sweep_corners=tour_esc)    # at [0,0] -> farthest is [-6,0]
+    check("(A2) tour picks the farthest corner first", close(g0, [-6.0, 0.0]))
+    p.note_wall_hit(g0); p.note_wall_hit(g0)                       # 2 bumps on the current corner -> retire it
+    g_esc, _, done_esc = p.select([], [0.0, 0.0], sweep_corners=tour_esc)
+    check("(A2) escape: retired corner marked visited -> advance to the next unvisited corner",
+          p.sweeping and not done_esc and close(g_esc, [5.0, 0.0]) and p._corner_visited([-6.0, 0.0]))
+    # …and if NO unvisited corner remains, the escape declares done instead of looping forever (explored).
     p2 = FrontierPlanner(None); p2._ever_had_frontiers = True
-    g1, _, _ = p2.select([], [0.0, 0.0], sweep_corner=[5.0, 0.0])
-    p2.note_wall_hit(g1); p2.note_wall_hit(g1)
-    _, _, done_none = p2.select([], [0.0, 0.0], sweep_corner=None)  # no corner left
+    tour2 = [[0.0, 0.0], [5.0, 0.0]]
+    g1, _, _ = p2.select([], [0.0, 0.0], sweep_corners=tour2)      # at [0,0] (auto-marked) -> [5,0]
+    p2.note_wall_hit(g1); p2.note_wall_hit(g1)                     # retire [5,0]
+    _, _, done_none = p2.select([], [0.0, 0.0], sweep_corners=tour2)   # no unvisited corner left
     check("(A2) escape with no corner left -> done", done_none and not p2.sweeping)
 
     # (opt) clearance inset: a chosen frontier goal is run through the injected clearance_fn before commit,
