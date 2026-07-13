@@ -40,7 +40,11 @@
     "All durations are platform-dynamics medians and are TUNABLE live.",
     "  reverse_probe = a SUSTAINED reverse (experiment: does straight-back translation keep MASt3R-SLAM",
     "             TRACKING while a big turn breaks it?). reverse 0.7 like back_off; the 4.0s duration is a",
-    "             deliberate tunable KNOB (NOT measured, NOT a room distance) — trim it live in the experiment."
+    "             deliberate tunable KNOB (NOT measured, NOT a room distance) — trim it live in the experiment.",
+    "  strafe  = a short lateral scoot for parallax between turns (joy_horizontal +1 right / -1 left; the",
+    "             autopilot flips the sign per side). Strafe is the MOST responsive axis (near-zero warm-up,",
+    "             more than backward, much more than forward), so a 0.25s TIMED hold gives the slight scoot",
+    "             we want (operator-measured). Platform control dynamic, TUNABLE live; NOT a room distance."
   ],
 
   "presets": {
@@ -71,7 +75,8 @@
       {"btnCdown": true, "duration_s": 0.16}
     ],
     "back_off": [{"reverse": 0.7, "duration_s": 0.3}],
-    "reverse_probe": [{"reverse": 0.7, "duration_s": 4.0}]
+    "reverse_probe": [{"reverse": 0.7, "duration_s": 4.0}],
+    "strafe": [{"joy_horizontal": 1.0, "duration_s": 0.25}]
   },
 
   "rules": {

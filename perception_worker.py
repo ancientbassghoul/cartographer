@@ -159,6 +159,10 @@ class Pipeline:
         # Clearance RING: clearance at headings around the drone (for the autopilot's parallax scouting).
         # Sampled at multiples of turn_step_deg so it lines up with the autopilot's turn quantization.
         self.clearance_ring_step = float(e.get("turn_step_deg", 45.0))
+        # The ring feeds SHORT parallax scoots (~parallax_push_dist), so it uses a NEAR-FIELD range cap: a far
+        # wall is irrelevant to "can I translate a bit this way", and capping keeps the cone a tight pencil where
+        # it's consumed. The forward-cruise stand-off keeps the full clearance_max_range (it wants distant walls).
+        self.ring_max_range = float(e.get("ring_max_range", 1.5))
         self._last_clearance = None       # last published forward_clearance_dist (for the report line)
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
@@ -359,7 +363,7 @@ class Pipeline:
             relw = ((i * step + 180.0) % 360.0) - 180.0     # wrap each offset to (-180, 180]
             d = self.mapstore.clearance(cc, heading_deg + i * step, fan_deg=self.clearance_fan_deg,
                                         fan_n=self.clearance_fan_n, skip=self.clearance_skip,
-                                        min_count=self.clearance_min_count, max_range=self.clearance_max_range)
+                                        min_count=self.clearance_min_count, max_range=self.ring_max_range)
             ring.append([round(relw, 1), (round(float(d), 4) if d is not None else None)])
         payload["clearance_ring"] = ring
 

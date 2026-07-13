@@ -1,17 +1,18 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-12** (session 11 built **+ FLEW**). Resume from THIS file. **Session-11 built,
-self-test-green, and had its FIRST LIVE FLIGHT (`20260712`)** (`plans/height-calib-state-gate-and-slam-debug.md`):
-(1) the STATE-GATED height-calibration fix (rolling flying-altitude baseline frozen during calib, judged
-AFTER the routine by a new `CALIB_VERIFY` → a sunk result climbs `ASCEND_ESCAPE` then slides 1u
-`CALIB_TRANSLATE` before retrying; retired the old ceiling-tap `CALIB_NUDGE`); (2) paired
-`slam_start`(orange)/`slam_finish`(green) SLAM logging in the REPLAY HTML; (3) `t_wall`/`t_mono` unify. The
-flight surfaced + fixed a SLAM-log **timestamp bug** (records read "from the future"), and we added a
-one-command **`fly.py`** launcher (graceful autopilot stop so the report keeps its map backdrop).
-**Height calibration is NOT fully out of the woods** — the operator is still dissecting this flight's log.
-**Next = operator restarts the machine (40-day uptime) + handles an errand, then resumes dissecting the
-last flight's log → expect follow-up questions here.** Session-10 items (all-corners tour + floor-dock
-postlude) still await their own clean live confirmation._
+_Last updated **2026-07-13** (session 12 **BUILT + all self-tests green; live-fly PENDING**). Resume from THIS
+file. Flight `20260713_101220` flew well then **"lost its shit"** after a parallax strafe; we diagnosed it
+fully, wrote **`plans/strafe-throttle-and-recovery-loop.md`** (D1–D5), and **BUILT all five** (49/49 autopilot
+self-tests pass; flow/frontier/ground_grid/perception green). **NEXT = live re-fly** of the same far-corner
+scenario to confirm the fixes (watch the D1 caveat: does 0.2 actually slow the strafe? and the D2 reposition
+displacement). The diagnosis: a full-magnitude strafe (`joy_horizontal −1.0` — strafe was the one axis never throttled
+to 0.2) into an UNMAPPED side, while the drone was yawed, **scraped the wall → spun the drone to face it →
+monocular SLAM died** (the spin is invisible in the log: the pose froze while the real airframe rotated). Then
+a **frantic HOLD_LOST↔REWIND loop for 100+ s that could never die**, because a flickering SLAM status
+(PLAN-LOST↔PLAN-STALE) RESET the recovery FSM every ~3 s (`_fallback_attempts=0` + a fresh non-consuming
+`_invert_history()`), making `STUCK` mathematically unreachable. Raycast never fired: the forward ray is blind
+to a lateral strafe, and the side ring read `None` (unmapped ⇒ treated as open). Session-11 height-calib +
+session-10 tour/floor-dock still await their own clean live confirmation._
 
 **Status:** Phase-1 (manual map + target localization) done & hardware-verified. Phase-2 autonomous
 **Map-mode explorer** (`autopilot.py --explore`) flies live — clean session-8 flight
@@ -28,12 +29,35 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = the operator is DISSECTING the last flight's log** (`20260712`, the first live run of the
-session-11 build) and will bring specific follow-up questions. He plans to restart the machine (40-day
-uptime) + run an errand first, then resume the analysis — so the immediate job here is to answer those
-questions, not to build. The session-11 build flew, but **height calibration is NOT confirmed good** —
-watch the real `CALIBRATING_HEIGHT → ASCEND → DESCEND → CALIB_VERIFY (→ ASCEND_ESCAPE → CALIB_TRANSLATE →
-retry)` behavior in the log and keep questioning it._
+_**NEXT = LIVE RE-FLY** to confirm session 12 (`plans/strafe-throttle-and-recovery-loop.md`, BUILT +
+self-test-green). The five decisions, all built (`python fly.py`, then watch a far-corner strafe + a SLAM loss):_
+- _**D1 — Strafe throttle → 0.2.** Add config `strafe_throttle` (default 0.2) → `self._strafe_mag`; strafe was
+  the one axis left at full 1.0. CAVEAT: `joy_horizontal` MIGHT be a discrete full-thrust axis like
+  `joy_vertical` (documented identically "(-1 to 1)") — verify live that 0.2 actually slows it._
+- _**D2 — Forward-reposition before a "scraping-danger" strafe.** When a parallax push resolves to STRAFE AND
+  back-ring is very close (`strafe_backwall_danger_dist` ~0.4) AND the forward raycast is clearly open → a
+  ~2.0s forward push @0.2 (`strafe_reposition_fwd_s`) to leave the tight/yawed corner, then strafe (coasts into
+  a safe fwd-left diagonal). Else skip → throttled strafe._
+- _**D3 — Recovery FALLBACK sweep uses the REAL ring-picked parallax push** (backward-first, else strafe to the
+  roomier MAPPED side) at a **15°** step (`recovery_turn_step_deg`), not the blind fwd/back retreat._
+- _**D4 — Kill the frantic loop / graceful death / bounded log.** Make STUCK reachable (D5); on terminal STUCK
+  latch stuck-interval `[start,end]` + PAUSE the log spam; if a valid plan returns, resume mission + logging; at
+  normal mission-complete the session-10 floor-dock postlude homes to origin, logs a mission-end summary
+  INCLUDING the stuck ranges, then turns logging OFF (so the operator can walk away without a 200GB log)._
+- _**D5 — Reverse-list lifecycle (core).** `_recovering` + `_history_broken` flags that PERSIST across
+  PLAN-LOST/PLAN-STALE flickers (this is the loop fix). On first PLAN-STALE: freeze `command_history` appends,
+  enter a CONSUMING pop-based REWIND (drain to empty → FALLBACK → STUCK; remove the counter resets at
+  `autopilot.py:1299`/`:1744`). OK-return is NOT trusted: re-aim (ORIENT/parallax/ADVANCE) is unlogged + counter
+  unchanged, and entering any spatial state sets `_history_broken`. A secondary drop: if `_history_broken` is
+  False (still the initial rewind) continue popping; if True (drone already moved unconfirmed) CLEAR the stale
+  history + BYPASS REWIND straight to the D3 FALLBACK sweep (no ghost path). Only a post-recovery ADVANCE that
+  travels **≥1 SLAM unit** (`recovery_confirm_dist`) confirms: drop both flags, reset counter, clear the list,
+  resume logging fresh._
+
+_Build order suggestion: D1 (+ playbook) → D5 recovery FSM (the meat, has the most self-test surface) → D3 →
+D2 → D4. Self-test after each (extend the recovery tests near `autopilot.py:3005-3055`), then a live re-fly of
+the same far-corner scenario. Session-11 height-calib + session-10 tour/floor-dock still await clean live
+confirmation and can fold into the same re-fly._
 
 _Running the stack is now one command: **`python fly.py`** (spawns perception `--no-display` + autopilot
 `--explore --log --stop-file` + visualizer + io_bridge in separate windows, then `Xlab.exe`; press `m` on
@@ -136,6 +160,30 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Documentation (what we tried)
+
+### Session 12 (2026-07-13) — diagnosed the strafe scrape-spin + the un-killable recovery loop; built the fix  [BUILT; all self-tests green; live-fly pending]
+Flight `20260713_101220` flew well, then died after a parallax strafe. We wanted to know why, and found two
+distinct failures. **The death:** at a far, tightly-boxed corner the planner correctly chose `strafe_left` (back
++ right were too close to push into), but the strafe fired at FULL magnitude (`joy_horizontal −1.0`) — strafe
+turned out to be the ONE control axis we never throttled to 0.2 like advance/reverse — into a side the map read
+as `None` (unmapped ⇒ `_pushable` treats it as open room). Because the drone was yawed relative to that wall, a
+full-tilt lateral shove **scraped the wall, torqued the airframe into a spin, and swung the camera to face the
+wall → monocular SLAM died.** The spin never shows in the log because the last good pose freezes while the real
+drone keeps rotating — a lesson in itself. Raycast couldn't have saved us: the forward clearance ray is blind to
+a sideways strafe, and the side ring was `None`. **The frantic loop after:** the drone thrashed `HOLD_LOST↔REWIND`
+for 100+ s and could never give up, because a flickering SLAM status (PLAN-LOST↔PLAN-STALE, ~every 3 s) RESET the
+whole recovery FSM each cycle — `_fallback_attempts=0` + a fresh, non-consuming `_invert_history()` — so `STUCK`
+was mathematically unreachable and the reverse-list never emptied (exactly the operator's intuition). We built
+`plans/strafe-throttle-and-recovery-loop.md` (all self-tests green): throttle the strafe (`strafe_throttle` 0.2);
+a gated forward-reposition out of a scrape-danger corner before strafing; a recovery that CONSUMES its
+reverse-list and PERSISTS across the flicker so it marches REWIND→FALLBACK→STUCK; a "don't trust the re-lock
+until we've flown ≥1u" rule (`_recovering`/`_history_broken` flags, confirming ADVANCE) with a ghost-path guard
+(a secondary drop after the drone has moved unconfirmed clears the now-spatially-stale history and jumps straight
+to the ring-picked fallback sweep at a gentle 15° step); and a graceful STUCK that latches the stuck interval,
+pauses the per-step log spam, and reports+closes it at the normal mission-end home/dock. Live re-fly pending.
+**Lesson: a wall CONTACT that
+induces a SPIN is invisible to a pose-based log (the pose freezes) — and a recovery FSM whose progress + give-up
+counter can be reset by the very status flicker a real loss produces can never terminate.**
 
 ### Session 11 (2026-07-12) — the height-calib bug was JUDGING TOO EARLY; state-gated it + paired SLAM spans  [built; self-test-green; FLEW 20260712, calib not yet confirmed]
 Session-10 flew, but a per-goal re-calibration on `20260709_122349` left the drone ~0.5u LOW: it re-tapped

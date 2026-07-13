@@ -14,6 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Because of (3), keep the **documentation** parts (the session log / what's been tried) VERY concise and narrative — "We wanted X. We tried Y. It failed because Z. So we tried W." — never the boring implementation details. The **up-next** part may be as detailed as needed; but once an up-next item is done or abandoned, translate it INTO the concise "tried that" one-liner style and move it to the documentation part. Detailed designs live in `plans/*.md` (referenced from PROGRESS.md), not inline.
 
+**Every plan MUST end with two closing steps, always the last items in the task list:** (1) **update `PROGRESS.md`** — fold the completed/abandoned work into the concise narrative, refresh the "Next" resume pointer, and reference any new `plans/*.md`; (2) **get ready for a context clear** — leave the tree and PROGRESS.md in a clean, self-describing state so the next session can resume cold from PROGRESS.md alone (self-tests noted, loose ends captured, nothing important living only in this conversation). Treat these two steps as non-negotiable — a plan is not complete until they are done.
+
 ### CRITICAL CODING STANDARD: NO SILENT FALLBACKS
 
 You are strictly forbidden from implementing silent fallbacks, hidden try-except downgrades, or automatic failover mechanisms anywhere in this codebase. If a model, pipeline component, or hardware context fails to initialize or execute, the system must either fail-fast (crash with an explicit error) or explicitly update a visible state flag that is logged and exposed to the UI.

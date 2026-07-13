@@ -326,6 +326,9 @@ function updatePanel(idx) {
     `${stale?' <span class="bad">STALE</span>':''} <span class="k">fid</span> ${s.frame_id!=null?s.frame_id:'—'}<br>` +
     `<span class="k">y</span> ${fmt(s.pos_y)} <span class="k">plan_berr</span> ${fmt(s.plan_bearing_err,1)}&deg; ` +
     `<span class="k">fwd_clear</span> ${fmt(s.fwd_clear)}<br>` +
+    // The four push-relevant ring reads (null = open near-field = room) — what a parallax push decision saw.
+    `<span class="k">ring</span> f ${fmt(s.ring_clear&&s.ring_clear.fwd)} b ${fmt(s.ring_clear&&s.ring_clear.back)} ` +
+    `l ${fmt(s.ring_clear&&s.ring_clear.left)} r ${fmt(s.ring_clear&&s.ring_clear.right)}<br>` +
     `<span class="k">goal</span> ${s.goal?('['+fmt(s.goal[0])+', '+fmt(s.goal[1])+']'):'—'} ` +
     `<span class="k">d</span> ${fmt(s.dist_to_goal)}${planPick}<br>` +
     // 2-bump blacklist counter: how close the CURRENT goal region is to being retired (2 = blacklist).

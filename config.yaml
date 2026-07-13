@@ -143,11 +143,15 @@ autonomy:
     # General stand-off margin (like goal_reach_dist / map.drone_clearance_m), NOT a room answer: the wall
     # position is mapped LIVE; we only hold a fixed clearance. Distances in SLAM units (scale not recovered).
     stop_on_clearance: true      # enable the raycast stand-off stop (flow contact stays as the glass/unmapped fallback)
-    clearance_fan_deg: 15.0      # cast rays across +/- this half-angle around forward (off-center walls / sparse voxels)
-    clearance_fan_n: 3           # rays in the fan (odd -> includes the center ray)
+    clearance_fan_deg: 8.0       # cast rays across +/- this half-angle around forward (16 deg full cone).
+                                 #   Tightened 15->8: at range a wide cone samples far off-axis (10u*sin15=2.6u vs
+                                 #   sin8=1.4u), conflating side geometry into the axial reading; density (below) covers the arc.
+    clearance_fan_n: 10          # rays in the fan (tightened cone -> denser sampling so a thin/oblique wall isn't threaded)
     clearance_skip: 0.25         # ignore mapped points within this of the camera (matches the target-lift skip)
     clearance_min_count: 2       # a voxel needs >= this many observations to count as a wall (ignore single-hit noise)
-    clearance_max_range: 10.0    # cap the ray length (SLAM units); beyond this is treated as "open"
+    clearance_max_range: 10.0    # cap the ray length (SLAM units) for the FORWARD-CRUISE stand-off; beyond -> "open"
+    ring_max_range: 1.5          # NEAR-FIELD cap for the parallax clearance RING only (a scoot moves ~parallax_push_dist,
+                                 #   so far walls are irrelevant to "can I translate a bit here"): beyond this reads None=room.
     stop_clearance_dist: 1.0     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
                                  #   (raised 0.6->1.0 in session 8: stop before the wall fills the FOV -> keeps SLAM richer)
     backoff_on_standoff: true    # after a clearance stand-off stop, play the small back_off recipe (reverse pulse) before
@@ -227,18 +231,32 @@ autonomy:
                                  # back-off, backward parallax push); overrides the playbook's 0.7. Lower = gentler
                                  # retreat so a fast backward ram can't throw the drone to SLAM-killing angles.
                                  # Continuous throttle like forward (manual 's' ramps it the same way); general magnitude.
-    turn_step_deg: 45.0          # quantize each aim change to this (45 -> 8 headings; 90 -> exact recipe only)
+    strafe_throttle: 0.2         # joy_horizontal (0-1) magnitude for the parallax STRAFE scoot; overrides the
+                                 # playbook's 1.0. Strafe was the ONE axis left at full magnitude -> a full-tilt
+                                 # lateral scoot into an unmapped, yawed corner SCRAPED the wall + spun the drone,
+                                 # killing SLAM (flight 20260713). Match advance/reverse. CAVEAT: joy_horizontal MAY
+                                 # be a discrete full-thrust axis like joy_vertical (both documented "(-1 to 1)") ->
+                                 # verify live that 0.2 actually slows the strafe; if not, shorten the strafe hold.
+    turn_step_deg: 30.0          # quantize each aim change to this (30 -> 12 headings; smaller open-loop turns are gentler
+                                 #   on monocular SLAM; the yaw-hold auto-scales via turn_recipe_deg). Also sets the ring step.
     turn_recipe_deg: 90.0        # the angle the playbook turn_left/right recipe produces (platform constant the user calibrated)
     leg_max_s: 20.0              # SAFETY: cap a single ADVANCE leg (then back off + replan)
     plan_timeout_s: 3.0          # NO SILENT FALLBACK: if no TOPIC_PLAN arrives within this window (perception dead) while airborne, HOLD
     # --- SLAM-loss recovery (CONTROL-SPACE; pose is invalid during a tracking loss, so recovery replays
     #     inverse COMMANDS, not a fly-to-pose). PLAN-LOST (perception silent) = hard hover-hold indefinitely
-    #     (no time-based escalation). PLAN-STALE = RECOVERY_REWIND: replay the inverse of the last
-    #     command_history_s of maneuvers to re-expose keyframes, watching for OK; empty/exhausted history ->
-    #     parallax + <=45deg fallback. General platform params; nothing here is this room's geometry. ---
-    command_history_s: 12.0      # rewind horizon: retrace ~this many seconds of recent maneuvers (inverse replay)
-    fallback_retreat_s: 0.5      # translate this long toward the roomier axis per fallback attempt (parallax + <=45 turn)
-    fallback_max_attempts: 16    # unidirectional +45deg sweep attempts (16 = >360deg full re-expose) before STUCK (HOLD until perception recovers)
+    #     (no time-based escalation). PLAN-STALE = RECOVERY_REWIND: a CONSUMING replay of the inverse of the
+    #     recently-flown maneuvers (popped one at a time) to re-expose keyframes, watching for OK; drained/empty
+    #     history -> ring-picked parallax fallback -> STUCK. `_recovering` PERSISTS across the PLAN-LOST/PLAN-STALE
+    #     flicker and the give-up counter resets ONLY on a confirming ADVANCE, so STUCK stays reachable (session
+    #     12; flight-20260713 frantic loop). General platform params; nothing here is this room's geometry. ---
+    command_history_s: 12.0      # (legacy) full-rewind horizon; the consuming rewind now drains the whole queue (maxlen 100)
+    fallback_retreat_s: 0.5      # translate this long (ring-picked backward/strafe push) per fallback attempt before the turn
+    fallback_max_attempts: 16    # unidirectional sweep attempts (16 = >360deg full re-expose) before STUCK (HOLD until perception recovers)
+    recovery_confirm_dist: 1.0   # a post-recovery ADVANCE must travel >= this (SLAM units) to CONFIRM the re-lock is trustworthy
+                                 #   (then: drop _recovering, reset the give-up counter, clear the stale reverse-list, resume logging).
+                                 #   Progress-gated so a re-lock that instantly bumps a wall at ~0 distance does NOT falsely confirm.
+    recovery_turn_step_deg: 15.0 # gentler turn step for the recovery FALLBACK sweep (vs turn_step_deg for normal flight): a
+                                 #   fragile re-lock survives a smaller open-loop turn; more attempts still cover a full sweep.
     # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
     #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are
@@ -272,12 +290,23 @@ autonomy:
     #     and keeps the drone roughly in place instead of advancing off-goal into inner walls. All decisions
     #     from LIVE raycast clearance / SLAM pose; general margins only — no room answer. ---
     parallax_scout: true         # enable turn<->push<->turn for goals more than one turn_step away
-    parallax_push_dist: 0.5      # push until the SLAM pose has translated this far (SLAM units) -> "a few units" of parallax
-    parallax_pad: 0.4            # only push into a body axis whose clearance > stop_clearance_dist + this (else skip; just turn)
-    parallax_push_throttle: 0.4  # FORWARD push magnitude, DECOUPLED from the 0.1 ADVANCE crawl (which gave ~no parallax);
-                                 #   the push is short + clearance-guarded so it can be brisk. Backward stays on reverse_throttle.
-    parallax_push_s: 2.0         # SAFETY time cap on a push (raised so DISTANCE, not the timer, ends the push at the new throttle)
-    parallax_max_pushes: 8       # cap consecutive pushes per leg (anti-deadlock; a 180-deg goal needs ~4 at 45-deg steps)
+    parallax_push_dist: 0.5      # BACKWARD push: translate this far (SLAM units, distance-quantized off the live pose)
+    parallax_clear_buffer: 0.2   # push gate = parallax_push_dist + this (~0.7u): a direction is pushable if its ring clearance
+                                 #   is None (nothing near -> room) OR >= this gate. Replaces the old stop_clearance_dist+pad
+                                 #   gate (1.4u), which refused pushes into a 1.25u space that was plenty for a 0.5u scoot.
+    parallax_push_throttle: 0.4  # (legacy forward push magnitude; forward push retired — backward/strafe only. Kept for compat.)
+    parallax_push_s: 2.0         # SAFETY time cap on a push (backward distance-quantized; strafe is a short timed hold)
+    parallax_max_pushes: 8       # cap consecutive pushes per leg (anti-deadlock; a 180-deg goal needs ~6 at 30-deg steps)
+    # --- D2 SCRAPE GUARD (session 12): a parallax STRAFE while pinned very close behind (and possibly yawed) can
+    #     drive the drone's flank into the wall -> scrape -> spin -> SLAM death (flight 20260713). When the back
+    #     ring is that close AND the forward raycast is clearly open, reposition FORWARD out of the tight corner
+    #     first, then strafe from safer space. GENERAL margins/durations (no room answer): a close-behind danger
+    #     distance, a forward-open gate (~stop_clearance_dist + goal_reach_dist), and a forward-push duration
+    #     scaled for the gentle 0.2 throttle + slow acceleration-from-rest (operator-derived; ~1s manual push at
+    #     higher throttle -> ~2s at 0.2). All tunable live. ---
+    strafe_backwall_danger_dist: 0.4  # back-ring clearance below this (SLAM units) = "scrape danger" -> consider a reposition
+    strafe_reposition_min_fwd: 2.0    # only reposition if the forward raycast is clearly open beyond this (SLAM units)
+    strafe_reposition_fwd_s: 2.0      # forward reposition duration (s) before handing off to the queued strafe
 
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.
