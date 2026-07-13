@@ -1,7 +1,15 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-13** (session 12 **BUILT + all self-tests green; live-fly PENDING**). Resume from THIS
-file. Flight `20260713_101220` flew well then **"lost its shit"** after a parallax strafe; we diagnosed it
+_Last updated **2026-07-13** (session 13 **BUILT + all self-tests green; live-fly PENDING**). Resume from THIS
+file. **Session 13** (`plans/crystalline-swimming-floyd.md`): on flight `20260713_163055` a per-goal ceiling
+re-tap started, then a brief PLAN-LOST hit mid-ASCEND — the drone **forgot it was calibrating**, dropped into
+normal recovery (`HOLD_LOST→SLAM_HOLD→SETTLE→REPLAN`), skipped the DESCEND, and **stayed glued to the ceiling
+(`pos_y≈-2.2`) for the rest of the flight**. Fixed with a dedicated `CALIB_LOST_HOLD` state that survives the
+loss: hold, watch the SLAM frame pulse (`slam_ms`), **redo** the calibration once ≥6 fresh frames <1000 ms AND
+`status==OK` (the OK-gate beats the level-triggered status flicker that would otherwise 1-tick-oscillate), and
+**bump DOWN once (max)** if SLAM stays choked (6 slow frames → wake SLAM) OR solves fast but the plan won't lock.
+All self-tests green; **live-fly PENDING**. Session-12 (below) also still awaits its live re-fly.
+Flight `20260713_101220` flew well then **"lost its shit"** after a parallax strafe; we diagnosed it
 fully, wrote **`plans/strafe-throttle-and-recovery-loop.md`** (D1–D5), and **BUILT all five** (49/49 autopilot
 self-tests pass; flow/frontier/ground_grid/perception green). **NEXT = live re-fly** of the same far-corner
 scenario to confirm the fixes (watch the D1 caveat: does 0.2 actually slow the strafe? and the D2 reposition
@@ -29,8 +37,20 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = LIVE RE-FLY** to confirm session 12 (`plans/strafe-throttle-and-recovery-loop.md`, BUILT +
-self-test-green). The five decisions, all built (`python fly.py`, then watch a far-corner strafe + a SLAM loss):_
+_**NEXT = LIVE RE-FLY** — one flight now confirms BOTH session 13 and session 12 (both BUILT + all self-tests
+green). Run `python fly.py`, press `m` to hand over._
+
+_**Session 13 — calibration survives a plan loss** (`plans/crystalline-swimming-floyd.md`, BUILT + self-test
+green). Watch a per-goal `CALIBRATING_HEIGHT` where SLAM chokes during the re-tap:_
+- _On the loss the state must go `... ASCEND → CALIB_LOST_HOLD` (NOT `HOLD_LOST`), with NO 1-tick
+  `CALIBRATING_HEIGHT↔CALIB_LOST_HOLD` oscillation while `status` lags._
+- _On recovery (≥6 fresh frames <1000 ms AND `status==OK`) it re-enters `CALIBRATING_HEIGHT` and completes
+  `ASCEND→DESCEND→CALIB_VERIFY`; **altitude must DROP off the ceiling** (`pos_y` back toward the flying-height
+  median — the `pos_y≈-2.2` glued symptom gone)._
+- _If SLAM stays choked (or solves fast but the plan won't lock) exactly ONE DOWN bump appears, then a hold._
+
+_**Session 12 — strafe throttle + un-killable recovery loop** (`plans/strafe-throttle-and-recovery-loop.md`,
+BUILT + self-test-green). The five decisions, all built (watch a far-corner strafe + a SLAM loss):_
 - _**D1 — Strafe throttle → 0.2.** Add config `strafe_throttle` (default 0.2) → `self._strafe_mag`; strafe was
   the one axis left at full 1.0. CAVEAT: `joy_horizontal` MIGHT be a discrete full-thrust axis like
   `joy_vertical` (documented identically "(-1 to 1)") — verify live that 0.2 actually slows it._
@@ -139,6 +159,9 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Future (backlog)
+- **Calibration survives a plan loss — BUILT (session 13), self-test green, LIVE-FLY PENDING**
+  (`plans/crystalline-swimming-floyd.md`): `CALIB_LOST_HOLD` + `_calib_interrupted`; redo on a 6-fast-frame +
+  `status==OK` SLAM-pulse recovery, one DOWN bump if stuck, `status==OK`-gated exit (anti-flicker).
 - **Height calibration — BUILT + FLEW (session 11), NOT confirmed good** (`plans/height-calib-state-gate-and-slam-debug.md`):
   state-gated `CALIB_VERIFY`/`ASCEND_ESCAPE`/`CALIB_TRANSLATE`. The operator is dissecting the `20260712`
   flight log; expect follow-up questions on whether the low-drone occupancy poisoning is actually solved.
@@ -160,6 +183,26 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Documentation (what we tried)
+
+### Session 13 (2026-07-13) — a plan loss during a ceiling re-tap erased the calibration; built CALIB_LOST_HOLD  [BUILT; all self-tests green; live-fly pending]
+Flight `20260713_163055`: a per-goal `CALIBRATING_HEIGHT` fired, and mid-ASCEND (flush at the ceiling) SLAM
+ground on the frozen image for 2.8 s — long enough that `plan_age` crossed `plan_timeout_s` and a **brief
+PLAN-LOST** fired. The global recovery guard forced `HOLD_LOST`, and when the plan returned ~0.28 s later the
+normal path funnelled `SLAM_HOLD→SETTLE→REPLAN` — the mission leg loop, **with zero memory of the
+calibration**. The DESCEND never ran, so the drone **stayed glued to the ceiling (`pos_y≈-2.2`) for the whole
+rest of the flight**. We wanted the calibration to SURVIVE a loss. Built a dedicated, telemetry-visible
+`CALIB_LOST_HOLD` state (`plans/crystalline-swimming-floyd.md`): on any loss (LOST/NO-PLAN/STALE) while
+`_calib_active`, latch `_calib_interrupted`, release controls, and hold watching the SLAM frame pulse
+(`slam_ms`, the true liveness signal — even when the coarse plan status lags). **Redo** the whole calibration
+once ≥6 fresh frames solve <1000 ms **AND** `status==OK`; **bump DOWN once (max)** if either the SLAM solve
+stays choked (≥6 slow frames → wake SLAM) OR it solves fast but the planner still won't lock a path.
+**Two traps caught in review:** (1) the redo exit MUST be gated on `status==OK`, not the frame streak alone —
+`status` is level-triggered and lags a healthy SLAM, so exiting on the streak would re-enter the guard on the
+next (still-lost) tick, wipe the streaks, and **1-tick-oscillate `CALIBRATING_HEIGHT↔CALIB_LOST_HOLD` forever**;
+(2) emit the descend bump's first frame on the trigger tick, not a wasted neutral tick. **Lesson: a maneuver
+interrupted by a transient loss must remember it was mid-maneuver — dropping into generic recovery silently
+abandons the sub-mission; and any exit gated on a fast signal (SLAM frames) must ALSO wait for the slow
+level-triggered signal (plan status) to catch up, or the two race into an oscillation.**
 
 ### Session 12 (2026-07-13) — diagnosed the strafe scrape-spin + the un-killable recovery loop; built the fix  [BUILT; all self-tests green; live-fly pending]
 Flight `20260713_101220` flew well, then died after a parallax strafe. We wanted to know why, and found two
@@ -384,6 +427,11 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   4's **event-driven 2-bump** rule finally holds.
 
 ### Open issues
+- **`CALIB_LOST_HOLD` (session 13) — BUILT + self-test green, LIVE-FLY PENDING.** A plan loss during a
+  ceiling re-tap no longer forgets the calibration. Watch live: on the loss → `CALIB_LOST_HOLD` (not
+  `HOLD_LOST`); NO `CALIBRATING_HEIGHT↔CALIB_LOST_HOLD` oscillation while `status` lags; on recovery the
+  altitude drops off the ceiling (no more `pos_y≈-2.2` glue). Knobs: `calib_lost_recover_frames`,
+  `calib_lost_bump_slow_frames` (both 6). The one-bump-max is deliberate (a 2nd nudge risks hitting walls).
 - **`CALIB_VERIFY`/`ASCEND_ESCAPE`/`CALIB_TRANSLATE` (session 11) — FLEW `20260712`, NOT confirmed good.**
   The operator is dissecting this flight's log; whether the low-drone occupancy poisoning is actually solved
   is still an open question (expect follow-up questions here). Watch the real per-goal re-calibration: the
@@ -442,7 +490,9 @@ multi-target estimate. Offline E2E confirmed.
   leg loop **REPLAN → ORIENT (open-loop ≤45° turn) → ADVANCE (forward until the clearance stand-off / flow
   WALL / self-calibrating ram guard) → SETTLE**; a per-goal **CALIBRATING_HEIGHT** re-tap routes ASCEND →
   DESCEND → **CALIB_VERIFY** (state-gated judge vs the frozen flying-height baseline; a sunk result →
-  **ASCEND_ESCAPE → CALIB_TRANSLATE →** re-tap, session 11); on `done` the **floor-dock postlude
+  **ASCEND_ESCAPE → CALIB_TRANSLATE →** re-tap, session 11); a plan loss DURING any re-tap diverts to
+  **CALIB_LOST_HOLD** (survive the loss → redo the calibration on a 6-fast-frame + `status==OK` SLAM-pulse
+  recovery, one DOWN bump if stuck; session 13); on `done` the **floor-dock postlude
   RETURN_TO_ORIGIN → DOCK_FLOOR (two-phase pulsed descent) → LOW_STANDOFF → DONE** (session 10);
   control-space **recovery** on SLAM loss; **STUCK** hold; event-driven 2-bump blacklist for unreachable
   goals. **Ram guard is self-calibrating**; the clearance stand-off is the primary wall stop. (The ORIENT
@@ -533,4 +583,10 @@ a state-gated height-calibration fix (frozen-during-calib `_mapping_altitude_his
 wall FINISH, timestamp bug found + fixed on this flight), and a `t_wall`/`t_mono` unify; plus a one-command
 `fly.py` launcher with a graceful stop-file shutdown 🛠️ all built + all six module self-tests green + flew;
 **height calibration NOT yet confirmed — operator dissecting the flight log.** Plan
-`plans/height-calib-state-gate-and-slam-debug.md`.**
+`plans/height-calib-state-gate-and-slam-debug.md`.** **Session 13: diagnosed `20260713_163055` — a brief
+PLAN-LOST during a per-goal ceiling re-tap made the drone forget it was calibrating, skip the DESCEND, and stay
+glued to the ceiling (`pos_y≈-2.2`) for the whole flight. Built a dedicated `CALIB_LOST_HOLD` state (+
+`_calib_interrupted` flag) that survives the loss, redoes the calibration on a 6-fast-frame + `status==OK`
+SLAM-pulse recovery, bumps DOWN once if stuck, and gates the redo exit on `status==OK` to beat the
+level-triggered flicker (avoids a 1-tick `CALIBRATING_HEIGHT↔CALIB_LOST_HOLD` oscillation) 🛠️ all built + all
+six module self-tests green, live-fly pending. Plan `plans/crystalline-swimming-floyd.md`.**

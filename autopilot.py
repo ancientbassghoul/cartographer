@@ -773,6 +773,13 @@ class ExploreController:
         self.calib_low_height_margin = float(e.get("calib_low_height_margin", 0.3))  # settled y > med + this => SANK => FAIL
         self.calib_verify_max_s = float(e.get("calib_verify_max_s", 5.0))      # SAFETY cap on settle-and-judge (then PASS, logged)
         self.calib_retry_translate_dist = float(e.get("calib_retry_translate_dist", 1.0))  # CALIB_TRANSLATE slide distance
+        # --- calibration INTERRUPTED by a plan loss (CALIB_LOST_HOLD): survive the loss, redo the re-tap ---
+        # A plan loss DURING a calibration must NOT drop the drone into the normal recovery (which forgets the
+        # calibration and leaves it glued near the ceiling). Instead hold, watch the SLAM frame "pulse", and
+        # REDO the calibration once SLAM solves fast AND the plan is OK. Frame counts of the platform's SLAM
+        # pulse (general robustness params, NOT a room answer).
+        self.calib_lost_recover_frames = int(e.get("calib_lost_recover_frames", 6))    # fresh frames < slam_slow_ms => solve OK
+        self.calib_lost_bump_slow_frames = int(e.get("calib_lost_bump_slow_frames", 6))  # fresh frames >= slam_slow_ms => wake-SLAM bump
         self._last_calib_t = None            # 'now' of the last ceiling tap (cooldown gauge); FLIGHT-level (persists)
         self._leg_goal_prev = None           # last goal committed for ORIENT/calibration (goal-change gauge; persists)
         # Continuous rolling baseline of NORMAL flying altitude (pos_y). Ingested ONLY in steady horizontal
@@ -782,6 +789,8 @@ class ExploreController:
         self._calib_active = False           # True from a calibration start (TAKEOFF->ASCEND / CALIBRATING_HEIGHT)
         #                                      until CALIB_VERIFY resolves — freezes the baseline ingest.
         self._descend_issue_t = None         # 'now' the DESCEND recipe was created (CALIB_VERIFY settlement-gate origin)
+        self._calib_interrupted = False      # a calibration was cut short by a plan loss -> a redo is owed (redo on recovery)
+        self._calib_lost_bumped = False      # the one-shot (max-1) un-glue DOWN bump has fired this CALIB_LOST_HOLD episode
         # --- POST-MISSION FLOOR-DOCK POSTLUDE (RETURN_TO_ORIGIN -> DOCK_FLOOR -> LOW_STANDOFF -> DONE) ---
         # When the corner tour is fully exhausted (planner done=True), instead of a static hover at mapping
         # height the drone flies home to the take-off origin, descends GENTLY (pulsed, mirroring the two-phase
@@ -967,6 +976,8 @@ class ExploreController:
         self._calib_retries = 0
         self._calib_active = False
         self._descend_issue_t = None
+        self._calib_interrupted = False      # a manual takeover abandons any owed calibration redo
+        self._calib_lost_bumped = False
 
     def _quantize_turn(self, be):
         """Quantize a bearing error (deg) to the nearest whole `turn_step_deg` aim change (signed)."""
@@ -1122,6 +1133,57 @@ class ExploreController:
             return {}, "WARMUP", "PLAN-STALE at startup (SLAM still initializing) -> HOLD (no blind sweep)"
         return self._begin_fallback(now, "PLAN-STALE + EMPTY command history (post-collision?) -> ring-picked "
                                          "parallax fallback")
+
+    def _step_calib_lost(self, now, status):
+        """A plan loss (LOST/NO-PLAN/STALE) interrupted a height calibration. Release all controls and HOLD;
+        watch the SLAM frame "pulse" (fresh frame_id + slam_ms, maintained by _update_slam every tick).
+          RECOVER: >= calib_lost_recover_frames consecutive FRESH frames under slam_slow_ms AND the (level-
+            triggered) planner status has ALSO caught up (status == OK) -> REDO the interrupted calibration
+            (its own descend re-establishes the mapping height). The status == OK gate is what stops a 1-tick
+            CALIBRATING_HEIGHT<->CALIB_LOST_HOLD oscillation when the status lags a healthy SLAM.
+          STUCK: ONE DOWN bump (max, per hold) to try to unglue, then keep holding indefinitely for plan OK.
+            Two causes, one bump total: (A) SLAM's SOLVE grinding (>= calib_lost_bump_slow_frames choked fresh
+            frames) -> wake SLAM; (B) SLAM fast but the planner still can't lock a path -> unglue. A second
+            nudge won't help SLAM and risks hitting walls, so it is capped at one.
+        No time cap — the SLAM frame stream is the liveness signal (operator ask)."""
+        # ENTRY (first loss during a calibration): latch, release controls, count the pulse FRESH from here
+        # (ignore the pre-loss streak, which would let a stale "healthy" reading exit immediately).
+        if self.state != "CALIB_LOST_HOLD":
+            self._calib_interrupted = True
+            self._calib_lost_bumped = False
+            self._player = None
+            self._slam_fast_streak = 0
+            self._slam_slow_streak = 0
+            self._enter("CALIB_LOST_HOLD", now)
+            return {}, "CALIB_LOST_HOLD", ("plan loss DURING height-calib -> release controls, HOLD; redo "
+                                           "calibration once SLAM solves fast AND plan is OK (calib interrupted)")
+        # A descend bump in flight -> play it out, then back to neutral hold.
+        if self._player is not None:
+            active, done = self._player.fields(now)
+            if done:
+                self._player = None
+                return {}, "CALIB_LOST_HOLD", None
+            return active, "CALIB_LOST_HOLD", None
+        slam_fast = self._slam_fast_streak >= self.calib_lost_recover_frames
+        # RECOVER: SLAM's solve is healthy AND the planner has caught up -> redo the calibration.
+        if slam_fast and status == "OK":
+            self._recalibrating = True          # DESCEND PASS -> REPLAN (per-goal path), never the prelude path
+            self._calib_retries = 0             # a fresh redo gets its full retry budget
+            self._enter("CALIBRATING_HEIGHT", now)   # re-sets _calib_active, clears _player/_ascend_phase
+            return {}, "CALIBRATING_HEIGHT", (f"SLAM healthy ({self._slam_fast_streak} fresh frames "
+                                              f"<{self.slam_slow_ms:.0f}ms) + plan OK -> REDO height calibration")
+        # STUCK -> ONE bump total per hold (either cause), first frame emitted NOW, then hold for plan OK.
+        stuck_slam = self._slam_slow_streak >= self.calib_lost_bump_slow_frames   # cause A: wake a grinding SLAM
+        stuck_plan = slam_fast and status != "OK"                                 # cause B: unglue a stuck planner
+        if not self._calib_lost_bumped and (stuck_slam or stuck_plan):
+            self._calib_lost_bumped = True
+            self._player = self.pb.player("descend")
+            active, done = self._player.fields(now)   # emit the first bump frame THIS tick (no wasted neutral tick)
+            if done:
+                self._player = None
+            why = "SLAM solve choking" if stuck_slam else f"SLAM fast but plan {status}"
+            return active, "CALIB_LOST_HOLD", (f"{why} -> bump DOWN once (max) to unglue, then hold for plan OK")
+        return {}, "CALIB_LOST_HOLD", None          # holding; wait for the SLAM pulse / plan OK
 
     def _begin_fallback(self, now, event):
         """One fallback attempt: a short RING-PICKED parallax push (the SAME direction pick as normal scouting —
@@ -1353,6 +1415,14 @@ class ExploreController:
 
         # --- status-gated SLAM-loss recovery (CONTROL-SPACE); active only in the explore phase ---
         if self._explore_started:
+            lost = status in ("PLAN-LOST", "NO-PLAN", "PLAN-STALE")
+            # A plan loss DURING a height calibration must NOT drop us into the normal recovery (which forgets
+            # the calibration and leaves the drone glued near the ceiling). Latch "interrupted", release
+            # controls, and hold in a DEDICATED state; on recovery REDO the calibration. Covers LOST/NO-PLAN/
+            # STALE. `st == CALIB_LOST_HOLD` routes EVERY status (incl. OK) into the handler so it owns its own
+            # recovery exit — and that exit is gated on status == OK to beat the level-triggered status flicker.
+            if st == "CALIB_LOST_HOLD" or (lost and self._calib_active):
+                return self._step_calib_lost(now, status)
             if status in ("PLAN-LOST", "NO-PLAN"):
                 # Perception is SILENT. HARD HOVER-HOLD indefinitely — never move on a clock while we're
                 # blind. Wait for perception to speak; the branch below (OK/STALE) then decides.
@@ -1594,6 +1664,7 @@ class ExploreController:
             if result == "PASS":
                 self._calib_active = False           # UNFREEZE the baseline ingest — height confirmed OK
                 self._recalibrating = False
+                self._calib_interrupted = False      # the (possibly interrupted) calibration completed smoothly
                 nxt = self._settle_to or "REPLAN"
                 self._settle_to = None
                 self._enter(nxt, now)
@@ -1609,6 +1680,7 @@ class ExploreController:
                 else:
                     self._calib_active = False
                     self._recalibrating = False
+                    self._calib_interrupted = False   # calibration resolved (abandoned after retries) -> no redo owed
                     nxt = self._settle_to or "REPLAN"
                     self._settle_to = None
                     self._enter(nxt, now)
@@ -3164,6 +3236,77 @@ def run_self_test(cfg):
           f"(PASS-at-height+re-tap-down={calib_route}, cooldown-gates={cooldown_gate}, "
           f"low-settle->escape/translate/retry={fail_retry}, empty-baseline->PASS={empty_pass}, "
           f"cap_ts-None-holds={capnone_ok}, baseline-ingest-gated={ingest_gate})  visited {o1}")
+
+    # ---- Calibration INTERRUPTED by a plan loss: CALIB_LOST_HOLD (survive the loss, redo the re-tap) ----
+    def _calib_lost_ctrl():
+        c = ExploreController(cfg, no_takeoff=True)     # no_takeoff => _explore_started True
+        c.calib_lost_recover_frames, c.calib_lost_bump_slow_frames = 6, 6
+        c._calib_active, c.state = True, "ASCEND"        # mid re-tap when the loss lands
+        return c
+    ANY_LOST = "PLAN-LOST"
+    # (a) ENTRY: a loss DURING a calibration diverts to CALIB_LOST_HOLD (NOT HOLD_LOST), latches the flag,
+    #     releases controls, and resets the pulse streaks so we count FRESH from the loss.
+    cl = _calib_lost_ctrl()
+    cl._slam_fast_streak = 9                              # a stale pre-loss streak that must NOT leak in
+    a_ent, s_ent, _ = cl.step(0.0, {"frame_id": 500, "slam_ms": 200.0}, False, status=ANY_LOST)
+    entry_ok = (s_ent == "CALIB_LOST_HOLD" and cl._calib_interrupted and a_ent == {}
+                and cl._slam_fast_streak == 0 and cl._slam_slow_streak == 0)
+    # (b) CAUSE A (wake SLAM) + immediate-bump: 6 fresh CHOKED frames -> exactly one DOWN bump on the 6th
+    #     frame's tick (joy_vertical == +1 = down), then a 7th choked frame yields no second bump.
+    t, fid = 0.05, 600
+    bump_tick, bumps = None, 0
+    for k in range(6):
+        a, s, _ = cl.step(t, {"frame_id": fid, "slam_ms": 2000.0}, False, status=ANY_LOST)
+        if a.get("joy_vertical") == 1:
+            bumps += 1; bump_tick = k
+        t += 0.05; fid += 1
+    # drain the in-flight descend player, then a further choked frame -> no new bump
+    for _ in range(6):
+        a, s, _ = cl.step(t, {"frame_id": fid, "slam_ms": 2000.0}, False, status=ANY_LOST)
+        if a.get("joy_vertical") == 1 and cl._player is None:
+            bumps += 1
+        t += 0.05; fid += 1
+    causeA_ok = (bumps == 1 and bump_tick == 5 and cl._calib_lost_bumped and cl.state == "CALIB_LOST_HOLD")
+    # (c) CAUSE B + TRAP-1: 6 fresh FAST frames but status still lost -> MUST NOT exit to CALIBRATING_HEIGHT;
+    #     it bumps once (to unglue the stuck planner) and keeps holding.
+    cb = _calib_lost_ctrl()
+    cb.step(0.0, {"frame_id": 700, "slam_ms": 200.0}, False, status=ANY_LOST)   # enter the hold
+    t, fid, saw_calib, saw_downB = 0.05, 701, False, False
+    for _ in range(8):
+        a, s, _ = cb.step(t, {"frame_id": fid, "slam_ms": 200.0}, False, status=ANY_LOST)
+        saw_calib = saw_calib or (s == "CALIBRATING_HEIGHT")
+        saw_downB = saw_downB or (a.get("joy_vertical") == 1)
+        t += 0.05; fid += 1
+    # `_calib_lost_bumped` is one-shot, so it guarantees "exactly one bump" without counting playout ticks.
+    causeB_trap1_ok = (not saw_calib and cb.state == "CALIB_LOST_HOLD" and saw_downB and cb._calib_lost_bumped)
+    # (d) RECOVER: 6 fresh FAST frames AND status OK -> redo the calibration (CALIBRATING_HEIGHT), with a
+    #     fresh retry budget and the per-goal DESCEND routing (_recalibrating True).
+    cr = _calib_lost_ctrl()
+    cr._calib_retries = 2                                 # a spent budget that the redo must reset
+    cr.step(0.0, {"frame_id": 800, "slam_ms": 200.0}, False, status="PLAN-LOST")  # enter the hold
+    t, fid, reached = 0.05, 801, False
+    for _ in range(8):
+        a, s, _ = cr.step(t, {"frame_id": fid, "slam_ms": 200.0}, False, status="OK")
+        if s == "CALIBRATING_HEIGHT":
+            reached = True; break
+        t += 0.05; fid += 1
+    recover_ok = (reached and cr._recalibrating and cr._calib_retries == 0)
+    # (e) a FULL redo that reaches CALIB_VERIFY PASS clears the interrupted flag (redo went smoothly).
+    cp = ExploreController(cfg, no_takeoff=True)
+    cp._last_calib_t, cp._leg_goal_prev = 0.0, [0.0, 0.0]
+    cp._calib_interrupted = True                          # pretend a prior loss owed a redo
+    _run_calib(cp, goal_far, 100.0, baseline=flat_baseline, verify_posy=-1.0)
+    verify_clears_ok = (not cp._calib_interrupted and not cp._calib_active)
+    # (f) STALE (not just LOST) during a calibration also diverts to _step_calib_lost (not _step_stale).
+    cs2 = _calib_lost_ctrl()
+    _a, s_stale, _ = cs2.step(0.0, {"frame_id": 900, "slam_ms": 200.0}, False, status="PLAN-STALE")
+    stale_divert_ok = (s_stale == "CALIB_LOST_HOLD" and cs2._calib_interrupted)
+    calib_lost_ok = (entry_ok and causeA_ok and causeB_trap1_ok and recover_ok and verify_clears_ok
+                     and stale_divert_ok)
+    ok = ok and calib_lost_ok
+    print(f"[self-test] {'PASS' if calib_lost_ok else 'FAIL'}  CALIB_LOST_HOLD (interrupted re-tap survives loss) "
+          f"(entry+reset={entry_ok}, causeA-1bump-immediate={causeA_ok}, causeB+trap1-no-exit={causeB_trap1_ok}, "
+          f"recover=redo={recover_ok}, verify-clears-flag={verify_clears_ok}, stale-diverts={stale_divert_ok})")
 
     # ---- Map mode: CONTROL-SPACE SLAM-loss recovery (hold-on-LOST + rewind-on-STALE + parallax fallback) ----
     # (a) invert_history: reverse order, invert each maneuver (forward<->reverse, turn theta->-theta).

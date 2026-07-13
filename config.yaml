@@ -195,6 +195,12 @@ autonomy:
     calib_low_height_margin: 0.3     # settled pos_y > median + this (+Y DOWN => lower) = a SANK calibration => FAIL
     calib_verify_max_s: 5.0          # SAFETY: cap the settle-and-judge; persistent 'higher than median' => PASS (logged)
     calib_retry_translate_dist: 1.0  # CALIB_TRANSLATE: clean horizontal slide (SLAM units) in high airspace before re-run
+    # --- calibration INTERRUPTED by a plan loss (CALIB_LOST_HOLD): survive the loss, redo the re-tap ---
+    # A plan loss DURING a re-tap must not forget the calibration (else the drone stays glued near the ceiling).
+    # Hold, watch the SLAM frame pulse (slam_ms), and REDO the calibration once SLAM solves fast AND plan is OK;
+    # bump DOWN once (max) if SLAM stays choked OR solves fast but the plan won't lock. Counts of the SLAM pulse.
+    calib_lost_recover_frames: 6     # consecutive fresh frames < slam_slow_ms confirming SLAM's SOLVE recovered
+    calib_lost_bump_slow_frames: 6   # consecutive fresh frames >= slam_slow_ms (SLAM grinding) => one wake-SLAM DOWN bump
     # --- POST-MISSION FLOOR-DOCK POSTLUDE (when the all-corners tour is exhausted, planner done=True):
     #     RETURN_TO_ORIGIN -> DOCK_FLOOR (gentle PULSED descent) -> LOW_STANDOFF -> DONE. Instead of a
     #     static hover at mapping height, fly home to the take-off origin (SLAM-frame [0,0]), descend
