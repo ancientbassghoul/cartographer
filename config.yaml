@@ -201,6 +201,15 @@ autonomy:
     # bump DOWN once (max) if SLAM stays choked OR solves fast but the plan won't lock. Counts of the SLAM pulse.
     calib_lost_recover_frames: 6     # consecutive fresh frames < slam_slow_ms confirming SLAM's SOLVE recovered
     calib_lost_bump_slow_frames: 6   # consecutive fresh frames >= slam_slow_ms (SLAM grinding) => one wake-SLAM DOWN bump
+    # --- calibration ESCAPE (session 15): break the finish->lose-plan->retry loop when SLAM is badly confused.
+    # After calib_escape_after CONSECUTIVE failed calibration attempts (each interrupted by a loss, or a
+    # CALIB_VERIFY that timed out with no settled healthy pose), stop redoing in place: do ONE ring-picked
+    # parallax push to a new vantage, then HOLD indefinitely until SLAM+plan are OK for calib_escape_ok_frames
+    # frames, then retry. If it fails calib_escape_after MORE times after the escape -> STUCK (hold, logging
+    # paused). All general robustness counts, no room answer.
+    calib_escape_after: 3            # consecutive failed calibrations -> escape (first time) / STUCK (after an escape)
+    calib_escape_ok_frames: 12       # consecutive fresh fast frames + status OK to declare SLAM recovered post-escape
+    calib_escape_push_s: 1.0         # duration of the one ring-picked parallax push to a fresh vantage
     # --- POST-MISSION FLOOR-DOCK POSTLUDE (when the all-corners tour is exhausted, planner done=True):
     #     RETURN_TO_ORIGIN -> DOCK_FLOOR (gentle PULSED descent) -> LOW_STANDOFF -> DONE. Instead of a
     #     static hover at mapping height, fly home to the take-off origin (SLAM-frame [0,0]), descend
@@ -209,13 +218,32 @@ autonomy:
     #     NOT a room answer. A continuous hold-down is FORBIDDEN (rapid downward accel chokes SLAM), so the
     #     descent MIRRORS the two-phase ascent: DOWN micro-pulses metered by the SLAM descent gain, then a
     #     continuous latch hold to catch a clean FLOOR. FLOOR detection is NEW/unvalidated -> dock_max_s caps it. ---
-    home_reach_dist: 1.0             # "reached the origin" test (SLAM units; defaults to goal_reach_dist)
+    home_reach_dist: 0.5             # "reached the origin" test (SLAM units) — tightened 1.0->0.5 so the drone actually
+                                     #   flies home at altitude before docking (a general tolerance, NOT a room answer)
     home_max_s: 30.0                 # SAFETY: cap the homing; then dock HERE (logged, NO SILENT FALLBACK)
     dock_pulse_s: 0.1               # Phase-1: DOWN micro-pulse length (near-zero momentum; mirrors ascend_micro_pulse_s)
     dock_rest_s: 1.0                # Phase-1: rest after each DOWN pulse (momentum bleed + a clean pose to read dZ)
     dock_max_s: 20.0                 # SAFETY: cap the descent even if no FLOOR latches, then proceed (logged)
     floor_standoff_nudge: 0.5        # LOW_STANDOFF: UP-nudge duration (s) to clear the ground before standby
     # (the descent reuses the ascend gain/stall/latch knobs: ascend_gain_eps / ascend_stall_cycles / ascend_latch_hold_s)
+    # --- GRADUAL HEIGHT TRIM (session 14): a fine, dose-able altitude correction BETWEEN calibrations ---
+    #   joy_vertical is a DISCRETE full-thrust ±1 axis (coarse), so we have never had a gradual vertical
+    #   primitive. TRIM uses the sim's PITCH aim instead: pitch the aim UP + push forward -> the drone flies
+    #   toward the raised aim = a GRADUAL climb (rate set by the push duration). Bonus: the forward component
+    #   is translation = SLAM parallax (a pure joy_vertical pulse stretches vertical features + chokes SLAM).
+    #   At each height calibration we record ceiling_y (glued-to-ceiling), desired_y (after the bump-down),
+    #   and delta = desired_y - ceiling_y. On a fresh healthy frame in a whitelisted state (SETTLE/ADVANCE),
+    #   if pos_y sank past ceiling_y + trim_sag_ratio*delta (== desired + 0.2*delta) -> run TRIM. All GENERAL
+    #   platform params + LIVE self-calibrating references (the 3 values are re-measured every calibration) --
+    #   no room answer. Verification is deferred (log the post-trim height; read the logs).
+    trim_enable: true
+    trim_sag_ratio: 1.2              # sag trigger: pos_y > ceiling_y + this*delta  (1.2 == desired + 0.2*delta)
+    trim_aim_s: 1.0                  # hold the pitch aim UP this long (aim reaches its highest)
+    trim_fwd_s: 1.0                  # forward push (with pitch still up) = the gradual climb
+    trim_settle_s: 1.0               # WAIT for a healthy frame CAPTURED >= trim_cmd_t0 + this before logging (async-SLAM guard)
+    trim_reposition_s: 0.5           # if forward is blocked: reverse/strafe this long to open forward room, then climb
+    trim_pitch_up: -1.0              # pitch value that raises the aim = CLIMB (sign confirmed live: +1.0 aimed DOWN)
+    trim_throttle: 1.0               # forward-push magnitude during the climb (brisk, like the parallax push)
     # --- executor (autopilot run_explore) ---
     # The engine is a "fly toward your aim" scheme: yaw moves an aim crosshair, forward thrust flies
     # toward it, and a sustained yaw HOLD (then 'c' reset) rotates the body. A turn's ANGLE = how long
@@ -263,6 +291,12 @@ autonomy:
                                  #   Progress-gated so a re-lock that instantly bumps a wall at ~0 distance does NOT falsely confirm.
     recovery_turn_step_deg: 15.0 # gentler turn step for the recovery FALLBACK sweep (vs turn_step_deg for normal flight): a
                                  #   fragile re-lock survives a smaller open-loop turn; more attempts still cover a full sweep.
+    recovery_settle_frames: 4    # a SETTLE between every recovery action (REWIND inverse maneuvers + FALLBACK sweep attempts):
+                                 #   hold neutral until this many FRESH frames are CAPTURED after the hold began, so monocular SLAM
+                                 #   gets a still moment to re-lock instead of firing/spinning back-to-back. Lost-SLAM flavor:
+                                 #   NOT gated on fast/OK (a genuine re-lock exits recovery at the step() top).
+    recovery_settle_max_s: 2.5   # bounded escape: if the pipeline is dead (no fresh frames), end the settle after this and still
+                                 #   proceed to the next re-exposure maneuver (VISIBLE log; sitting still forever defeats the rewind).
     # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
     #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are
@@ -270,6 +304,10 @@ autonomy:
     slam_slow_ms: 1000.0         # a frame build >= this = SLAM choking -> stop moving and hold
     slam_settle_frames: 6        # "stable" only after >5 consecutive FRESH frames each built under slam_slow_ms
                                  #   (raised 3->6 in session 8 to give SLAM more margin before resuming flight)
+    settle_fresh_frames: 6       # session 15: a GOAL-FLYING SETTLE (nxt REPLAN/…) waits for this many SLAM "done"
+                                 #   frames CAPTURED AFTER the settle began (cap_ts >= entry) AND under slam_slow_ms,
+                                 #   before any flying command — no ORIENT/advance on a stale pose. Vertical routine
+                                 #   (TAKEOFF/ASCEND/DESCEND/BASELINE_NUDGE) is exempt (kept timed).
     # SLAM-settle REWIND step-back: if SLAM stays slow in a HOLD (plan still OK), stepping one entry back
     # through the rewind queue re-exposes known-good geometry to help the solve re-lock (the user's
     # "back up until it settles" idea). Re-arm needs another full run of slow frames; capped per hold.

@@ -1,14 +1,44 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-13** (session 13 **BUILT + all self-tests green; live-fly PENDING**). Resume from THIS
-file. **Session 13** (`plans/crystalline-swimming-floyd.md`): on flight `20260713_163055` a per-goal ceiling
-re-tap started, then a brief PLAN-LOST hit mid-ASCEND — the drone **forgot it was calibrating**, dropped into
-normal recovery (`HOLD_LOST→SLAM_HOLD→SETTLE→REPLAN`), skipped the DESCEND, and **stayed glued to the ceiling
-(`pos_y≈-2.2`) for the rest of the flight**. Fixed with a dedicated `CALIB_LOST_HOLD` state that survives the
-loss: hold, watch the SLAM frame pulse (`slam_ms`), **redo** the calibration once ≥6 fresh frames <1000 ms AND
-`status==OK` (the OK-gate beats the level-triggered status flicker that would otherwise 1-tick-oscillate), and
-**bump DOWN once (max)** if SLAM stays choked (6 slow frames → wake SLAM) OR solves fast but the plan won't lock.
-All self-tests green; **live-fly PENDING**. Session-12 (below) also still awaits its live re-fly.
+_Last updated **2026-07-14** (session 16 **BUILT + all module self-tests green; live-fly PENDING**). Resume from
+THIS file. **Session 16** (`plans/session16-settle-between-stages-and-return-to-origin.md`): a test flight's
+return-to-origin fell apart — it "turned like a maniac," fired the reverse-list back-to-back with no settles,
+then spun (no settles), declared STUCK, retried. One pattern in three places: commanded actions fire
+back-to-back with no still window for monocular SLAM to re-lock. Built a **shared settle gate** (`_settle_begin`
+/ `_settle_poll`, healthy + lost-SLAM flavors; the SETTLE state now calls it) and put a settle between EVERY
+action: (1) **REWIND** inverse maneuvers, (2) **spin FALLBACK** attempts (both lost-SLAM flavor, bounded by
+`recovery_settle_max_s` so a dead pipeline still re-exposes) — this resolves the session-15 parked
+"reverse-without-settling". Also **flipped the FALLBACK order to turn→push** (was push→turn) so the parallax
+translation is the LAST motion before the settle (rescues the rotation for RELOC; matches the 'c'-reset-then-push
+recipe). And built the **full return-to-origin ending**: `home_reach_dist` 1.0→0.5, a new
+**ORIENT_HOME** state facing the recorded `_takeoff_heading`, a **POSTLUDE_LOST_HOLD** so the dock survives a
+SLAM loss (mirror of CALIB_LOST_HOLD), `_POSTLUDE_NOLOCK` to stop floor re-inflation, and homing settles
+(`PLAN→TURN→SETTLE→ADVANCE→SETTLE→PLAN`). All module self-tests green; **live-fly PENDING.**_
+
+_**Session 15** (`plans/session15-trim-and-settle-fixes.md`): six fixes off the session-14 TRIM
+flight (`20260714_113312`). (1) TRIM **pitch was reversed** → `trim_pitch_up=-1.0` (now climbs). (2) A
+calibration **endless loop** (finish→lose-plan→retry) is now bounded: after 3 consecutive failed attempts a
+new **`CALIB_ESCAPE`** state does a ring-picked push to a fresh vantage + holds for SLAM (12 frames + OK) then
+retries; 3 more fails → **STUCK** (logging paused). (3) **SETTLE** no longer flies on a stale pose — a
+goal-flying settle waits for **6 SLAM frames captured AFTER the settle began** (`cap_ts ≥ entry`) and
+<1000 ms; the vertical prelude routine is exempt. (3b) **CALIB_VERIFY**'s timeout no longer PASSes-and-flies on
+a stale pose — it feeds the same escape/STUCK guard. (4) Debugger shows **live height numbers** (ceiling /
+desired / delta / all-flight median), dropped Δpos/Δgoal. (5) **fly.py** console flood fixed (restored
+`NEW_CONSOLE`). All module self-tests green; **live-fly PENDING**. Parked: reverse-without-settling — diagnose
+on the next log (the SETTLE gate may already fix it). Sessions 11/12/13/14 items fold into the same re-fly._
+
+_**Session 14** (`plans/gradual-height-trim.md`): flight `20260713_223231` flew great (height-calib + parallax
+fixes worked; **`CALIB_LOST_HOLD` fired 3× live and recovered cleanly — session 13 LIVE-PROVEN**). Built the
+operator's **gradual height TRIM**:
+a fine, dose-able altitude correction BETWEEN calibrations that uses the sim's PITCH aim (pitch the aim UP +
+push forward → fly toward the raised aim = a gradual climb; the forward part feeds SLAM parallax, unlike a
+discrete full-thrust `joy_vertical` pulse that chokes SLAM). At each calibration we now record ceiling_y /
+desired_y / delta; on a fresh healthy frame in SETTLE or ADVANCE, if `pos_y` sank past
+`ceiling_y + 1.2*delta`, a ring-gated TRIM climbs back (fwd-open → climb; else reverse/strafe to open forward
+room; else abort+pray), preserving the committed goal (re-aims ORIENT, never re-picks). Also diagnosed two
+things and wrote them up for a fresh session: the **return-to-origin ending** (`plans/return-to-origin-and-
+graceful-dock.md`) and the **2-minute glass-wall bounce** (`plans/blacklist-region-and-counter.md`). All
+module self-tests green; **live-fly PENDING**. Sessions 11/12/13 items also fold into the same re-fly.
 Flight `20260713_101220` flew well then **"lost its shit"** after a parallax strafe; we diagnosed it
 fully, wrote **`plans/strafe-throttle-and-recovery-loop.md`** (D1–D5), and **BUILT all five** (49/49 autopilot
 self-tests pass; flow/frontier/ground_grid/perception green). **NEXT = live re-fly** of the same far-corner
@@ -37,8 +67,36 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = LIVE RE-FLY** — one flight now confirms BOTH session 13 and session 12 (both BUILT + all self-tests
-green). Run `python fly.py`, press `m` to hand over._
+_**NEXT = LIVE RE-FLY** — one flight confirms sessions 16 + 15 + 14 (+ the still-pending 11/12/13 items). Run
+`python fly.py`, press `m` to hand over._
+
+_**Session 16 — settle between every action + full return-to-origin ending**
+(`plans/session16-settle-between-stages-and-return-to-origin.md`, BUILT + all module self-tests green). Watch:_
+- _At mission end: **homes AT altitude → ORIENT_HOME faces the take-off heading → gentle dock → up-bump → DONE**
+  — no descend-in-place, no jump-up, no "maniac" turning (homing settles between every turn/advance)._
+- _A deliberate **SLAM loss during the dock** → `POSTLUDE_LOST_HOLD` (NOT HOLD_LOST/FALLBACK) → resumes the dock
+  once SLAM+plan recover. `target_altitude_y` stays None through the descent (no floor re-inflation)._
+- _Whenever recovery fires: a **neutral settle between every REWIND step and every spin FALLBACK attempt** (no
+  back-to-back). A dead pipeline caps out at `recovery_settle_max_s` and still proceeds (logged)._
+- _Knobs: `recovery_settle_frames` (4), `recovery_settle_max_s` (2.5), `home_reach_dist` (0.5)._
+
+_**Session 15 — six fixes** (`plans/session15-trim-and-settle-fixes.md`, BUILT + all module self-tests green).
+Watch:_
+- _A **TRIM now CLIMBS** (`trim_pitch_up=-1.0` — the +1.0 was inverted). The before/after `pos_y` confirms it._
+- _A **leg SETTLE waits for 6 fresh <1000 ms SLAM frames captured after the settle** before ORIENT (no more
+  ORIENT one second after settle with a 2 s-stale pose). The vertical prelude routine stays timed._
+- _A **looping re-calibration escapes**: after 3 fails → `CALIB_ESCAPE` (ring push + hold for SLAM) → retry;
+  3 more → `STUCK` (logging paused). `CALIB_VERIFY` no longer flies to a goal on a stale/None pose._
+- _The replay's **HEIGHT CALIBRATION** panel shows live ceiling/desired/delta + a constantly-updating median
+  (Δpos/Δgoal removed). The launcher console is quiet (io_bridge back in its own window)._
+- _**Parked:** reverse fired back-to-back without settling — diagnose on THIS flight's log (the SETTLE gate may
+  already have fixed the `→SETTLE→REPLAN` reverses)._
+
+_**Session 14 — gradual height TRIM** (`plans/gradual-height-trim.md`, BUILT). A whitelisted-state sag
+(`pos_y > ceiling_y + 1.2*delta`, in SETTLE/ADVANCE) fires a ring-gated `TRIM` (pitch-up → forward → `c` →
+frame-dated WAIT) that re-aims at the SAME committed goal (never re-picks). Two diagnosed-not-built items are
+queued as their own plans: `plans/return-to-origin-and-graceful-dock.md` (the ending) and
+`plans/blacklist-region-and-counter.md` (the glass-wall bounce)._
 
 _**Session 13 — calibration survives a plan loss** (`plans/crystalline-swimming-floyd.md`, BUILT + self-test
 green). Watch a per-goal `CALIBRATING_HEIGHT` where SLAM chokes during the re-tap:_
@@ -159,7 +217,30 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Future (backlog)
-- **Calibration survives a plan loss — BUILT (session 13), self-test green, LIVE-FLY PENDING**
+- **Session-15 six fixes — BUILT, all module self-tests green, LIVE-FLY PENDING**
+  (`plans/session15-trim-and-settle-fixes.md`): TRIM pitch sign (`trim_pitch_up=-1.0`); calibration
+  escape/STUCK guard (`CALIB_ESCAPE` + `_calib_fail_escalate`, config `calib_escape_*`); SETTLE fresh-frame
+  gate (`settle_fresh_frames`, `_SETTLE_EXEMPT_NXT`); CALIB_VERIFY no-fly-on-stale (`TIMEOUT_FAIL`→escalate);
+  debugger live height numbers (`alt_*` + `_alt_median`); fly.py `NEW_CONSOLE`.
+- **Settle between every recovery action + full return-to-origin ending — BUILT (session 16), LIVE-FLY PENDING**
+  (`plans/session16-settle-between-stages-and-return-to-origin.md`): shared `_settle_begin`/`_settle_poll` gate;
+  a settle between REWIND inverse maneuvers and between spin FALLBACK attempts (resolves the parked
+  "reverse-without-settling"); `home_reach_dist` 0.5, `ORIENT_HOME`, `POSTLUDE_LOST_HOLD` (dock survives a SLAM
+  loss), `_POSTLUDE_NOLOCK` (no floor re-inflation), homing `TURN→SETTLE→ADVANCE→SETTLE`. Knobs
+  `recovery_settle_frames`/`recovery_settle_max_s`.
+- **Gradual height TRIM — BUILT (session 14), pitch sign fixed session 15, LIVE-FLY PENDING**
+  (`plans/gradual-height-trim.md`): PITCH-aim + forward climb between calibrations; 3-value capture
+  (ceiling_y/desired_y/delta) at CALIB_VERIFY; `pos_y > ceiling_y + 1.2*delta` trigger in SETTLE/ADVANCE;
+  ring-gated (reverse/strafe reposition, else abort); goal-preserving exit. Config knobs `trim_*`.
+- **Return-to-origin + graceful dock — BUILT (session 16), LIVE-FLY PENDING**
+  (`plans/return-to-origin-and-graceful-dock.md` = diagnosis of record; built per
+  `plans/session16-settle-between-stages-and-return-to-origin.md`): home at altitude (`home_reach_dist` 0.5),
+  `ORIENT_HOME` to the recorded take-off heading, `POSTLUDE_LOST_HOLD` (DOCK survives a SLAM loss),
+  `_POSTLUDE_NOLOCK` kills the floor-level altitude-lock re-inflation.
+- **Glass-wall bounce (blacklist region + counter) — DIAGNOSED (session 14), plan written, NOT BUILT**
+  (`plans/blacklist-region-and-counter.md`): widen the blacklist region past the frontier spacing + per-region
+  bump tallies (stop the `counter defeated` thrash).
+- **Calibration survives a plan loss — BUILT (session 13), LIVE-PROVEN (session 14 flight, 3× recover)**
   (`plans/crystalline-swimming-floyd.md`): `CALIB_LOST_HOLD` + `_calib_interrupted`; redo on a 6-fast-frame +
   `status==OK` SLAM-pulse recovery, one DOWN bump if stuck, `status==OK`-gated exit (anti-flicker).
 - **Height calibration — BUILT + FLEW (session 11), NOT confirmed good** (`plans/height-calib-state-gate-and-slam-debug.md`):
@@ -183,6 +264,82 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Documentation (what we tried)
+
+### Session 16 (2026-07-14) — a SETTLE between every action (recovery + postlude) + the full return-to-origin ending  [BUILT; all module self-tests green; live-fly pending]
+A test flight finished its last corner, tried to return to origin, and fell apart — it "turned like a maniac,"
+fired the reverse-list back-to-back with NO settles, exhausted itself, fell back to spinning (also no settles),
+declared STUCK, then retried. We recognized ONE pattern in three places: commanded actions fire back-to-back
+with no still window for monocular SLAM to re-lock, so the pose stays frozen/stale and the failure compounds —
+the same thing session 15 fixed for the per-leg SETTLE, just never applied to the recovery mechanisms or the
+postlude. So we generalized the session-15 SETTLE tracker into a **shared gate** (`_settle_begin` /
+`_settle_poll`, two flavors — HEALTHY `require_fast=True` and a bounded LOST-SLAM `require_fast=False` that gates
+on fresh CAPTURE only, since SLAM is STALE by definition during recovery) and refactored the SETTLE state onto
+it (behavior-identical). Then we put a settle **between every REWIND inverse maneuver and every spin FALLBACK
+attempt** (bounded by `recovery_settle_max_s` so a dead pipeline still re-exposes) — resolving the session-15
+parked "reverse-without-settling." The operator then caught a related ordering bug: each spin FALLBACK attempt
+was `push → turn`, leaving a BARE ROTATION as the last motion before the settle — exactly the SLAM-killer, right
+when we ask it to re-lock. Flipped to **`turn → push`** so the parallax translation is last (rescues the
+rotation for RELOC; also matches the established "reset attitude with 'c' BEFORE a push" recipe, since a turn is
+`yaw + 'c'`). The operator also chose to build the **full return-to-origin ending** in the
+same session (it's where the mess showed up): `home_reach_dist` 1.0→0.5 (so it homes at altitude instead of
+docking 0.86u out), a new **ORIENT_HOME** state facing the recorded `_takeoff_heading`, a **POSTLUDE_LOST_HOLD**
+(mirror of CALIB_LOST_HOLD) so a SLAM loss during the dock HOLDs + resumes instead of thrashing into recovery,
+**`_POSTLUDE_NOLOCK`** to stop the flying-height altitude lock from re-inflating a floor-level drone, and homing
+settles (`PLAN→TURN→SETTLE→ADVANCE→SETTLE→PLAN` — the direct "maniac turning" fix). All module self-tests green
+(new inter-action-settle + ORIENT_HOME-bearing-wrap + DOCK-survives-loss + no-re-inflate tests). **Lesson: the
+"settle so SLAM can re-lock" discipline isn't just for the mapping loop — every place that emits a maneuver
+(recovery, homing, orient) must give the monocular solver a still window, or it thrashes; a bounded settle
+(fresh-capture-verified, time-capped) is the general primitive.**
+
+### Session 15 (2026-07-14) — TRIM pitch fix + calib escape/STUCK + SETTLE fresh-frame gate + debugger numbers  [BUILT; all module self-tests green; live-fly pending]
+The session-14 TRIM flight (`20260714_113312`) surfaced six things. (1) The TRIM **pitch axis was inverted** —
+`+1.0` aimed DOWN so the drone descended; flipped to `-1.0`. (2) When SLAM got badly confused a re-calibration
+**looped forever** (finish/interrupt → lose plan → redo → …); we bounded it with a shared `_calib_fail_escalate`
+counter and a new `CALIB_ESCAPE` state — after 3 consecutive failed attempts, push once to a fresh vantage +
+hold for SLAM (12 fresh frames + OK) then retry; 3 more → `STUCK` (logging paused). (3) The operator caught a
+`SETTLE` that fired `ORIENT` ~1 s later with the last SLAM solve ~2 s stale → a shaky pose → plan loss; a
+**settle must SETTLE**. Fixed: a goal-flying settle now waits for **6 SLAM "done" frames CAPTURED after the
+settle began** (`cap_ts ≥ entry`) and under 1000 ms — the running streak was stale-high (frames had stopped
+arriving), so we count frames by their capture time, not a pre-existing streak. The operator challenged an
+early claim that the prelude runs before SLAM tracks — the data proved him right (SLAM is solving from the
+first ARM tick, `frame_id=670`), so the vertical prelude routine is exempt by role, not by track status. (3b)
+`CALIB_VERIFY`'s 5 s timeout used to PASS-and-fly to a goal on a stale/absent pose — now it counts a failed
+attempt and feeds the same escape/STUCK guard. (4) The debugger's useless `Δpos/Δgoal` was replaced with a
+**HEIGHT CALIBRATION** number group (last ceiling/desired/delta + the all-flight rolling median CALIB_VERIFY
+judges against). (5) The launcher console flooded because two services had lost their `NEW_CONSOLE`. All module
+self-tests green (new SETTLE-gate + CALIB_ESCAPE tests; `_drive` now injects a live frame stream so the gate is
+exercisable). **Lesson: a "settle" that trusts a running health streak can proceed on a frozen-but-recently-
+healthy track — gate on frames whose CAPTURE time is after the settle started; and always CHECK THE DATA before
+asserting what the prelude does.** Parked: reverse fired without settling — diagnose on the next log.
+
+### Session 14 (2026-07-14) — gradual height TRIM (pitch-aim climb); diagnosed the ending + glass-wall bounce  [BUILT; all module self-tests green; live-fly pending]
+Flight `20260713_223231` flew great and **live-proved `CALIB_LOST_HOLD`** (it fired 3× and recovered every
+time — session 13 confirmed). But the drone still gradually LOST height: calibration only re-taps on a goal
+change, and ~half the flight sat in SLAM_HOLD/HOLD_LOST where the discrete `joy_vertical` altitude-lock never
+corrects. We wanted a FINE, dose-able vertical primitive. The operator's idea: use the sim's PITCH aim — pitch
+the aim UP and push forward, and the drone flies toward the raised aim = a GRADUAL climb (rate = push
+duration), the forward part feeding SLAM parallax (a pure `joy_vertical` pulse stretches vertical features and
+chokes SLAM — exactly what bit DOCK_FLOOR this flight). Built it: at each calibration's `CALIB_VERIFY` pass we
+record `ceiling_y` (climb peak), `desired_y` (settled), `delta`; on a fresh healthy frame in SETTLE/ADVANCE, if
+`pos_y > ceiling_y + 1.2*delta` (== sunk >20% of the ceiling gap below desired) a **`TRIM`** state runs: a ring
+gate picks a safe way to climb-forward (fwd-open → climb; else reverse to open forward room; else strafe to an
+open side; else abort+"pray", all visible), then pitch-up (`trim_aim_s`) → forward push with pitch still up
+(`trim_fwd_s`) → `c` reset → WAIT for a healthy frame CAPTURED ≥ `trim_cmd_t0 + trim_settle_s` (the async-SLAM
+guard, same monotonic clock as CALIB_VERIFY) → LOG the post-trim height. It **preserves the committed goal**
+(snapshots `leg_goal`, re-aims ORIENT at it on exit — never re-picks, so a trim can't pollute goal
+commitment). Four review "traps" folded in: forward-push stays interruptible by the live flow/ram guards
+(A); goal snapshot+restore (B); the cap_ts↔now monotonic baseline is the project's proven CALIB_VERIFY gate
+(C); the 3 values are captured only at a settled CALIB_VERIFY pass, never mid-wobble (D). All module
+self-tests green (incl. a new HEIGHT-TRIM test). **Also diagnosed but NOT built** (each its own plan for a
+fresh session): the **return-to-origin ending** — `home_reach_dist=1.0` made it "reach" origin 0.86u out and
+dock in place from flying height; the dock then lost SLAM → recovery loop; the flying-height altitude-lock
+re-inflated the floor-level drone → land/crawl/jump (`plans/return-to-origin-and-graceful-dock.md`); and the
+**2-minute glass-wall bounce** — the blacklist region is smaller than the frontier spacing (whack-a-mole,
+every blacklist `1 total`) AND the 2-bump counter reset when the planner alternated to distant goals
+(`counter defeated` ×209) (`plans/blacklist-region-and-counter.md`). **Lesson: `joy_vertical` being a discrete
+full-thrust axis is WHY we had no gentle altitude trim; the pitch-aim + forward "fly toward your aim" trick is
+a gradual, SLAM-friendly vertical primitive — and any brief interrupt maneuver must snapshot + restore the
+committed goal so it doesn't pollute the mission's goal commitment.**
 
 ### Session 13 (2026-07-13) — a plan loss during a ceiling re-tap erased the calibration; built CALIB_LOST_HOLD  [BUILT; all self-tests green; live-fly pending]
 Flight `20260713_163055`: a per-goal `CALIBRATING_HEIGHT` fired, and mid-ASCEND (flush at the ceiling) SLAM
@@ -427,6 +584,13 @@ A live flight showed the earlier "glass-stuck" watchdog was built on a WRONG gla
   4's **event-driven 2-bump** rule finally holds.
 
 ### Open issues
+- **Return-to-origin ending + inter-action settles (session 16) — BUILT + all self-tests green, LIVE-FLY
+  PENDING.** New states `ORIENT_HOME` / `POSTLUDE_LOST_HOLD` and the recovery/postlude settles have never flown.
+  Watch live: the ending homes AT altitude → faces the take-off heading → gentle dock → up-bump (no
+  descend-in-place / no jump-up / no maniac turning); a SLAM loss mid-dock → `POSTLUDE_LOST_HOLD` → resume (not
+  recovery); a neutral settle between every REWIND step + spin attempt. If `recovery_settle_max_s` (2.5) is too
+  short/long or `home_reach_dist` (0.5) too tight, adjust. `_takeoff_heading` is captured from the first healthy
+  post-prelude `heading_deg` — confirm it reads a stable heading, not a wobble.
 - **`CALIB_LOST_HOLD` (session 13) — BUILT + self-test green, LIVE-FLY PENDING.** A plan loss during a
   ceiling re-tap no longer forgets the calibration. Watch live: on the loss → `CALIB_LOST_HOLD` (not
   `HOLD_LOST`); NO `CALIBRATING_HEIGHT↔CALIB_LOST_HOLD` oscillation while `status` lags; on recovery the
@@ -492,7 +656,11 @@ multi-target estimate. Offline E2E confirmed.
   DESCEND → **CALIB_VERIFY** (state-gated judge vs the frozen flying-height baseline; a sunk result →
   **ASCEND_ESCAPE → CALIB_TRANSLATE →** re-tap, session 11); a plan loss DURING any re-tap diverts to
   **CALIB_LOST_HOLD** (survive the loss → redo the calibration on a 6-fast-frame + `status==OK` SLAM-pulse
-  recovery, one DOWN bump if stuck; session 13); on `done` the **floor-dock postlude
+  recovery, one DOWN bump if stuck; session 13), and 3 consecutive failed calibrations divert to
+  **CALIB_ESCAPE** (ring push + hold for SLAM → retry; 3 more → STUCK; session 15); a gradual-height **TRIM**
+  (session 14) fires from SETTLE/ADVANCE when `pos_y` sinks past `ceiling_y + 1.2*delta` — ring-gated PITCH-aim
+  + forward climb (`trim_pitch_up=-1.0`), goal-preserving; a leg **SETTLE waits for 6 fresh post-settle SLAM
+  frames** before flying (session 15); on `done` the **floor-dock postlude
   RETURN_TO_ORIGIN → DOCK_FLOOR (two-phase pulsed descent) → LOW_STANDOFF → DONE** (session 10);
   control-space **recovery** on SLAM loss; **STUCK** hold; event-driven 2-bump blacklist for unreachable
   goals. **Ram guard is self-calibrating**; the clearance stand-off is the primary wall stop. (The ORIENT

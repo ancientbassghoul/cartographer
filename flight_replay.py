@@ -365,13 +365,8 @@ function updatePanel(idx) {
 const dist2 = (a, b) => (a && b) ? Math.hypot(a[0]-b[0], a[1]-b[1]) : null;
 function updateTelemetry(idx) {
   const s = STEPS[idx];
-  const prev = idx > 0 ? STEPS[idx-1] : null;
   const X = s.pos ? s.pos[0] : null, Z = s.pos ? s.pos[1] : null, Y = s.pos_y;
-  // deltas (raw world step displacement + distance closed to the goal this step)
-  const dpos = (prev && prev.pos && s.pos) ? dist2(s.pos, prev.pos) : null;
   const dg = s.goal ? dist2(s.pos, s.goal) : null;
-  const dgPrev = (prev && prev.goal && prev.pos) ? dist2(prev.pos, prev.goal) : null;
-  const dgClosed = (dg != null && dgPrev != null) ? (dgPrev - dg) : null;   // + = got closer
   // raw command dict -> key:value string ({} = hover; undefined = not recorded in this log)
   let cmdStr;
   if (s.cmd === undefined) cmdStr = '<span class="k">— (not recorded)</span>';
@@ -396,9 +391,11 @@ function updateTelemetry(idx) {
     `<span class="k">nominal</span> <span class="v">${fmt(s.nominal_speed,3)}</span>  ` +
     `<span class="k">ram&lt;33%</span> <span class="${(s.speed!=null&&s.nominal_speed!=null&&s.speed<0.33*s.nominal_speed)?'bad':'v'}">` +
       `${(s.nominal_speed!=null)?(s.speed!=null?((s.speed<0.33*s.nominal_speed)?'STALLED':'ok'):'—'):'calibrating'}</span>` +
-    `<div class="grp">DELTA (this step)</div>` +
-    `<span class="k">&Delta;pos</span> <span class="v">${fmt(dpos,3)}</span>  ` +
-    `<span class="k">&Delta;goal</span> <span class="v">${fmt(dgClosed,3)}</span>` +
+    `<div class="grp">HEIGHT CALIBRATION (+Y DOWN)</div>` +
+    `<span class="k">ceiling</span> <span class="v">${fmt(s.alt_ceiling,3)}</span>  ` +
+    `<span class="k">desired</span> <span class="v">${fmt(s.alt_desired,3)}</span>  ` +
+    `<span class="k">delta</span> <span class="v">${fmt(s.alt_delta,3)}</span><br>` +
+    `<span class="k">drone-height median (all-flight)</span> <span class="v">${fmt(s.alt_median,3)}</span>` +
     `<div class="grp">PLAN STATUS</div>` +
     `<span class="${stCol}">${s.status || 'OK'}</span>`;
 }
@@ -565,9 +562,10 @@ def _self_test():
         c7 = (by_frame[5].get("cmd") == {"trigger": 0.2}
               and by_frame[5].get("speed") == 0.42 and by_frame[5].get("nominal_speed") == 0.45
               and "updateTelemetry" in html and "RAW TRANSLATION" in html and "RAW COMMAND" in html
-              and "DELTA (this step)" in html and 'id="telemetry"' in html
+              and "HEIGHT CALIBRATION (+Y DOWN)" in html and 'id="telemetry"' in html
+              and "drone-height median (all-flight)" in html
               and "DIST &rarr; GOAL (SLAM units)" in html and "SPEED (world, u/s)" in html)
-        print(f"[self-test] {'PASS' if c7 else 'FAIL'}  raw telemetry panel (translation/cmd/dist/speed/delta) wired")
+        print(f"[self-test] {'PASS' if c7 else 'FAIL'}  raw telemetry panel (translation/cmd/dist/speed/height-calib) wired")
         ok = ok and c7
 
         # NEW: committed-goal vs plan-pick separation + staleness exposure survived + the render code is present
