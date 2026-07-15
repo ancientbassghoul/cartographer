@@ -1,7 +1,51 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-14** (session 16 **BUILT + all module self-tests green; live-fly PENDING**). Resume from
-THIS file. **Session 16** (`plans/session16-settle-between-stages-and-return-to-origin.md`): a test flight's
+_Last updated **2026-07-15** (session 18 **BUILT — io_bridge + autopilot + flight_replay self-tests green;
+LIVE-FLY PENDING**). Resume from THIS file. **NEXT = LIVE-FLY** (`python fly.py`, press `m`) to confirm session
+18 AND the still-pending sessions 17/16/15/14/11-13 in one go; then **RE-TUNE the throttle knobs** (session-17
+"lower the speed knobs"; turn durations are unaffected — yaw is no longer ramped). Plan of record:
+**`plans/session18-command-smoothing-and-height-median.md`**._
+
+_**Session 18 — manual-style command SMOOTHING for autonomy + a real height-median (BUILT):** the operator
+noticed autonomous flight is height-erratic (hard brake + pitch-up + altitude jump on every stop / plan-loss)
+while his manual flight is "very very controlled." Root cause (found by diffing the `20260715_001039` manual
+command CSV): manual keys only toggle the `trigger_down`/`reverse_down` (and arrow) GATES, and io_bridge's 60 Hz
+loop RAMPS the analog toward them (`+0.05`/tick attack, `−0.1`/tick decay; yaw/pitch `±0.05` aim). The autopilot
+BYPASSED all of it — `_apply_autonomy_overlay` hard-wrote the analog after the ramp, and `_neutralize_autonomy`
+snapped to 0. Fix: the autopilot's **`trigger`/`reverse`** are now RAMP TARGETS the existing loop
+chases (new `_ramp` + `_auto_*_target`; `_update_controls`→testable `_step_controls`), so thrust eases in/out
+like a hand-flown stick while KEEPING the throttle magnitudes; release decays smoothly (aim axes + gates
+still snap for safety). **yaw/pitch are NOT ramped** — live-flight showed the turn is duration-not-magnitude (the
+sim eases the aim itself and the drone only rotates once the aim REACHES ±1), so ramping stole ~0.33 s from every
+turn (30°→~5°); they pass straight through, restoring the calibrated turn recipe. Also **re-added `--log-commands`** (the reverted session-17 outgoing-packet CSV) — now
+permanent + always-on via `fly.py` — so MANUAL vs AUTO smoothing is diffable. Second, independent fix: the
+debugger's **drone-height median** was appended every ~50 Hz tick with no frame dedup (re-appending one stale
+pose ~25×) and seeded with ~0 ground samples pre-takeoff — hence the −0.008→−1.8 jump-with-no-new-frame and the
+lag. Now it ingests ONE reading per FRESH SLAM frame (`frame_id` dedup), only after the first calibration
+(`_height_calibrated`), frozen during any calibration; `MAPPING_ALT_STATES` retired. New io_bridge
+`--self-test` (ramp) + rewritten autopilot ingest-gate test; all green. **LIVE-FLY PENDING. CAVEAT: smoothing
+attenuates short pulses (a 1–2-frame reverse tap / brief turn reaches less than commanded before the next
+command) — expect to RE-TUNE throttle knobs AND maneuver durations / back-off counts on the first flight.**_
+
+_**Session 17 — THE BIG ONE (BUILT):** while diagnosing the broken height TRIM we built temporary
+io_bridge diagnostics (a `t` trim macro, a `y` replay, a `--log-commands` full-packet CSV) and, by diffing a
+hand-flown trim against the macro, found the root cause of MONTHS of pain: **the Unity sim gates real thrust on
+the `triggerDown`/`reverseDown` BOOLEAN, NOT the analog `trigger`/`reverse`.** The autopilot had NEVER set it
+(`AUTONOMY_FIELDS` omitted it; io_bridge even decays the analog to 0 unless the boolean is held), so every
+autonomous forward/reverse ran with the gas button UNPRESSED — the near-certain explanation for the legendary
+~0.02-0.04 u/s "crawl". The operator also confirmed the drone HOLDS ALTITUDE on its own during horizontal
+flight; it only climbs uncontrollably when flying FORWARD or STRAFING into a wall (reverse doesn't) — so the
+periodic height-calibration + TRIM were fighting a self-inflicted sag. Built: (a) `trigger_down`/`reverse_down`
+added to `AUTONOMY_FIELDS` (io_bridge) + `_neutralize_autonomy`, and DERIVED CENTRALLY in `autopilot._full_vector`
+(the single choke point) from the analog value — so EVERY forward/reverse emit site engages thrust; (b) KEPT the
+first calibration + flight-height median + all calib recovery; (c) DELETED the periodic re-calibration trigger
+and ALL of TRIM (state/trigger/exit/vars/config/self-test). All six module self-tests green. LIVE-FLY pending;
+expect to re-tune speed knobs afterward. A wall-hit-triggered re-calibration is the next FUTURE item (the kept
+`CALIBRATING_HEIGHT` machinery + median exist for exactly it). The Step-0 diagnostic scaffolding was reverted
+(`git restore io_bridge.py`)._
+
+_**Session 16** (`plans/session16-settle-between-stages-and-return-to-origin.md`, **BUILT + committed 44b4fa6,
+live-fly PENDING** — will be confirmed on the same flight as session 17): a test flight's
 return-to-origin fell apart — it "turned like a maniac," fired the reverse-list back-to-back with no settles,
 then spun (no settles), declared STUCK, retried. One pattern in three places: commanded actions fire
 back-to-back with no still window for monocular SLAM to re-lock. Built a **shared settle gate** (`_settle_begin`
@@ -67,8 +111,19 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = LIVE RE-FLY** — one flight confirms sessions 16 + 15 + 14 (+ the still-pending 11/12/13 items). Run
-`python fly.py`, press `m` to hand over._
+_**NEXT = LIVE-FLY SESSION 18** (BUILT — `plans/session18-command-smoothing-and-height-median.md`; io_bridge +
+autopilot + flight_replay self-tests green). Run `python fly.py`, press `m` to hand over, and watch:_
+- _**Smoothed flight** — forward legs + turns EASE in/out; a plan-loss brake is markedly GENTLER (thrust bleeds,
+  no hard pitch-up/altitude jump). Open `OUTPUT/diag/<ts>_commands.csv` (now always-on): AUTO rows show `trigger`
+  ramping 0.05 up / 0.1 down and yaw 0.05/tick — the SAME curve as MANUAL rows._
+- _**Height median is sane** in the replay HTML — steps once per SLAM frame toward the live `pos_y`; no
+  −0.008→−1.8 jump-with-no-new-frame, no frozen lag._
+- _**RE-TUNE** afterward: throttle knobs (session-17 "lower the speed knobs") AND maneuver durations / back-off
+  counts — smoothing attenuates short pulses (`flight_playbook.json`, turn durations, `strafe_reposition_fwd_s`)._
+- _Session-17 items still hold: proper speed (thrust engaged), height HOLDS during horizontal flight, first
+  calibration runs at takeoff; fly forward/strafe INTO a wall → CONFIRM the uncontrolled-climb (motivates the
+  future wall-hit re-calibration)._
+- _This one flight also confirms the still-pending sessions 17/16/15/14/11-13._
 
 _**Session 16 — settle between every action + full return-to-origin ending**
 (`plans/session16-settle-between-stages-and-return-to-origin.md`, BUILT + all module self-tests green). Watch:_
@@ -217,6 +272,25 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Future (backlog)
+- **Session-18 command smoothing + height-median — BUILT, self-tests green, LIVE-FLY PENDING**
+  (`plans/session18-command-smoothing-and-height-median.md`): autopilot trigger/reverse/yaw/pitch are now RAMP
+  TARGETS io_bridge's 60 Hz loop chases (manual constants) → smoothed flight + smooth release; `--log-commands`
+  re-added (always-on via fly.py); height-median ingests one reading per FRESH SLAM frame after the first calib
+  (frame dedup, `MAPPING_ALT_STATES` retired). **NEXT = live-fly + re-tune throttle knobs AND maneuver durations
+  (smoothing attenuates short pulses).**
+- **Session-17 triggerDown fix + height simplification — BUILT, all six module self-tests green, LIVE-FLY PENDING**
+  (`plans/session17-triggerdown-and-height-simplification.md`): Unity gates thrust on the
+  `triggerDown`/`reverseDown` BOOLEAN (autopilot never set it → the "crawl"). Added them to `AUTONOMY_FIELDS` +
+  `_neutralize_autonomy` (io_bridge) and DERIVED centrally in `autopilot._full_vector` from the analog value;
+  deleted the periodic re-calibration trigger + all of TRIM (state/trigger/exit/vars/config/self-test); kept the
+  first calibration + flight-height median + calib recovery. **NEXT = live-fly + re-tune speed knobs.**
+- **Wall-hit-triggered re-calibration — FUTURE (the next thing to build after session 17 flies).** The drone
+  holds altitude on its own EXCEPT it climbs uncontrollably when flying forward/strafe INTO a wall (reverse
+  doesn't). Session 17 kept the `CALIBRATING_HEIGHT` machinery + flight-height median (both unwired now)
+  specifically so a wall-contact event can trigger a re-calibration judged against the median. To wire: on a
+  forward/strafe wall-contact event, `self._recalibrating = True; self._enter("CALIBRATING_HEIGHT")`.
+- **Session-16 settle-between-stages + return-to-origin — BUILT (committed 44b4fa6), LIVE-FLY PENDING**
+  (`plans/session16-settle-between-stages-and-return-to-origin.md`): confirmed on the same flight as session 17.
 - **Session-15 six fixes — BUILT, all module self-tests green, LIVE-FLY PENDING**
   (`plans/session15-trim-and-settle-fixes.md`): TRIM pitch sign (`trim_pitch_up=-1.0`); calibration
   escape/STUCK guard (`CALIB_ESCAPE` + `_calib_fail_escalate`, config `calib_escape_*`); SETTLE fresh-frame
@@ -264,6 +338,69 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Documentation (what we tried)
+
+### Session 18 (2026-07-15) — gave autonomy the manual stick-smoothing; fixed the nonsensical height-median  [BUILT; io_bridge + autopilot + flight_replay self-tests green; live-fly pending]
+Post-session-17 the drone finally thrusts, but autonomous flight was height-erratic — a hard brake + pitch-up +
+altitude jump on every stop and plan-loss — while the operator's MANUAL flight is "very very controlled." He
+suspected the missing piece was the smoothing he feels manually, and he was right. Diffing his `20260715_001039`
+manual command CSV against how the autopilot drives showed it exactly: manual keys only toggle the
+`trigger_down`/`reverse_down` (and arrow) GATES, and io_bridge's 60 Hz loop RAMPS the analog toward them
+(`+0.05`/tick attack, `−0.1`/tick decay; yaw/pitch `±0.05` aim). The autopilot BYPASSED all of it — the overlay
+hard-wrote the analog *after* the ramp and `_neutralize_autonomy` snapped to 0 — so every scripted thrust was a
+hard step and every release a hard zero (the jolt). We made the autopilot's THROTTLE (trigger/reverse) RAMP
+TARGETS the existing loop chases (reusing the manual constants), so thrust now eases in/out like a hand-flown
+stick while KEEPING its magnitudes; release decays smoothly (aim + gates still snap for safety). A first live-fly
+then taught us to LEAVE yaw/pitch UN-ramped: the turn is duration-not-magnitude (the sim eases the aim itself,
+and the drone only rotates once the aim REACHES ±1), so a yaw ramp merely delayed reaching ±1 and shrank every
+turn (30°→~5° — visible in the command log: yaw took 0.33 s to reach 1.0, leaving ~0.17 s of a ~0.5 s hold at
+full deflection) — and it was double-smoothing on top of Unity anyway. So ONLY throttle is ramped; yaw/pitch pass
+straight through (one tick), restoring the calibrated `turn_left/right` recipe (`turn_recipe_deg=90`, hold
+1.625 s). The same flight also showed the **plan-lost pitch-up is a Unity braking response, not a pitch we send** — the
+outgoing command log has ZERO non-zero pitch rows all flight, and trigger DOES decay smoothly on neutral
+(0.4→0 at 0.1/tick). BUT a follow-up code read found a GAS-GATE TIMING miss that likely CAUSES that brake: the
+`trigger_down`/`reverse_down` boolean (which Unity gates thrust on) was set from the COMMANDED analog, so it
+dropped to False the instant a stop was commanded while the analog was still decaying → Unity hard-cut the thrust
+and the smooth decay never reached it. Fixed: io_bridge now derives the gate from its own RAMPED analog
+(`gate = analog > 0`), holding it True until the throttle reaches 0 (hypothesis — confirm on the next flight that
+the pitch-up softens; harmless if Unity actually follows the analog). We also
+re-added the `--log-commands` outgoing-packet CSV (regretted reverting it in session 17) — now permanent and
+always-on via fly.py — so MANUAL vs AUTO smoothing is directly diffable (it was the tool that proved both the
+yaw-delay and the zero-pitch findings above). Separately, the operator couldn't make
+sense of the debugger's drone-height median (it jumped −0.008→−1.8 with no new SLAM frame, then wouldn't reach
+the current height). Root cause: it appended every ~50 Hz control tick with no frame dedup — re-adding one stale
+pose ~25× — and was seeded with ~0 ground samples during the pre-takeoff SETTLE. Now it ingests ONE reading per
+FRESH `frame_id`, only after the first calibration reports height-OK, frozen during any calibration; the old
+`MAPPING_ALT_STATES` state-gate is retired (measure in any state). New io_bridge `--self-test` (ramp) + a
+rewritten autopilot ingest-gate test; all green. **Lesson: to make a scripted actuator behave like a human's,
+replicate the platform's OWN input-conditioning (its ramp/gate model) rather than writing raw setpoints — and a
+rolling statistic must ingest once per real SAMPLE (dedup by frame id), not once per consumer tick. And know your
+actuator's model before you smooth it — the sim's YAW isn't a magnitude axis (it rotates at a fixed rate once the
+aim saturates), so "smoothing" it only stole turn time; smooth THROTTLE, pass AIM through. CAVEAT: throttle knobs
+still want the session-17 "lower the speed knobs" pass; turn durations are UNAFFECTED (yaw no longer ramped).**
+
+### Session 17 (2026-07-15) — the triggerDown discovery: autonomous thrust was never engaged; simplified the height system  [BUILT; all six module self-tests green; live-fly pending]
+For MONTHS the autonomous drone "crawled" (~0.02-0.04 u/s) and the height sagged, and we blamed SLAM/geometry.
+While diagnosing the broken height TRIM we finally instrumented the FULL outgoing control vector (a temporary
+io_bridge `--log-commands` CSV + a `t` trim macro + a `y` replay of a hand-flown trim) and diffed a MANUAL trim
+against the autopilot's macro. The manual packets carried `triggerDown=True`; the macro's carried `False`. That
+was it: **Unity gates REAL thrust on the `triggerDown`/`reverseDown` BOOLEAN, not the analog `trigger`/`reverse`
+we'd been driving.** The autopilot never set the boolean (`AUTONOMY_FIELDS` omitted it, and io_bridge's smoothing
+DECAYS the analog to 0 unless the boolean is held), so every autonomous forward/reverse ever flown ran with the
+gas button UNPRESSED — the whole "crawl." The operator confirmed two things in manual: with the boolean held the
+`t` macro "plays beautiful," and the drone HOLDS ALTITUDE on its own in horizontal flight — it only climbs
+uncontrollably when flying forward/strafe INTO a wall (reverse doesn't). So the periodic height re-calibration +
+the gradual TRIM had been fighting a SELF-INFLICTED sag that only existed because thrust was never on. We fixed
+the root cause once, centrally: added `trigger_down`/`reverse_down` to io_bridge's `AUTONOMY_FIELDS` +
+`_neutralize_autonomy`, and DERIVED them in `autopilot._full_vector` — the single choke point every command
+flows through — from the analog value (`trigger>0 → trigger_down=True`), so all emit sites (presets, parallax
+pushes, back_off, rewind/fallback reverses, homing) engage thrust with one edit. Then we DELETED the now-pointless
+machinery: the periodic per-goal re-calibration trigger and ALL of TRIM (state, sag trigger, `_trim_exit`, vars,
+the 3 ceiling/desired/delta references, config, self-test). We KEPT the first-takeoff calibration, the
+flight-height median, and all calibration-recovery states — retained (unwired) for a FUTURE wall-hit-triggered
+re-calibration, which the wall-climb behaviour now motivates. All six module self-tests green; live-fly pending,
+and the speed knobs will need lowering now that the drone actually thrusts. **Lesson: when a whole platform
+"just moves badly," LOG THE LITERAL BYTES LEAVING YOUR PROCESS and diff them against a known-good manual action
+before building elaborate compensation — months of height machinery were treating a symptom of one unset boolean.**
 
 ### Session 16 (2026-07-14) — a SETTLE between every action (recovery + postlude) + the full return-to-origin ending  [BUILT; all module self-tests green; live-fly pending]
 A test flight finished its last corner, tried to return to origin, and fell apart — it "turned like a maniac,"

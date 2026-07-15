@@ -32,7 +32,9 @@ def main():
         # The autopilot writes the flight report; give it the stop-file so it can flush its map + timeline on exit.
         autopilot = subprocess.Popen([python_exe, "autopilot.py", "--explore", "--log", "--stop-file", stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         processes.append(subprocess.Popen([python_exe, "visualizer.py"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
-        processes.append(subprocess.Popen([python_exe, "io_bridge.py"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
+        # --log-commands: always-on outgoing-packet log (post-ramp, MANUAL vs AUTO) so every flight leaves
+        # a diffable record of the stick smoothing (session 18). Cheap; NullLog-equivalent overhead when idle.
+        processes.append(subprocess.Popen([python_exe, "io_bridge.py", "--log-commands"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
 
         time.sleep(1.0)
         processes.append(subprocess.Popen([xlab_exe], cwd=xlab_dir))

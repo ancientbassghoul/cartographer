@@ -178,15 +178,14 @@ autonomy:
     # (parallax) BEFORE the first exploration yaw (pure rotation is the SLAM-killer). Reuses the parallax ring-pick.
     baseline_nudge_dist: 0.4     # translate this far to seed parallax (SLAM units)
     baseline_nudge_max_s: 2.0    # SAFETY time cap on the baseline nudge
-    # Per-goal HEIGHT RE-CALIBRATION (item 1 + session-11 STATE-GATED fix): on a GENUINE goal change, re-run the
-    # two-phase ascend->descend, then JUDGE THE RESULT AFTER IT ENDS (CALIB_VERIFY) against a continuous rolling
-    # baseline of NORMAL flying altitude (frozen during any calibration). A settled height significantly below the
-    # baseline median => the calibration SANK the drone (poisoning the live-camera-Y occupancy slab) => climb to
-    # clean airspace (ASCEND_ESCAPE) -> slide 1u (CALIB_TRANSLATE) -> retry. All GENERAL / LIVE-relative params
-    # (margins vs the LIVE median, a settle window, a 1u displacement) -> no room-answer leak.
-    calibrate_on_goal_change: true   # enable CALIBRATING_HEIGHT on a genuine goal change (needs ascend_to_ceiling)
-    calib_cooldown_s: 60.0           # min seconds between ceiling taps (also skips the first post-prelude goal)
-    calib_goal_change_dist: 1.0      # the goal must move MORE than this (SLAM units) to trigger a re-tap
+    # HEIGHT RE-CALIBRATION (session-11 STATE-GATED fix): re-run the two-phase ascend->descend, then JUDGE THE
+    # RESULT AFTER IT ENDS (CALIB_VERIFY) against a continuous rolling baseline of NORMAL flying altitude (frozen
+    # during any calibration). A settled height significantly below the baseline median => the calibration SANK the
+    # drone (poisoning the live-camera-Y occupancy slab) => climb to clean airspace (ASCEND_ESCAPE) -> slide 1u
+    # (CALIB_TRANSLATE) -> retry. All GENERAL / LIVE-relative params -> no room-answer leak.
+    # SESSION-17: the PERIODIC per-goal-change TRIGGER was DELETED (the drone holds altitude on its own now that
+    # thrust/triggerDown is engaged) — keys calibrate_on_goal_change / calib_cooldown_s / calib_goal_change_dist
+    # are gone. The CALIBRATING_HEIGHT machinery below is RETAINED, unwired, for a future WALL-HIT trigger.
     calib_max_retries: 2             # climb+translate+re-run attempts per calibration before abandoning (logged)
     # --- session-11 state-gated verification (CALIB_VERIFY + ASCEND_ESCAPE + CALIB_TRANSLATE) ---
     mapping_alt_history_len: 200     # rolling baseline length: samples of NORMAL flying altitude (frozen during calib)
@@ -226,24 +225,10 @@ autonomy:
     dock_max_s: 20.0                 # SAFETY: cap the descent even if no FLOOR latches, then proceed (logged)
     floor_standoff_nudge: 0.5        # LOW_STANDOFF: UP-nudge duration (s) to clear the ground before standby
     # (the descent reuses the ascend gain/stall/latch knobs: ascend_gain_eps / ascend_stall_cycles / ascend_latch_hold_s)
-    # --- GRADUAL HEIGHT TRIM (session 14): a fine, dose-able altitude correction BETWEEN calibrations ---
-    #   joy_vertical is a DISCRETE full-thrust ±1 axis (coarse), so we have never had a gradual vertical
-    #   primitive. TRIM uses the sim's PITCH aim instead: pitch the aim UP + push forward -> the drone flies
-    #   toward the raised aim = a GRADUAL climb (rate set by the push duration). Bonus: the forward component
-    #   is translation = SLAM parallax (a pure joy_vertical pulse stretches vertical features + chokes SLAM).
-    #   At each height calibration we record ceiling_y (glued-to-ceiling), desired_y (after the bump-down),
-    #   and delta = desired_y - ceiling_y. On a fresh healthy frame in a whitelisted state (SETTLE/ADVANCE),
-    #   if pos_y sank past ceiling_y + trim_sag_ratio*delta (== desired + 0.2*delta) -> run TRIM. All GENERAL
-    #   platform params + LIVE self-calibrating references (the 3 values are re-measured every calibration) --
-    #   no room answer. Verification is deferred (log the post-trim height; read the logs).
-    trim_enable: true
-    trim_sag_ratio: 1.2              # sag trigger: pos_y > ceiling_y + this*delta  (1.2 == desired + 0.2*delta)
-    trim_aim_s: 1.0                  # hold the pitch aim UP this long (aim reaches its highest)
-    trim_fwd_s: 1.0                  # forward push (with pitch still up) = the gradual climb
-    trim_settle_s: 1.0               # WAIT for a healthy frame CAPTURED >= trim_cmd_t0 + this before logging (async-SLAM guard)
-    trim_reposition_s: 0.5           # if forward is blocked: reverse/strafe this long to open forward room, then climb
-    trim_pitch_up: -1.0              # pitch value that raises the aim = CLIMB (sign confirmed live: +1.0 aimed DOWN)
-    trim_throttle: 1.0               # forward-push magnitude during the climb (brisk, like the parallax push)
+    # (SESSION-17: the gradual HEIGHT TRIM block — trim_enable / trim_sag_ratio / trim_aim_s / trim_fwd_s /
+    #  trim_settle_s / trim_reposition_s / trim_pitch_up / trim_throttle — was DELETED. It fought a self-inflicted
+    #  sag that only existed because autonomous thrust was never engaged; with triggerDown driven the drone holds
+    #  altitude on its own during horizontal flight, so no between-calibration trim is needed.)
     # --- executor (autopilot run_explore) ---
     # The engine is a "fly toward your aim" scheme: yaw moves an aim crosshair, forward thrust flies
     # toward it, and a sustained yaw HOLD (then 'c' reset) rotates the body. A turn's ANGLE = how long

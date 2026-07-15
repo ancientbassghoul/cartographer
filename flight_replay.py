@@ -392,9 +392,6 @@ function updateTelemetry(idx) {
     `<span class="k">ram&lt;33%</span> <span class="${(s.speed!=null&&s.nominal_speed!=null&&s.speed<0.33*s.nominal_speed)?'bad':'v'}">` +
       `${(s.nominal_speed!=null)?(s.speed!=null?((s.speed<0.33*s.nominal_speed)?'STALLED':'ok'):'—'):'calibrating'}</span>` +
     `<div class="grp">HEIGHT CALIBRATION (+Y DOWN)</div>` +
-    `<span class="k">ceiling</span> <span class="v">${fmt(s.alt_ceiling,3)}</span>  ` +
-    `<span class="k">desired</span> <span class="v">${fmt(s.alt_desired,3)}</span>  ` +
-    `<span class="k">delta</span> <span class="v">${fmt(s.alt_delta,3)}</span><br>` +
     `<span class="k">drone-height median (all-flight)</span> <span class="v">${fmt(s.alt_median,3)}</span>` +
     `<div class="grp">PLAN STATUS</div>` +
     `<span class="${stCol}">${s.status || 'OK'}</span>`;

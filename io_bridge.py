@@ -43,6 +43,19 @@ def clamp(minimum, x, maximum):
     return max(minimum, min(x, maximum))
 
 
+def _ramp(cur, target, up, down):
+    """Move `cur` one 60 Hz step toward `target`: rise by `up`, fall by `down`, never overshooting.
+    This is the sim's own manual-stick smoothing (trigger/reverse up=0.05 / down=0.1; yaw/pitch 0.05 /
+    0.05) applied to AUTONOMOUS commands too (session 18), so scripted flight eases in and out exactly
+    like a hand-flown stick instead of hard-stepping. `target` is always already in range, so no clamp
+    is needed here."""
+    if cur < target:
+        return min(target, cur + up)
+    if cur > target:
+        return max(target, cur - down)
+    return cur
+
+
 def load_config(path=None):
     path = path or os.path.join(REPO, "config.yaml")
     with open(path, "r", encoding="utf-8") as f:
@@ -70,13 +83,16 @@ class DroneControl:
     # boxes, the wire-only 'autopilot' flag) stays owned by io_bridge. btnCdown is included so the
     # autopilot can pulse the attitude/camera reset ('c') before a forward push (clean yaw/pitch so a
     # wall reads as a clean expansion-collapse) — see flight_playbook.json reset_attitude_before_forward.
+    # NB: trigger_down/reverse_down are the BOOLEAN gas gates — Unity gates REAL thrust on these,
+    # not the analog trigger/reverse (session 17). The autopilot now derives them centrally in
+    # _full_vector and drives them over this whitelist, so autonomous flight finally has real thrust.
     AUTONOMY_FIELDS = (
-        "btnARMdown", "btnCdown", "trigger", "reverse",
+        "btnARMdown", "btnCdown", "trigger", "reverse", "trigger_down", "reverse_down",
         "joy_vertical", "joy_horizontal", "yaw", "pitch",
     )
 
     def __init__(self, host, port, detect_key="g", capture_key="space", debug_keys=False,
-                 autonomy_enable_key="m", cmd_timeout_s=0.5, key_log=None):
+                 autonomy_enable_key="m", cmd_timeout_s=0.5, key_log=None, cmd_log=None):
         self.host = host
         self.port = port
         self.detect_key = detect_key
@@ -92,6 +108,12 @@ class DroneControl:
         self.key_log = key_log or NullLog()
         self.current_rec_frame = None      # set by the main loop; blank in the log before recording starts
         self._keys_down = set()            # keys currently physically held, to drop keyboard auto-repeats
+
+        # --- outgoing-packet logging (--log-commands). One row per 60 Hz send of the ACTUAL packet that
+        # reaches Unity (post-ramp, post-overlay), tagged with the live source (MANUAL | AUTO | AUTO(STALE)).
+        # This is the diagnostic that found the session-17 triggerDown bug and lets us confirm the session-18
+        # autonomy smoothing matches manual — diff AUTO vs MANUAL rows to see the identical ramp. Log-only.
+        self.cmd_log = cmd_log or NullLog()
 
         self.control_state = {
             "btnAdown": False, "btnBdown": False, "btnCdown": False,
@@ -134,6 +156,13 @@ class DroneControl:
         self._autonomy_cmd_seq = -1        # last applied command seq (for logging gaps)
         self.autonomy_status = "MANUAL"    # HUD/telemetry string: MANUAL | AUTO | AUTO(STALE)
         self._last_auto_log = None         # on-change diagnostic of the APPLIED autonomy vector
+        # Session 18: the autopilot's THROTTLE (trigger/reverse) are RAMP TARGETS the 60 Hz loop chases
+        # (via _ramp), not values written straight through — so thrust is smoothed like a manual stick.
+        # Neutral (0) = the ramp bleeds the axis down; the throttle magnitude the autopilot asks for is
+        # preserved (the ramp just chases 0.2 instead of manual's 1.0). yaw/pitch are NOT ramped (aim axes,
+        # eased by the sim; turn is duration-not-magnitude) — ramping them stole time from every turn.
+        self._auto_trigger_target = 0.0
+        self._auto_reverse_target = 0.0
 
     # -- TCP server -----------------------------------------------------------
     def start(self):
@@ -199,6 +228,16 @@ class DroneControl:
                 "yaw": cs["yaw"], "pitch": cs["pitch"],
                 "thumbDown": cs["thumb_down"], "joyClick": cs["joy_click"],
             }
+            # --log-commands: record the ACTUAL outgoing packet (post-ramp) with its source, so the
+            # manual vs autonomous smoothing is directly diffable. NullLog when the flag is off (no cost).
+            self.cmd_log.row(
+                mono_ts=round(time.monotonic(), 4), source=self.autonomy_status,
+                pitch=cs["pitch"], yaw=cs["yaw"],
+                trigger=cs["trigger"], triggerDown=cs["trigger_down"],
+                reverse=cs["reverse"], reverseDown=cs["reverse_down"],
+                joy_vertical=cs["joy_vertical"], joy_horizontal=cs["joy_horizontal"],
+                btnAdown=cs["btnAdown"], btnBdown=cs["btnBdown"], btnCdown=cs["btnCdown"],
+                btnARMdown=cs["btnARMdown"], thumbDown=cs["thumb_down"], joyClick=cs["joy_click"])
             body = json.dumps(response).encode("utf-8")
             try:
                 conn.send(len(body).to_bytes(4, byteorder="big"))
@@ -210,45 +249,76 @@ class DroneControl:
             time.sleep(1 / 60)  # 60 Hz
 
     def _update_controls(self):
-        cs = self.control_state
         while self._running.is_set():
-            # Smooth Trigger (gas)
-            if cs["trigger"] > 0 and not cs["trigger_down"]:
-                cs["trigger"] = clamp(0, cs["trigger"] - 0.1, 1)
-            if cs["trigger"] < 1 and cs["trigger_down"]:
-                cs["trigger"] = clamp(0, cs["trigger"] + 0.05, 1)
-            # Smooth Reverse
-            if cs["reverse"] > 0 and not cs["reverse_down"]:
-                cs["reverse"] = clamp(0, cs["reverse"] - 0.1, 1)
-            if cs["reverse"] < 1 and cs["reverse_down"]:
-                cs["reverse"] = clamp(0, cs["reverse"] + 0.05, 1)
-            # Joystick (altitude / strafe)
-            if cs["joy_up"]:
-                cs["joy_vertical"] = -1
-            elif cs["joy_down"]:
-                cs["joy_vertical"] = 1
-            else:
-                cs["joy_vertical"] = 0
-            if cs["joy_left"]:
-                cs["joy_horizontal"] = -1
-            elif cs["joy_right"]:
-                cs["joy_horizontal"] = 1
-            else:
-                cs["joy_horizontal"] = 0
-            # Yaw / pitch with smoothing
-            if cs["arrow_right"]:
-                cs["yaw"] = clamp(-1, cs["yaw"] + 0.05, 1)
-            elif cs["arrow_left"]:
-                cs["yaw"] = clamp(-1, cs["yaw"] - 0.05, 1)
-            if cs["arrow_up"]:
-                cs["pitch"] = clamp(-1, cs["pitch"] - 0.05, 1)
-            elif cs["arrow_down"]:
-                cs["pitch"] = clamp(-1, cs["pitch"] + 0.05, 1)
-            if cs["btnCdown"]:
-                cs["pitch"] = 0
-                cs["yaw"] = 0
-            self._apply_autonomy_overlay()
+            self._step_controls()
             time.sleep(1 / 60)
+
+    def _step_controls(self):
+        """One 60 Hz control tick. Apply the autonomy overlay (which sets the ramp TARGETS when the
+        autopilot is driving), then ramp the analog axes toward those targets. Manual and autonomous
+        flight share the SAME smoothing constants (session 18) so scripted flight eases in/out like a
+        hand-flown stick instead of hard-stepping. Extracted from the loop so a self-test can drive it
+        tick-by-tick."""
+        cs = self.control_state
+        self._apply_autonomy_overlay()
+        if self.autonomy_active:
+            # AUTONOMY: smooth only the THROTTLE axes (trigger/reverse) — asymmetric +0.05 attack / -0.1
+            # decay, floor 0 — which is what gentled the height/brake jolt. yaw/pitch are AIM axes and are
+            # applied DIRECTLY by the overlay (NOT ramped): the sim itself eases the aim, and the drone only
+            # rotates once the aim REACHES full deflection, with the turn amount set by how long it's HELD
+            # there (duration, not magnitude). Ramping the aim here just delayed it reaching +/-1 and stole
+            # ~0.33s from every turn (session-18 live finding: 30deg turns collapsed to ~5deg). 'c' still
+            # snaps the aim to 0 (matches the sample) so a reset_attitude_before_forward pulse is prompt.
+            cs["trigger"] = _ramp(cs["trigger"], self._auto_trigger_target, 0.05, 0.1)
+            cs["reverse"] = _ramp(cs["reverse"], self._auto_reverse_target, 0.05, 0.1)
+            # Hold the gas GATE for as long as thrust is actually being SENT: derive trigger_down/reverse_down
+            # from the RAMPED analog, NOT the autopilot's commanded gate. Unity gates real thrust on the
+            # boolean (session 17), so if the gate drops the instant a stop is commanded while the analog is
+            # still decaying (0.4->0 over ~4 ticks), Unity hard-cuts the thrust and the smooth release never
+            # reaches it — the suspected plan-lost brake/pitch-up. Gate True <=> analog > 0 keeps thrust
+            # following the smooth decay all the way to 0 (and still engages on tick 1 of a ramp-up).
+            cs["trigger_down"] = cs["trigger"] > 0.0
+            cs["reverse_down"] = cs["reverse"] > 0.0
+            if cs["btnCdown"]:
+                cs["yaw"] = 0.0
+                cs["pitch"] = 0.0
+            return
+        # MANUAL: behaviour IDENTICAL to the sample (key-gated ramp; persisting yaw/pitch aim). UNCHANGED.
+        # Smooth Trigger (gas)
+        if cs["trigger"] > 0 and not cs["trigger_down"]:
+            cs["trigger"] = clamp(0, cs["trigger"] - 0.1, 1)
+        if cs["trigger"] < 1 and cs["trigger_down"]:
+            cs["trigger"] = clamp(0, cs["trigger"] + 0.05, 1)
+        # Smooth Reverse
+        if cs["reverse"] > 0 and not cs["reverse_down"]:
+            cs["reverse"] = clamp(0, cs["reverse"] - 0.1, 1)
+        if cs["reverse"] < 1 and cs["reverse_down"]:
+            cs["reverse"] = clamp(0, cs["reverse"] + 0.05, 1)
+        # Joystick (altitude / strafe)
+        if cs["joy_up"]:
+            cs["joy_vertical"] = -1
+        elif cs["joy_down"]:
+            cs["joy_vertical"] = 1
+        else:
+            cs["joy_vertical"] = 0
+        if cs["joy_left"]:
+            cs["joy_horizontal"] = -1
+        elif cs["joy_right"]:
+            cs["joy_horizontal"] = 1
+        else:
+            cs["joy_horizontal"] = 0
+        # Yaw / pitch with smoothing
+        if cs["arrow_right"]:
+            cs["yaw"] = clamp(-1, cs["yaw"] + 0.05, 1)
+        elif cs["arrow_left"]:
+            cs["yaw"] = clamp(-1, cs["yaw"] - 0.05, 1)
+        if cs["arrow_up"]:
+            cs["pitch"] = clamp(-1, cs["pitch"] - 0.05, 1)
+        elif cs["arrow_down"]:
+            cs["pitch"] = clamp(-1, cs["pitch"] + 0.05, 1)
+        if cs["btnCdown"]:
+            cs["pitch"] = 0
+            cs["yaw"] = 0
 
     def _apply_autonomy_overlay(self, now=None):
         """While autonomy is active, the autopilot's command vector OVERWRITES the manual-derived
@@ -264,8 +334,21 @@ class DroneControl:
         cmd = self._autonomy_cmd
         fresh = cmd is not None and (now - self._autonomy_cmd_mono) <= self.cmd_timeout_s
         if fresh:
+            # Session 18: the THROTTLE axes (trigger/reverse) become RAMP TARGETS the 60 Hz loop chases
+            # (see _step_controls) instead of being written straight through — so thrust eases in/out like
+            # a manual stick (this gentled the height/brake jolt). Everything else — yaw/pitch (AIM axes,
+            # which the sim eases itself and whose turn is duration-not-magnitude), the boolean gas gates
+            # trigger_down/reverse_down, btnARM/btnC, and the joysticks — is applied DIRECTLY. NB the
+            # derived trigger_down/reverse_down still gate Unity's real thrust, held True while the analog
+            # ramps up — identical to manual.
             for k in self.AUTONOMY_FIELDS:
-                if k in cmd:
+                if k not in cmd:
+                    continue
+                if k == "trigger":
+                    self._auto_trigger_target = float(cmd[k] or 0.0)
+                elif k == "reverse":
+                    self._auto_reverse_target = float(cmd[k] or 0.0)
+                else:
                     cs[k] = cmd[k]
             self.autonomy_status = "AUTO"
         else:
@@ -362,16 +445,22 @@ class DroneControl:
             self._autonomy_cmd_seq = seq
 
     def _neutralize_autonomy(self):
-        """Zero every field the autopilot can drive, immediately (used on abort/disable)."""
+        """Release everything the autopilot drives (abort / disable / stale-link). Session 18: THROTTLE
+        (trigger/reverse) bleeds down SMOOTHLY via the ramp targets — a hard cut is exactly the jolt we
+        removed — while the AIM axes (yaw/pitch) and the boolean gas gates snap to neutral immediately, so
+        a lost link can never leave the drone rotating or gated-on. The ramp (_step_controls) then decays
+        cs['trigger']/['reverse'] toward these 0 targets over the next few ticks, like releasing the stick."""
         cs = self.control_state
         cs["btnARMdown"] = False
         cs["btnCdown"] = False
-        cs["trigger"] = 0.0
-        cs["reverse"] = 0.0
+        cs["trigger_down"] = False   # release the BOOLEAN gas gate on abort/stale-link (session 17)
+        cs["reverse_down"] = False
         cs["joy_vertical"] = 0
         cs["joy_horizontal"] = 0
-        cs["yaw"] = 0.0
+        cs["yaw"] = 0.0             # aim axes snap to neutral (no auto-return in manual; must not coast a spin)
         cs["pitch"] = 0.0
+        self._auto_trigger_target = 0.0   # throttle bleeds down smoothly (ramp chases 0)
+        self._auto_reverse_target = 0.0
 
     def drain_detect_requests(self):
         """Return how many new 'g' presses occurred since the last call (and reset)."""
@@ -405,6 +494,7 @@ class DroneControl:
         except Exception:
             pass
         self.key_log.close()
+        self.cmd_log.close()
         if self._conn:
             try:
                 self._conn.close()
@@ -465,6 +555,64 @@ def open_ndi(source_filter="Unity", discover_iters=10, wait_ms=500):
 # ==============================================================================
 # Main loop
 # ==============================================================================
+def _self_test():
+    """Offline unit test for the session-18 command SMOOTHING (no sockets / NDI). Drives _step_controls
+    tick-by-tick and asserts the autopilot's trigger/reverse/yaw are ramped with the manual constants,
+    that release DECAYS, that 'c' snaps the aim, and that MANUAL flight is byte-identical to before."""
+    APPROX = 1e-9
+    dc = DroneControl("127.0.0.1", 0)
+    dc.autonomy_active = True
+    seq = 0
+
+    def auto(**cmd):
+        nonlocal seq
+        seq += 1
+        cmd["seq"] = seq
+        dc.set_autonomy_command(cmd)
+        dc._step_controls()
+
+    # trigger ramps 0 -> 0.2 at +0.05/tick (throttle target 0.2, NOT full 1.0), then holds without overshoot
+    for _ in range(3):
+        auto(trigger=0.2, trigger_down=True)
+    up_ok = abs(dc.control_state["trigger"] - 0.15) < APPROX
+    for _ in range(5):
+        auto(trigger=0.2, trigger_down=True)
+    hold_ok = abs(dc.control_state["trigger"] - 0.2) < APPROX
+    # release (fresh command, trigger 0) DECAYS at -0.1/tick down to 0 — the smooth "let go of the stick".
+    # The gas GATE must stay True WHILE the analog is still >0 (derived from the RAMPED analog, not the
+    # commanded gate=False), so Unity's boolean-gated thrust follows the smooth decay instead of hard-cutting.
+    auto(trigger=0.0, trigger_down=False)
+    dec1_ok = abs(dc.control_state["trigger"] - 0.1) < APPROX and dc.control_state["trigger_down"] is True
+    auto(trigger=0.0, trigger_down=False)
+    dec0_ok = abs(dc.control_state["trigger"] - 0.0) < APPROX and dc.control_state["trigger_down"] is False
+    trig_ok = up_ok and hold_ok and dec1_ok and dec0_ok
+
+    # yaw (AIM) is NOT ramped — it passes straight through in ONE tick (the sim eases it; the turn is
+    # duration-not-magnitude, so ramping would only steal turn time). A 'c' reset snaps the aim to 0.
+    dy = DroneControl("127.0.0.1", 0)
+    dy.autonomy_active = True
+    dy.set_autonomy_command({"seq": 1, "yaw": 1.0})
+    dy._step_controls()
+    yaw_passthru_ok = dy.control_state["yaw"] == 1.0            # full deflection immediately, no ramp
+    dy.set_autonomy_command({"seq": 2, "yaw": 1.0, "btnCdown": True})
+    dy._step_controls()
+    yaw_snap_ok = dy.control_state["yaw"] == 0.0
+    yaw_ok = yaw_passthru_ok and yaw_snap_ok
+
+    # MANUAL flight unchanged: holding the gas gate ramps trigger toward 1.0 at +0.05/tick
+    dm = DroneControl("127.0.0.1", 0)   # autonomy_active stays False
+    dm.control_state["trigger_down"] = True
+    for _ in range(3):
+        dm._step_controls()
+    manual_ok = abs(dm.control_state["trigger"] - 0.15) < APPROX
+
+    ok = trig_ok and yaw_ok and manual_ok
+    print(f"[self-test] {'PASS' if ok else 'FAIL'}  io_bridge command SMOOTHING "
+          f"(auto trigger up/hold/decay={trig_ok}, auto yaw passthru+c-snap={yaw_ok}, manual unchanged={manual_ok})")
+    return ok
+
+
+# ==============================================================================
 def main():
     parser = argparse.ArgumentParser(description="Cartographer io_bridge (P1)")
     parser.add_argument("--config", default=None, help="path to config.yaml")
@@ -473,7 +621,17 @@ def main():
     parser.add_argument("--log-keys", action="store_true",
                         help="write every keyboard edge (rec_frame,mono_ts,key,action) to "
                              "OUTPUT/diag/<ts>_keys.csv, frame-synced to the recorded flight video")
+    parser.add_argument("--log-commands", action="store_true",
+                        help="write the actual outgoing control packet (post-ramp, tagged MANUAL/AUTO) "
+                             "every 60 Hz send to OUTPUT/diag/<ts>_commands.csv — for diffing manual vs "
+                             "autonomous stick smoothing (session 18)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the offline command-smoothing unit test (no sockets/NDI) and exit")
     args = parser.parse_args()
+
+    if args.self_test:
+        import sys
+        sys.exit(0 if _self_test() else 1)
 
     cfg = load_config(args.config)
     host = cfg["network"]["unity_server_ip"]
@@ -512,10 +670,19 @@ def main():
     if args.log_keys:
         key_log = DiagLog("keys", ["rec_frame", "mono_ts", "key", "action"])
 
+    # --- optional outgoing-packet log (--log-commands): the actual post-ramp control vector + source,
+    # for diffing manual vs autonomous stick smoothing (session 18). Header matches the session-17 artifacts. ---
+    cmd_log = None
+    if args.log_commands:
+        cmd_log = DiagLog("commands", [
+            "mono_ts", "source", "pitch", "yaw", "trigger", "triggerDown", "reverse", "reverseDown",
+            "joy_vertical", "joy_horizontal", "btnAdown", "btnBdown", "btnCdown", "btnARMdown",
+            "thumbDown", "joyClick"])
+
     # --- control server + NDI (both fail-fast) ---
     control = DroneControl(host, port, detect_key=detect_key, capture_key=capture_key,
                            debug_keys=args.debug_keys, autonomy_enable_key=autonomy_enable_key,
-                           cmd_timeout_s=cmd_timeout_s, key_log=key_log)
+                           cmd_timeout_s=cmd_timeout_s, key_log=key_log, cmd_log=cmd_log)
     control.start()
     recv = open_ndi(ndi_filter)
 
