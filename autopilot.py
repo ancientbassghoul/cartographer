@@ -654,6 +654,15 @@ class ExploreController:
         ft = e.get("forward_throttle", None)
         if ft is not None:
             self.forward_preset = dict(self.forward_preset, trigger=float(ft))
+        # Committed-goal HOP cadence (session 20): ADVANCE flies hop_ticks controller ticks, SETTLEs (a
+        # fresh-frame SLAM breather), then RESUMES advancing toward the SAME committed leg_goal (no REPLAN)
+        # until the goal is reached or a real block. 0 = disabled (cruise straight to the goal). The leg-level
+        # progress trackers below let a committed goal that can't be approached (e.g. behind glass SLAM can't
+        # map) be blacklisted FAST via a bump — the speed ram guard is reset by each hop's settle, so it can't.
+        self.hop_ticks = int(e.get("hop_ticks", 0))
+        self._hop_tick = 0                   # advancing ticks in the CURRENT hop (reset on each ADVANCE entry)
+        self._leg_best_dist = None           # closest approach to leg_goal this LEG (reset on a new leg_goal)
+        self._leg_progress_t = None          # 'now' of the last >ram_progress_eps improvement (leg-level stall clock)
         # Reverse throttle override (config): gentler BACKWARD speed for every reverse maneuver (back_off,
         # reverse_probe, recovery back-off, backward parallax push), so a fast backward ram into a wall can't
         # throw the drone to SLAM-killing angles. Reverse is a continuous 0-1 throttle like forward; we rewrite
@@ -852,6 +861,8 @@ class ExploreController:
         # threshold (0.15 u / 3 s ~= 0.05 u/s) could not — it false-fired on the platform's normal crawl.
         self.ram_stall_s = float(e.get("ram_stall_s", 3.0))            # below-nominal seconds -> stop the leg
         self.ram_speed_frac = float(e.get("ram_speed_frac", 0.33))     # fire when speed < frac * nominal
+        self.ram_progress_eps = float(e.get("ram_progress_eps", 0.15)) # session 20: min approach improvement (SLAM
+        #   units) that resets the LEG-level stall clock (distance to the committed goal); survives hop settles
         self.ram_speed_window_s = float(e.get("ram_speed_window_s", 1.0))   # rolling window for the live speed
         self.ram_calib_skip_s = float(e.get("ram_calib_skip_s", 1.0))       # skip the first Ns of the first ADVANCE
         self.ram_calib_sample_s = float(e.get("ram_calib_sample_s", 5.0))   # then sample nominal for up to Ns
@@ -992,6 +1003,9 @@ class ExploreController:
         self._ram_last_t = None
         self._ram_speed_win.clear() # a time gap across an interruption must not read as a false slowdown
         self._ram_speed = None
+        self._hop_tick = 0          # session 20: hop cadence + leg-level progress are per-leg
+        self._leg_best_dist = None
+        self._leg_progress_t = None
         # A finalized nominal free-flight speed PERSISTS (flight-level, like target_altitude_y); only an
         # in-progress calibration is discarded on a hard interruption -> it restarts on the next clean ADVANCE.
         if self._nominal_speed is None:
@@ -1507,6 +1521,11 @@ class ExploreController:
         # an advance (so the NEXT advance re-measures from its own start), but NOT across a mid-leg SLAM_HOLD.
         if state not in ("ADVANCE", "SLAM_HOLD"):
             self._recovery_adv_start = None
+        # Session 20: every ADVANCE entry (a fresh leg OR a resume after a hop-SETTLE / SLAM_HOLD) starts a fresh
+        # hop tick count. The LEG-level progress trackers (_leg_best_dist/_leg_progress_t) are NOT reset here —
+        # they persist across a leg's hops and reset only when a new leg_goal is committed (REPLAN) or reset_leg.
+        if state == "ADVANCE":
+            self._hop_tick = 0
         # SETTLE fresh-frame gate (session 15): start the post-entry frame count from THIS instant, so only SLAM
         # frames CAPTURED after the settle began can satisfy it (a pre-settle frame that merely finishes during
         # the settle must not count).
@@ -2119,6 +2138,8 @@ class ExploreController:
                     self._ram_last_t = None
                     self._ram_speed_win.clear()      # a new leg breaks the speed run; window must not span the gap
                     self._ram_speed = None
+                    self._leg_best_dist = None        # session 20: fresh leg-level progress toward the NEW committed goal
+                    self._leg_progress_t = None
                     self._finalize_or_discard_calib()  # a leg boundary ends a sampling run: accept if clean, else restart
                     be = plan.get("bearing_err")
                     theta = self._quantize_turn(be)
@@ -2190,6 +2211,15 @@ class ExploreController:
             reached = self._dist(plan.get("pos"), self.leg_goal)
             clr = plan.get("forward_clearance_dist")
             fwd_dur, fwd_val = (now - self.t_state), float(self.forward_preset.get("trigger", 0.0))
+            # Session-20 LEG-LEVEL progress toward the COMMITTED goal (survives inter-hop settles, unlike the
+            # speed ram guard). Update the closest-approach + its timestamp whenever the drone gets meaningfully
+            # (> ram_progress_eps) nearer the goal; the stall check below fires if it stops improving.
+            if reached is not None:
+                if self._leg_best_dist is None or reached < self._leg_best_dist - self.ram_progress_eps:
+                    self._leg_best_dist = reached
+                    self._leg_progress_t = now
+                elif self._leg_progress_t is None:
+                    self._leg_progress_t = now
             # CONFIRMING ADVANCE (D5): a re-locked drone is trusted again ONLY after it flies a genuine leg. Gauge
             # progress from this leg's start; once it has advanced >= recovery_confirm_dist, RESTORE trust — drop
             # `_recovering`/`_history_broken`, reset the give-up counter, and CLEAR the (now-stale) reverse-list so
@@ -2258,11 +2288,33 @@ class ExploreController:
                 self._log_move("forward", fwd_val, fwd_dur)
                 self._enter("SETTLE", now)
                 event = f"goal reached (d={reached:.2f}) -> settle"
+            elif (self.hop_ticks > 0 and reached is not None and self._leg_progress_t is not None
+                  and (now - self._leg_progress_t) >= self.ram_stall_s):
+                # Session-20 LEG STALL guard (the glass-wall-ramming fix for hop mode): the committed goal has
+                # not been approached (by > ram_progress_eps) for ram_stall_s ACROSS hops -> it's unreachable
+                # (behind glass SLAM can't map, or blocked). Bump toward it (feeds the 2-bump blacklist) and end
+                # the leg -> REPLAN picks a new goal. This survives the inter-hop settles that reset the speed
+                # ram guard, so a glass wall is blacklisted in ~2 stalled legs instead of ~3 minutes of ramming.
+                self._log_move("forward", fwd_val, fwd_dur)
+                self._register_bump(plan, "leg stall (no progress toward committed goal)")
+                self._enter("SETTLE", now)   # _settle_to unset -> REPLAN (new goal)
+                event = (f"leg STALL: no progress toward {self.leg_goal} for "
+                         f"{now - self._leg_progress_t:.1f}s (best d={self._leg_best_dist:.2f}) -> bump -> replan")
             elif (now - self.t_state) > self.leg_max_s:
                 self._log_move("forward", fwd_val, fwd_dur)
                 self._player = self.pb.player("back_off")
                 self._enter("BACKOFF", now)
                 event = f"LEG-TIMEOUT (>{self.leg_max_s}s) -> back off"
+            elif self.hop_ticks > 0 and self._hop_tick >= self.hop_ticks:
+                # Session-20 HOP: advanced hop_ticks -> SETTLE (a fresh-frame SLAM breather) -> RESUME advancing
+                # toward the SAME committed leg_goal (no REPLAN). The leg stays committed across hops until the
+                # goal is reached or a real block above; the settle gives monocular SLAM a still window to re-lock.
+                self._log_move("forward", fwd_val, fwd_dur)
+                self._settle_to = "ADVANCE"
+                self._enter("SETTLE", now)
+                event = ((f"hop {self.hop_ticks} ticks -> settle -> resume advance toward committed goal "
+                          f"{self.leg_goal} (d={reached:.2f})") if reached is not None else
+                         f"hop {self.hop_ticks} ticks -> settle -> resume advance toward committed goal")
             else:
                 # Ram guard (SELF-CALIBRATING): accrue time while the live world speed is BELOW
                 # `ram_speed_frac` of the drone's own calibrated nominal free-flight speed; reset the clock
@@ -2286,6 +2338,7 @@ class ExploreController:
                 else:
                     if calib_event is not None:
                         event = calib_event      # surface the one-time nominal calibration
+                    self._hop_tick += 1          # session 20: count advancing ticks toward the hop cap
                     active = dict(self.forward_preset)
                     # Altitude lock: counter the forward-push sink. World frame +Y is DOWN, so a drone that has
                     # sunk reads a LARGER pos_y than the cached target -> inject UP until it climbs back (deadband).
@@ -3524,6 +3577,41 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if edges_ok else 'FAIL'}  explore edges (turn- left, quantize 70->60/50->60/"
           f"10->0, theta~0->reset->ADVANCE, goal-reached settle)")
 
+    # ---- (session 20) COMMITTED-GOAL HOPS + LEG-STALL guard ----
+    # (1) hop cadence: ADVANCE hops toward the SAME leg_goal (SETTLE between, NO REPLAN/ORIENT) while advancing.
+    chop = ExploreController(cfg, no_takeoff=True)
+    chop.hop_ticks = 3; chop.settle_fresh_frames = 2
+    chop.leg_goal = [15.0, 0.0]; chop._enter("ADVANCE", 0.0)
+    hstates, t, x, fr = [], 0.0, 0.0, 5000
+    for _ in range(40):
+        x = round(x + 0.25, 3)                          # steady clear progress toward a FAR goal (never reached here)
+        _a, s, _ev = chop.step(t, {"plan_valid": True, "done": False, "goal": [15.0, 0.0], "pos": [x, 0.0],
+                                   "bearing_err": 0.0, "forward_clearance_dist": 15.0, "pos_y": 0.0,
+                                   "frame_id": fr, "cap_ts": t, "slam_ms": 200.0}, False)
+        if not hstates or hstates[-1] != s:
+            hstates.append(s)
+        t += 0.05; fr += 1
+    hop_ok = (hstates.count("ADVANCE") >= 2 and "SETTLE" in hstates          # re-entered ADVANCE after a hop-settle
+              and "REPLAN" not in hstates and "ORIENT" not in hstates        # goal stayed COMMITTED across hops
+              and chop.leg_goal == [15.0, 0.0])
+    # (2) leg-stall guard: a committed goal that stops being approached for ram_stall_s -> bump -> replan (glass fix).
+    cstall = ExploreController(cfg, no_takeoff=True)
+    cstall.hop_ticks = 3; cstall.settle_fresh_frames = 2; cstall.ram_stall_s = 0.5
+    cstall.leg_goal = [9.0, 0.0]; cstall._enter("ADVANCE", 0.0)
+    stall_fired, t, fr = False, 0.0, 6000
+    for _ in range(80):
+        _a, s, ev = cstall.step(t, {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [1.0, 0.0],
+                                    "bearing_err": 0.0, "forward_clearance_dist": 9.0, "pos_y": 0.0,
+                                    "frame_id": fr, "cap_ts": t, "slam_ms": 200.0}, False)
+        if ev and "leg STALL" in ev:
+            stall_fired = True; break
+        t += 0.05; fr += 1
+    stall_ok = stall_fired and cstall._bump_pulse == [9.0, 0.0] and cstall.state == "SETTLE"
+    hops_ok = hop_ok and stall_ok
+    ok = ok and hops_ok
+    print(f"[self-test] {'PASS' if hops_ok else 'FAIL'}  COMMITTED-GOAL HOPS "
+          f"(hop toward one goal, no replan/orient={hop_ok}; blocked-goal leg-stall->bump->replan={stall_ok})")
+
     # ---- Map mode: PRELUDE arm + takeoff + TWO-PHASE ascent + descend + baseline nudge (airborne + to height) ----
     ascend = int(cfg["autonomy"]["ascend_cmd"])
     plan_goal = {"done": False, "goal": [1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 90.0}
@@ -4276,6 +4364,7 @@ def run_self_test(cfg):
     cr.ram_stall_s, cr.ram_speed_window_s = 0.5, 0.2
     cr.ram_calib_skip_s, cr.ram_calib_sample_s, cr.ram_calib_min_sample_s = 0.2, 0.5, 0.2
     cr.leg_max_s = 100.0
+    cr.hop_ticks = 0            # session 20: isolate the SPEED ram guard (cruise mode; no hop preemption)
     gram = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "bearing_err": 0.0,
             "forward_clearance_dist": 9.0, "pos_y": 0.0}
     tr, fr, x, frozen, crawl_fired, ram_fired = 0.0, 0, 0.0, False, False, False
@@ -4299,6 +4388,7 @@ def run_self_test(cfg):
     crd.ram_stall_s, crd.ram_speed_window_s = 0.5, 0.2
     crd.ram_calib_skip_s, crd.ram_calib_sample_s, crd.ram_calib_min_sample_s = 0.2, 0.5, 0.2
     crd.leg_max_s = 100.0
+    crd.hop_ticks = 0          # session 20: isolate the SPEED ram guard (cruise mode)
     tr, fr, precalib_fired = 0.0, 0, False
     for _ in range(80):
         _a, s, ev = crd.step(tr, dict(gram, pos=[0.0, 0.0], frame_id=fr, slam_ms=200.0), False, status="OK")

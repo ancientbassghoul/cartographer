@@ -242,10 +242,13 @@ autonomy:
     # platform behavior, NOT a room answer (the reverse DURATION lives in flight_playbook.json reverse_probe).
     reverse_probe_on_wall: true  # FALLBACK action on a flow WALL hit (glass/unmapped): SETTLE -> REVERSE_PROBE -> SETTLE -> REPLAN
     clamp_leg_turn: true         # cap each leg's turn to ONE turn_step (<=45 deg) -> SLAM survives the turn (proven live); per-leg replan corrects
-    forward_throttle: 0.2        # forward trigger (0-1) for ADVANCE + forward parallax pushes; lower = slower
-                                 # approach so SLAM maps the wall before impact and the clearance stop can fire.
+    forward_throttle: 1.0        # forward trigger (0-1) for ADVANCE + forward parallax pushes. Session 20: raised
+                                 # to 1.0 (from 0.2) to fly like manual — io_bridge's committed ramp eases it in
+                                 # over ~20 ticks and out over ~10, so each hop accelerates + eases to a stop.
                                  # Platform control magnitude (like the playbook's 0.55 cruise), NOT a room answer.
-                                 # 0.1 is a deliberately extreme first value to confirm the knob bites (may barely move).
+    hop_ticks: 40                # session 20: ADVANCE hops this many controller ticks then SETTLEs (SLAM breather)
+                                 # and RESUMES advancing toward the SAME committed goal (no replan) until reached
+                                 # or blocked. 0 = disabled = cruise straight to the goal (main's original behavior).
     reverse_throttle: 0.2        # reverse (0-1) for ALL backward maneuvers (back_off, reverse_probe, recovery
                                  # back-off, backward parallax push); overrides the playbook's 0.7. Lower = gentler
                                  # retreat so a fast backward ram can't throw the drone to SLAM-killing angles.

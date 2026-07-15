@@ -1,5 +1,30 @@
 # Cartographer — Progress & Resume Handoff
 
+_Last updated **2026-07-16** (session 20 **STEP 1 BUILT on main — autopilot self-tests green; UNCOMMITTED;
+FLY-PENDING for a HEIGHT check**). Resume from THIS file. Plan of record:
+**`plans/session20-committed-hops-and-return-to-origin.md`** (to be written)._
+
+_**Session 20 — decision + a controlled experiment on main.** Two flights compared: the **session-19** version
+(`20260715_195007`, on branch **`session19-profiled-forward-leg`**, commit 0b03021) maps ~26% faster (63K vs 85K
+ticks) with less plan-lost, BUT rammed a glass wall ~3 min (root cause: its `step_duration` hop re-plans every
+hop → resets the ram-guard timer + never registers a bump; escape needed 2 random collisions). The **committed**
+version (`20260715_150250`, a737aa4) was rock-solid height-wise but slow. Return-to-origin (no orient-to-north +
+violent descent) is broken in BOTH → PRE-EXISTING, not a session-19 regression. Decision: keep session-19 on the
+branch as a fallback; on CLEAN main add ONLY a minimal controlled experiment to isolate the height variable._
+
+_**Session 20 STEP 1 (BUILT, main, UNCOMMITTED, FLY-PENDING):** **committed-goal HOPS** (`hop_ticks: 40`) —
+ADVANCE hops `hop_ticks` ticks, SETTLEs (a fresh-frame SLAM breather), then RESUMES advancing toward the SAME
+committed `leg_goal` (`_settle_to="ADVANCE"`, no REPLAN) until reached or blocked; 0 = old cruise-to-goal. Plus a
+**leg-level stall guard** (repurposes the unused `ram_progress_eps`): if the committed goal isn't approached for
+`ram_stall_s` ACROSS hops → `_register_bump` → REPLAN — this is the glass-wall-ramming fix (survives the hop
+settles that reset the speed ram guard). And **`forward_throttle: 0.2 → 1.0`** (rides main's committed session-18
+io_bridge ramp). New COMMITTED-GOAL-HOPS self-test green. **NEXT = fly it (`python fly.py`, m) and watch the
+height median — is 1.0 throttle stable? does a glass wall now blacklist fast (no 3-min ram)?** THEN build Step 2
+(orient to north: capture `_takeoff_heading` early + ORIENT_HOME fine convergence) + Step 3 (gentle stepped
+descent: smaller pulses + fresh-frame settles). Both are PRE-EXISTING return-to-origin bugs (broken on main too)._
+
+_Session-18 (below) + 17 are committed (a737aa4). Session-19 is on branch `session19-profiled-forward-leg`._
+
 _Last updated **2026-07-15** (session 18 **BUILT — io_bridge + autopilot + flight_replay self-tests green;
 LIVE-FLY PENDING**). Resume from THIS file. **NEXT = LIVE-FLY** (`python fly.py`, press `m`) to confirm session
 18 AND the still-pending sessions 17/16/15/14/11-13 in one go; then **RE-TUNE the throttle knobs** (session-17
