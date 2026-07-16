@@ -119,6 +119,29 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #events .slam_finish { color: #33cc55; }    /* SLAM_TRACKER [FINISH] pose accepted + latency (green) */
   .legend { font-size: 11px; color: #999; padding: 6px 10px; border-bottom: 1px solid #333; }
   .sw { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: middle; }
+  /* Floating goals-DB table (toggled by the Goals DB button; draggable by its header) */
+  #goaldb { position: fixed; top: 64px; left: 20px; width: 360px; max-height: 66vh; display: none;
+            flex-direction: column; background: #141414; border: 1px solid #555; border-radius: 4px;
+            box-shadow: 0 6px 24px rgba(0,0,0,.6); z-index: 50; font-size: 11px; }
+  #goaldb h4 { margin: 0; padding: 6px 10px; background: #242424; border-bottom: 1px solid #444; cursor: move;
+               font-size: 12px; color: #9ad; display: flex; justify-content: space-between; align-items: center; }
+  #goaldb h4 .x { cursor: pointer; color: #888; padding: 0 4px; }
+  #goaldb h4 .x:hover { color: #fff; }
+  #goaldb .body { overflow: auto; }
+  #goaldb table { border-collapse: collapse; width: 100%; }
+  #goaldb th, #goaldb td { padding: 3px 8px; text-align: right; border-bottom: 1px solid #262626; white-space: nowrap; }
+  #goaldb th { position: sticky; top: 0; background: #1c1c1c; color: #888; font-weight: normal; text-align: right; }
+  #goaldb td.c { text-align: left; color: #ccc; }
+  #goaldb tr.goal td { border-top: 1px solid #333; font-weight: 600; }
+  #goaldb tr.loc td { color: #8a9; font-weight: normal; border-bottom: 1px solid #1e1e1e; }
+  #goaldb tr.loc td.c { color: #667; padding-left: 16px; }
+  #goaldb tr.loc td[colspan] { text-align: left; }
+  #goaldb tr.dead td { color: #ff5b5b; }
+  #goaldb tr.loc.dead td { color: #b56; }
+  #goaldb tr.cur td { background: #2a2a1a; }
+  #goaldb tr.goal.cur td.c { color: #d9b400; }
+  #goaldb .mp { color: #777; font-weight: normal; font-size: 10px; margin-left: 4px; }
+  #goaldb .empty { padding: 10px; color: #777; }
 </style>
 </head>
 <body>
@@ -137,6 +160,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           <option value="8">8x</option>
         </select>
       </label>
+      <button id="dbBtn" title="Persistent goals database (picks / strikes / blacklist) at the cursor">Goals DB</button>
       <span id="clock"></span>
     </div>
   </div>
@@ -155,6 +179,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div id="events"></div>
   </div>
+</div>
+<div id="goaldb">
+  <h4><span>Goals DB <span id="dbcount" style="color:#777"></span></span><span class="x" id="dbClose">&times;</span></h4>
+  <div class="body" id="dbBody"></div>
 </div>
 <script>
 const RECORDS = __DATA__;
@@ -300,6 +328,43 @@ function render(idx) {
   updatePanel(idx);
   updateTelemetry(idx);
   drawSlam(idx);
+  updateGoalDb(idx);
+}
+
+// Floating goals-DB table: the planner's persistent per-disc picks / strikes / blacklist state at the cursor
+// (rides each step record as `goal_db`). Updates live while scrubbing/playing — each new pick/strike shows.
+function updateGoalDb(idx) {
+  const panel = document.getElementById('goaldb');
+  if (panel.style.display !== 'flex') return;          // skip work while hidden
+  const s = STEPS[idx] || {};
+  const db = s.goal_db || null;
+  const active = s.goal || null;
+  const near = (c) => active && Math.abs(c[0]-active[0]) <= 0.5 && Math.abs(c[1]-active[1]) <= 0.5;
+  document.getElementById('dbcount').textContent = db ? `(${db.length})` : '';
+  const body = document.getElementById('dbBody');
+  if (!db) { body.innerHTML = '<div class="empty">no goal_db in this record (older flight log)</div>'; return; }
+  if (!db.length) { body.innerHTML = '<div class="empty">empty — no goal picked yet</div>'; return; }
+  // max pairwise spread among a goal's drone-locations = the cluster DIAMETER the loop test compares to 1u
+  // (loop fires only when this is <= goal_loop_pos_dist, i.e. ALL locs clustered); null if <2 locs.
+  const maxSpread = (L) => { let m = null; for (let i=0;i<L.length;i++) for (let j=i+1;j<L.length;j++) {
+    const d = Math.hypot(L[i][0]-L[j][0], L[i][1]-L[j][1]); if (m===null||d>m) m=d; } return m; };
+  let rows = '';
+  for (const e of db) {
+    const dead = e.blacklisted ? ' dead' : '', cur = near(e.center) ? ' cur' : '';
+    const locs = e.drone_locs || [];
+    const mp = maxSpread(locs), mpTxt = (mp===null) ? '' : ` spread ${fmt(mp)}u`;
+    // goal (parent) row: center · picks · strikes · status
+    rows += `<tr class="goal${dead+cur}"><td class="c">[${fmt(e.center[0])}, ${fmt(e.center[1])}]</td>` +
+            `<td>${e.picks}</td><td>${e.strikes}</td>` +
+            `<td>${e.blacklisted ? 'BLACKLIST' : 'active'}<span class="mp">${mpTxt}</span></td></tr>`;
+    // one sub-row per DRONE LOCATION at a pick (what the <1u clustering test runs on)
+    for (let i=0;i<locs.length;i++) {
+      rows += `<tr class="loc${dead}"><td class="c">&#8627; loc ${i+1}</td>` +
+              `<td colspan="3">[${fmt(locs[i][0])}, ${fmt(locs[i][1])}]</td></tr>`;
+    }
+  }
+  body.innerHTML = '<table><thead><tr><th class="c">goal center (x,z) / drone loc</th><th>picks</th>' +
+                   '<th>strikes</th><th>status</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 const fmt = (v, d=2) => (v === null || v === undefined) ? '—' : (+v).toFixed(d);
@@ -451,6 +516,31 @@ function setPlaying(p) {
 document.getElementById('play').addEventListener('click', () => setPlaying(!playing));
 window.addEventListener('resize', fit);
 
+// ---- Goals-DB floating panel: toggle + drag by its header ----
+const dbPanel = document.getElementById('goaldb');
+function toggleDb() {
+  dbPanel.style.display = (dbPanel.style.display === 'flex') ? 'none' : 'flex';
+  updateGoalDb(cur);
+}
+document.getElementById('dbBtn').addEventListener('click', toggleDb);
+document.getElementById('dbClose').addEventListener('click', () => { dbPanel.style.display = 'none'; });
+(function () {
+  const h = dbPanel.querySelector('h4');
+  let dx = 0, dy = 0, drag = false;
+  h.addEventListener('mousedown', (e) => {
+    if (e.target.classList.contains('x')) return;
+    drag = true; const r = dbPanel.getBoundingClientRect();
+    dx = e.clientX - r.left; dy = e.clientY - r.top;
+    dbPanel.style.right = 'auto'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    dbPanel.style.left = Math.max(0, e.clientX - dx) + 'px';
+    dbPanel.style.top = Math.max(0, e.clientY - dy) + 'px';
+  });
+  window.addEventListener('mouseup', () => { drag = false; });
+})();
+
 if (STEPS.length === 0) {
   document.getElementById('hud').textContent = 'No step records in this timeline.';
 } else {
@@ -480,7 +570,11 @@ def _self_test():
          "slam_ms": 480.0, "fwd_clear": 1.0, "goal": [1.0, 1.0], "plan_bearing_err": 2.0,
          "plan_goal": [2.5, 0.5], "dist_to_goal": 0.99, "plan_age_s": 0.2, "frame_id": 5,
          "goals": [{"xz": [1.0, 1.0], "state": "active"}, {"xz": [2.5, 0.5], "state": "plan_pick"}],
-         "cmd": {"trigger": 0.2}, "speed": 0.42, "nominal_speed": 0.45},
+         "cmd": {"trigger": 0.2}, "speed": 0.42, "nominal_speed": 0.45,
+         "goal_db": [{"center": [1.0, 1.0], "picks": 2, "strikes": 1,
+                      "drone_locs": [[0.30, 0.30], [0.34, 0.28]], "blacklisted": False},
+                     {"center": [2.5, 0.5], "picks": 1, "strikes": 0,
+                      "drone_locs": [[0.30, 0.30]], "blacklisted": True}]},
         {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
         {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
@@ -538,6 +632,15 @@ def _self_test():
         c5 = ("2200" in html and "drawSlam" in html and "drawGoals" in html and "<canvas id=\"scene\"" in html)
         print(f"[self-test] {'PASS' if c5 else 'FAIL'}  HTML carries slam spike + scene/goal/slam draw code")
         ok = ok and c5
+
+        # goals-DB floating table: the goal_db field survived load + the render/toggle code is wired in
+        db_rec = next((r for r in embedded if r.get("goal_db")), None)
+        c_db = (db_rec is not None and db_rec["goal_db"][0]["strikes"] == 1
+                and db_rec["goal_db"][0]["drone_locs"][0] == [0.30, 0.30]
+                and "updateGoalDb" in html and 'id="goaldb"' in html and 'id="dbBtn"' in html
+                and 'loc ${i+1}' in html and 'e.drone_locs' in html)   # per-loc coordinate sub-rows render
+        print(f"[self-test] {'PASS' if c_db else 'FAIL'}  goals-DB table (drone_locs survive + loc-rows render)")
+        ok = ok and c_db
 
         # Paired SLAM logs (ev_kind:"slam_start"/"slam_finish") carried + the orange/green interleave render path
         n_slam = sum(1 for r in embedded if r.get("ev_kind") in ("slam_start", "slam_finish"))

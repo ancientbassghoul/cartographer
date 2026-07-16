@@ -100,6 +100,28 @@ class FrontierPlanner:
         # fallback — we commit the raw goal but flag it).
         self._clearance_fn = None
         self.clearance_ok = True
+        # --- goals DATABASE: circling-LOOP + STALL (strike) blacklists (session 20b) ----------------------
+        # Treat every PICKED goal as a DISC (center = the picked point, radius = goal_area_radius). The DB is fed
+        # by the AUTOPILOT, once per leg (a REPLAN commit = one hop), NOT by the ~2 Hz select() — so a repeatedly
+        # re-picked goal actually accumulates. Two independent guards, both writing the SAME permanent _blacklist
+        # store _excluded reads; NEITHER blocks flight, both just add evidence:
+        #   • PICKS + drone_locs -> CIRCLING/ping-pong: a disc picked MORE than goal_loop_min_picks times with ALL
+        #     pick-time drone locations inside one goal_loop_pos_dist-wide cluster (max pairwise spread <= it) —
+        #     the drone keeps re-picking the same goal from ~one spot. "ALL clustered" (not "any pair close") so a
+        #     legit MARCHING approach over short <1u hops (adjacent picks close, trail >1u) does NOT false-fire.
+        #   • STRIKES -> STALL: the autopilot measures each hop's progress toward the goal; a hop that did not get
+        #     >= hop_progress_eps closer is a STRIKE (register_hop_outcome), reset to 0 on a hop that DID progress;
+        #     at goal_strike_limit strikes the goal is blacklisted. A FAR corner is strike-EXEMPT (caller passes
+        #     strike_eligible=False) — a corner is a reposition target flown from afar, unlike a nearby frontier.
+        # The DB PERSISTS the WHOLE flight — NEVER reset on a goal switch, hop, or recovery. General SLAM-unit
+        # params (HARD RULE), never a room answer.
+        self.goal_area_radius = float(g("goal_area_radius", 0.5))      # pick-association disc radius (SLAM units)
+        self.goal_loop_min_picks = int(g("goal_loop_min_picks", 2))   # a disc must be picked MORE than this (>2 => >=3)
+        self.goal_loop_pos_dist = float(g("goal_loop_pos_dist", 1.0))  # "same drone spot" across picks -> circling
+        self.goal_strike_limit = int(g("goal_strike_limit", 2))       # consecutive no-progress hops -> blacklist
+        self.goal_db_maxlocs = int(g("goal_db_maxlocs", 12))          # cap the per-disc drone-location history
+        self._goal_db = []            # [{center:[x,z], picks, drone_locs:[[x,z]...], strikes}] — PERSISTS the flight
+        self.last_loop_event = None    # transient {goal,picks,reason} of a DB-blacklist for the caller to log once
 
     @staticmethod
     def _d(a, b):
@@ -147,6 +169,80 @@ class FrontierPlanner:
                 return
         self._blacklist.append({"goal": g, "best_ever": best_now, "permanent": bool(permanent), "active": True})
         self.last_blacklist = g
+
+    # --------------------------------------------------- goals database (persistent) + loop/stall guards
+    def _db_entry(self, goal, create=True):
+        """The goals-DB disc whose center is within goal_area_radius of `goal` (first match), creating a fresh
+        one when none exists (unless create=False). Discs persist for the whole flight."""
+        g = [float(goal[0]), float(goal[1])]
+        for e in self._goal_db:
+            if self._d(e["center"], g) <= self.goal_area_radius:
+                return e
+        if not create:
+            return None
+        e = {"center": g, "picks": 0, "drone_locs": [], "strikes": 0}
+        self._goal_db.append(e)
+        return e
+
+    def _db_blacklist(self, center, reason, extra):
+        """Permanently blacklist a goals-DB disc via the SAME _blacklist store _excluded reads, dropping the
+        commitment if it is this region. Idempotent (skips an already-dead region so it logs once). Sets
+        last_loop_event {goal, reason, **extra} for the caller to surface. Returns True if it newly blacklisted."""
+        c = [float(center[0]), float(center[1])]
+        if self._excluded(c):
+            return False
+        self._blacklist_goal(c, permanent=True)
+        self.last_loop_event = dict(extra, goal=c, reason=reason)
+        if self.committed_goal is not None and self._d(self.committed_goal, c) <= self.blacklist_radius:
+            self.committed_goal = None          # drop the dead commitment -> the caller re-selects around it
+            self._reset_progress()
+        return True
+
+    def register_goal_pick(self, goal, pos):
+        """Fed by the AUTOPILOT once per leg (a REPLAN commit). Increment the goal's disc pick count + record the
+        pick-time drone `pos` (bounded), then run the CIRCLING/ping-pong test: picked MORE than goal_loop_min_picks
+        times with any two pick-time drone locations within goal_loop_pos_dist -> permanent blacklist."""
+        e = self._db_entry(goal)
+        e["picks"] += 1
+        if pos is not None:
+            e["drone_locs"].append([float(pos[0]), float(pos[1])])
+            if len(e["drone_locs"]) > self.goal_db_maxlocs:
+                e["drone_locs"] = e["drone_locs"][-self.goal_db_maxlocs:]
+        if e["picks"] > self.goal_loop_min_picks:
+            locs = e["drone_locs"]
+            # CIRCLING = ALL the pick-time drone locations sit inside one goal_loop_pos_dist-wide cluster (max
+            # pairwise spread <= the threshold). NOT "any pair within" — that false-fired on a legit MARCHING
+            # approach to a far goal over several short (<1u) hops (adjacent picks are close, but the trail
+            # spans >1u). A drone hammering one goal from ~one spot keeps every pick in the small ball; the
+            # STALL/strike guard separately covers "approached then got stuck" (net no progress).
+            spread = max((self._d(locs[i], locs[j])
+                          for i in range(len(locs)) for j in range(i + 1, len(locs))), default=0.0)
+            if len(locs) >= 2 and spread <= self.goal_loop_pos_dist:
+                self._db_blacklist(e["center"], "loop", {"picks": e["picks"], "spread": round(spread, 3)})
+
+    def register_hop_outcome(self, goal, progressed, strike_eligible=True):
+        """Fed by the AUTOPILOT once per hop (at the REPLAN that ends it). STALL guard via STRIKES: a hop that got
+        meaningfully closer (`progressed=True`) RESETS the goal's strikes; one that did not adds a STRIKE; at
+        goal_strike_limit strikes -> permanent blacklist. `strike_eligible=False` (a FAR corner) is a no-op —
+        neither strike nor reset (a far corner must never be retired for being stalled far from it)."""
+        e = self._db_entry(goal)
+        if progressed:
+            e["strikes"] = 0
+            return
+        if not strike_eligible:
+            return
+        e["strikes"] += 1
+        if e["strikes"] >= self.goal_strike_limit:
+            self._db_blacklist(e["center"], "stall", {"strikes": e["strikes"]})
+
+    def goal_db_snapshot(self):
+        """Per-disc view for telemetry / the replay debugger: center, picks, strikes, the DRONE LOCATIONS at each
+        pick (what the <goal_loop_pos_dist clustering test runs on — so the operator can see whether a loop
+        blacklist was legit), and whether the disc is currently blacklisted (dead in the _blacklist store)."""
+        return [{"center": [round(e["center"][0], 3), round(e["center"][1], 3)],
+                 "picks": e["picks"], "strikes": e["strikes"],
+                 "drone_locs": [[round(p[0], 3), round(p[1], 3)] for p in e["drone_locs"]],
+                 "blacklisted": bool(self._excluded(e["center"]))} for e in self._goal_db]
 
     def _whitelist_round(self):
         """Clear the round's SOFT exclusions (set active=False on every non-permanent entry) so the
@@ -224,7 +320,9 @@ class FrontierPlanner:
 
     def _commit(self, goal):
         """Commit to `goal`, restarting progress tracking only when it is a genuinely DIFFERENT region
-        (a jump beyond `assoc_dist`) — small centroid drift under association keeps the same stall clock."""
+        (a jump beyond `assoc_dist`) — small centroid drift under association keeps the same stall clock. The
+        goals-DB pick/strike counting is driven by the AUTOPILOT per leg (register_goal_pick / register_hop_
+        outcome), NOT here — the ~2 Hz select() must not inflate a held goal's counts."""
         g = [float(goal[0]), float(goal[1])]
         if self.committed_goal is None or self._d(self.committed_goal, g) > self.assoc_dist:
             self._reset_progress()
@@ -566,6 +664,69 @@ def run_self_test():
     g_c2, _, _ = p.select([A], [0.0, 0.0], heading_deg=0.0)
     check("(opt) clearance inset None -> commit raw goal + clearance_ok=False (visible, no silent fallback)",
           close(g_c2, [0.0, 3.0]) and p.clearance_ok is False)
+
+    # ---- (session 20) GOALS DATABASE + circling-LOOP blacklist ----
+    # Each PICKED goal is a DISC (radius goal_area_radius=0.5). A pick registers only on a genuine goal-SWITCH
+    # (a different disc than the last pick), so holding one goal across the ~2 Hz selects counts once, while
+    # ping-pong counts each switch. A disc picked > goal_loop_min_picks (>2) with any two pick-time drone
+    # locations within goal_loop_pos_dist (<1u) == circling -> PERMANENT blacklist. The DB PERSISTS the flight.
+    A = [5.0, 0.0]
+
+    # (db1) CIRCLING loop: register_goal_pick counts REPEATED picks of the SAME goal (autopilot-driven, per leg);
+    #       3 picks from ~one spot (drone-locs clustered <1u) -> permanent LOOP blacklist. This is the regression
+    #       the session-20 flight exposed (the old disc-cursor suppressed repeated same-goal picks).
+    p = FrontierPlanner(None)
+    for _ in range(3):
+        p.register_goal_pick(A, [0.1, 0.1])
+    check("(db1) 3 repeated picks of one goal from ~one spot -> LOOP blacklist",
+          p._excluded(A) and p.last_loop_event and p.last_loop_event["reason"] == "loop"
+          and p.last_loop_event["picks"] == 3)
+
+    # (db2) picks from SPREAD-OUT spots -> a legit revisit, NOT a loop.
+    p = FrontierPlanner(None)
+    for ps in ([0.0, 0.0], [3.0, 0.0], [6.0, 0.0]):
+        p.register_goal_pick(A, ps)
+    check("(db2) 3 picks from spread-out spots -> NOT a loop", not p._excluded(A) and p.last_loop_event is None)
+
+    # (db2b) MARCHING approach: adjacent picks < 1u apart but the trail spans > 1u -> NOT a loop (the tightening;
+    #        the old "any pair < 1u" rule would have false-fired here on a legit approach to a far goal).
+    p = FrontierPlanner(None)
+    for ps in ([0.0, 0.0], [0.6, 0.0], [1.2, 0.0]):    # adjacent gaps 0.6u (<1), total spread 1.2u (>1)
+        p.register_goal_pick(A, ps)
+    check("(db2b) marching approach (adjacent <1u, spread >1u) -> NOT a loop",
+          not p._excluded(A) and p.last_loop_event is None)
+
+    # (db3) STALL via strikes: two consecutive no-progress hops -> blacklist; a progressing hop RESETS strikes.
+    p = FrontierPlanner(None)
+    p.register_hop_outcome(A, progressed=False)
+    armed = (not p._excluded(A)) and p._goal_db[0]["strikes"] == 1
+    p.register_hop_outcome(A, progressed=False)
+    check("(db3) two no-progress hops -> STALL blacklist (1 strike doesn't)",
+          armed and p._excluded(A) and p.last_loop_event["reason"] == "stall")
+    p2 = FrontierPlanner(None)
+    p2.register_hop_outcome(A, progressed=False)
+    p2.register_hop_outcome(A, progressed=True)      # meaningful advancement resets the strike
+    p2.register_hop_outcome(A, progressed=False)
+    check("(db3) a progressing hop resets strikes (no premature blacklist)",
+          not p2._excluded(A) and p2._goal_db[0]["strikes"] == 1)
+
+    # (db4) a FAR corner (strike_eligible=False) is NEVER struck/blacklisted, however many stalled hops.
+    p = FrontierPlanner(None)
+    for _ in range(5):
+        p.register_hop_outcome([9.0, 0.0], progressed=False, strike_eligible=False)
+    check("(db4) far corner is strike-exempt -> never blacklisted",
+          not p._excluded([9.0, 0.0]) and p._goal_db[0]["strikes"] == 0)
+
+    # (db5) DB PERSISTS across goal switches + snapshot shape (picks/strikes/blacklisted).
+    p = FrontierPlanner(None)
+    p.register_goal_pick(A, [0.0, 0.0]); p.register_goal_pick([0.0, 5.0], [0.0, 0.0])
+    p.register_hop_outcome(A, progressed=False); p.register_goal_pick(A, [0.0, 0.0])
+    snap = p.goal_db_snapshot()
+    a_row = next((r for r in snap if abs(r["center"][0] - 5.0) < 1e-6), None)
+    check("(db5) DB persists across switches + snapshot has picks/strikes/drone_locs",
+          len(snap) == 2 and a_row and a_row["picks"] == 2 and a_row["strikes"] == 1
+          and a_row["drone_locs"] == [[0.0, 0.0], [0.0, 0.0]]
+          and set(a_row) == {"center", "picks", "strikes", "drone_locs", "blacklisted"})
 
     print(f"\n[frontier_planner][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

@@ -111,6 +111,22 @@ autonomy:
     goal_progress_eps: 0.2       # min closing distance (SLAM units) counted as progress; the round-blacklist
                                  #   soft-vs-PERMANENT promotion test. Keep DEFINITIVE (>= ~0.05).
     goal_blacklist_radius: 1.0   # a frontier within this of a dead goal is "the same" region (defaults to goal_assoc_dist)
+    # --- goals DATABASE: LOOP + STALL blacklists (session 20b). Letting SLAM re-pick freely (no hard commitment)
+    #     flies smooth but can get the drone stuck re-picking one goal or ping-ponging a few. The planner keeps a
+    #     PERSISTENT goals DB (never reset mid-flight), fed by the AUTOPILOT once per leg. Each picked goal is a
+    #     DISC (radius goal_area_radius). Two independent guards, both feeding the SAME permanent blacklist, and
+    #     NEITHER blocks flight — a far CORNER goal is exempt from both (a reposition target flown from afar):
+    #       LOOP  — a disc picked MORE than goal_loop_min_picks times with ALL pick-time drone locations inside one
+    #               goal_loop_pos_dist-wide cluster (max spread <= it) = circling/hammering one goal from ~one spot.
+    #               "ALL clustered" (not "any pair") so a legit MARCHING approach over short hops doesn't false-fire.
+    #       STALL — the autopilot measures each HOP's progress toward the goal; a hop that didn't get >=
+    #               hop_progress_eps closer is a STRIKE (reset on a hop that DID progress); goal_strike_limit
+    #               strikes -> blacklist. General SLAM-unit params, LIVE points — never a room answer (HARD RULE). ---
+    goal_area_radius: 0.5        # a picked goal is a DISC of this radius; a pick/hop inside it = the same goal
+    goal_loop_min_picks: 2       # a disc must be picked MORE than this to be loop-eligible (>2 => 3rd pick arms it)
+    goal_loop_pos_dist: 1.0      # ALL pick-time drone locations within this-wide cluster (SLAM units) -> circling
+    goal_strike_limit: 2         # consecutive no-progress hops toward a goal before it is blacklisted (STALL guard)
+    goal_db_maxlocs: 12          # cap the per-disc drone-location history (bounded memory)
     # Map-validated clearance buffer: a chosen frontier goal (which sits on the FREE/unobserved boundary)
     # can hug an obstacle/corner and stall the drone; the planner pulls it back along the drone->goal axis
     # to a FREE cell with this much clearance (SLAM units) before committing. General stand-off scale
@@ -132,6 +148,10 @@ autonomy:
                                  #   before reaching the target; above it, the target is short of the corner.
                                  #   Perception clamps + warns. A bbox axis narrower than 2*inset targets that
                                  #   axis's midpoint instead (ground_grid.sweep_corner), so corridors don't overshoot.
+    corner_no_blacklist_dist: 1.0  # session 20: a sweep-tour CORNER goal farther than this (SLAM units) from the
+                                 #   drone CANNOT be bumped/blacklisted — a mildly-stuck-then-freed drone must not
+                                 #   retire a far corner it simply hasn't reached (SLAM must stay ALLOWED to find +
+                                 #   investigate frontiers en route to a corner; each hop re-picks). General param.
     no_goal_idle_s: 12.0         # REPLAN idle backstop: if the planner returns no goal AND not done for longer than
                                  #   this (only a startup transient with the sweep planner), raise a VISIBLE log +
                                  #   telemetry flag instead of idling dark forever (NO SILENT FALLBACK). General
@@ -247,8 +267,10 @@ autonomy:
                                  # over ~20 ticks and out over ~10, so each hop accelerates + eases to a stop.
                                  # Platform control magnitude (like the playbook's 0.55 cruise), NOT a room answer.
     hop_ticks: 40                # session 20: ADVANCE hops this many controller ticks then SETTLEs (SLAM breather)
-                                 # and RESUMES advancing toward the SAME committed goal (no replan) until reached
-                                 # or blocked. 0 = disabled = cruise straight to the goal (main's original behavior).
+                                 # then REPLANs (re-reads SLAM's current goal, adopts it with a parallax push if
+                                 # off-axis). 0 = disabled = cruise straight to the goal (main's original behavior).
+    hop_progress_eps: 0.2        # session 20b: min distance (SLAM units) a HOP must close on its goal to count as
+                                 # PROGRESS; a hop that closes less is a STALL -> a STRIKE in the goals DB (2 -> dead).
     reverse_throttle: 0.2        # reverse (0-1) for ALL backward maneuvers (back_off, reverse_probe, recovery
                                  # back-off, backward parallax push); overrides the playbook's 0.7. Lower = gentler
                                  # retreat so a fast backward ram can't throw the drone to SLAM-killing angles.
@@ -315,7 +337,6 @@ autonomy:
     #     Detect it in POS space and STOP the leg before the ram kills SLAM; a repeated re-commit then hits the
     #     goal_stagnation_s blacklist. General robustness params, not room geometry. ---
     ram_stall_s: 3.0             # forward-advancing seconds with NO leg-distance progress before the leg is stopped
-    ram_progress_eps: 0.15       # min leg-distance improvement (SLAM units) that counts as advancing (resets the ram timer)
     # --- parallax scouting (a goal needing MORE than one turn_step is reached as turn -> short translate
     #     (forward/back, whichever the rays say is roomier) -> settle -> turn again -> ... -> aim -> advance.
     #     The translation between rotations gives SLAM the parallax it needs to survive a multi-step turn,

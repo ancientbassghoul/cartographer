@@ -393,6 +393,12 @@ class Pipeline:
         payload["blacklist"] = self.planner.blacklist_points()
         payload["blacklist_permanent"] = self.planner.blacklist_permanent()
         payload["goal_clearance_ok"] = bool(self.planner.clearance_ok)   # visible flag: clearance inset succeeded
+        # A published corner goal (sweep tour) is flagged so the autopilot can SUPPRESS a bump/strike against a
+        # FAR corner (a mildly-stuck drone must not blacklist a corner it hasn't approached — session 20).
+        payload["goal_is_corner"] = bool(self.planner.sweeping)
+        # Persistent goals DB (per-disc picks / strikes / blacklisted) -> the replay debugger's floating table.
+        # DB-blacklist events (loop/stall) are logged in the run() drain that feeds the DB, not here.
+        payload["goal_db"] = self.planner.goal_db_snapshot()
         tgt = self.planner.sweep_target
         if self.planner.sweeping and tgt is not None and tgt != self._sweep_target_logged:
             n_left = sum(1 for c in (corners or []) if not self.planner._corner_visited(c))
@@ -547,6 +553,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
     # (never gated on SLAM health — the whole point of the event-driven design).
     apevent_sub = frame_bus.StateSubscriber(ctrl_port, topics=[frame_bus.TOPIC_AUTOPILOT_EVENT])
     last_bump_seq = -1
+    last_pick_seq = -1
     print(f"[perception] frame bus SUB :{frame_port} | state PUB :{pstate_port} "
           f"(TOPIC_POSE/MAP/PLAN/TARGET) | detection SUB :{obj_port}")
     print(f"[perception] SLAM every frame ({pipe.slam.tracking_mode}); depth removed (SLAM owns the GPU)")
@@ -587,6 +594,26 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
                         msg = f"BUMP goal={g} count={out['count']}/2 (increment)"
                     pipe.last_planner_event = msg
                     print(f"[perception] planner: {msg}", flush=True)
+                # Goals-DB pick + previous-hop STRIKE/progress outcome (one pulse per leg). Feed the STALL guard
+                # (register_hop_outcome) then the CIRCLING guard (register_goal_pick); log any DB-blacklist.
+                pseq, pg = ev.get("pick_seq"), ev.get("pick_goal")
+                if pg is not None and pseq is not None and pseq != last_pick_seq:
+                    last_pick_seq = pseq
+                    prev_goal = ev.get("prev_goal")
+                    if prev_goal is not None:
+                        pipe.planner.register_hop_outcome(prev_goal, bool(ev.get("prev_progressed")),
+                                                          bool(ev.get("prev_strike_eligible", True)))
+                    pipe.planner.register_goal_pick(pg, ev.get("pick_pos"))
+                    lev = pipe.planner.last_loop_event
+                    if lev is not None:
+                        lg = [round(lev["goal"][0], 3), round(lev["goal"][1], 3)]
+                        tag = "STRIKE-BLACKLIST" if lev.get("reason") == "stall" else "LOOP-BLACKLIST"
+                        extra = (f"strikes={lev['strikes']}" if lev.get("reason") == "stall"
+                                 else f"picks={lev['picks']}")
+                        msg = f"{tag} goal={lg} {extra} ({len(pipe.planner._blacklist)} total) -> reselecting"
+                        pipe.last_planner_event = msg
+                        print(f"[perception] planner: {msg}", flush=True)
+                        pipe.planner.last_loop_event = None
                 ap = apevent_sub.recv(timeout_ms=0)
 
             _, _, panel, map_updated = pipe.step(frame, meta, state_pub, show)

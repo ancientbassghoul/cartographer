@@ -175,6 +175,8 @@ def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan:
         # (goal-change reset / blacklist), so the replay shows the mechanism the flight log used to hide.
         "wall_hit_count": g("wall_hit_count"), "wall_hit_goal": g("wall_hit_goal"),
         "planner_event": g("planner_event"),
+        # Persistent goals DB snapshot (per-disc picks/strikes/blacklisted) -> the replay's floating table.
+        "goal_db": g("goal_db"),
         # Raw command actually sent to the sim this frame (the joystick-bridge output) — pristine
         # per-frame telemetry so a crawl (forward trigger set but pose barely moving) is self-evident.
         # {} is preserved (hover/neutral); None only when no command was supplied (old logs omit the key).
@@ -654,15 +656,31 @@ class ExploreController:
         ft = e.get("forward_throttle", None)
         if ft is not None:
             self.forward_preset = dict(self.forward_preset, trigger=float(ft))
-        # Committed-goal HOP cadence (session 20): ADVANCE flies hop_ticks controller ticks, SETTLEs (a
-        # fresh-frame SLAM breather), then RESUMES advancing toward the SAME committed leg_goal (no REPLAN)
-        # until the goal is reached or a real block. 0 = disabled (cruise straight to the goal). The leg-level
-        # progress trackers below let a committed goal that can't be approached (e.g. behind glass SLAM can't
-        # map) be blacklisted FAST via a bump — the speed ram guard is reset by each hop's settle, so it can't.
+        # HOP cadence, NO goal commitment (session 20 rev): ADVANCE flies hop_ticks controller ticks, SETTLEs (a
+        # fresh-frame SLAM breather), then REPLANs — re-reading SLAM's CURRENT goal. If SLAM re-picked a
+        # different goal while the drone advanced, the drone adopts the NEW goal (re-orient WITH the parallax
+        # scout -> hop), instead of resuming the old, unreached leg_goal. So the drone never hardens its life by
+        # committing to one distant goal; SLAM stays free to re-pick, and the goals-DB guards (frontier_planner)
+        # retire ping-pong + stalls. 0 = disabled (cruise straight to the goal).
         self.hop_ticks = int(e.get("hop_ticks", 0))
         self._hop_tick = 0                   # advancing ticks in the CURRENT hop (reset on each ADVANCE entry)
-        self._leg_best_dist = None           # closest approach to leg_goal this LEG (reset on a new leg_goal)
-        self._leg_progress_t = None          # 'now' of the last >ram_progress_eps improvement (leg-level stall clock)
+        # Per-HOP progress (session 20b): a stall is a MEASURED CONSEQUENCE of a hop that failed to get closer,
+        # never a precondition that blocks ADVANCE. On ADVANCE entry we snapshot the distance to the goal; when
+        # the hop ends and we REPLAN we compare — closed >= hop_progress_eps == progress (reset that goal's
+        # strikes), else a STRIKE toward that goal in the planner's goals-DB (2 strikes -> blacklist). A mid-hop
+        # plan-loss INVALIDATES the pending eval (_hop_start_goal cleared) so the interrupted hop isn't a strike.
+        self._hop_start_dist = None          # dist(pos, leg_goal) snapshotted at the current hop's ADVANCE entry
+        self._hop_start_goal = None          # the goal that snapshot was against (None = no pending hop to judge)
+        self.hop_progress_eps = float(e.get("hop_progress_eps", e.get("goal_progress_eps", 0.2)))  # min closing
+        #                                    distance (SLAM units) over a hop that counts as MEANINGFUL advancement
+        self._leg_is_corner = False          # True while the committed leg_goal is a sweep-tour CORNER (from the
+        #                                    plan's goal_is_corner) — gates the far-corner bump/strike suppression
+        self.corner_no_blacklist_dist = float(e.get("corner_no_blacklist_dist", 1.0))  # a sweep CORNER goal
+        #                                    farther than this from the drone CANNOT be bumped/struck/blacklisted:
+        #                                    a mildly-stuck drone must never retire a far corner it hasn't reached
+        self._pick_pulse = None              # stashed {pick_goal,pick_pos,prev_goal,prev_progressed,
+        #                                    prev_strike_eligible} for run_explore to publish to perception (the
+        #                                    goals-DB pick + previous-hop strike/progress outcome), mirror of _bump_pulse
         # Reverse throttle override (config): gentler BACKWARD speed for every reverse maneuver (back_off,
         # reverse_probe, recovery back-off, backward parallax push), so a fast backward ram into a wall can't
         # throw the drone to SLAM-killing angles. Reverse is a continuous 0-1 throttle like forward; we rewrite
@@ -861,8 +879,6 @@ class ExploreController:
         # threshold (0.15 u / 3 s ~= 0.05 u/s) could not — it false-fired on the platform's normal crawl.
         self.ram_stall_s = float(e.get("ram_stall_s", 3.0))            # below-nominal seconds -> stop the leg
         self.ram_speed_frac = float(e.get("ram_speed_frac", 0.33))     # fire when speed < frac * nominal
-        self.ram_progress_eps = float(e.get("ram_progress_eps", 0.15)) # session 20: min approach improvement (SLAM
-        #   units) that resets the LEG-level stall clock (distance to the committed goal); survives hop settles
         self.ram_speed_window_s = float(e.get("ram_speed_window_s", 1.0))   # rolling window for the live speed
         self.ram_calib_skip_s = float(e.get("ram_calib_skip_s", 1.0))       # skip the first Ns of the first ADVANCE
         self.ram_calib_sample_s = float(e.get("ram_calib_sample_s", 5.0))   # then sample nominal for up to Ns
@@ -1003,9 +1019,9 @@ class ExploreController:
         self._ram_last_t = None
         self._ram_speed_win.clear() # a time gap across an interruption must not read as a false slowdown
         self._ram_speed = None
-        self._hop_tick = 0          # session 20: hop cadence + leg-level progress are per-leg
-        self._leg_best_dist = None
-        self._leg_progress_t = None
+        self._hop_tick = 0          # session 20: hop cadence is per-leg
+        self._hop_start_dist = None  # a hard interruption abandons the pending per-hop progress eval
+        self._hop_start_goal = None
         # A finalized nominal free-flight speed PERSISTS (flight-level, like target_altitude_y); only an
         # in-progress calibration is discarded on a hard interruption -> it restarts on the next clean ADVANCE.
         if self._nominal_speed is None:
@@ -1522,10 +1538,15 @@ class ExploreController:
         if state not in ("ADVANCE", "SLAM_HOLD"):
             self._recovery_adv_start = None
         # Session 20: every ADVANCE entry (a fresh leg OR a resume after a hop-SETTLE / SLAM_HOLD) starts a fresh
-        # hop tick count. The LEG-level progress trackers (_leg_best_dist/_leg_progress_t) are NOT reset here —
-        # they persist across a leg's hops and reset only when a new leg_goal is committed (REPLAN) or reset_leg.
+        # hop tick count + a FRESH per-hop progress snapshot: clear _hop_start_goal here so the ADVANCE handler
+        # re-captures the start distance on its first posed tick (each hop is judged from its OWN start).
         if state == "ADVANCE":
             self._hop_tick = 0
+            self._hop_start_goal = None
+        # A plan-loss / SLAM-choke hold ABANDONS the pending per-hop eval (an interrupted hop is not a strike —
+        # per the rule "wait for OK, then settle, then it's a NEW advance command"). Recovery chains from these.
+        if state in ("HOLD_LOST", "SLAM_HOLD"):
+            self._hop_start_goal = None
         # SETTLE fresh-frame gate (session 15): start the post-entry frame count from THIS instant, so only SLAM
         # frames CAPTURED after the settle began can satisfy it (a pre-settle frame that merely finishes during
         # the settle must not count).
@@ -1595,9 +1616,20 @@ class ExploreController:
         ram-guard / clearance stand-off) toward the committed goal, stash ONE bump pulse for run_explore to
         publish, then DISARM + record the stop position as the re-arm anchor. Suppressed while already
         disarmed (a stuttering state machine can't multiply-count one continuous contact) — a suppressed real
-        contact stashes a MISSED-BUMP marker (`self._missed_bump`) so run_explore can log the un-counted hit."""
+        contact stashes a MISSED-BUMP marker (`self._missed_bump`) so run_explore can log the un-counted hit.
+
+        FAR-CORNER GUARD (session 20): a sweep-tour CORNER goal that is still farther than
+        `corner_no_blacklist_dist` from the drone is NEVER bumped — so a mildly-stuck-then-freed drone can't
+        blacklist a distant corner it simply hasn't reached yet (the pulse never reaches note_wall_hit, which
+        blocks BOTH the region blacklist and the corner retirement). Frontiers and near corners bump normally."""
         if self.leg_goal is None:
             return
+        if self._leg_is_corner:
+            d = self._dist(plan.get("pos"), self.leg_goal)
+            if d is not None and d > self.corner_no_blacklist_dist:
+                self._missed_bump = (f"{reason} (FAR-CORNER guard — corner {self.leg_goal} is {d:.2f}u away "
+                                     f"> {self.corner_no_blacklist_dist:.2f}u; not blacklisting a far corner)")
+                return
         if not self._bump_armed:
             self._missed_bump = f"{reason} (latch disarmed — drone hasn't disengaged since the last bump)"
             return
@@ -1629,6 +1661,13 @@ class ExploreController:
         g, r = self._bump_pulse, self._bump_reason
         self._bump_pulse = self._bump_reason = None
         return g, r
+
+    def take_pick_pulse(self):
+        """Pop the pending goals-DB pick+hop-outcome dict (or None) stashed at a REPLAN leg-commit. run_explore
+        publishes it on TOPIC_AUTOPILOT_EVENT; perception feeds it to planner.register_hop_outcome (previous
+        hop's STRIKE/progress) + planner.register_goal_pick (this leg's pick -> ping-pong loop guard)."""
+        p, self._pick_pulse = self._pick_pulse, None
+        return p
 
     @staticmethod
     def _dist(a, b):
@@ -2127,7 +2166,32 @@ class ExploreController:
                 event = ("mission complete — no reachable frontier remains -> RETURN_TO_ORIGIN "
                          "(floor-dock postlude)")
             elif plan.get("goal") is not None:
+                pos = plan.get("pos")
+                # --- Session 20b: judge the HOP that just finished (per-hop progress -> STRIKE/reset), THEN
+                #     register the new PICK. Both ride one pulse to the planner's goals-DB (run_explore publishes
+                #     it). prev_strike_eligible uses the OLD leg's corner-ness + our distance to it: a FAR corner
+                #     (> corner_no_blacklist_dist) is never struck (a corner is a far reposition target, unlike a
+                #     nearby frontier). A mid-hop plan-loss already cleared _hop_start_goal, so it won't be judged.
+                prev_goal = self._hop_start_goal
+                prev_progressed, prev_strike_eligible = None, True
+                if prev_goal is not None and self._hop_start_dist is not None:
+                    end_d = self._dist(pos, prev_goal)
+                    if end_d is not None:
+                        # progress = closed >= eps, OR the goal is now REACHED (reaching is the ultimate progress,
+                        # never a strike — a hop that ends by arriving must reset, not accrue, strikes).
+                        prev_progressed = ((self._hop_start_dist - end_d) >= self.hop_progress_eps
+                                           or end_d <= self.goal_reach_dist)
+                        if self._leg_is_corner and end_d > self.corner_no_blacklist_dist:
+                            prev_strike_eligible = False   # far corner -> no strike
+                self._hop_start_dist = None               # judged (or unjudgeable) -> clear the pending eval
+                self._hop_start_goal = None
                 self.leg_goal = list(plan["goal"])
+                self._leg_is_corner = bool(plan.get("goal_is_corner"))  # the new published goal is a sweep-tour corner?
+                self._pick_pulse = {"pick_goal": list(self.leg_goal),
+                                    "pick_pos": (list(pos) if pos is not None else None),
+                                    "prev_goal": (list(prev_goal) if prev_goal is not None else None),
+                                    "prev_progressed": prev_progressed,
+                                    "prev_strike_eligible": prev_strike_eligible}
                 # Session-17: the PERIODIC per-goal re-calibration trigger was DELETED. The drone holds altitude on
                 # its own now that thrust (triggerDown) is engaged, so there is no per-leg sag to re-tap. Always
                 # orient straight to the committed goal. (CALIBRATING_HEIGHT machinery is retained, unwired, for a
@@ -2138,8 +2202,6 @@ class ExploreController:
                     self._ram_last_t = None
                     self._ram_speed_win.clear()      # a new leg breaks the speed run; window must not span the gap
                     self._ram_speed = None
-                    self._leg_best_dist = None        # session 20: fresh leg-level progress toward the NEW committed goal
-                    self._leg_progress_t = None
                     self._finalize_or_discard_calib()  # a leg boundary ends a sampling run: accept if clean, else restart
                     be = plan.get("bearing_err")
                     theta = self._quantize_turn(be)
@@ -2211,15 +2273,12 @@ class ExploreController:
             reached = self._dist(plan.get("pos"), self.leg_goal)
             clr = plan.get("forward_clearance_dist")
             fwd_dur, fwd_val = (now - self.t_state), float(self.forward_preset.get("trigger", 0.0))
-            # Session-20 LEG-LEVEL progress toward the COMMITTED goal (survives inter-hop settles, unlike the
-            # speed ram guard). Update the closest-approach + its timestamp whenever the drone gets meaningfully
-            # (> ram_progress_eps) nearer the goal; the stall check below fires if it stops improving.
-            if reached is not None:
-                if self._leg_best_dist is None or reached < self._leg_best_dist - self.ram_progress_eps:
-                    self._leg_best_dist = reached
-                    self._leg_progress_t = now
-                elif self._leg_progress_t is None:
-                    self._leg_progress_t = now
+            # Session-20b PER-HOP progress snapshot: on the first ADVANCE tick with a pose, record the distance to
+            # the goal so the NEXT REPLAN can judge whether this hop got meaningfully closer (progress) or not (a
+            # STRIKE toward this goal). Captured here (not _enter) because _enter has no pose. Cleared at REPLAN.
+            if reached is not None and self._hop_start_goal is None:
+                self._hop_start_dist = reached
+                self._hop_start_goal = list(self.leg_goal)
             # CONFIRMING ADVANCE (D5): a re-locked drone is trusted again ONLY after it flies a genuine leg. Gauge
             # progress from this leg's start; once it has advanced >= recovery_confirm_dist, RESTORE trust — drop
             # `_recovering`/`_history_broken`, reset the give-up counter, and CLEAR the (now-stale) reverse-list so
@@ -2288,33 +2347,23 @@ class ExploreController:
                 self._log_move("forward", fwd_val, fwd_dur)
                 self._enter("SETTLE", now)
                 event = f"goal reached (d={reached:.2f}) -> settle"
-            elif (self.hop_ticks > 0 and reached is not None and self._leg_progress_t is not None
-                  and (now - self._leg_progress_t) >= self.ram_stall_s):
-                # Session-20 LEG STALL guard (the glass-wall-ramming fix for hop mode): the committed goal has
-                # not been approached (by > ram_progress_eps) for ram_stall_s ACROSS hops -> it's unreachable
-                # (behind glass SLAM can't map, or blocked). Bump toward it (feeds the 2-bump blacklist) and end
-                # the leg -> REPLAN picks a new goal. This survives the inter-hop settles that reset the speed
-                # ram guard, so a glass wall is blacklisted in ~2 stalled legs instead of ~3 minutes of ramming.
-                self._log_move("forward", fwd_val, fwd_dur)
-                self._register_bump(plan, "leg stall (no progress toward committed goal)")
-                self._enter("SETTLE", now)   # _settle_to unset -> REPLAN (new goal)
-                event = (f"leg STALL: no progress toward {self.leg_goal} for "
-                         f"{now - self._leg_progress_t:.1f}s (best d={self._leg_best_dist:.2f}) -> bump -> replan")
             elif (now - self.t_state) > self.leg_max_s:
                 self._log_move("forward", fwd_val, fwd_dur)
                 self._player = self.pb.player("back_off")
                 self._enter("BACKOFF", now)
                 event = f"LEG-TIMEOUT (>{self.leg_max_s}s) -> back off"
             elif self.hop_ticks > 0 and self._hop_tick >= self.hop_ticks:
-                # Session-20 HOP: advanced hop_ticks -> SETTLE (a fresh-frame SLAM breather) -> RESUME advancing
-                # toward the SAME committed leg_goal (no REPLAN). The leg stays committed across hops until the
-                # goal is reached or a real block above; the settle gives monocular SLAM a still window to re-lock.
+                # Session-20 HOP (NO commitment): advanced hop_ticks -> SETTLE (a fresh-frame SLAM breather) ->
+                # REPLAN — re-read SLAM's CURRENT goal. If SLAM re-picked a different goal while the drone hopped,
+                # REPLAN commits the NEW one and re-orients (WITH the parallax scout for an off-axis goal) before
+                # the next hop; a same-goal re-pick just re-orients ('c') and hops on. The drone NEVER resumes an
+                # old, unreached leg_goal — SLAM stays free to steer, the goals-DB retires any ping-pong loop.
                 self._log_move("forward", fwd_val, fwd_dur)
-                self._settle_to = "ADVANCE"
+                self._settle_to = "REPLAN"
                 self._enter("SETTLE", now)
-                event = ((f"hop {self.hop_ticks} ticks -> settle -> resume advance toward committed goal "
-                          f"{self.leg_goal} (d={reached:.2f})") if reached is not None else
-                         f"hop {self.hop_ticks} ticks -> settle -> resume advance toward committed goal")
+                event = ((f"hop {self.hop_ticks} ticks -> settle -> REPLAN (re-pick SLAM's current goal; "
+                          f"was {self.leg_goal}, d={reached:.2f})") if reached is not None else
+                         f"hop {self.hop_ticks} ticks -> settle -> REPLAN (re-pick SLAM's current goal)")
             else:
                 # Ram guard (SELF-CALIBRATING): accrue time while the live world speed is BELOW
                 # `ram_speed_frac` of the drone's own calibrated nominal free-flight speed; reset the clock
@@ -2771,6 +2820,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
 
     seq = 0
     bump_seq = 0          # dedup id for TOPIC_AUTOPILOT_EVENT bump pulses (perception drops repeats)
+    pick_seq = 0          # dedup id for TOPIC_AUTOPILOT_EVENT pick+hop-outcome pulses (goals-DB)
     last_pub = last_log = 0.0
     last_plan = None
     last_plan_t = time.monotonic()
@@ -2981,6 +3031,12 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 print(bline, flush=True)
                 diag.line(bline)
                 bump_seq += 1
+            # Goals-DB pick + previous-hop STRIKE/progress outcome, stashed at the REPLAN leg-commit. One pulse
+            # per leg; perception drains it into the planner's goals-DB (loop + stall guards). Deduped by seq.
+            pick = ctrl.take_pick_pulse()
+            if pick is not None:
+                pub.publish(frame_bus.TOPIC_AUTOPILOT_EVENT, dict(pick, pick_seq=pick_seq))
+                pick_seq += 1
             # A real advance-blocked contact that emitted NO pulse (latch disarmed / parallax-blocked path) —
             # these are the un-counted glass contacts that let the 2-bump blacklist under-count. Surface them.
             missed = ctrl.take_missed_bump()
@@ -3577,40 +3633,67 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if edges_ok else 'FAIL'}  explore edges (turn- left, quantize 70->60/50->60/"
           f"10->0, theta~0->reset->ADVANCE, goal-reached settle)")
 
-    # ---- (session 20) COMMITTED-GOAL HOPS + LEG-STALL guard ----
-    # (1) hop cadence: ADVANCE hops toward the SAME leg_goal (SETTLE between, NO REPLAN/ORIENT) while advancing.
+    # ---- (session 20b) HOPS + per-hop PROGRESS pulse (strike/reset) + far-corner exemption + far-corner bump ----
+    # (1a) hop cadence RE-PLANS: ADVANCE hops toward leg_goal; at hop_ticks -> SETTLE routed to REPLAN (NOT a
+    #      resume of the old goal). Capture _settle_to at the hop->settle transition.
     chop = ExploreController(cfg, no_takeoff=True)
     chop.hop_ticks = 3; chop.settle_fresh_frames = 2
     chop.leg_goal = [15.0, 0.0]; chop._enter("ADVANCE", 0.0)
-    hstates, t, x, fr = [], 0.0, 0.0, 5000
-    for _ in range(40):
+    settle_route, t, x, fr, prev = None, 0.0, 0.0, 5000, "ADVANCE"
+    for _ in range(12):
         x = round(x + 0.25, 3)                          # steady clear progress toward a FAR goal (never reached here)
         _a, s, _ev = chop.step(t, {"plan_valid": True, "done": False, "goal": [15.0, 0.0], "pos": [x, 0.0],
                                    "bearing_err": 0.0, "forward_clearance_dist": 15.0, "pos_y": 0.0,
                                    "frame_id": fr, "cap_ts": t, "slam_ms": 200.0}, False)
-        if not hstates or hstates[-1] != s:
-            hstates.append(s)
-        t += 0.05; fr += 1
-    hop_ok = (hstates.count("ADVANCE") >= 2 and "SETTLE" in hstates          # re-entered ADVANCE after a hop-settle
-              and "REPLAN" not in hstates and "ORIENT" not in hstates        # goal stayed COMMITTED across hops
-              and chop.leg_goal == [15.0, 0.0])
-    # (2) leg-stall guard: a committed goal that stops being approached for ram_stall_s -> bump -> replan (glass fix).
-    cstall = ExploreController(cfg, no_takeoff=True)
-    cstall.hop_ticks = 3; cstall.settle_fresh_frames = 2; cstall.ram_stall_s = 0.5
-    cstall.leg_goal = [9.0, 0.0]; cstall._enter("ADVANCE", 0.0)
-    stall_fired, t, fr = False, 0.0, 6000
-    for _ in range(80):
-        _a, s, ev = cstall.step(t, {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [1.0, 0.0],
-                                    "bearing_err": 0.0, "forward_clearance_dist": 9.0, "pos_y": 0.0,
-                                    "frame_id": fr, "cap_ts": t, "slam_ms": 200.0}, False)
-        if ev and "leg STALL" in ev:
-            stall_fired = True; break
-        t += 0.05; fr += 1
-    stall_ok = stall_fired and cstall._bump_pulse == [9.0, 0.0] and cstall.state == "SETTLE"
-    hops_ok = hop_ok and stall_ok
+        if s == "SETTLE" and prev == "ADVANCE":
+            settle_route = chop._settle_to             # captured at the hop->settle transition (before SETTLE runs)
+        prev = s; t += 0.05; fr += 1
+    hop_route_ok = (settle_route == "REPLAN")
+    # (1b) REPLAN ADOPTS a re-picked, off-axis goal and re-orients WITH the parallax scout (not the old goal).
+    crp = ExploreController(cfg, no_takeoff=True); crp.hop_ticks = 3
+    crp.leg_goal = [15.0, 0.0]; crp._enter("REPLAN", 0.0)
+    crp.step(0.0, {"plan_valid": True, "done": False, "goal": [0.0, 15.0], "pos": [1.0, 0.0],
+                   "bearing_err": 90.0, "forward_clearance_dist": 15.0, "pos_y": 0.0,
+                   "clearance_ring": [[0.0, None]], "frame_id": 1, "cap_ts": 0.0, "slam_ms": 200.0}, False)
+    replan_adopt_ok = (crp.leg_goal == [0.0, 15.0] and crp.state == "ORIENT"
+                       and crp._after_orient == "PARALLAX_PUSH")
+    # (1c) PER-HOP progress pulse: a REPLAN judges the finished hop (from _hop_start_dist) and emits the combined
+    #      pick+outcome pulse. A hop that CLOSED >= hop_progress_eps -> prev_progressed True; one that didn't ->
+    #      False (a STRIKE). A FAR corner (old leg corner + still > corner_no_blacklist_dist) -> not strike-eligible.
+    def _hop_pulse(start_dist, end_pos, is_corner, goal=[9.0, 0.0]):
+        c = ExploreController(cfg, no_takeoff=True); c.hop_ticks = 3
+        c.leg_goal = list(goal); c._hop_start_goal = list(goal); c._hop_start_dist = start_dist
+        c._leg_is_corner = is_corner; c._enter("REPLAN", 0.0)
+        c.step(0.0, {"plan_valid": True, "done": False, "goal": list(goal), "pos": list(end_pos),
+                     "bearing_err": 0.0, "forward_clearance_dist": 9.0, "pos_y": 0.0,
+                     "frame_id": 1, "cap_ts": 0.0, "slam_ms": 200.0}, False)
+        return c.take_pick_pulse()
+    pu_prog = _hop_pulse(5.0, [8.0, 0.0], False)                    # 5.0 -> 1.0 closed 4.0 -> progress
+    pu_stall = _hop_pulse(5.0, [4.05, 0.0], False)                  # 5.0 -> 4.95 closed 0.05 -> STALL
+    pu_corner = _hop_pulse(8.0, [2.0, 0.0], True, goal=[10.0, 0.0])  # no progress but 8u FAR corner -> exempt
+    hop_pulse_ok = (pu_prog and pu_prog["prev_progressed"] is True and pu_prog["prev_strike_eligible"] is True
+                    and pu_prog["prev_goal"] == [9.0, 0.0] and pu_prog["pick_goal"] == [9.0, 0.0]
+                    and pu_stall and pu_stall["prev_progressed"] is False and pu_stall["prev_strike_eligible"] is True
+                    and pu_corner and pu_corner["prev_progressed"] is False
+                    and pu_corner["prev_strike_eligible"] is False)
+    # (2) a plan-loss / SLAM-choke hold ABANDONS the pending per-hop eval (an interrupted hop is not a strike).
+    cabort = ExploreController(cfg, no_takeoff=True)
+    cabort._hop_start_goal = [9.0, 0.0]; cabort._hop_start_dist = 5.0
+    cabort._enter("HOLD_LOST", 0.0)
+    abort_ok = cabort._hop_start_goal is None
+    # (3) FAR-CORNER bump guard: a corner goal >corner_no_blacklist_dist away is NOT bumped; a near one IS.
+    def _corner_bump(dist_away):
+        c = ExploreController(cfg, no_takeoff=True)
+        c.leg_goal = [10.0, 0.0]; c._leg_is_corner = True; c._bump_armed = True
+        c._register_bump({"pos": [10.0 - dist_away, 0.0]}, "flow WALL contact")
+        return c._bump_pulse
+    far_corner_ok = (_corner_bump(3.0) is None                       # far corner -> suppressed (no pulse)
+                     and _corner_bump(0.5) == [10.0, 0.0])           # near corner -> bumps normally
+    hops_ok = hop_route_ok and replan_adopt_ok and hop_pulse_ok and abort_ok and far_corner_ok
     ok = ok and hops_ok
-    print(f"[self-test] {'PASS' if hops_ok else 'FAIL'}  COMMITTED-GOAL HOPS "
-          f"(hop toward one goal, no replan/orient={hop_ok}; blocked-goal leg-stall->bump->replan={stall_ok})")
+    print(f"[self-test] {'PASS' if hops_ok else 'FAIL'}  HOPS+PER-HOP-STRIKE "
+          f"(hop->REPLAN={hop_route_ok}; adopts new goal+parallax={replan_adopt_ok}; "
+          f"progress/stall/far-corner pulse={hop_pulse_ok}; hold abandons eval={abort_ok}; far-corner bump={far_corner_ok})")
 
     # ---- Map mode: PRELUDE arm + takeoff + TWO-PHASE ascent + descend + baseline nudge (airborne + to height) ----
     ascend = int(cfg["autonomy"]["ascend_cmd"])

@@ -1,29 +1,60 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-16** (session 20 **STEP 1 BUILT on main — autopilot self-tests green; UNCOMMITTED;
-FLY-PENDING for a HEIGHT check**). Resume from THIS file. Plan of record:
-**`plans/session20-committed-hops-and-return-to-origin.md`** (to be written)._
+_Last updated **2026-07-16** (session 20b **BUILT on `leg-hops-and-goal-commit-fix` — all 6 module self-tests
+green; UNCOMMITTED; LIVE-FLY PENDING**). Resume from THIS file. Plan of record:
+**`plans/session20-goal-db-loop-blacklist.md`**._
 
-_**Session 20 — decision + a controlled experiment on main.** Two flights compared: the **session-19** version
-(`20260715_195007`, on branch **`session19-profiled-forward-leg`**, commit 0b03021) maps ~26% faster (63K vs 85K
-ticks) with less plan-lost, BUT rammed a glass wall ~3 min (root cause: its `step_duration` hop re-plans every
-hop → resets the ram-guard timer + never registers a bump; escape needed 2 random collisions). The **committed**
-version (`20260715_150250`, a737aa4) was rock-solid height-wise but slow. Return-to-origin (no orient-to-north +
-violent descent) is broken in BOTH → PRE-EXISTING, not a session-19 regression. Decision: keep session-19 on the
-branch as a fallback; on CLEAN main add ONLY a minimal controlled experiment to isolate the height variable._
+_**Session 20b — per-hop progress + strikes (kill the instant-stall death-loop) + goals DB in the debugger.**
+Flight `20260716_140437` froze re-picking one goal forever ("leg STALL … 75.0s" every leg, never blacklisted).
+Cause: the session-20 leg-stall guard fired the INSTANT ADVANCE began (its stall clock never reset across
+same-region re-picks; the drone was farther than its stale best-dist), bailing to SETTLE **before emitting any
+forward command** → the drone never moved; and neither blacklist path caught a stationary re-pick of one goal
+(the 2-bump latch can't re-arm on a frozen drone; the goals-DB counted only a DIFFERENT disc). Rebuilt per the
+operator's tightened rules: (1) a stall is now a MEASURED CONSEQUENCE — on ADVANCE entry snapshot the distance to
+the goal; at the next REPLAN, a hop that closed < `hop_progress_eps` (0.2u) is a STALL. (2) The goals-DB is fed by
+the AUTOPILOT once per leg (a combined pick+hop-outcome pulse on TOPIC_AUTOPILOT_EVENT, mirroring the bump pulse)
+and holds THREE complementary, non-blocking guards, all writing the same permanent blacklist: **2-bump** (twice
+physically touched), **strikes** (2 hops in a row no closer → dead; reset on real progress), **picks-loop** (≥3
+picks with ALL drone-locs inside one 1u cluster → circling; TIGHTENED from "any pair <1u", which false-fired on a
+legit marching approach over short hops — the debugger's per-pick drone-location rows made it visible). (3) A FAR
+corner (>1u away) is exempt from strike + bump — a
+corner is a reposition target flown from afar, unlike a nearby frontier. Removed the old leg-stall guard + its
+trackers + region-gate. Also added the **goals DB to the replay debugger** — a draggable floating "Goals DB"
+table (center / picks / strikes / locs / status) that updates as you scrub. New knobs `hop_progress_eps` (0.2),
+`goal_strike_limit` (2). All 6 module self-tests green (rewrote the HOPS test → HOPS+PER-HOP-STRIKE; new planner
+strike/loop tests db1–db5; flight_replay goal_db test). **NEXT = LIVE-FLY:** a blocked goal should strike 1→2
+then blacklist (watch the floating table + a `STRIKE-BLACKLIST` / `LOOP-BLACKLIST` event), a far corner survives
+a transient stall, and the drone never freezes on one goal._
 
-_**Session 20 STEP 1 (BUILT, main, UNCOMMITTED, FLY-PENDING):** **committed-goal HOPS** (`hop_ticks: 40`) —
-ADVANCE hops `hop_ticks` ticks, SETTLEs (a fresh-frame SLAM breather), then RESUMES advancing toward the SAME
-committed `leg_goal` (`_settle_to="ADVANCE"`, no REPLAN) until reached or blocked; 0 = old cruise-to-goal. Plus a
-**leg-level stall guard** (repurposes the unused `ram_progress_eps`): if the committed goal isn't approached for
-`ram_stall_s` ACROSS hops → `_register_bump` → REPLAN — this is the glass-wall-ramming fix (survives the hop
-settles that reset the speed ram guard). And **`forward_throttle: 0.2 → 1.0`** (rides main's committed session-18
-io_bridge ramp). New COMMITTED-GOAL-HOPS self-test green. **NEXT = fly it (`python fly.py`, m) and watch the
-height median — is 1.0 throttle stable? does a glass wall now blacklist fast (no 3-min ram)?** THEN build Step 2
-(orient to north: capture `_takeoff_heading` early + ORIENT_HOME fine convergence) + Step 3 (gentle stepped
-descent: smaller pulses + fresh-frame settles). Both are PRE-EXISTING return-to-origin bugs (broken on main too)._
+_**Session 20 REV — de-commit the hops + a persistent goals database + corner-goal safety (BUILT on
+`leg-hops-and-goal-commit-fix`; `main` untouched as the clean fallback).** The prior STEP-1 experiment
+(committed-goal hops, below) flew badly, and the operator diagnosed WHY session-19 flies smooth: **SLAM is let to
+re-pick its goal freely** — the drone must NOT harden its life by committing to one distant goal. But free
+re-picking re-opens **goal ping-pong** (the planner oscillates between a few goals, the drone circles, and the
+2-bump watcher goes blind because its counter resets on every goal change). Fix, three parts. (1) **Keep the
+40-tick hop cadence, remove the COMMITMENT**: the post-hop SETTLE now routes to **REPLAN** (was resume-`ADVANCE`),
+so every hop re-reads SLAM's current goal and, if it changed, adopts it — re-orient WITH the parallax scout →
+hop — instead of finishing the old, unreached leg. (2) **A persistent goals DATABASE (`frontier_planner`)**:
+each picked goal is a 0.5u DISC; a genuine goal-switch registers a "pick" (holding one goal across the 2 Hz
+selects counts once); a disc picked ≥3× with any two pick-time drone locations <1u == circling → **PERMANENTLY
+blacklist it** via the SAME store the 2-bump uses. The DB **persists the whole flight, never reset mid-flight** —
+that is what lets a slow loop accumulate across goal changes (immune to the "counter defeated" hole). (3)
+**Corner-goal safety**: SLAM stays free to find + adopt a frontier en route to a corner (free, since a corner
+cruise is itself hopped + re-planned); and a sweep CORNER goal farther than `corner_no_blacklist_dist` (1.0) from
+the drone can NEVER be bumped/blacklisted — a mildly-stuck-then-freed drone must not retire a far corner. Kept:
+the **leg-stall guard** as a safety (its tracker reset is now region-gated so per-hop re-planning can't neuter
+it) and **`forward_throttle: 1.0`**. All 6 module self-tests green (rewrote the hop test → HOPS-NO-COMMITMENT; new
+goals-DB tests db1–db5). **NEXT = LIVE-FLY (`python fly.py`, m)** — watch each hop re-pick, a ping-pong loop retire
+in a handful of picks via `LOOP-BLACKLIST` (no 3-min ram / "counter defeated" thrash), and a far corner survive a
+transient stall. Return-to-origin (orient-to-north + gentle descent) remains a PRE-EXISTING bug for a later step._
 
-_Session-18 (below) + 17 are committed (a737aa4). Session-19 is on branch `session19-profiled-forward-leg`._
+_**Session 20 STEP 1 (SUPERSEDED by the REV above — was: committed-goal HOPS on main):** ADVANCE hopped
+`hop_ticks` ticks then RESUMED the SAME committed `leg_goal` (`_settle_to="ADVANCE"`, no REPLAN). This
+COMMITMENT is exactly what the REV removed (post-hop → REPLAN). The leg-stall guard + `forward_throttle 1.0`
+carried forward; the `_settle_to="ADVANCE"` resume did not._
+
+_Session-18 (below) + 17 are committed (a737aa4). Session-19 is on branch `session19-profiled-forward-leg`;
+this work is on `leg-hops-and-goal-commit-fix`._
 
 _Last updated **2026-07-15** (session 18 **BUILT — io_bridge + autopilot + flight_replay self-tests green;
 LIVE-FLY PENDING**). Resume from THIS file. **NEXT = LIVE-FLY** (`python fly.py`, press `m`) to confirm session
@@ -136,8 +167,24 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = LIVE-FLY SESSION 18** (BUILT — `plans/session18-command-smoothing-and-height-median.md`; io_bridge +
-autopilot + flight_replay self-tests green). Run `python fly.py`, press `m` to hand over, and watch:_
+_**NEXT = LIVE-FLY SESSION 20b** (BUILT on `leg-hops-and-goal-commit-fix`; all 6 module self-tests green;
+UNCOMMITTED. Plan: `plans/session20-goal-db-loop-blacklist.md`). `main` is the clean fallback — DO NOT touch it.
+Run `python fly.py`, press `m`, and watch:_
+- _**No more freeze on one goal.** The drone actually ADVANCEs each hop (the instant-stall guard is gone). A goal
+  it can't get ≥0.2u closer on takes a STRIKE; TWO strikes → `[perception] planner: STRIKE-BLACKLIST goal=…
+  strikes=2` and it reselects. A ping-pong/circling still logs `LOOP-BLACKLIST … picks=N`._
+- _**Each hop RE-PICKS**: 40-tick hop → SETTLE → REPLAN; if SLAM re-picked, ORIENT (parallax push if off-axis)
+  toward the NEW goal — never resumes an old, unreached leg._
+- _**Goals DB floating table**: click **Goals DB** in the replay control bar — a draggable table (center / picks /
+  strikes / locs / status) that updates as you scrub; a blocked goal shows strikes 1→2 then BLACKLIST._
+- _**Corners**: SLAM may find + adopt a frontier en route to a corner (corner cruise is hopped + re-planned); a
+  far corner (> `corner_no_blacklist_dist`=1.0) is exempt from BOTH strike + bump while transiently stuck._
+- _**Knobs** (autonomy.explore): `hop_progress_eps` 0.2, `goal_strike_limit` 2, `goal_area_radius` 0.5,
+  `goal_loop_min_picks` 2, `goal_loop_pos_dist` 1.0, `corner_no_blacklist_dist` 1.0; `forward_throttle` 1.0 +
+  `hop_ticks` 40 kept. Return-to-origin (orient-to-north + gentle descent) is a KNOWN pre-existing bug, later._
+
+_**Session 18 — earlier live-fly checklist** (BUILT — `plans/session18-command-smoothing-and-height-median.md`;
+io_bridge + autopilot + flight_replay self-tests green). Still worth confirming on the same flight:_
 - _**Smoothed flight** — forward legs + turns EASE in/out; a plan-loss brake is markedly GENTLER (thrust bleeds,
   no hard pitch-up/altitude jump). Open `OUTPUT/diag/<ts>_commands.csv` (now always-on): AUTO rows show `trigger`
   ramping 0.05 up / 0.1 down and yaw 0.05/tick — the SAME curve as MANUAL rows._
@@ -297,6 +344,14 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Future (backlog)
+- **Session-20 REV — de-commit hops + persistent goals DB + corner safety — BUILT (`leg-hops-and-goal-commit-fix`),
+  all 6 module self-tests green, UNCOMMITTED, LIVE-FLY PENDING** (`plans/session20-goal-db-loop-blacklist.md`):
+  hop→REPLAN (re-pick every hop, adopt SLAM's new goal with parallax; `_settle_to="REPLAN"`); `frontier_planner`
+  persistent `_goal_db` (goals-as-0.5u-discs, pick count + pick-time drone locs; ≥3 picks with any pair of
+  drone-locs <1u → permanent loop-blacklist via the same store; NEVER reset mid-flight); `_register_bump`
+  far-corner guard (`corner_no_blacklist_dist` 1.0); region-gated leg-stall tracker reset; kept the leg-stall
+  guard + `forward_throttle 1.0`. New knobs under `autonomy.explore`. **NEXT = live-fly + watch LOOP-BLACKLIST +
+  far-corner survival.** FOLLOW-UP: return-to-origin (orient-to-north + gentle stepped descent) still pre-existing.
 - **Session-18 command smoothing + height-median — BUILT, self-tests green, LIVE-FLY PENDING**
   (`plans/session18-command-smoothing-and-height-median.md`): autopilot trigger/reverse/yaw/pitch are now RAMP
   TARGETS io_bridge's 60 Hz loop chases (manual constants) → smoothed flight + smooth release; `--log-commands`
