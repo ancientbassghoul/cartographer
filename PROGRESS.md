@@ -1,12 +1,39 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-20** (session 26 **BUILT on `leg-hops-and-goal-commit-fix` — all module self-tests
-green; COMMITTED; LIVE-FLY PENDING**). Resume from THIS file. Plan of record:
-**`plans/session26-homing-backoff-settle-freshness-pick-dedup.md`** (+
+_Last updated **2026-07-20** (session 27 **BUILT on `leg-hops-and-goal-commit-fix` — self-verified,
+COMMITTED**). Resume from THIS file. **The operator flew a live session right after session 27 landed
+— "exceptional" apart from ONE new bug that put the drone into a loop; they'll bring that flight's log
+next session to diagnose (see "Next" below — this is the very next thing to do).** Plan of record:
+**`plans/session27-video-recording-pointcloud-export-graceful-shutdown.md`** (+
+`plans/session26-homing-backoff-settle-freshness-pick-dedup.md`,
 `plans/session25-trim-macros-recovery-fixes-goaldb-schema-debugger-nav.md`,
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
 parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
 `plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 27 — visualizer video recording + SLAM point-cloud export on quit + graceful shutdown for
+all three processes (BUILT — self-verified, no GPU/hardware in this environment to live-fly it
+directly).** Two feature requests: save the visualizer dashboard as video without adding GPU load, and
+export the SLAM point cloud (Blender-loadable) on quit. Both easier than expected: `visualizer.py`
+already owns no GPU (pure display, composes one BGR image/tick already) — recording is just a
+`cv2.VideoWriter` fed the same composed frame, wall-clock throttled (`--record`/`--record-fps`, default
+15). `map_store.py` already had a working `save_ply()` (Blender-loadable ASCII PLY, true-color voxels +
+green flight path + magenta targets) plus `save_npz`/`render_topdown`, proven by the OFFLINE `--video`
+export path — the real gap was that NONE of it ever ran for a LIVE flight, because `fly.py` hard-
+`terminate()`s `perception_worker.py` (launched `--no-display`, so no `'q'`-quit path either) on stop,
+skipping its `finally:` entirely. Gave it the same `--stop-file` sentinel `autopilot.py` already uses
+for exactly this reason, and wired the three already-proven export calls into `finally:`
+(`OUTPUT/diag/<ts>_livemap.{ply,npz}` + `_livemap_topdown.png`). Then found a bug in the FIRST feature's
+own shutdown, in the very same session: `--record`'s video was left in `fly.py`'s generic
+hard-terminated process list, so a normal `fly.py` stop corrupted the MP4 (confirmed by reproducing it
+directly — a hard-killed writer leaves `mdat` with no `moov` atom, the frame index every player needs;
+a cleanly-`release()`d one has both). Fixed by giving `visualizer.py` the identical `--stop-file`
+treatment. `fly.py` now tracks `autopilot`/`perception`/`visualizer` as three separately-sequenced
+graceful-stop steps (generic `processes` list hard-terminates only what's left: io_bridge + sim).
+Verified end-to-end by actually hard-killing and gracefully-stopping the real modules and inspecting
+the resulting MP4's box structure both ways (see the plan doc for the exact bytes). See
+`plans/session27-video-recording-pointcloud-export-graceful-shutdown.md`. **NEXT: the operator has a
+NEW bug from a live flight to diagnose (see top of file) — likely session 28.**_
 
 _**Session 26 — homing back-off + settle-gate stale-frame fix + postlude recovery budget + pick-dedup
 fix (BUILT — self-tests green).** Two more flights, diagnosed the same way as before (line-by-line off
@@ -330,14 +357,44 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = LIVE-FLY SESSIONS 26 + 25 + 24 + 23 + 22 + 20b together** (BUILT on
-`leg-hops-and-goal-commit-fix`; all module self-tests green; sessions 20b-26 all COMMITTED as of
-2026-07-20. Plans: `plans/session26-homing-backoff-settle-freshness-pick-dedup.md` +
+### >>> IMMEDIATE NEXT TASK <<<
+
+The operator flew a live session on the current (session 27) build. Per their own account: **"exceptional"
+apart from ONE bug that put the drone into a loop toward the end of the flight.** They will bring that
+flight's `_timeline.jsonl` (path TBD — ask if not given) next session to diagnose. Follow the SAME method
+every prior session-diagnosis used successfully: read the raw jsonl line-by-line around the loop (state/
+event/pos/goal/status fields), do NOT substitute the console `.log` for the jsonl unless explicitly told
+to, form a hypothesis and verify it against the actual field values before presenting it (this repo's
+history has a couple of corrected wrong-first-guesses from under-checking — see session 26/27 write-ups),
+and check `goal_db`/`wall_hit_count` state alongside the state-machine trace since several past loop bugs
+lived in the goals-DB accounting (strikes/picks/bumps), not the flight logic itself. This is genuinely the
+very next thing to do — start here before anything else below.
+
+_**NEXT (after the above) = LIVE-FLY SESSIONS 26 + 25 + 24 + 23 + 22 + 20b together** (BUILT on
+`leg-hops-and-goal-commit-fix`; all module self-tests green; sessions 20b-27 all COMMITTED as of
+2026-07-20. Plans: `plans/session27-video-recording-pointcloud-export-graceful-shutdown.md` +
+`plans/session26-homing-backoff-settle-freshness-pick-dedup.md` +
 `plans/session25-trim-macros-recovery-fixes-goaldb-schema-debugger-nav.md` +
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md` + `plans/session23-backwall-reaction-and-
 parallax-retry.md` + `plans/session22-fixed-height-ref-and-bidirectional-trim.md` +
 `plans/session20-goal-db-loop-blacklist.md`). `main` is the clean fallback — DO NOT touch it. Run
 `python fly.py`, press `m`, and watch:_
+
+_**Session 27 (visualizer --record + perception point-cloud export + graceful shutdown) checklist:**_
+- _After a normal `fly.py` stop (press ENTER, let the teardown run): `OUTPUT/diag/<ts>_visualizer.mp4`
+  opens without a "corrupted" error and plays back roughly the flight's duration — this was BROKEN
+  (missing `moov` atom from a hard-terminate) until the same-session fix; worth double-checking on a
+  real flight, not just the synthetic hard-kill reproduction in the plan doc._
+- _`OUTPUT/diag/<ts>_livemap.ply` exists after a normal stop; open in Blender (File > Import > Stanford
+  PLY) — voxel cloud in true color, green flight-path points, magenta target marker(s) if any target was
+  ever localized._
+- _`OUTPUT/diag/<ts>_livemap.npz` + `_livemap_topdown.png` also land alongside it (same export call as
+  the offline `--video` path, just live now)._
+- _Watch each of the three console windows (perception/autopilot/visualizer) print its own
+  "shutting down ..." line in turn when the launcher's teardown runs, instead of a window just
+  vanishing — confirms the graceful-stop sequencing (autopilot -> perception -> visualizer -> the rest)._
+- _GPU load during `--record` should be visibly unaffected (Task Manager / `nvidia-smi`) — expected
+  since the encode is CPU-side, but worth a live sanity glance._
 
 _**Session 26 (homing back-off + settle-gate freshness + postlude budget + pick-dedup) checklist:**_
 - _**Homing that hits a wall should back off, not sit pinned.** During `RETURN_TO_ORIGIN`, a

@@ -570,14 +570,19 @@ def _show_and_quit(panel, pipe, map_updated, show):
     return (cv2.waitKey(1) & 0xFF) == ord("q")
 
 
-def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
+def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_file=None):
+    from datetime import datetime
+    from pathlib import Path
     frame_port = cfg["network"]["frame_bus_port"]
     pstate_port = cfg["network"]["perception_state_port"]
     obj_port = cfg["network"]["object_state_port"]
     ctrl_port = cfg["network"]["autonomy_control_port"]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")   # shared by the diag CSVs + the shutdown map export
+    out_dir = Path(REPO) / "OUTPUT" / "diag"
+    out_dir.mkdir(parents=True, exist_ok=True)
     pipe = Pipeline(cfg, conf_thresh=conf_thresh, debug_lift=debug_lift)
     if log:
-        pipe.enable_diag()
+        pipe.enable_diag(ts=ts)
     frame_sub = frame_bus.FrameSubscriber(frame_port)
     state_pub = frame_bus.StatePublisher(pstate_port)  # binds; fail-fast if taken
     # SUB to object_worker's detections (lazy connect — fine whether or not it's running yet).
@@ -596,6 +601,13 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
           "(focus a window, 'q' to quit).\n")
     try:
         while True:
+            # Graceful-stop sentinel (mirrors autopilot.py's _FileStopEvent): a launcher that hard-
+            # terminates a CREATE_NEW_CONSOLE child on Windows skips `finally` entirely, so a polled
+            # file is the reliable way to let this loop exit NORMALLY and run the shutdown map export
+            # below. Checked every iteration, independent of whether a frame arrived this tick.
+            if stop_file is not None and os.path.exists(stop_file):
+                print("[perception] stop-file seen -> shutting down cleanly")
+                break
             got = frame_sub.recv(timeout_ms=500)
             if got is None:
                 if show and (cv2.waitKey(1) & 0xFF) == ord("q"):
@@ -695,6 +707,21 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
         pass
     finally:
         print("[perception] shutting down ...")
+        # Export the fused SLAM map -- same three calls run_offline_video() already makes (proven
+        # there), just <ts>-prefixed into OUTPUT/diag/ instead of <stem>-prefixed into OUTPUT/. Only
+        # reachable if this loop exits NORMALLY (the 'q' key, Ctrl+C in this console, or the
+        # stop-file above) -- a hard TerminateProcess skips this, same caveat as autopilot's own
+        # shutdown-emitted report.
+        ests = pipe.estimator.estimate_all()
+        targets = [e["position"] for e in ests] if ests else None
+        png = out_dir / f"{ts}_livemap_topdown.png"
+        pipe.mapstore.render_topdown(png, min_count=2, targets=targets)
+        pipe.mapstore.save_npz(out_dir / f"{ts}_livemap.npz", min_count=2)
+        ply = out_dir / f"{ts}_livemap.ply"
+        pipe.mapstore.save_ply(ply, min_count=2, trajectory=True, targets=targets)
+        print(f"[perception] top-down (flight path + target marks) -> {png}")
+        print(f"[perception] voxel map -> {out_dir / f'{ts}_livemap.npz'}")
+        print(f"[perception] point cloud + flight path + targets (.ply, Blender-loadable) -> {ply}")
         pipe.close_diag()
         frame_sub.close()
         state_pub.close()
@@ -904,6 +931,10 @@ def main():
     parser.add_argument("--log", action="store_true",
                         help="write diagnostic CSVs to OUTPUT/diag/ (per-frame SLAM/loop timing + "
                              "per-lift hit geometry) for live-flight debugging")
+    parser.add_argument("--stop-file", default=None,
+                        help="live: path to a sentinel file; when it appears, exit the loop CLEANLY "
+                             "(runs the shutdown map/point-cloud export) instead of being hard-"
+                             "terminated by a launcher. Mirrors autopilot.py's --stop-file.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -916,8 +947,14 @@ def main():
                           detect=args.detect, detect_every=args.detect_every,
                           debug_lift=args.debug_lift, log=args.log)
     else:
+        # A stale sentinel from a crashed prior run would stop us instantly -- clear it before we start.
+        if args.stop_file and os.path.exists(args.stop_file):
+            try:
+                os.remove(args.stop_file)
+            except OSError:
+                pass
         run_live(cfg, show=not args.no_display, conf_thresh=args.conf_thresh,
-                 debug_lift=args.debug_lift, log=args.log)
+                 debug_lift=args.debug_lift, log=args.log, stop_file=args.stop_file)
 
 
 if __name__ == "__main__":

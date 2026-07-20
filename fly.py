@@ -18,20 +18,37 @@ def main():
     stop_file = os.path.join(cartographer_dir, "OUTPUT", f".stop_{os.getpid()}")
     if os.path.exists(stop_file):
         os.remove(stop_file)
+    # Same sentinel idea for perception_worker: it holds the SLAM map + point cloud in-process and
+    # only exports it (the .ply/.npz/topdown) on a NORMAL loop exit -- a hard TerminateProcess (what
+    # step 2 below does to everything else) skips that entirely. Own sentinel + own wait/terminate,
+    # sequenced AFTER the autopilot's own clean shutdown (which still needs perception's published
+    # pose/plan while it's flying its last leg).
+    perception_stop_file = os.path.join(cartographer_dir, "OUTPUT", f".stop_perception_{os.getpid()}")
+    if os.path.exists(perception_stop_file):
+        os.remove(perception_stop_file)
+    # Same again for visualizer: --record's cv2.VideoWriter only writes the MP4's moov atom (the
+    # frame index -- without it the file is unplayable, confirmed by reproducing exactly that via a
+    # hard TerminateProcess) on a normal loop exit. Nothing else depends on visualizer staying alive,
+    # so its graceful-stop step can run in any order relative to autopilot's/perception's.
+    visualizer_stop_file = os.path.join(cartographer_dir, "OUTPUT", f".stop_visualizer_{os.getpid()}")
+    if os.path.exists(visualizer_stop_file):
+        os.remove(visualizer_stop_file)
 
     # Only compile a report from a timeline THIS run produced (mtime after launch) — never a previous flight's.
     launch_t = time.time()
 
     autopilot = None            # handled separately from `processes`: it must stop CLEANLY (it writes the report)
+    perception = None           # handled separately too: it must stop CLEANLY (exports the map/point cloud)
+    visualizer = None           # handled separately too: it must stop CLEANLY (releases the --record video)
     processes = []              # every OTHER service (hard-terminated on teardown)
     print("[+] Launching background services into individual logging windows...")
 
     try:
         NEW_CONSOLE = subprocess.CREATE_NEW_CONSOLE   # separate window per service, just like a batch file
-        processes.append(subprocess.Popen([python_exe, "perception_worker.py", "--no-display"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
+        perception = subprocess.Popen([python_exe, "perception_worker.py", "--no-display", "--stop-file", perception_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         # The autopilot writes the flight report; give it the stop-file so it can flush its map + timeline on exit.
         autopilot = subprocess.Popen([python_exe, "autopilot.py", "--explore", "--log", "--stop-file", stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
-        processes.append(subprocess.Popen([python_exe, "visualizer.py"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
+        visualizer = subprocess.Popen([python_exe, "visualizer.py", "--record", "--stop-file", visualizer_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         processes.append(subprocess.Popen([python_exe, "io_bridge.py"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
 
         time.sleep(1.0)
@@ -57,6 +74,33 @@ def main():
                 print("[!] Autopilot did not exit in time -> terminating (report may lack the map backdrop).")
                 autopilot.terminate()
 
+        # 1b) NOW ask perception to stop CLEANLY too (autopilot no longer needs its published state) and
+        #     give it time to export the map/point cloud. Only hard-terminate as a last resort if it hangs.
+        print("[+] Requesting a clean perception shutdown (flush the map + point cloud)...")
+        if perception is not None and perception.poll() is None:
+            try:
+                open(perception_stop_file, "w").close()
+            except OSError:
+                pass
+            try:
+                perception.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                print("[!] Perception did not exit in time -> terminating (no map/point-cloud export).")
+                perception.terminate()
+
+        # 1c) Same for visualizer (--record's MP4 needs a clean release() to be playable).
+        print("[+] Requesting a clean visualizer shutdown (flush the recording)...")
+        if visualizer is not None and visualizer.poll() is None:
+            try:
+                open(visualizer_stop_file, "w").close()
+            except OSError:
+                pass
+            try:
+                visualizer.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                print("[!] Visualizer did not exit in time -> terminating (recording will be corrupted).")
+                visualizer.terminate()
+
         # 2) Tear down the remaining services + the sim (reverse launch order: sim first, io_bridge last, so the
         #    autopilot's final HOLD above still had a live bus to publish onto).
         print("[+] Terminating the remaining flight-stack processes...")
@@ -64,11 +108,12 @@ def main():
             if p.poll() is None:
                 p.terminate()
 
-        if os.path.exists(stop_file):
-            try:
-                os.remove(stop_file)
-            except OSError:
-                pass
+        for f in (stop_file, perception_stop_file, visualizer_stop_file):
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
         # 3) Compile the replay ONLY from a timeline this run produced (guards against reporting a stale flight
         #    if the autopilot never logged, e.g. it failed to start).

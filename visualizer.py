@@ -35,6 +35,7 @@ import argparse
 import os
 import time
 from collections import deque
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -371,7 +372,26 @@ class Dashboard:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def run(cfg, show_frame=True):
+def _open_video_writer(fps):
+    """Open a VideoWriter sized to the dashboard's fixed composed dimensions (no need to wait for a
+    sample frame — the layout constants determine it exactly), timestamped like every other module's
+    OUTPUT/diag/<ts>_<role> artifact. Pure CPU/software encode (mp4v via OpenCV's bundled FFmpeg) —
+    this process touches no GPU today and this doesn't change that."""
+    out_dir = os.path.join(REPO, "OUTPUT", "diag")
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"{ts}_visualizer.mp4")
+    width = PANEL_W + GAP + MAP_SIZE
+    height = STATUS_H + MAP_SIZE
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"could not open video writer for {path} (mp4v codec unavailable?)")
+    print(f"[visualizer] recording -> {path} ({width}x{height} @ {fps:g}fps target)")
+    return writer
+
+
+def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
     pstate_port = cfg["network"]["perception_state_port"]
     frame_port = cfg["network"]["frame_bus_port"]
     state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/map/plan/target)
@@ -381,9 +401,22 @@ def run(cfg, show_frame=True):
           + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF"))
     print("[visualizer] === READY === waiting for perception_worker ('q' to quit).\n")
 
+    writer = _open_video_writer(record_fps) if record else None
+    write_interval = 1.0 / record_fps
+    last_write_t = 0.0
+
     dash = Dashboard()
     try:
         while True:
+            # Graceful-stop sentinel (mirrors autopilot.py's _FileStopEvent / perception_worker.py's
+            # own poll): a launcher that hard-terminates a CREATE_NEW_CONSOLE child on Windows skips
+            # `finally` entirely, which would skip `writer.release()` below and leave --record's MP4
+            # without its moov atom (unplayable, even though frame data was written) -- confirmed by
+            # reproducing exactly that corruption via a hard TerminateProcess. Checked every
+            # iteration so a stop request is noticed even while idle (no new state arriving).
+            if stop_file is not None and os.path.exists(stop_file):
+                print("[visualizer] stop-file seen -> shutting down cleanly")
+                break
             # Drain the (non-conflated) state bus so we always render the freshest of each topic.
             got = state_sub.recv(timeout_ms=30)
             while got is not None:
@@ -393,7 +426,15 @@ def run(cfg, show_frame=True):
                 fr = frame_sub.recv(timeout_ms=0)
                 if fr is not None:
                     dash.frame = fr[0]
-            cv2.imshow(WINDOW, dash.render())
+            img = dash.render()
+            cv2.imshow(WINDOW, img)
+            if writer is not None:
+                # Wall-clock throttled (the render loop's own tick rate is NOT fixed) so the output
+                # plays back at roughly real elapsed time instead of assuming a fixed tick rate.
+                now = time.monotonic()
+                if now - last_write_t >= write_interval:
+                    writer.write(img)
+                    last_write_t = now
             if (cv2.waitKey(15) & 0xFF) == ord("q"):
                 break
     except KeyboardInterrupt:
@@ -403,6 +444,8 @@ def run(cfg, show_frame=True):
         state_sub.close()
         if frame_sub is not None:
             frame_sub.close()
+        if writer is not None:
+            writer.release()
         try:
             cv2.destroyAllWindows()
         except cv2.error:
@@ -414,8 +457,24 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--no-frame", action="store_true",
                     help="don't subscribe to the frame bus (skip the live input panel)")
+    ap.add_argument("--record", action="store_true",
+                    help="also write the composed dashboard to OUTPUT/diag/<ts>_visualizer.mp4 "
+                         "(CPU-side encode; this process owns no GPU)")
+    ap.add_argument("--record-fps", type=float, default=15.0,
+                    help="target playback fps for --record (wall-clock throttled)")
+    ap.add_argument("--stop-file", default=None,
+                    help="path to a sentinel file; when it appears, exit the loop CLEANLY (releases "
+                         "the --record video properly) instead of being hard-terminated by a "
+                         "launcher. Mirrors autopilot.py's --stop-file.")
     args = ap.parse_args()
-    run(load_config(args.config), show_frame=not args.no_frame)
+    # A stale sentinel from a crashed prior run would stop us instantly -- clear it before we start.
+    if args.stop_file and os.path.exists(args.stop_file):
+        try:
+            os.remove(args.stop_file)
+        except OSError:
+            pass
+    run(load_config(args.config), show_frame=not args.no_frame,
+        record=args.record, record_fps=args.record_fps, stop_file=args.stop_file)
 
 
 if __name__ == "__main__":
