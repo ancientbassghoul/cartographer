@@ -148,6 +148,22 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #goaldb tr.goal.cur td.c { color: #d9b400; }
   #goaldb .mp { color: #777; font-weight: normal; font-size: 10px; margin-left: 4px; }
   #goaldb .empty { padding: 10px; color: #777; }
+  /* Floating clearance-detail table (session 29): the raw ray-hit picture (hits/rays/fraction/closest/
+     farthest/blocked) behind the fwd/back/left/right clearance judgment -- mirrors #goaldb's shell. */
+  #clrdet { position: fixed; top: 64px; left: 400px; width: 300px; max-height: 40vh; display: none;
+            flex-direction: column; background: #141414; border: 1px solid #555; border-radius: 4px;
+            box-shadow: 0 6px 24px rgba(0,0,0,.6); z-index: 50; font-size: 11px; }
+  #clrdet h4 { margin: 0; padding: 6px 10px; background: #242424; border-bottom: 1px solid #444; cursor: move;
+               font-size: 12px; color: #9ad; display: flex; justify-content: space-between; align-items: center; }
+  #clrdet h4 .x { cursor: pointer; color: #888; padding: 0 4px; }
+  #clrdet h4 .x:hover { color: #fff; }
+  #clrdet .body { overflow: auto; }
+  #clrdet table { border-collapse: collapse; width: 100%; }
+  #clrdet th, #clrdet td { padding: 3px 8px; text-align: right; border-bottom: 1px solid #262626; white-space: nowrap; }
+  #clrdet th { position: sticky; top: 0; background: #1c1c1c; color: #888; font-weight: normal; text-align: right; }
+  #clrdet td.c { text-align: left; color: #ccc; }
+  #clrdet tr.blocked td { color: #ff5b5b; }
+  #clrdet .empty { padding: 10px; color: #777; }
 </style>
 </head>
 <body>
@@ -167,6 +183,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         </select>
       </label>
       <button id="dbBtn" title="Persistent goals database (picks / strikes / blacklist) at the cursor">Goals DB</button>
+      <button id="clrBtn" title="Fwd/back/left/right clearance ray-hit detail at the cursor">Clearance</button>
       <button id="evPrev" title="Jump to the previous log message">&#9664; Msg</button>
       <button id="evNext" title="Jump to the next log message">Msg &#9654;</button>
       <label style="font-size:12px;color:#999">
@@ -194,6 +211,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div id="goaldb">
   <h4><span>Goals DB <span id="dbcount" style="color:#777"></span></span><span class="x" id="dbClose">&times;</span></h4>
   <div class="body" id="dbBody"></div>
+</div>
+<div id="clrdet">
+  <h4><span>Clearance</span><span class="x" id="clrClose">&times;</span></h4>
+  <div class="body" id="clrBody"></div>
 </div>
 <script>
 const RECORDS = __DATA__;
@@ -385,6 +406,33 @@ function render(idx) {
   updateTelemetry(idx);
   drawSlam(idx);
   updateGoalDb(idx);
+  updateClearanceDetail(idx);
+}
+
+// Floating clearance-detail table (session 29): the raw ray-hit picture (hits / total rays / fraction /
+// closest / farthest / judged-blocked) behind the fwd/back/left/right clearance calls TRIM/PARALLAX_PUSH/
+// FALLBACK actually consult — rides each step record as `clearance_detail`. Undefined on an older log
+// (pre this session) -> shows an explanatory empty state rather than a blank table.
+function updateClearanceDetail(idx) {
+  const panel = document.getElementById('clrdet');
+  if (panel.style.display !== 'flex') return;          // skip work while hidden
+  const s = STEPS[idx] || {};
+  const cd = s.clearance_detail || null;
+  const body = document.getElementById('clrBody');
+  if (!cd) { body.innerHTML = '<div class="empty">no clearance_detail in this record (older flight log)</div>'; return; }
+  const LABEL = { fwd: 'Forward', back: 'Backward', left: 'Left', right: 'Right' };
+  let rows = '';
+  for (const tag of ['fwd', 'back', 'left', 'right']) {
+    const d = cd[tag];
+    if (!d) continue;
+    rows += `<tr class="${d.blocked ? 'blocked' : ''}"><td class="c">${LABEL[tag]}</td>` +
+            `<td>${d.n_hits}/${d.n_rays}</td><td>${fmt(d.fraction, 2)}</td>` +
+            `<td>${fmt(d.min_dist)}</td><td>${fmt(d.max_dist)}</td>` +
+            `<td>${d.blocked ? 'BLOCKED' : 'open'}</td></tr>`;
+  }
+  body.innerHTML = '<table><thead><tr><th class="c">dir</th><th>hits</th><th>frac</th>' +
+                   '<th>closest</th><th>farthest</th><th>judged</th></tr></thead><tbody>' +
+                   rows + '</tbody></table>';
 }
 
 // Floating goals-DB table: the planner's persistent per-disc picks / strikes / bumps / corner-giveups /
@@ -670,6 +718,31 @@ document.getElementById('dbClose').addEventListener('click', () => { dbPanel.sty
   window.addEventListener('mouseup', () => { drag = false; });
 })();
 
+// ---- Clearance-detail floating panel (session 29): toggle + drag by its header ----
+const clrPanel = document.getElementById('clrdet');
+function toggleClr() {
+  clrPanel.style.display = (clrPanel.style.display === 'flex') ? 'none' : 'flex';
+  updateClearanceDetail(cur);
+}
+document.getElementById('clrBtn').addEventListener('click', toggleClr);
+document.getElementById('clrClose').addEventListener('click', () => { clrPanel.style.display = 'none'; });
+(function () {
+  const h = clrPanel.querySelector('h4');
+  let dx = 0, dy = 0, drag = false;
+  h.addEventListener('mousedown', (e) => {
+    if (e.target.classList.contains('x')) return;
+    drag = true; const r = clrPanel.getBoundingClientRect();
+    dx = e.clientX - r.left; dy = e.clientY - r.top;
+    clrPanel.style.right = 'auto'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    clrPanel.style.left = Math.max(0, e.clientX - dx) + 'px';
+    clrPanel.style.top = Math.max(0, e.clientY - dy) + 'px';
+  });
+  window.addEventListener('mouseup', () => { drag = false; });
+})();
+
 if (STEPS.length === 0) {
   document.getElementById('hud').textContent = 'No step records in this timeline.';
 } else {
@@ -707,7 +780,16 @@ def _self_test():
                       "blacklisted": False, "blacklist_reason": None, "blacklist_evidence": {}},
                      {"center": [2.5, 0.5], "picks": 1, "strikes": 0, "bumps": 2, "corner_giveups": 3,
                       "is_corner": True, "drone_locs": [[0.30, 0.30]], "blacklisted": True,
-                      "blacklist_reason": "2bump", "blacklist_evidence": {"pos": [2.4, 0.6]}}]},
+                      "blacklist_reason": "2bump", "blacklist_evidence": {"pos": [2.4, 0.6]}}],
+         "clearance_detail": {
+             "fwd": {"dist": None, "n_hits": 1, "n_rays": 10, "fraction": 0.1, "min_dist": 2.5,
+                     "max_dist": 2.5, "blocked": False},
+             "back": {"dist": 0.8, "n_hits": 4, "n_rays": 10, "fraction": 0.4, "min_dist": 0.8,
+                      "max_dist": 1.2, "blocked": True},
+             "left": {"dist": None, "n_hits": 0, "n_rays": 10, "fraction": 0.0, "min_dist": None,
+                      "max_dist": None, "blocked": False},
+             "right": {"dist": 1.1, "n_hits": 5, "n_rays": 10, "fraction": 0.5, "min_dist": 1.1,
+                       "max_dist": 1.4, "blocked": True}}},
         {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
         {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
@@ -794,6 +876,18 @@ def _self_test():
         print(f"[self-test] {'PASS' if c_db2 else 'FAIL'}  goals-DB schema split "
               f"(bumps/corner_giveups/is_corner/reason/evidence survive + render code wired)")
         ok = ok and c_db2
+
+        # Clearance-detail floating table (session 29): fwd/back/left/right ray-hit stats survive load +
+        # the render/toggle code is wired in.
+        cd_rec = next((r for r in embedded if r.get("clearance_detail")), None)
+        c_clr = (cd_rec is not None and cd_rec["clearance_detail"]["back"]["n_hits"] == 4
+                 and cd_rec["clearance_detail"]["back"]["blocked"] is True
+                 and cd_rec["clearance_detail"]["left"]["n_hits"] == 0
+                 and "updateClearanceDetail" in html and 'id="clrdet"' in html and 'id="clrBtn"' in html
+                 and "d.min_dist" in html and "d.max_dist" in html and "d.fraction" in html)
+        print(f"[self-test] {'PASS' if c_clr else 'FAIL'}  clearance-detail table "
+              f"(fwd/back/left/right ray stats survive + render code wired)")
+        ok = ok and c_clr
 
         # Paired SLAM logs (ev_kind:"slam_start"/"slam_finish") carried + the orange/green interleave render path
         n_slam = sum(1 for r in embedded if r.get("ev_kind") in ("slam_start", "slam_finish"))

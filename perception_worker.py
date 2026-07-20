@@ -156,6 +156,12 @@ class Pipeline:
         self.clearance_skip = float(e.get("clearance_skip", 0.25))
         self.clearance_min_count = int(e.get("clearance_min_count", 2))
         self.clearance_max_range = float(e.get("clearance_max_range", 10.0))
+        # Session 28: a direction only counts as BLOCKED once at least this FRACTION of the fan's rays hit
+        # something within range (0.0 = prior behavior, a single ray hit is enough) — protects against an
+        # isolated, spatially-noisy voxel (still passing clearance_min_count) falsely reading an entire
+        # direction as blocked on a sparse/messy reconstruction. See MapStore.clearance()'s docstring for
+        # the tradeoff against the reason MIN-over-fan was originally chosen (thin/off-center wall capture).
+        self.clearance_min_hit_fraction = float(e.get("clearance_min_hit_fraction", 0.0))
         # Clearance RING: clearance at headings around the drone (for the autopilot's parallax scouting).
         # Sampled at multiples of turn_step_deg so it lines up with the autopilot's turn quantization.
         self.clearance_ring_step = float(e.get("turn_step_deg", 45.0))
@@ -367,7 +373,8 @@ class Pipeline:
         # within range ahead -> the autopilot leans on the flow contact detector instead.
         clr = self.mapstore.clearance(cc, heading_deg, fan_deg=self.clearance_fan_deg,
                                       fan_n=self.clearance_fan_n, skip=self.clearance_skip,
-                                      min_count=self.clearance_min_count, max_range=self.clearance_max_range)
+                                      min_count=self.clearance_min_count, max_range=self.clearance_max_range,
+                                      min_hit_fraction=self.clearance_min_hit_fraction)
         payload["forward_clearance_dist"] = (round(float(clr), 4) if clr is not None else None)
         self._last_clearance = payload["forward_clearance_dist"]
         # Camera altitude for the autopilot's altitude lock. World frame is camera-convention +Y DOWN
@@ -383,9 +390,21 @@ class Pipeline:
             relw = ((i * step + 180.0) % 360.0) - 180.0     # wrap each offset to (-180, 180]
             d = self.mapstore.clearance(cc, heading_deg + i * step, fan_deg=self.clearance_fan_deg,
                                         fan_n=self.clearance_fan_n, skip=self.clearance_skip,
-                                        min_count=self.clearance_min_count, max_range=self.ring_max_range)
+                                        min_count=self.clearance_min_count, max_range=self.ring_max_range,
+                                        min_hit_fraction=self.clearance_min_hit_fraction)
             ring.append([round(relw, 1), (round(float(d), 4) if d is not None else None)])
         payload["clearance_ring"] = ring
+        # Session 29: the raw ray-hit picture at the 4 cardinal directions (same params the ring/TRIM/
+        # PARALLAX_PUSH/FALLBACK actually consult — ring_max_range, not the longer forward-cruise range) —
+        # for the replay debugger's Clearance tab, so a "ring blocked" judgment is auditable at a glance
+        # instead of re-derived from raw voxel data by hand after the fact.
+        cd = {}
+        for tag, off in (("fwd", 0.0), ("back", 180.0), ("left", -90.0), ("right", 90.0)):
+            cd[tag] = self.mapstore.clearance(cc, heading_deg + off, fan_deg=self.clearance_fan_deg,
+                                              fan_n=self.clearance_fan_n, skip=self.clearance_skip,
+                                              min_count=self.clearance_min_count, max_range=self.ring_max_range,
+                                              min_hit_fraction=self.clearance_min_hit_fraction, detail=True)
+        payload["clearance_detail"] = cd
 
         def _ring_fb(target):                                # nearest-offset lookup (forward=0, backward=180)
             best, bd = None, 1e9

@@ -91,9 +91,13 @@ class DroneControl:
     # NB: trigger_down/reverse_down are the BOOLEAN gas gates — Unity gates REAL thrust on these,
     # not the analog trigger/reverse (session 17). The autopilot now derives them centrally in
     # _full_vector and drives them over this whitelist, so autonomous flight finally has real thrust.
+    # gate_override (session 30): normally _step_controls re-derives trigger_down/reverse_down from the
+    # RAMPED analog every tick (so a release decays smoothly instead of Unity hard-cutting mid-ramp) —
+    # when this is True, it instead trusts the boolean JUST WRITTEN here from the command, unmodified, for
+    # states (BACKOFF) that need the gate to flip the instant it's commanded, not once the analog catches up.
     AUTONOMY_FIELDS = (
         "btnARMdown", "btnCdown", "trigger", "reverse", "trigger_down", "reverse_down",
-        "joy_vertical", "joy_horizontal", "yaw", "pitch",
+        "joy_vertical", "joy_horizontal", "yaw", "pitch", "gate_override",
     )
 
     def __init__(self, host, port, detect_key="h", capture_key="space", debug_keys=False,
@@ -125,6 +129,7 @@ class DroneControl:
             "btnARMdown": False,
             "trigger": 0.0, "trigger_down": False,
             "reverse": 0.0, "reverse_down": False,
+            "gate_override": False,
             "joy_vertical": 0, "joy_horizontal": 0,
             "yaw": 0.0, "pitch": 0.0,
             "thumb_down": False, "joy_click": False,
@@ -295,8 +300,12 @@ class DroneControl:
             # still decaying (0.4->0 over ~4 ticks), Unity hard-cuts the thrust and the smooth release never
             # reaches it — the suspected plan-lost brake/pitch-up. Gate True <=> analog > 0 keeps thrust
             # following the smooth decay all the way to 0 (and still engages on tick 1 of a ramp-up).
-            cs["trigger_down"] = cs["trigger"] > 0.0
-            cs["reverse_down"] = cs["reverse"] > 0.0
+            # gate_override (session 30): a state (BACKOFF) that needs the gate to flip the INSTANT it's
+            # commanded — not once the analog catches up — sets this, so we trust the boolean
+            # _apply_autonomy_overlay just wrote into cs[...] this tick instead of overwriting it here.
+            if not cs.get("gate_override", False):
+                cs["trigger_down"] = cs["trigger"] > 0.0
+                cs["reverse_down"] = cs["reverse"] > 0.0
             if cs["btnCdown"]:
                 cs["yaw"] = 0.0
                 cs["pitch"] = 0.0
@@ -525,6 +534,7 @@ class DroneControl:
         cs["btnCdown"] = False
         cs["trigger_down"] = False   # release the BOOLEAN gas gate on abort/stale-link (session 17)
         cs["reverse_down"] = False
+        cs["gate_override"] = False  # a dropped link mid-BACKOFF must not leave this stuck (session 30)
         cs["joy_vertical"] = 0
         cs["joy_horizontal"] = 0
         cs["yaw"] = 0.0             # aim axes snap to neutral (no auto-return in manual; must not coast a spin)
@@ -679,6 +689,65 @@ def _self_test():
     ok = trig_ok and yaw_ok and manual_ok
     print(f"[self-test] {'PASS' if ok else 'FAIL'}  io_bridge command SMOOTHING "
           f"(auto trigger up/hold/decay={trig_ok}, auto yaw passthru+c-snap={yaw_ok}, manual unchanged={manual_ok})")
+
+    # gate_override (session 30): a command with gate_override=True must make trigger_down/reverse_down
+    # follow the COMMANDED boolean immediately, not the ramped analog -- so a fast forward->reverse switch
+    # (BACKOFF) can cut the gas gate the instant it's commanded instead of waiting ~10 ticks for the decaying
+    # analog to reach 0.
+    dg = DroneControl("127.0.0.1", 0)
+    dg.autonomy_active = True
+    seq_g = 0
+
+    def auto_g(**cmd):
+        nonlocal seq_g
+        seq_g += 1
+        cmd["seq"] = seq_g
+        dg.set_autonomy_command(cmd)
+        dg._step_controls()
+
+    for _ in range(5):                          # spin trigger up to a large residual value first
+        auto_g(trigger=1.0, trigger_down=True)
+    residual_trigger = dg.control_state["trigger"]
+    override_armed = residual_trigger > 0.2      # sanity: there IS meaningful residual thrust to fight
+    # command the switch WITH gate_override: trigger_down must flip False and reverse_down True on THIS
+    # very tick, even though the trigger analog is still decaying from a large residual value.
+    auto_g(trigger=0.0, trigger_down=False, reverse=1.0, reverse_down=True, gate_override=True)
+    gate_flips_ok = (dg.control_state["trigger_down"] is False and dg.control_state["reverse_down"] is True
+                     and dg.control_state["trigger"] > 0.0)   # analog itself is UNCHANGED -- still decaying
+    override_ok = override_armed and gate_flips_ok
+
+    # regression: the SAME switch WITHOUT gate_override reproduces today's exact behavior — trigger_down
+    # stays True (derived from the still->0 analog) despite the commanded False.
+    dr = DroneControl("127.0.0.1", 0)
+    dr.autonomy_active = True
+    seq_r = 0
+
+    def auto_r(**cmd):
+        nonlocal seq_r
+        seq_r += 1
+        cmd["seq"] = seq_r
+        dr.set_autonomy_command(cmd)
+        dr._step_controls()
+
+    for _ in range(5):
+        auto_r(trigger=1.0, trigger_down=True)
+    auto_r(trigger=0.0, trigger_down=False, reverse=1.0, reverse_down=True)   # NO gate_override
+    no_override_regression_ok = (dr.control_state["trigger_down"] is True    # still derived from analog>0
+                                 and dr.control_state["reverse_down"] is True)
+
+    # _neutralize_autonomy must clear a stuck gate_override (a dropped link mid-BACKOFF can't leave it set).
+    dn = DroneControl("127.0.0.1", 0)
+    dn.control_state["gate_override"] = True
+    dn._neutralize_autonomy()
+    neutralize_clears_ok = dn.control_state["gate_override"] is False
+
+    gate_override_ok = override_ok and no_override_regression_ok and neutralize_clears_ok
+    print(f"[self-test] {'PASS' if gate_override_ok else 'FAIL'}  io_bridge gate_override "
+          f"(instant gate flip despite decaying analog={override_ok}, "
+          f"no-override preserves today's derived-gate behavior={no_override_regression_ok}, "
+          f"_neutralize_autonomy clears a stuck flag={neutralize_clears_ok})")
+
+    ok = ok and gate_override_ok
     return ok
 
 

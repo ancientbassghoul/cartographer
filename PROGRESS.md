@@ -1,15 +1,141 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-20** (session 27 **BUILT on `leg-hops-and-goal-commit-fix` — self-verified,
-COMMITTED**). Resume from THIS file. **The operator flew a live session right after session 27 landed
-— "exceptional" apart from ONE new bug that put the drone into a loop; they'll bring that flight's log
-next session to diagnose (see "Next" below — this is the very next thing to do).** Plan of record:
-**`plans/session27-video-recording-pointcloud-export-graceful-shutdown.md`** (+
+_Last updated **2026-07-21** (session 31 **BUILT — self-tests green, NOT YET live-flown**). Resume from
+THIS file. **Session 31 killed REWIND (config-gated off, not deleted) and replaced FALLBACK's direction-
+cycling search with a simple 4-phase wait→turn→push→wait sweep — see "Next" below.** Plan of record:
+**`plans/session31-rewind-off-simple-fallback-sweep.md`** (+ `plans/session30-backoff-hard-gate.md`,
+`plans/session29-clearance-tab-direction-cycling-fallback.md`,
+`plans/session28-trim-resume-gate-clearance-vote.md`,
+`plans/session27-video-recording-pointcloud-export-graceful-shutdown.md`,
 `plans/session26-homing-backoff-settle-freshness-pick-dedup.md`,
 `plans/session25-trim-macros-recovery-fixes-goaldb-schema-debugger-nav.md`,
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
 parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
 `plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 31 — REWIND killed (config-gated off), FALLBACK rebuilt as a simple 4-phase sweep, operator ask
+off many real flights (BUILT — self-tests green, live-fly PENDING).** The operator: "That REWIND mechanism
+is annoying the living fuck out of me. I didn't see it help a stale plan ONCE IN MY LIFE." Rather than
+delete it, gated it behind `use_rewind_on_stale` (config.yaml, default `false`) — one edit to bring back,
+per the operator's own suggested approach. Separately, session 29's FALLBACK (a shuffled-direction-queue
+with per-direction tries + opposite-phase retry) tested badly live: locking a push direction across several
+tries gave bad, unpredictable results. Replaced it with the operator's own exact algorithm: wait 20s → turn
+15° → push a FRESH random direction (fwd/bkwd/lft/rt, re-rolled every cycle, no per-direction budget) → wait
+10s → repeat until 720° cumulative rotation → STUCK. Kept the live wall/backwall-contact early-exit
+("leave it for the slim chance we WILL sense the wall") — confirmed it needs ~1.2s sustained motion to
+latch, which the new push durations (below) now comfortably clear. Push throttle/duration came from the
+operator's own manual-flight comparison: forward/backward full throttle (1.0) held 2.0s including ramp-up;
+left/right full magnitude (±1.0) held 0.5s (`joy_horizontal` isn't ramped, unlike `trigger`/`reverse`) — both
+bypass the throttled knobs (`reverse_throttle`, `_strafe_mag`) that every other site still uses. While
+wiring the REWIND gate, found + fixed a real bug: the first draft checked the REWIND flag before the
+pre-existing `_ever_tracked` startup guard, so with REWIND off a PLAN-STALE at STARTUP (before SLAM ever
+tracked) skipped WARMUP and went straight into a blind sweep — reordered so the startup guard always wins
+regardless of the flag. Rewrote the FALLBACK self-test block entirely (initial wait, full TURN→PUSH→WAIT_POST
+cycle, live-contact early-exit, 720° exhaustion, flicker-persistence across a `HOLD_LOST` bounce) and added
+explicit `use_rewind_on_stale = True` overrides to every pre-existing test that still needs to exercise
+REWIND now that it's default-off. `python autopilot.py --self-test` and `python io_bridge.py --self-test`:
+ALL PASS. See `plans/session31-rewind-off-simple-fallback-sweep.md` for the full design. **NEXT = LIVE-FLY**
+— does the push direction look genuinely randomized, does the 2s full-throttle push carry visible authority,
+does recovery still cut the sweep short the instant status reads OK._
+
+_**Session 30 — BACKOFF rebuilt as a phase-timer: hard gate cut + full-magnitude 2s reverse, diagnosed off
+flight `20260720_210809` using the session-29 Clearance tab (BUILT — self-tests green, live-fly PENDING).**
+The operator flagged a BACKOFF firing mid-ADVANCE and suspected it "never executes" (tied to several prior
+crashed flights). Traced it: the autopilot's state machine and `cmd` output were fine (ADVANCE→BACKOFF
+transitions cleanly, `reverse: 0.2` emitted for the whole 0.3s recipe) — the real lag was one layer down,
+in `io_bridge.py`'s session-18 throttle smoothing (shared by manual AND autonomous flight). Going from
+`trigger=1.0` to the old throttled `reverse=0.2` took trigger ~10 ticks (~167ms) to decay while reverse
+only took ~4 ticks (~67ms) to ramp up, and the boolean thrust gate Unity actually gates on was *derived
+from the ramped analog*, not the freshly-commanded boolean — so both gates could read `True` at once during
+that window, eating a meaningful chunk of BACKOFF's already-short 0.3s reaction time. The operator then ran
+a manual experiment (full throttle → release trigger → immediately hold reverse) and found it takes ~2
+SECONDS of held reverse for the right effect — io_bridge's own ramp math only explains ~167ms of that; the
+rest is very likely Unity's own physics/momentum once thrust reaches the sim (a black box from this side of
+the socket). Rebuilt BACKOFF entirely around that finding, using the platform's OWN already-characterized
+ramp rates (10 ticks down / 20 ticks up, unchanged) rather than inventing new ones: a new `gate_override`
+flag (`io_bridge.py`, strictly opt-in, every other emit site unaffected) lets `trigger_down`/`reverse_down`
+flip the INSTANT they're commanded instead of waiting for the ramped analog to catch up; BACKOFF itself is
+now a phase-timer (not a `flight_playbook.json` recipe) — hard-cut trigger + full-magnitude (1.0, not the
+throttled `reverse_throttle`) reverse held for `backoff_hold_s` (2.0), then release + a short open-loop
+wait (`backoff_release_s`, 0.2) for the ramp-down to finish before SETTLE. Scoped to the top-level
+`"BACKOFF"` state only (its 3 entry sites: clearance stand-off, wall-contact, leg-timeout) — homing's own
+backoff sub-phase and `BLIND_BACKOFF` keep their current recipe-based behavior. Also found + fixed, while
+extending self-test drive windows for the new ~2.2s duration: two OTHER pre-existing tests
+(`RECOVERY control-space`'s FALLBACK case, `SESSION-12`'s consuming-REWIND-drain case) were silently broken
+by a live `config.yaml` retune of `recovery_settle_max_s` (2.5→10.0) that happened between sessions — fixed
+by giving both their own local override, same pattern several other tests already use, so they're robust to
+future tuning of that knob instead of silently assuming its value. `python autopilot.py --self-test` and
+`python io_bridge.py --self-test`: ALL PASS. See `plans/session30-backoff-hard-gate.md` for the full trace +
+design. **NEXT = LIVE-FLY** — the 2-second hold duration came from exactly one manual test; expect to retune
+`backoff_hold_s` after watching it live._
+
+_**Session 29 — Clearance-detail debugger tab + direction-cycling blind recovery sweep, diagnosed off the
+session-28-build flight `20260720_180112` (BUILT — self-tests green, live-fly PENDING).** The operator
+asked about a ~113s stuck episode: plan recovered from PLAN-LOST, went PLAN-STALE a frame later, and the
+drone spent the whole episode visibly turning/pushing/getting straightened back out by a wall (per the
+operator's account — the telemetry itself was frozen the whole time, SLAM being blind) before giving up
+into STUCK, which then sat next to solve-times-look-normal SLAM for ~83 more recorded seconds. Root cause
+of the wall-bounce: `_begin_fallback()`'s push direction was picked from `self._last_ring`, a snapshot
+frozen from BEFORE the loss and never refreshed — as the (correct, unidirectional) turn sweep accumulated
+real heading change across 31 attempts, that stale judgment grew increasingly wrong and could repeatedly
+push the drone right back into the same wall, which naturally re-aligns (straightens) the nose on contact,
+erasing the sweep's own progress each cycle. **Fix:** replaced the ring-derived pick with a direction-
+cycling search — cycle a shuffled [forward, backward, left, right] queue, `fallback_dir_tries` attempts per
+direction then its opposite, a live wall/backwall contact ends a forward/backward attempt early (operator's
+explicit call: forward pushes are now ALLOWED while blind — "we might as well be with our back to the wall
+and a push forward will save us"; no live signal exists for left/right, so those run their full budget), 2
+complete passes with no recovery -> STUCK. While rewriting this, found + fixed a THIRD bug: the existing
+`fallback_max_attempts` cap was only ever checked from FALLBACK's own internal continuation path, never
+from the top-level PLAN-STALE re-entry a flickering connection actually takes (exactly what this flight
+did) — it silently reached 31 attempts against a configured cap of 16. Now unified inside `_begin_fallback`
+itself, the one place every caller funnels through; `fallback_max_attempts` raised 16→70 in config.yaml so
+the new 2-lap search (64-attempt worst case) can normally complete on its own terms, with the cap staying
+as a backstop. The STUCK-next-to-"healthy"-SLAM question turned out to have a clean, non-bug explanation
+(SLAM's solve TIMES looked normal but every solve reported `dx:+0.00 dy:+0.00` for ~83s straight — far more
+consistent with a non-tracking/relocalizing mode repeating a frozen pose than genuine re-acquired tracking;
+STUCK's own "logging paused" design is why the jsonl can't confirm this directly) — **operator declined a
+fix to STUCK's logging this session.** Separately, built the requested **Clearance details tab**: a new
+`detail=True` mode on `map_store.clearance()` exposes the raw ray-hit picture (hits/rays/fraction/closest/
+farthest/the vote's outcome) behind a fwd/back/left/right judgment, published from `perception_worker.py`
+and rendered in a new floating panel in `flight_replay.py` (mirrors the existing Goals DB panel). All
+touched module self-tests green (`autopilot.py`, `map_store.py`, `perception_worker.py`, `flight_replay.py`
+— new tests for both the direction-cycling FALLBACK mechanics and the clearance-detail plumbing). See
+`plans/session29-clearance-tab-direction-cycling-fallback.md` for the full trace + design._
+
+_**Session 28 — diagnosed the session-27 flight's loop bug (three parts) off `20260720_135307`'s raw
+timeline; fixed two, documented one pending evidence (BUILT — self-tests green, live-fly PENDING).**
+(1) The goals-DB's picks/strikes/bumps appearing to jump together in one tick, and a BUMP/BLACKLIST line
+repeating 33x, turned out to be a pure OBSERVABILITY artifact, not a logic bug: two consecutive SLAM solves
+took 10.48s and 9.13s back to back, and `perception_worker.py`'s main loop is fully SYNCHRONOUS — it can't
+drain autopilot-event pulses or publish a fresh plan while blocked inside one slow solve, so ~19s of two
+genuinely independent, correctly-decided real-time events (a hop-progress judgment, a live flow-based wall
+bump -> 2-bump blacklist) only became visible in one batched tick once the solve finally returned; the
+33x-repeat is the same mechanism at smaller scale (perception published once; the autopilot just re-logged
+its still-held plan on every one of its own faster control ticks). No code change — this is almost
+certainly also why bug (3) below can happen, but making SLAM solving async is a much bigger change than
+this session. (2) **Found + FIXED why the drone kept flying at a goal it had just blacklisted**: the ONE
+queued chance to REPLAN (adopting a fresh goal) after a SLAM-loss recovery got hijacked by the height-TRIM
+trigger, which — on an at-entry ring-blocked abort — RESTORED `leg_goal` from a pre-blacklist snapshot and
+re-aimed at it instantly, off whatever pose happened to be sitting in the current plan, never going through
+REPLAN again because SLAM died for good ~4s later. A follow-up question ("shouldn't a REPLAN-class
+transition require a SLAM frame captured after the last command, like the session-24 settle-gate already
+does for the normal path?") sharpened the fix: TRIM's abort path was bypassing that exact gate. Rebuilt
+`_trim_exit()` to hand off to a new `TRIM_RESUME_WAIT` state that waits for the settle-gate (a provably
+fresh post-TRIM frame) before resolving, and re-validates the preserved goal against the live blacklist at
+that point — a permanently-dead goal now falls through to the same SETTLE->REPLAN convergence a genuinely
+new leg uses (which, via the existing session-24 pick-dedup, still avoids polluting the goals-DB when the
+goal turns out unchanged — Trap B's original intent, preserved). (3) **plan-stale -> fallback -> spin ->
+stuck against the wall — documented, NOT fixed** (operator's explicit ask: wants a visualizer clip before
+finalizing a direction). Separately, while auditing TRIM's "ring blocked on all sides" judgment, found +
+fixed a related gap in `map_store.clearance()`: it took the MIN hit across a ray fan, so ONE isolated (but
+still `min_count`-qualified) noisy voxel was enough to call an entire direction blocked — added a
+`min_hit_fraction` vote (config `clearance_min_hit_fraction: 0.3`, a general ratio not a room-specific
+value) shared by the forward stand-off, the ring, TRIM, and PARALLAX_PUSH. All touched module self-tests
+green (`autopilot.py`, `map_store.py` — which gained its first `run_self_test()` — `perception_worker.py`,
+`frontier_planner.py`, `flight_replay.py`). See `plans/session28-trim-resume-gate-clearance-vote.md` for
+the full trace + design. **NEXT = LIVE-FLY** (see "Next" below) — this is a genuine tradeoff (MIN-over-fan
+was chosen to catch a thin/off-axis wall a single ray could thread) so watch for BOTH false-opens (ramming
+a real thin wall) and whether the false-blocks the operator observed actually go away._
 
 _**Session 27 — visualizer video recording + SLAM point-cloud export on quit + graceful shutdown for
 all three processes (BUILT — self-verified, no GPU/hardware in this environment to live-fly it
@@ -359,16 +485,52 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ### >>> IMMEDIATE NEXT TASK <<<
 
-The operator flew a live session on the current (session 27) build. Per their own account: **"exceptional"
-apart from ONE bug that put the drone into a loop toward the end of the flight.** They will bring that
-flight's `_timeline.jsonl` (path TBD — ask if not given) next session to diagnose. Follow the SAME method
-every prior session-diagnosis used successfully: read the raw jsonl line-by-line around the loop (state/
-event/pos/goal/status fields), do NOT substitute the console `.log` for the jsonl unless explicitly told
-to, form a hypothesis and verify it against the actual field values before presenting it (this repo's
-history has a couple of corrected wrong-first-guesses from under-checking — see session 26/27 write-ups),
-and check `goal_db`/`wall_hit_count` state alongside the state-machine trace since several past loop bugs
-lived in the goals-DB accounting (strikes/picks/bumps), not the flight logic itself. This is genuinely the
-very next thing to do — start here before anything else below.
+**LIVE-FLY the session-31 build** (`python fly.py`, press `m`) — this stacks session 31 (REWIND killed via
+config gate, FALLBACK rebuilt as a simple 4-phase wait→turn→push→wait sweep) on top of session 30 (BACKOFF
+hard-gate phase-timer) on top of session 29 (Clearance tab) on top of session 28 (TRIM resume gate +
+clearance min-hit-fraction vote), and NONE of sessions 28-31 have been live-flown yet. No hardware/GPU in
+the dev environment, so all were BUILT + self-tested only; live confirmation is the very next thing to do.
+Watch specifically for:
+- **A PLAN-STALE episode should go straight into the turn/push/wait cycle, no REWIND detour** — confirm the
+  console/replay debugger never shows a `REWIND` state (it's config-gated off by default now,
+  `use_rewind_on_stale: false`). If REWIND genuinely never helped, this should be invisible; if the operator
+  wants to sanity-check REWIND is still intact, flip the flag back to `true` for one test flight.
+- **The FALLBACK push direction should look genuinely randomized** attempt-to-attempt — no repeating the
+  same direction several times in a row the way the OLD locked-direction search did (the thing that tested
+  badly and triggered this rebuild). Watch the FALLBACK event lines in the console/replay debugger for the
+  `wait -> turn -> push {dirn} -> wait` cadence.
+- **Forward/backward pushes should now visibly carry more authority** — full throttle (1.0) held 2.0s
+  including ramp-up, vs. the old throttled/short push. Left/right strafe: full magnitude (±1.0) held 0.5s.
+  These durations came from the operator's own manual-flight comparison, not a live measurement on the
+  autonomous stack — watch whether they feel right in person and retune
+  `fallback_push_fwd_back_s`/`fallback_push_strafe_s` if not.
+- **Recovery should still cut the sweep short the instant `status` reads OK** — no waiting out the remainder
+  of `fallback_post_push_wait_s` once a genuine re-lock happens; confirm via the replay debugger that a
+  recovered episode's SETTLE→REPLAN follows immediately, not after a visible extra pause.
+- **A live wall/backwall contact should end a forward/backward push early** now that the 2.0s hold clears
+  `flow_contact_detector.py`'s ~1.2s latch requirement (the old 0.5s push never could) — confirm this
+  actually fires at least once across a few flights; if it never does, the "slim chance" framing was
+  optimistic and worth revisiting.
+- **Time a full stuck episode end-to-end** against the back-of-envelope estimate (48 cycles × (turn ~0.5s +
+  push 0.5-2.0s + 10s wait) + 20s ≈ 9-10 minutes worst case) — these are the operator's own judgment-call
+  durations (`fallback_initial_wait_s`, `fallback_post_push_wait_s`, `fallback_max_rotation_deg`), not
+  measured; retune if it feels too long or short in practice.
+- **BACKOFF (session 30) should stop/reverse noticeably faster and more decisively** at a clearance
+  stand-off, wall contact, or leg-timeout — watch for the drone actually gaining separation from the wall
+  instead of drifting closer. The 2-second full-reverse hold (`backoff_hold_s`) came from exactly ONE manual
+  experiment — watch whether it feels right in person (too long/short) and retune. Confirm no regression in
+  any OTHER reverse-emitting maneuver (parallax push, fallback, reverse-probe, homing backoff) — the new
+  `gate_override` mechanism is strictly opt-in and should only ever show up during BACKOFF.
+- **After a goal gets 2-bump-blacklisted** (session 28), does the drone reach REPLAN and re-target promptly
+  instead of riding the dead goal? A `TRIM_RESUME_WAIT` state should appear briefly in the replay debugger
+  if TRIM happens to interrupt right around a blacklist.
+- **Does TRIM/ring-blocked judgment stop false-firing on sparse point-cloud noise** (session 28,
+  `clearance_min_hit_fraction: 0.3`) — also watch for the opposite failure, a genuine thin/off-axis wall no
+  longer stopping the drone.
+- If a plan-stale/spin/stuck-against-wall loop recurs in a DIFFERENT shape than session 29 already fixed,
+  **get the visualizer clip** the operator wants before diagnosing further — they specifically want to
+  verify an orientation-during-"lost" observation on real footage before any fix direction there is
+  finalized (see the session-28 write-up's bug-3 section for the two standing hypotheses to check against).
 
 _**NEXT (after the above) = LIVE-FLY SESSIONS 26 + 25 + 24 + 23 + 22 + 20b together** (BUILT on
 `leg-hops-and-goal-commit-fix`; all module self-tests green; sessions 20b-27 all COMMITTED as of

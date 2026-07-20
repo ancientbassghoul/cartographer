@@ -176,14 +176,31 @@ autonomy:
     clearance_fan_n: 10          # rays in the fan (tightened cone -> denser sampling so a thin/oblique wall isn't threaded)
     clearance_skip: 0.25         # ignore mapped points within this of the camera (matches the target-lift skip)
     clearance_min_count: 2       # a voxel needs >= this many observations to count as a wall (ignore single-hit noise)
+    clearance_min_hit_fraction: 0.3   # session 28: a direction only counts BLOCKED once >= this fraction of the fan's
+                                 #   rays hit within range (was implicitly 0.0 -- ANY single ray hit was enough, which a
+                                 #   sparse/messy reconstruction's isolated noisy voxels could false-fire on). Applies to
+                                 #   BOTH the forward stand-off and the clearance ring (TRIM/PARALLAX_PUSH). Tradeoff vs
+                                 #   MIN-over-fan's original purpose (catching a thin/off-center wall a lone ray could
+                                 #   thread) -- watch live for BOTH false-opens (ramming a real thin wall) and whether
+                                 #   this actually kills the false-blocks it was added for.
     clearance_max_range: 10.0    # cap the ray length (SLAM units) for the FORWARD-CRUISE stand-off; beyond -> "open"
     ring_max_range: 1.5          # NEAR-FIELD cap for the parallax clearance RING only (a scoot moves ~parallax_push_dist,
                                  #   so far walls are irrelevant to "can I translate a bit here"): beyond this reads None=room.
     stop_clearance_dist: 1.0     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
                                  #   (raised 0.6->1.0 in session 8: stop before the wall fills the FOV -> keeps SLAM richer)
-    backoff_on_standoff: true    # after a clearance stand-off stop, play the small back_off recipe (reverse pulse) before
+    backoff_on_standoff: true    # after a clearance stand-off stop, play the BACKOFF phase-timer (below) before
                                  #   settling: it re-arms the 2-bump latch so a stand-off pin can still blacklist an
                                  #   unreachable wall (Bug B) + seeds SLAM parallax. false = direct settle (old behavior).
+    # BACKOFF phase-timer (session 30, replaces the old fixed 0.3s / reverse_throttle-magnitude recipe): hard-cuts
+    # trigger + immediately engages reverse (see io_bridge.py gate_override) instead of waiting for io_bridge's own
+    # smooth release/attack ramp to derive the gates from the decaying/rising analog. A manual test (full throttle
+    # -> release trigger -> immediately hold reverse) found ~2s of held reverse gives the right backoff effect --
+    # io_bridge's ramp math alone only explains a fraction of that; the rest is very likely Unity's own physics/
+    # momentum once thrust reaches the sim (a black box from this side of the socket). General platform CONTROL-
+    # DYNAMICS characteristics (learned response time + magnitude), not a room-specific value.
+    backoff_hold_s: 2.0           # hold full reverse this long (clock starts at BACKOFF entry, includes the ramp-up)
+    backoff_release_s: 0.2        # then wait this long (open-loop) for the reverse ramp-down to finish before SETTLE
+    backoff_reverse_mag: 1.0      # BACKOFF's own reverse target -- independent of reverse_throttle (every OTHER reverse site)
     # NOTE: the settle pause between maneuvers/legs is rules.rest_between_s in flight_playbook.json (tune it there).
     # --- prelude (autopilot: arm -> takeoff -> [TWO-PHASE ascend to ceiling -> descend -> baseline nudge] -> explore) ---
     ascend_to_ceiling: true      # after takeoff, climb until the flow CEILING fires, then drop a bit, so mapping runs at a consistent height near the ceiling
@@ -337,25 +354,42 @@ autonomy:
     plan_timeout_s: 3.0          # NO SILENT FALLBACK: if no TOPIC_PLAN arrives within this window (perception dead) while airborne, HOLD
     # --- SLAM-loss recovery (CONTROL-SPACE; pose is invalid during a tracking loss, so recovery replays
     #     inverse COMMANDS, not a fly-to-pose). PLAN-LOST (perception silent) = hard hover-hold indefinitely
-    #     (no time-based escalation). PLAN-STALE = RECOVERY_REWIND: a CONSUMING replay of the inverse of the
-    #     recently-flown maneuvers (popped one at a time) to re-expose keyframes, watching for OK; drained/empty
-    #     history -> ring-picked parallax fallback -> STUCK. `_recovering` PERSISTS across the PLAN-LOST/PLAN-STALE
-    #     flicker and the give-up counter resets ONLY on a confirming ADVANCE, so STUCK stays reachable (session
-    #     12; flight-20260713 frantic loop). General platform params; nothing here is this room's geometry. ---
+    #     (no time-based escalation). PLAN-STALE = the FALLBACK sweep (session 31) directly by default, or
+    #     (if use_rewind_on_stale) RECOVERY_REWIND first: a CONSUMING replay of the inverse of the recently-
+    #     flown maneuvers (popped one at a time) to re-expose keyframes, watching for OK; drained/empty
+    #     history -> the FALLBACK sweep -> STUCK. `_recovering` PERSISTS across the PLAN-LOST/PLAN-STALE
+    #     flicker and the give-up state resets ONLY on a confirming ADVANCE, so STUCK stays reachable
+    #     (session 12; flight-20260713 frantic loop). General platform params; nothing here is this room's
+    #     geometry. ---
+    use_rewind_on_stale: false   # session 31 (operator ask): REWIND never once visibly helped recover a stale plan across
+                                 #   many real flights -- config-gated OFF rather than deleted; flip true to bring it back.
     command_history_s: 12.0      # (legacy) full-rewind horizon; the consuming rewind now drains the whole queue (maxlen 100)
-    fallback_retreat_s: 0.5      # translate this long (ring-picked backward/strafe push) per fallback attempt before the turn
-    fallback_max_attempts: 16    # unidirectional sweep attempts (16 = >360deg full re-expose) before STUCK (HOLD until perception recovers)
+    # --- FALLBACK sweep (session 31, replaces the session-29 shuffled-direction-queue-with-per-direction-
+    #     tries-and-opposite-phase search -- live flights showed LOCKING a push direction across several tries
+    #     produced bad, unpredictable results). Deliberately simple 4-phase cycle: wait -> turn -> push (a
+    #     FRESH random direction every single cycle, no per-direction budget or retry) -> wait -> repeat, until
+    #     the cumulative commanded turn reaches fallback_max_rotation_deg -> STUCK. ---
+    fallback_initial_wait_s: 20.0    # step 0: let a transient stale patch clear on its own before doing anything invasive
+    fallback_post_push_wait_s: 10.0  # step 3: settle after each push, BLIND fixed wait (a genuine recovery to status==OK
+                                     #   exits the sweep immediately regardless, via the generic recovery convergence -- this
+                                     #   wait is only ever fully spent while still genuinely stale)
+    fallback_max_rotation_deg: 720.0 # exhaustion cap: 2 full rotations (48 cycles @ 15deg) with no recovery -> STUCK
+    fallback_push_fwd_back_s: 2.0    # forward/backward push: FULL throttle (1.0), held this long INCLUDING ramp-up
+                                     #   (operator-measured: ~2s of held full reverse is what it actually takes to matter)
+    fallback_push_strafe_s: 0.5      # left/right push: FULL magnitude (+-1.0); joy_horizontal isn't ramped at all
+                                     #   (unlike trigger/reverse), so there's no ramp-up time to fold into this duration
     recovery_confirm_dist: 1.0   # a post-recovery ADVANCE must travel >= this (SLAM units) to CONFIRM the re-lock is trustworthy
                                  #   (then: drop _recovering, reset the give-up counter, clear the stale reverse-list, resume logging).
                                  #   Progress-gated so a re-lock that instantly bumps a wall at ~0 distance does NOT falsely confirm.
     recovery_turn_step_deg: 15.0 # gentler turn step for the recovery FALLBACK sweep (vs turn_step_deg for normal flight): a
-                                 #   fragile re-lock survives a smaller open-loop turn; more attempts still cover a full sweep.
-    recovery_settle_frames: 4    # a SETTLE between every recovery action (REWIND inverse maneuvers + FALLBACK sweep attempts):
-                                 #   hold neutral until this many FRESH frames are CAPTURED after the hold began, so monocular SLAM
-                                 #   gets a still moment to re-lock instead of firing/spinning back-to-back. Lost-SLAM flavor:
-                                 #   NOT gated on fast/OK (a genuine re-lock exits recovery at the step() top).
-    recovery_settle_max_s: 2.5   # bounded escape: if the pipeline is dead (no fresh frames), end the settle after this and still
-                                 #   proceed to the next re-exposure maneuver (VISIBLE log; sitting still forever defeats the rewind).
+                                 #   fragile re-lock survives a smaller open-loop turn; more cycles still cover a full sweep.
+    recovery_settle_frames: 4    # a SETTLE between every REWIND inverse maneuver (only relevant when use_rewind_on_stale is
+                                 #   true -- the FALLBACK sweep uses its own fixed fallback_post_push_wait_s instead): hold
+                                 #   neutral until this many FRESH frames are CAPTURED after the hold began, so monocular
+                                 #   SLAM gets a still moment to re-lock instead of firing/spinning back-to-back. Lost-SLAM
+                                 #   flavor: NOT gated on fast/OK (a genuine re-lock exits recovery at the step() top).
+    recovery_settle_max_s: 10.0   # bounded escape for the REWIND inter-step settle above: if the pipeline is dead (no fresh
+                                 #   frames), end the settle after this and still proceed to the next re-exposure maneuver.
     # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
     #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are

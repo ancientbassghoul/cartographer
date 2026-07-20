@@ -36,6 +36,7 @@ import copy
 import json
 import math
 import os
+import random
 import time
 from datetime import datetime, timedelta
 
@@ -79,6 +80,8 @@ _NEUTRAL = {
     "btnARMdown": False, "btnCdown": False, "trigger": 0.0, "reverse": 0.0,
     "trigger_down": False, "reverse_down": False,
     "joy_vertical": 0, "joy_horizontal": 0, "yaw": 0.0, "pitch": 0.0,
+    "gate_override": False,   # session 30: ALWAYS declared so io_bridge can't leave it stuck from a
+                              # previous tick (same guarantee this dict already gives trigger_down/reverse_down)
 }
 
 
@@ -165,6 +168,10 @@ def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan:
                                    "left": ExploreController._ring_get(r, -90.0),
                                    "right": ExploreController._ring_get(r, 90.0)})(g("clearance_ring"))
                        if g("clearance_ring") else None),
+        # Session 29: the raw ray-hit picture behind the fwd/back/left/right clearance judgment (hits,
+        # total rays, fraction, closest/farthest, the min_hit_fraction vote outcome) -> the replay's
+        # Clearance tab, so a "ring blocked" call is auditable instead of re-derived by hand.
+        "clearance_detail": g("clearance_detail"),
         # GOAL = the controller's committed leg_goal (acted-on); plan_goal = perception's async pick.
         "goal": ([round(float(leg_goal[0]), 4), round(float(leg_goal[1]), 4)] if leg_goal is not None else None),
         "plan_goal": g("goal"), "dist_to_goal": dist_to_goal, "plan_bearing_err": g("bearing_err"),
@@ -736,14 +743,32 @@ class ExploreController:
         # in flight_playbook.json (the user's request), not a config constant.
         # --- SLAM-loss recovery (CONTROL-SPACE, not state-space: pose is invalid during a tracking loss) ---
         # PLAN-LOST (perception silent) -> HARD HOVER-HOLD indefinitely (no blind recovery on a clock).
-        # PLAN-STALE (perception publishing, SLAM not TRACKING) -> RECOVERY_REWIND: replay the INVERSE of the
-        # recently-flown maneuvers to re-expose the camera to keyframes it already recorded, watching for OK.
-        # If the history is empty/exhausted (e.g. a wall hit cleared it) -> parallax + <=45deg fallback.
+        # PLAN-STALE (perception publishing, SLAM not TRACKING) -> RECOVERY_REWIND (config-gated, default OFF
+        # as of session 31 -- see use_rewind_on_stale below): replay the INVERSE of the recently-flown
+        # maneuvers to re-expose the camera to keyframes it already recorded, watching for OK. Otherwise (or
+        # once the history is empty/exhausted) -> the FALLBACK sweep.
         self.command_history = collections.deque(maxlen=100)   # maneuvers flown during normal exploration
         self.command_history_s = float(e.get("command_history_s", 12.0))  # rewind horizon (seconds of motion)
-        self.fallback_retreat_s = float(e.get("fallback_retreat_s", 0.5))  # retreat duration per fallback attempt
-        self.fallback_max_attempts = int(e.get("fallback_max_attempts", 16))
-        self._fallback_attempts = 0
+        # Session 31 (operator ask): REWIND never once visibly helped recover a stale plan across many real
+        # flights -- config-gated off rather than deleted, so it's one edit to bring back if that changes.
+        self.use_rewind_on_stale = bool(e.get("use_rewind_on_stale", False))
+        # --- FALLBACK sweep (session 31, replaces session 29's shuffled-direction-queue-with-per-direction-
+        # tries-and-opposite-phase search -- operator ask, after live flights showed LOCKING a push direction
+        # across several tries produced bad, unpredictable results). Deliberately simple, 4-phase cycle:
+        # wait -> turn -> push (a FRESH random direction every single cycle, no per-direction budget or
+        # opposite-phase retry) -> wait -> repeat, until the cumulative commanded turn reaches
+        # fallback_max_rotation_deg. Forward is a candidate here (unlike normal scouting, which never pushes
+        # forward) -- while blind there's no live signal saying the back is any safer than the front.
+        self.fallback_initial_wait_s = float(e.get("fallback_initial_wait_s", 20.0))    # step 0: let a transient stale patch clear on its own first
+        self.fallback_post_push_wait_s = float(e.get("fallback_post_push_wait_s", 10.0))  # step 3: settle after each push
+        self.fallback_max_rotation_deg = float(e.get("fallback_max_rotation_deg", 720.0))  # exhaustion cap (replaces fallback_max_attempts)
+        self.fallback_push_fwd_back_s = float(e.get("fallback_push_fwd_back_s", 2.0))   # forward/backward push hold, FULL throttle, includes ramp-up
+        self.fallback_push_strafe_s = float(e.get("fallback_push_strafe_s", 0.5))       # left/right push hold, FULL magnitude (joy_horizontal isn't ramped)
+        self._fallback_phase = None         # None | "INITIAL_WAIT" | "TURN" | "PUSH" | "WAIT_POST"
+        self._fallback_phase_t0 = None      # 'now' the current phase began
+        self._fallback_cum_deg = 0.0        # cumulative commanded turn this episode (exhaustion criterion)
+        self._fallback_cycle = 0            # diagnostic: completed turn+push+wait cycles this episode
+        self._fallback_push_dirn = None     # the CURRENT push's direction (for the live-contact early-exit)
         # --- SESSION 12 recovery redesign (see plans/strafe-throttle-and-recovery-loop.md D5) ---
         # A flickering SLAM status (PLAN-LOST<->PLAN-STALE) used to RESET recovery every ~3s, so STUCK was
         # unreachable and the rewind never emptied (flight 20260713 frantic loop). Fix: `_recovering` PERSISTS
@@ -805,7 +830,7 @@ class ExploreController:
         self.slam_stepback_after_frames = int(e.get("slam_stepback_after_frames", 10))
         self.slam_stepback_max_steps = int(e.get("slam_stepback_max_steps", 3))
         # PERSISTS across a PLAN-LOST/HOLD_LOST bounce within one bad SLAM patch (mirrors the
-        # `_recovering`/`_fallback_attempts` persistence rule) -- a solve slow enough to trip this almost
+        # `_recovering`/FALLBACK-sweep persistence rule) -- a solve slow enough to trip this almost
         # always exceeds `plan_timeout_s` before it finishes, so the FSM bounces HOLD_LOST -> OK -> a FRESH
         # SLAM_HOLD every time; resetting this on every fresh hold entry (the old behavior) meant the
         # escalation could never reach its cap in exactly the scenario it exists to bound (confirmed on the
@@ -847,6 +872,16 @@ class ExploreController:
         # otherwise the tight REPLAN->ORIENT(0)->ADVANCE->standoff loop never reverses/displaces and the
         # counter is stuck at 1 (Bug B). Also seeds SLAM parallax. Set False to restore the direct settle.
         self.backoff_on_standoff = bool(e.get("backoff_on_standoff", True))
+        # BACKOFF phase-timer (session 30, replaces the old fixed 0.3s/0.2-throttled recipe): a manual
+        # experiment (full throttle -> release trigger -> immediately hold reverse) found it takes ~2s of
+        # held reverse to get the right backoff effect -- io_bridge's own ramp math only accounts for a
+        # fraction of that (the rest is very likely Unity's own physics/momentum once thrust reaches the
+        # sim, invisible from this side of the socket). General platform CONTROL-DYNAMICS characteristics
+        # (learned response time + magnitude), not a room-specific value.
+        self.backoff_hold_s = float(e.get("backoff_hold_s", 2.0))          # hold full reverse this long (clock starts at BACKOFF entry, includes the ramp-up)
+        self.backoff_release_s = float(e.get("backoff_release_s", 0.2))    # then wait this long (open-loop) for the reverse ramp-down to finish before SETTLE
+        self.backoff_reverse_mag = float(e.get("backoff_reverse_mag", 1.0))  # BACKOFF's own reverse target -- independent of reverse_throttle (every OTHER reverse site)
+        self._backoff_t0 = None      # 'now' BACKOFF was entered (phase-timer origin)
         # Altitude lock: hold the LIVE-cached mapping height during long ADVANCE pushes (forward pitch sinks
         # the drone into inner walls). target_altitude_y is cached live from the first valid post-prelude
         # pose (self-calibrating, NOT a baked value); world frame is +Y DOWN so a sink = LARGER y.
@@ -1087,8 +1122,9 @@ class ExploreController:
         self._push_after_reposition = None   # D2: the strafe dir queued behind a forward-reposition (scrape guard)
         self._push_start_pos = None
         self._after_orient = "ADVANCE"
-        self._fallback_attempts = 0
+        self._backoff_t0 = None
         self._fallback_retreat_forward = None
+        self._reset_fallback_sweep()
         # Session-12 recovery flags. A manual takeover (the only caller of reset_leg) invalidates any in-flight
         # recovery, so clear them here; DURING a flight they persist across the PLAN-LOST/PLAN-STALE flicker.
         self._recovering = False       # True from the first PLAN-STALE of a loss until a confirming ADVANCE (>=1u)
@@ -1128,6 +1164,7 @@ class ExploreController:
         self._trim_phase_t0 = None      # entry time of the current TRIM sub-phase
         self._trim_cmd_t0 = None        # 'now' the climb command issued (WAIT settle-gate origin; same clock as cap_ts)
         self._trim_resume_goal = None   # the committed leg_goal snapshotted on TRIM entry (Trap B: re-aim at it, don't re-pick)
+        self._trim_exit_msg = None      # the TRIM-end reason string, stashed across TRIM_RESUME_WAIT for the final event line
         self._trim_repos_move = None    # the reposition control dict (reverse/strafe) chosen by the ring gate
         self._trim_sag_y = None         # pos_y that tripped the sag trigger (for the entry log)
         self._trimming = False          # telemetry: True while a TRIM is running
@@ -1199,18 +1236,43 @@ class ExploreController:
         return RecipePlayer(self._turn_steps(theta), name=f"turn{theta:+.0f}")
 
     def _trim_exit(self, now, plan, msg):
-        """Leave a gradual-height TRIM (session 14, restored session 21). Trap B: RESTORE the committed goal
-        snapshotted on entry and re-aim (ORIENT) at it — never a fresh planner pick, so the trim can't pollute
-        goal commitment or the goals-DB. Falls back to SETTLE->REPLAN only if no goal was committed or the pose
-        is untrustworthy. Sets the next state via _enter and RETURNS the event string (the TRIM handler falls
-        through to the common return)."""
+        """Leave a gradual-height TRIM (session 14, restored session 21, GATED session 28). Does NOT resolve
+        immediately: stashes the exit reason and opens a settle-gate wait (`TRIM_RESUME_WAIT`) so the eventual
+        re-aim (or fallback) is computed off a PROVABLY FRESH post-TRIM frame, never whatever pose happened to
+        be sitting in `plan` the instant TRIM ended (the 20260720 bug: an at-entry ring-blocked abort re-aimed
+        INSTANTLY at a goal that had, moments earlier, been permanently 2-bump-blacklisted, and rode that stale
+        commitment for the rest of the flight because no REPLAN ever got another chance — see
+        `_trim_resolve_resume` for the other half of the fix, the blacklist re-check). Sets the next state via
+        `_enter` and RETURNS the event string (the TRIM handler falls through to the common return)."""
         self._trimming = False
         self._trim_phase = None
         self._player = None
+        self._trim_exit_msg = msg
+        self._settle_gate_begin(now)
+        self._enter("TRIM_RESUME_WAIT", now)
+        return f"{msg} -> wait for a fresh post-trim frame before resuming"
+
+    def _trim_resolve_resume(self, now, plan):
+        """Resolve a `TRIM_RESUME_WAIT` once its settle-gate clears (see `_trim_exit`). Trap B: RESTORE the
+        committed goal snapshotted on TRIM entry and re-aim (ORIENT) at it — never a fresh planner pick, so a
+        routine TRIM can't pollute goal commitment or the goals-DB. BUT first re-validate the preserved goal
+        against the NOW-current blacklist (`plan.get("blacklist")`/`blacklist_permanent`, the same live data
+        `_timeline_goals` already reads) — a goal that died (2-bump/stall/loop) while TRIM was interrupting the
+        leg must NOT be blindly restored. Falls back to SETTLE->REPLAN (the SAME convergence a genuinely new
+        leg uses — its own pick-dedup already suppresses a redundant pick when the goal turns out unchanged,
+        so this preserves Trap B's intent for the common case) when the preserved goal is dead, unset, or the
+        pose is unavailable. Returns the event string."""
+        msg = self._trim_exit_msg or "TRIM done"
+        self._trim_exit_msg = None
         g = self._trim_resume_goal
         self._trim_resume_goal = None
         pos, hd = plan.get("pos"), plan.get("heading_deg")
-        if g is not None and pos is not None and hd is not None:
+        bl = plan.get("blacklist") or []
+        perm = plan.get("blacklist_permanent") or []
+        dead = g is not None and any(
+            (bool(perm[i]) if i < len(perm) else False) and self._dist(g, pt) <= self.goal_area_radius
+            for i, pt in enumerate(bl))
+        if g is not None and not dead and pos is not None and hd is not None:
             self.leg_goal = list(g)
             bearing = math.degrees(math.atan2(g[0] - pos[0], g[1] - pos[1]))   # 0=+Z, +90=+X (matches homing)
             be = ((bearing - float(hd) + 180.0) % 360.0) - 180.0
@@ -1224,7 +1286,8 @@ class ExploreController:
             return f"{msg} -> re-aim ORIENT at preserved goal {self.leg_goal} (turn {theta:+.0f})"
         self._settle_to = "REPLAN"
         self._enter("SETTLE", now)
-        return f"{msg} -> settle -> replan (no committed goal / pose unavailable)"
+        reason = "preserved goal was blacklisted while trimming" if dead else "no committed goal / pose unavailable"
+        return f"{msg} -> settle -> replan ({reason})"
 
     # ------------------------------------------------- command history (control-space rewind)
     # While `_recovering` (a re-lock we don't yet trust), appends are FROZEN: the re-aim maneuvers are flown on a
@@ -1294,17 +1357,21 @@ class ExploreController:
                 return steps
         return None
 
-    def _step_stale(self, now, plan, wall_contact):
-        """PLAN-STALE (SLAM not TRACKING, perception publishing): a CONSUMING control-space rewind — pop the
-        inverse of the recently-flown maneuvers ONE at a time (watching for OK at the step() top), draining the
-        history to empty, then the ring-picked <=45deg fallback -> STUCK. `_recovering` + the give-up counter
-        PERSIST across any PLAN-LOST/HOLD_LOST flicker, so the rewind never restarts and STUCK stays reachable
-        (fixes the flight-20260713 frantic loop). If the drone already MOVED on an unconfirmed re-lock
-        (`_history_broken`), the leftover history is spatially stale -> clear it and go straight to FALLBACK
-        (no displaced ghost-path replay)."""
+    def _step_stale(self, now, plan, wall_contact, backwall_contact=False):
+        """PLAN-STALE (SLAM not TRACKING, perception publishing). If `use_rewind_on_stale` is True: a
+        CONSUMING control-space rewind — pop the inverse of the recently-flown maneuvers ONE at a time
+        (watching for OK at the step() top), draining the history to empty, then the FALLBACK sweep (session
+        31 — see `_enter_fallback_sweep`/`_step_fallback_sweep`) -> STUCK. Default (session 31, operator ask
+        after REWIND never once visibly helped recover a stale plan across many real flights): skip straight
+        to the FALLBACK sweep. `_recovering` + the give-up state PERSIST across any PLAN-LOST/HOLD_LOST
+        flicker (fixes the flight-20260713 frantic loop). If the drone already MOVED on an unconfirmed
+        re-lock (`_history_broken`), the leftover history is spatially stale -> clear it and go straight to
+        the sweep (no displaced ghost-path replay) regardless of the REWIND flag. `wall_contact`/
+        `backwall_contact` are the SLAM-independent flow detectors, threaded through so a FALLBACK push can
+        be cut short on a live contact (see `_step_fallback_sweep`)."""
         ring = plan.get("clearance_ring")
         if ring:
-            self._last_ring = ring          # remember the last good ring for the fallback direction choice
+            self._last_ring = ring          # still used by CALIB_ESCAPE's own ring-picked push
         st = self.state
         if st in ("STUCK", "WARMUP"):
             return {}, st, None              # hold until OK returns (handled at the step() top)
@@ -1320,14 +1387,14 @@ class ExploreController:
                     return {}, "REWIND", None
                 self._rec_settling = False
                 cap = " (settle timed out, no fresh frames)" if capped else ""
-                # DRAIN the queue (consuming rewind): pop + play the next inverse, else the ring-picked fallback.
+                # DRAIN the queue (consuming rewind): pop + play the next inverse, else the fallback sweep.
                 steps = self._pop_stepback()
                 if steps is not None:
                     self._player = RecipePlayer(steps, name="rewind")
                     return {}, "REWIND", (f"settled between rewind steps{cap} -> next inverse "
                                           f"[{len(self.command_history)} left]")
                 self._player = None
-                return self._begin_fallback(now, f"rewind drained (history empty){cap} -> ring-picked parallax fallback")
+                return self._enter_fallback_sweep(now, f"rewind drained (history empty){cap} -> FALLBACK sweep")
             active, done = self._player.fields(now)
             if not done:
                 return active, "REWIND", None
@@ -1336,45 +1403,31 @@ class ExploreController:
             self._settle_begin(now)
             return {}, "REWIND", "rewind step done -> settle (let SLAM breathe / re-lock) before the next inverse"
         if st == "FALLBACK":
-            if self._rec_settling:
-                # Inter-attempt settle: no more back-to-back spinning — hold neutral between sweep attempts so
-                # SLAM can re-lock (bounded lost-SLAM flavor).
-                sdone, capped = self._settle_poll(now, plan, require_fast=False,
-                                                  min_frames=self.recovery_settle_frames,
-                                                  max_hold_s=self.recovery_settle_max_s)
-                if not sdone:
-                    return {}, "FALLBACK", None
-                self._rec_settling = False
-                cap = " (settle timed out, no fresh frames)" if capped else ""
-                if self._fallback_attempts >= self.fallback_max_attempts:
-                    self._enter("STUCK", now)
-                    return {}, "STUCK", (f"fallback exhausted ({self._fallback_attempts} attempts){cap} -> STUCK "
-                                         "(HOLD; awaiting perception)")
-                return self._begin_fallback(now, None)
-            active, done = self._player.fields(now)
-            if not done:
-                return active, "FALLBACK", None
-            self._player = None
-            # This sweep attempt finished -> SETTLE before the next attempt / STUCK check.
-            self._rec_settling = True
-            self._settle_begin(now)
-            return {}, "FALLBACK", "fallback attempt done -> settle (let SLAM breathe / re-lock) before the next sweep"
+            return self._step_fallback_sweep(now, wall_contact, backwall_contact)
         # ---- fresh entry (first PLAN-STALE of this loss) OR re-entry after a HOLD_LOST flicker ----
         if not self._recovering:
-            # The FIRST PLAN-STALE of this loss episode arms recovery. The flags + counter then PERSIST until a
-            # confirming ADVANCE — never reset by a bare OK or by a LOST/STALE flicker (that was the loop bug).
+            # The FIRST PLAN-STALE of this loss episode arms recovery. The flags PERSIST until a confirming
+            # ADVANCE — never reset by a bare OK or by a LOST/STALE flicker (that was the loop bug).
             self._recovering = True
             self._history_broken = False
-            self._fallback_attempts = 0
+        if not self._ever_tracked:
+            # STARTUP: SLAM has never TRACKED yet (the prelude finishes on the FLOW ceiling detector, not on
+            # SLAM). Don't spin a blind fallback into an unmapped room — HOLD and wait for SLAM to initialize.
+            # The step() top snaps WARMUP -> SLAM_HOLD -> SETTLE -> REPLAN when OK returns. This guard applies
+            # regardless of use_rewind_on_stale -- REWIND being off doesn't mean "sweep blindly at startup".
+            self._enter("WARMUP", now)
+            return {}, "WARMUP", "PLAN-STALE at startup (SLAM still initializing) -> HOLD (no blind sweep)"
+        if not self.use_rewind_on_stale:
+            return self._enter_fallback_sweep(now, "PLAN-STALE -> FALLBACK sweep (REWIND disabled)")
         # Ghost-path guard: a re-lock that already MOVED (unconfirmed) decoupled the leftover history from the
-        # true pose -> clear it and BYPASS REWIND straight to the safe ring-picked fallback sweep.
+        # true pose -> clear it and BYPASS REWIND straight to the safe FALLBACK sweep.
         if self._history_broken:
             if self.command_history:
                 self.command_history.clear()
-                return self._begin_fallback(now, "secondary loss after an unconfirmed re-aim -> stale history "
-                                                 "cleared -> ring-picked parallax fallback (no ghost path)")
-            return self._begin_fallback(now, "secondary loss after an unconfirmed re-aim (history already "
-                                             "drained) -> ring-picked parallax fallback")
+                return self._enter_fallback_sweep(now, "secondary loss after an unconfirmed re-aim -> stale "
+                                                       "history cleared -> FALLBACK sweep (no ghost path)")
+            return self._enter_fallback_sweep(now, "secondary loss after an unconfirmed re-aim (history "
+                                                   "already drained) -> FALLBACK sweep")
         # CONSUMING rewind: pop the newest maneuver's inverse and play it; the step() top watches for OK.
         steps = self._pop_stepback()
         if steps is not None:
@@ -1382,14 +1435,8 @@ class ExploreController:
             self._enter("REWIND", now)
             return {}, "REWIND", ("PLAN-STALE -> RECOVERY_REWIND (consuming): retracing recent maneuvers one "
                                   f"at a time to re-expose keyframes [{len(self.command_history)} left after this pop]")
-        if not self._ever_tracked:
-            # STARTUP: SLAM has never TRACKED yet (the prelude finishes on the FLOW ceiling detector, not on
-            # SLAM). Don't spin a blind fallback into an unmapped room — HOLD and wait for SLAM to initialize.
-            # The step() top snaps WARMUP -> SLAM_HOLD -> SETTLE -> REPLAN when OK returns.
-            self._enter("WARMUP", now)
-            return {}, "WARMUP", "PLAN-STALE at startup (SLAM still initializing) -> HOLD (no blind sweep)"
-        return self._begin_fallback(now, "PLAN-STALE + EMPTY command history (post-collision?) -> ring-picked "
-                                         "parallax fallback")
+        return self._enter_fallback_sweep(now, "PLAN-STALE + EMPTY command history (post-collision?) -> "
+                                               "FALLBACK sweep")
 
     def _step_calib_lost(self, now, status):
         """A plan loss (LOST/NO-PLAN/STALE) interrupted a height calibration. Release all controls and HOLD;
@@ -1589,45 +1636,94 @@ class ExploreController:
                                  f"-> resume {resume}")
         return {}, "POSTLUDE_LOST_HOLD", None          # holding; wait for the SLAM pulse + plan OK
 
-    def _begin_fallback(self, now, event):
-        """One fallback attempt: a SINGLE recovery-step turn to re-expose a new heading, THEN a short RING-PICKED
-        parallax push (the SAME direction pick as normal scouting — backward if pushable, else strafe toward the
-        roomier pushable side; NEVER forward, so it can't ram). The turn uses `recovery_turn_step_deg` (default
-        15deg — gentler than the normal step so a fragile re-lock survives; still a UNIDIRECTIONAL sweep, so N
-        attempts re-expose every heading for RELOC). Push LAST is deliberate: the motion right before the
-        inter-attempt SETTLE is then a TRANSLATION (parallax), not a bare rotation (the SLAM-killer), so SLAM
-        re-locks on the rescued view — and it matches the "reset attitude with 'c' BEFORE a push" playbook recipe
-        (`_turn_steps` = yaw + 'c'). If no direction is pushable, just turn (the rotation alone re-exposes geometry)."""
-        self._fallback_attempts += 1
-        ring = self._last_ring
-        # Direction pick mirrors PARALLAX_PUSH: backward-first (pure translation, camera still on scene), else the
-        # roomier pushable side (None = open near-field ranks as most room). Strafe magnitude is now throttled
-        # (strafe_throttle) so a recovery scoot is gentle. `_pushable` gates each candidate on the live clearance.
-        move, tag = None, "no-push"
-        if self._pushable(self._ring_get(ring, 180.0)):
-            move, tag = {"reverse": self.reverse_throttle}, "backward"
-        else:
-            sides = [(-90.0, self._ring_get(ring, -90.0)), (90.0, self._ring_get(ring, 90.0))]
-            pushable = [(rel, c) for rel, c in sides if self._pushable(c)]
-            if pushable:
-                rel, _ = max(pushable, key=lambda kv: (float("inf") if kv[1] is None else kv[1]))
-                sign = 1.0 if rel == 90.0 else -1.0
-                move = {"joy_horizontal": sign * self._strafe_mag}
-                tag = "strafe_right" if rel == 90.0 else "strafe_left"
-        theta = self.recovery_turn_step_deg              # gentle unidirectional RELOC sweep step
-        # ORDER: turn (yaw + 'c' attitude reset) FIRST, then a rest, then the ring-picked push LAST — so the last
-        # motion before the inter-attempt SETTLE is the parallax translation that rescues the rotation for RELOC.
-        # (The push direction was picked from the PRE-turn ring; 15deg is small + the push is short/throttled/
-        # never-forward, so the ram risk stays low.) The inter-attempt SETTLE (fresh-frame gated) owns the pause
-        # after the push — no trailing rest here.
-        steps = [*self._turn_steps(theta)]
-        if move is not None:
-            steps += [{"duration_s": self.rest_between_s}, dict(move, duration_s=self.fallback_retreat_s)]
-        self._player = RecipePlayer(steps, name=f"fallback#{self._fallback_attempts}")
+    def _reset_fallback_sweep(self):
+        """Clear the FALLBACK sweep's phase-timer state (session 31). Called everywhere a fresh loss
+        episode is armed, a recovery is confirmed, or a manual takeover resets the leg — so a NEW blind
+        episode always starts a fresh 4-phase cycle rather than resuming mid-sweep from a stale prior
+        episode."""
+        self._fallback_phase = None
+        self._fallback_phase_t0 = None
+        self._fallback_cum_deg = 0.0
+        self._fallback_cycle = 0
+        self._fallback_push_dirn = None
+
+    def _enter_fallback_sweep(self, now, event):
+        """Route into the FALLBACK sweep (session 31: wait -> turn -> push a FRESH random direction -> wait
+        -> repeat until `fallback_max_rotation_deg` is reached -> STUCK; see `_step_fallback_sweep` for the
+        per-tick phase logic). A TRUE fresh episode (`_fallback_phase is None`, via `_reset_fallback_sweep`)
+        starts at INITIAL_WAIT; a RESUME after a PLAN-LOST/PLAN-STALE flicker (which bounces the drone
+        through HOLD_LOST — a totally separate top-level branch — abandoning whatever phase was in
+        progress, then flickers back) just re-enters FALLBACK and continues from wherever `_fallback_phase`
+        already was, so the 720° budget and elapsed phase timer both persist across the flicker exactly
+        like `_recovering` already does (the flight-20260713 flicker-persist fix)."""
+        if self._fallback_phase is None:
+            self._fallback_phase = "INITIAL_WAIT"
+            self._fallback_phase_t0 = now
         self._enter("FALLBACK", now)
-        ev = event or (f"FALLBACK #{self._fallback_attempts}: turn {theta:+.0f} then ring-picked {tag} push "
-                       "(recovery sweep — parallax last), then settle")
-        return {}, "FALLBACK", ev
+        return {}, "FALLBACK", event
+
+    def _step_fallback_sweep(self, now, wall_contact, backwall_contact):
+        """Per-tick FALLBACK sweep dispatch (session 31), on `self._fallback_phase`:
+          INITIAL_WAIT -> (fallback_initial_wait_s) -> TURN -> (recovery_turn_step_deg, unidirectional) ->
+          PUSH -> (a FRESH random direction every cycle, full throttle/magnitude, fallback_push_fwd_back_s
+          or fallback_push_strafe_s) -> WAIT_POST -> (fallback_post_push_wait_s) -> TURN again, until
+          `_fallback_cum_deg >= fallback_max_rotation_deg` -> STUCK.
+        Each phase rebuilds `self._player` if it's `None` (build-if-None, the same pattern `REVERSE_PROBE`
+        already uses) rather than assuming a player survived a PLAN-LOST/HOLD_LOST interruption intact — a
+        resume after a flicker (see `_enter_fallback_sweep`) cleanly restarts just the CURRENT TURN/PUSH
+        sub-step, not the whole sweep. Forward IS a candidate (unlike normal scouting, which never pushes
+        forward) — while blind there's no live signal saying the back is any safer than the front; a live
+        wall/backwall contact matching the in-flight push direction still ends it early (real information,
+        just faster) — no equivalent live signal exists for left/right."""
+        phase = self._fallback_phase
+        elapsed = now - self._fallback_phase_t0
+        if phase == "INITIAL_WAIT":
+            if elapsed < self.fallback_initial_wait_s:
+                return {}, "FALLBACK", None
+            self._fallback_phase, self._fallback_phase_t0 = "TURN", now
+            return {}, "FALLBACK", (f"FALLBACK: initial {self.fallback_initial_wait_s:.0f}s wait done -> turn")
+        if phase == "TURN":
+            if self._player is None:
+                self._player = self._build_turn(self.recovery_turn_step_deg)
+            active, done = self._player.fields(now)
+            if not done:
+                return active, "FALLBACK", None
+            self._player = None
+            self._fallback_cum_deg += self.recovery_turn_step_deg
+            self._fallback_cycle += 1
+            self._fallback_push_dirn = random.choice(["forward", "backward", "left", "right"])
+            self._fallback_phase, self._fallback_phase_t0 = "PUSH", now
+            return {}, "FALLBACK", (f"FALLBACK cycle {self._fallback_cycle}: turned "
+                                    f"{self.recovery_turn_step_deg:+.0f} (cum {self._fallback_cum_deg:.0f}/"
+                                    f"{self.fallback_max_rotation_deg:.0f}) -> push {self._fallback_push_dirn}")
+        if phase == "PUSH":
+            if self._player is None:
+                dirn = self._fallback_push_dirn
+                move = {
+                    "forward": {"trigger": 1.0}, "backward": {"reverse": 1.0},
+                    "left": {"joy_horizontal": -1.0}, "right": {"joy_horizontal": 1.0},
+                }[dirn]
+                dur = (self.fallback_push_fwd_back_s if dirn in ("forward", "backward")
+                       else self.fallback_push_strafe_s)
+                self._player = RecipePlayer([dict(move, duration_s=dur)], name=f"fallback-push-{dirn}")
+            if ((self._fallback_push_dirn == "forward" and wall_contact)
+                    or (self._fallback_push_dirn == "backward" and backwall_contact)):
+                self._player.i = len(self._player.steps)   # abort the push -- RecipePlayer.done reads True next
+            active, done = self._player.fields(now)
+            if not done:
+                return active, "FALLBACK", None
+            self._player = None
+            self._fallback_phase, self._fallback_phase_t0 = "WAIT_POST", now
+            return {}, "FALLBACK", f"FALLBACK: push {self._fallback_push_dirn} done -> settle"
+        # WAIT_POST
+        if elapsed < self.fallback_post_push_wait_s:
+            return {}, "FALLBACK", None
+        if self._fallback_cum_deg >= self.fallback_max_rotation_deg:
+            self._enter("STUCK", now)
+            return {}, "STUCK", (f"FALLBACK sweep exhausted ({self._fallback_cum_deg:.0f}° over "
+                                 f"{self._fallback_cycle} cycles) -> STUCK (HOLD; awaiting perception)")
+        self._fallback_phase, self._fallback_phase_t0 = "TURN", now
+        return {}, "FALLBACK", None
 
     @staticmethod
     def _fmt(be):
@@ -1826,8 +1922,8 @@ class ExploreController:
     def _enter(self, state, now):
         # Ghost-path guard (D5): the moment a re-locked-but-unconfirmed drone enters a SPATIAL state it physically
         # moves (turn/translate) with logging frozen, so the leftover pre-loss command_history no longer maps to
-        # the drone's true pose. Mark it broken -> a secondary SLAM drop clears it and jumps to the ring-picked
-        # FALLBACK sweep instead of replaying a displaced ghost path.
+        # the drone's true pose. Mark it broken -> a secondary SLAM drop clears it and jumps to the
+        # direction-search FALLBACK sweep instead of replaying a displaced ghost path.
         if self._recovering and state in ("ORIENT", "PARALLAX_PUSH", "ADVANCE"):
             self._history_broken = True
         # The post-recovery ADVANCE progress gauge is captured lazily in the ADVANCE handler; drop it when leaving
@@ -2222,7 +2318,7 @@ class ExploreController:
                 return {}, "HOLD_LOST", None
             if status == "PLAN-STALE":
                 # Perception is publishing but SLAM is not TRACKING -> retrace to re-expose keyframes.
-                return self._step_stale(now, plan, wall_contact)
+                return self._step_stale(now, plan, wall_contact, backwall_contact)
             # status OK: if we were recovering, perception is TRACKING again -> DON'T fly on the first frame
             # back (a fresh RELOC pose is shaky). Hold until SLAM settles (>N fast frames), THEN brake + REPLAN.
             # NOTE: `_recovering` + the give-up counter are NOT cleared here — a bare OK is not yet trusted; only a
@@ -2933,7 +3029,7 @@ class ExploreController:
                     if moved is not None and moved >= self.recovery_confirm_dist:
                         self._recovering = False
                         self._history_broken = False
-                        self._fallback_attempts = 0
+                        self._reset_fallback_sweep()
                         self.command_history.clear()
                         self._recovery_adv_start = None
                         event = (f"recovery CONFIRMED: advanced {moved:.2f}u >= {self.recovery_confirm_dist:g}u "
@@ -2961,7 +3057,8 @@ class ExploreController:
                 self._log_move("forward", fwd_val, fwd_dur)   # record the clean forward leg for a later rewind
                 self._register_bump(plan, "clearance stand-off")  # advance-blocked stop -> bump toward committed goal
                 if self.backoff_on_standoff:
-                    self._player = self.pb.player("back_off")
+                    self._player = None
+                    self._backoff_t0 = now
                     self._enter("BACKOFF", now)
                     event = (f"clearance {clr:.2f} <= {self.stop_clearance_dist:.2f} -> standoff stop -> "
                              "back off (re-arm bump latch) -> settle")
@@ -2981,7 +3078,8 @@ class ExploreController:
                     self._enter("SETTLE", now)
                     event = "WALL contact -> clear history -> settle -> reverse probe (experiment)"
                 else:
-                    self._player = self.pb.player("back_off")
+                    self._player = None
+                    self._backoff_t0 = now
                     self._enter("BACKOFF", now)
                     event = "WALL contact -> clear history -> back off"
             elif reached is not None and reached <= self.goal_reach_dist:
@@ -2990,7 +3088,8 @@ class ExploreController:
                 event = f"goal reached (d={reached:.2f}) -> settle"
             elif (now - self.t_state) > self.leg_max_s:
                 self._log_move("forward", fwd_val, fwd_dur)
-                self._player = self.pb.player("back_off")
+                self._player = None
+                self._backoff_t0 = now
                 self._enter("BACKOFF", now)
                 event = f"LEG-TIMEOUT (>{self.leg_max_s}s) -> back off"
             elif self.hop_duration_s > 0 and fwd_dur >= self.hop_duration_s:
@@ -3039,8 +3138,22 @@ class ExploreController:
                         active["joy_vertical"] = self.ascend_preset["joy_vertical"]   # -1 = up (camera Y down)
 
         elif st == "BACKOFF":
-            active, bdone = self._player.fields(now)
-            if bdone:
+            # Session 30: a phase-timer, not a flight_playbook.json recipe. A manual test (full throttle ->
+            # release trigger -> immediately hold reverse) found ~2s of held reverse gives the right backoff
+            # effect, and that the gates need to flip the INSTANT they're commanded (not wait for io_bridge's
+            # own smooth release/attack ramp to catch up) — `gate_override` (io_bridge.py) makes that happen.
+            # HOLD: trigger cut immediately, full-magnitude reverse held for backoff_hold_s (the underlying
+            # analog ramps stay untouched — trigger decays over its normal ~10 ticks, reverse climbs over its
+            # normal ~20 ticks to backoff_reverse_mag, both while the gates already read the new state).
+            # RELEASE: reverse released immediately; wait backoff_release_s (open-loop, matching every other
+            # timed sub-phase in this file — the autopilot can't see io_bridge's internal ramped values) for
+            # the reverse analog to finish decaying before declaring BACKOFF done.
+            elapsed = now - self._backoff_t0
+            if elapsed < self.backoff_hold_s:
+                active = {"trigger": 0.0, "reverse": self.backoff_reverse_mag, "gate_override": True}
+            elif elapsed < self.backoff_hold_s + self.backoff_release_s:
+                active = {"trigger": 0.0, "reverse": 0.0, "gate_override": True}
+            else:
                 self._enter("SETTLE", now)
                 event = "backed off -> settle"
 
@@ -3269,6 +3382,14 @@ class ExploreController:
                            f"ratio {ratio:.2f})")
                     event = self._trim_exit(now, plan, msg)
                     return active, self.state, event
+
+        elif st == "TRIM_RESUME_WAIT":
+            # Session 28: hold neutral until the settle-gate proves a fresh post-TRIM frame exists, then hand
+            # off to _trim_resolve_resume (re-aim at the preserved goal, or fall back to SETTLE->REPLAN if it
+            # died — e.g. got permanently blacklisted — while TRIM was interrupting the leg). See _trim_exit
+            # for why this wait exists instead of resolving instantly off a possibly-stale pose.
+            if self._settle_gate_poll(now):
+                event = self._trim_resolve_resume(now, plan)
 
         elif st == "RETURN_TO_ORIGIN":
             # Postlude leg 1: home to the take-off origin [0,0] (SLAM frame) at the current mapping height, via a
@@ -4143,10 +4264,11 @@ def run_self_test(cfg):
     t, a, s, st = _drive(ctrl, plan_turn, False, 2.4, t)
     rec(st)
     advancing = (s == "ADVANCE" and float(a.get("trigger", 0)) > 0)
-    # WALL contact -> BACKOFF -> SETTLE.
+    # WALL contact -> BACKOFF -> SETTLE. BACKOFF is now a phase-timer (session 30): backoff_hold_s (2.0) +
+    # backoff_release_s (0.2) before it hands off, so the drive window must comfortably clear that.
     t, a, s, st = _drive(ctrl, plan_turn, True, 0.05, t)
     rec(st)
-    t, a, s, st = _drive(ctrl, plan_turn, False, 0.6, t)
+    t, a, s, st = _drive(ctrl, plan_turn, False, ctrl.backoff_hold_s + ctrl.backoff_release_s + 0.3, t)
     rec(st)
     # Frontiers exhausted during the settle window: a DONE plan must carry SETTLE -> REPLAN -> the postlude
     # (RETURN_TO_ORIGIN; pos=[0,0] so it reaches the origin immediately -> DOCK_FLOOR). Postlude coverage is
@@ -4358,15 +4480,22 @@ def run_self_test(cfg):
     adv_big = (s == "ADVANCE" and float(a.get("trigger", 0)) > 0)
     near = dict(big, forward_clearance_dist=cs.stop_clearance_dist - 0.05)
     # default (backoff_on_standoff=True): standoff -> BACKOFF (reverse>0) -> SETTLE, no REVERSE_PROBE.
-    bo_states, saw_rev_bo, tt = [], False, t
-    for _ in range(40):                                   # ~2s: BACKOFF(0.3s) -> SETTLE
+    # BACKOFF is now a phase-timer (session 30): backoff_hold_s (2.0) + backoff_release_s (0.2) before it
+    # hands off to SETTLE, so the drive window must comfortably clear that (was a flat 40 ticks / ~2s, sized
+    # for the old fixed 0.3s recipe).
+    bo_ticks = int((cs.backoff_hold_s + cs.backoff_release_s + 0.3) / 0.05)
+    bo_states, saw_rev_bo, saw_full_rev, tt = [], False, False, t
+    for _ in range(bo_ticks):
         a2, s2, _ev = cs.step(tt, near, False, False, status="OK")
         if not bo_states or bo_states[-1] != s2:
             bo_states.append(s2)
-        if float((a2 or {}).get("reverse", 0.0) or 0.0) > 0.0:
+        rev = float((a2 or {}).get("reverse", 0.0) or 0.0)
+        if rev > 0.0:
             saw_rev_bo = True
+        if rev >= cs.backoff_reverse_mag - 1e-6:
+            saw_full_rev = True
         tt += 0.05
-    backoff_path = (cs.backoff_on_standoff and s == "ADVANCE" and saw_rev_bo
+    backoff_path = (cs.backoff_on_standoff and s == "ADVANCE" and saw_rev_bo and saw_full_rev
                     and ("REVERSE_PROBE" not in bo_states)
                     and _is_subsequence(["BACKOFF", "SETTLE"], bo_states))
     # backoff_on_standoff=False: standoff settles directly (old behavior), no BACKOFF / reverse.
@@ -4384,6 +4513,34 @@ def run_self_test(cfg):
     ok = ok and clr_ok
     print(f"[self-test] {'PASS' if clr_ok else 'FAIL'}  explore CLEARANCE-STOP (far->advance, "
           f"<{cs.stop_clearance_dist:g}->BACKOFF(reverse re-arm)->settle | flag-off->direct settle, None->advance)")
+
+    # ---- BACKOFF phase-timer (session 30): hard gate cut + full-magnitude 2s reverse ----
+    cbo = ExploreController(cfg, no_takeoff=True)
+    cbo.backoff_hold_s = 0.3          # shrink the timings for a fast test; the LOGIC under test is the
+    cbo.backoff_release_s = 0.1       # phase transitions themselves, not the specific durations
+    cbo._backoff_t0 = 0.0
+    cbo._enter("BACKOFF", 0.0)
+    plan_bo = {"plan_valid": True, "done": False, "goal": [3.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0}
+    a0, s0, _ = cbo.step(0.0, plan_bo, False)
+    hold_ok = (s0 == "BACKOFF" and a0.get("gate_override") is True
+              and float(a0.get("trigger", -1)) == 0.0
+              and abs(float(a0.get("reverse", -1)) - cbo.backoff_reverse_mag) < 1e-9)
+    a1, s1, _ = cbo.step(0.2, plan_bo, False)                    # inside hold_s (0.3) still
+    still_holding = (s1 == "BACKOFF" and abs(float(a1.get("reverse", -1)) - cbo.backoff_reverse_mag) < 1e-9)
+    a2, s2, _ = cbo.step(0.31, plan_bo, False)                   # past hold_s -> RELEASE phase
+    release_ok = (s2 == "BACKOFF" and a2.get("gate_override") is True
+                 and float(a2.get("reverse", -1)) == 0.0 and float(a2.get("trigger", -1)) == 0.0)
+    a3, s3, ev3 = cbo.step(0.45, plan_bo, False)                 # past hold_s + release_s (0.4) -> done
+    done_ok = (s3 == "SETTLE" and "backed off" in (ev3 or ""))
+    # default backoff_reverse_mag is FULL magnitude (1.0), independent of the throttled reverse_throttle
+    # (0.2 by config) used by every other reverse-emitting site.
+    full_mag_ok = abs(cbo.backoff_reverse_mag - 1.0) < 1e-9
+    backoff_timer_ok = hold_ok and still_holding and release_ok and done_ok and full_mag_ok
+    ok = ok and backoff_timer_ok
+    print(f"[self-test] {'PASS' if backoff_timer_ok else 'FAIL'}  BACKOFF phase-timer "
+          f"(hold: gate_override+trigger=0+full reverse={hold_ok}, holds through hold_s={still_holding}, "
+          f"release: reverse=0+gate_override still True={release_ok}, done->settle={done_ok}, "
+          f"default mag is FULL (1.0, not reverse_throttle)={full_mag_ok})")
 
     # ---- forward_throttle override: the config knob sets the ADVANCE/parallax forward trigger ----
     ft_cfg = (cfg["autonomy"].get("explore") or {}).get("forward_throttle", None)
@@ -4554,13 +4711,30 @@ def run_self_test(cfg):
         c._ceiling_y, c._desired_y, c._trim_delta = -2.3, -1.9, 0.4   # threshold = -2.3 + 1.2*0.4 = -1.82
         c.trim_aim_s = c.trim_fwd_s = 0.1
         c.trim_reset_s, c.trim_reposition_s, c.trim_settle_s = 0.05, 0.1, 0.2
+        c.settle_gate_s = 0.05          # session 28: TRIM_RESUME_WAIT's gate -- independent of rest_between_s
+        c.settle_fresh_frames = 3       # shorten the post-abort/post-climb wait loops below
         return c
 
-    def _tplan(posy, pos=(0.0, 0.0), fcd=5.0, ring=None, cap=0.0):
-        return {"plan_valid": True, "done": False, "goal": [3.0, 0.0], "pos": list(pos),
-                "bearing_err": 0.0, "heading_deg": 0.0, "pos_y": posy, "slam_ms": 200.0, "frame_id": 1,
+    def _tplan(posy, pos=(0.0, 0.0), fcd=5.0, ring=None, cap=0.0, fid=1, goal=(3.0, 0.0),
+              blacklist=None, blacklist_permanent=None):
+        return {"plan_valid": True, "done": False, "goal": list(goal), "pos": list(pos),
+                "bearing_err": 0.0, "heading_deg": 0.0, "pos_y": posy, "slam_ms": 200.0, "frame_id": fid,
                 "cap_ts": cap, "forward_clearance_dist": fcd,
-                "clearance_ring": ring if ring is not None else [[0.0, 5.0], [180.0, 5.0], [90.0, 5.0], [-90.0, 5.0]]}
+                "clearance_ring": ring if ring is not None else [[0.0, 5.0], [180.0, 5.0], [90.0, 5.0], [-90.0, 5.0]],
+                "blacklist": blacklist or [], "blacklist_permanent": blacklist_permanent or []}
+
+    def _run_trim_resume_wait(c, t0, cap0, fid0, max_ticks=20, **plan_kw):
+        """Step `c` (currently in TRIM_RESUME_WAIT) forward, feeding a fresh healthy frame each tick
+        (new frame_id + cap_ts >= t0) until the settle-gate clears and it resolves away, or max_ticks is
+        exhausted. Returns (active, state, event) of the LAST tick."""
+        tt, cap, fid = t0, cap0, fid0
+        active, s, ev = {}, c.state, None
+        for _ in range(max_ticks):
+            active, s, ev = c.step(tt, _tplan(-1.7, cap=cap, fid=fid, **plan_kw), False)
+            if s != "TRIM_RESUME_WAIT":
+                break
+            tt += 0.02; cap += 0.02; fid += 1
+        return active, s, ev
     # (a) sag in ADVANCE fires TRIM, snapshots the committed goal (Trap B) AND clears the pending per-hop eval
     #     (session 20b: a trim-interrupted hop must not be judged); at desired height it does NOT fire.
     ta = _mk_trim(); ta._enter("ADVANCE", 0.0); ta.leg_goal = [3.0, 0.0]
@@ -4589,18 +4763,24 @@ def run_self_test(cfg):
     ts = _mk_trim(); ts._enter("ADVANCE", 0.0); ts.leg_goal = [3.0, 0.0]
     ts.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 5.0], [-90.0, 0.3]]), False)
     strafe_repos = (ts._trim_repos_move is not None and "joy_horizontal" in ts._trim_repos_move)
-    # (e) ring blocked all sides -> abort (VISIBLE), exit re-aiming ORIENT at the PRESERVED goal (not TRIM).
+    # (e) ring blocked all sides -> abort (VISIBLE) -> TRIM_RESUME_WAIT (session 28: gated on a fresh
+    #     post-abort frame, not instant) -> once the settle-gate clears, re-aims ORIENT at the PRESERVED goal.
     tz = _mk_trim(); tz._enter("ADVANCE", 0.0); tz.leg_goal = [3.0, 0.0]
-    _, sZ, evZ = tz.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]]), False)
-    abort_ok = (sZ != "TRIM" and tz.leg_goal == [3.0, 0.0] and "abort" in (evZ or ""))
+    _, sZ0, evZ0 = tz.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]],
+                                       cap=0.0, fid=1), False)
+    abort_gated = (sZ0 == "TRIM_RESUME_WAIT" and "abort" in (evZ0 or ""))
+    _, sZ, evZ = _run_trim_resume_wait(tz, 0.02, 0.02, 2)
+    abort_ok = (abort_gated and sZ == "ORIENT" and tz.leg_goal == [3.0, 0.0])
     # (f) full climb: emits pitch-up -> forward push (WITH trigger_down derived at the choke point — Unity gates
     #     real thrust on the boolean) -> 'c' reset; WAIT holds until cap_ts >= t0+settle (review-C: the gate is
-    #     phase-relative, so a stale pre-TRIM frame can't exit early); then re-aims ORIENT at the preserved goal.
+    #     phase-relative, so a stale pre-TRIM frame can't exit early); TRIM's own exit then hands off to
+    #     TRIM_RESUME_WAIT (session 28), which re-aims ORIENT at the preserved goal once ITS OWN settle-gate
+    #     (a fresh frame captured after the exit) clears.
     te = _mk_trim(); te._enter("ADVANCE", 0.0); te.leg_goal = [3.0, 0.0]
     saw_pitch = saw_fwd = saw_c = fwd_gated = False
-    tt, cap, final = 0.0, 0.0, None
+    tt, cap, fid, mid = 0.0, 0.0, 1, None
     for _ in range(300):
-        aE, sE, _ = te.step(tt, _tplan(-1.7, cap=cap), False)
+        aE, sE, _ = te.step(tt, _tplan(-1.7, cap=cap, fid=fid), False)
         if float(aE.get("pitch", 0.0)) != 0.0:
             saw_pitch = True
         if float(aE.get("trigger", 0.0) or 0.0) > 0.0:
@@ -4610,20 +4790,44 @@ def run_self_test(cfg):
         if aE.get("btnCdown"):
             saw_c = True
         if sE != "TRIM":
-            final = sE; break
-        tt += 0.02; cap += 0.02
-    climb_ok = (saw_pitch and saw_fwd and fwd_gated and saw_c and final == "ORIENT" and te.leg_goal == [3.0, 0.0])
+            mid = sE; break
+        tt += 0.02; cap += 0.02; fid += 1
+    climb_wait_gated = (mid == "TRIM_RESUME_WAIT")
+    _, final, _ = _run_trim_resume_wait(te, tt + 0.02, cap + 0.02, fid + 1)
+    climb_ok = (saw_pitch and saw_fwd and fwd_gated and saw_c and climb_wait_gated
+                and final == "ORIENT" and te.leg_goal == [3.0, 0.0])
     tw = _mk_trim(); tw._enter("TRIM", 0.0); tw._trim_phase = "WAIT"; tw._trim_cmd_t0 = 0.0
     tw._trim_resume_goal = [3.0, 0.0]; tw._trimming = True
     _, sW, _ = tw.step(1.0, _tplan(-1.7, cap=None), False)           # cap_ts None -> not ready -> hold
     wait_hold = (sW == "TRIM")
+    # (g) session 28: the preserved goal died (permanently blacklisted) WHILE TRIM was interrupting the leg
+    #     -> TRIM_RESUME_WAIT must NOT blindly restore it -> falls through to SETTLE->REPLAN instead.
+    tg = _mk_trim(); tg._enter("ADVANCE", 0.0); tg.leg_goal = [3.0, 0.0]
+    _, sG0, evG0 = tg.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]],
+                                       cap=0.0, fid=1), False)
+    gated_g = (sG0 == "TRIM_RESUME_WAIT")
+    _, sG, evG = _run_trim_resume_wait(tg, 0.02, 0.02, 2,
+                                       blacklist=[[3.0, 0.0]], blacklist_permanent=[True])
+    blacklist_reroute_ok = (gated_g and sG == "SETTLE" and tg._settle_to == "REPLAN"
+                            and tg.leg_goal == [3.0, 0.0]     # leg_goal untouched (never re-restored)
+                            and "blacklisted" in (evG or ""))
+    # (h) same setup, but the goal is only SOFT-blacklisted (not permanent) -> still restored normally
+    #     (only a PERMANENT kill should stop the restore -- a soft/round exclusion may clear next round).
+    th = _mk_trim(); th._enter("ADVANCE", 0.0); th.leg_goal = [3.0, 0.0]
+    th.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]],
+                        cap=0.0, fid=1), False)
+    _, sH, _ = _run_trim_resume_wait(th, 0.02, 0.02, 2,
+                                     blacklist=[[3.0, 0.0]], blacklist_permanent=[False])
+    soft_blacklist_still_restores = (sH == "ORIENT" and th.leg_goal == [3.0, 0.0])
     trim_ok = (trig_adv and no_trig and none_guard and suppress_ok and repos_rev and strafe_repos and abort_ok
-               and climb_ok and wait_hold)
+               and climb_ok and wait_hold and blacklist_reroute_ok and soft_blacklist_still_restores)
     ok = ok and trim_ok
     print(f"[self-test] {'PASS' if trim_ok else 'FAIL'}  explore HEIGHT-TRIM (sag->TRIM+goal-snapshot+hop-eval-clear="
           f"{trig_adv}, no-sag={no_trig}, None-refs-no-op={none_guard}, calib/state-suppress={suppress_ok}, "
-          f"reverse-repos={repos_rev}, strafe-repos={strafe_repos}, ring-blocked-abort={abort_ok}, "
-          f"climb pitch/fwd+triggerDown/c+re-aim={climb_ok}, cap-None-holds={wait_hold})")
+          f"reverse-repos={repos_rev}, strafe-repos={strafe_repos}, ring-blocked-abort(gated)={abort_ok}, "
+          f"climb pitch/fwd+triggerDown/c+re-aim(gated)={climb_ok}, cap-None-holds={wait_hold}, "
+          f"perm-blacklist->settle-replan={blacklist_reroute_ok}, "
+          f"soft-blacklist-still-restores={soft_blacklist_still_restores})")
 
     # ---- (session 21) PERIODIC HEIGHT RE-CALIBRATION on goal change (cooldown-gated) ----
     cfg_cal = copy.deepcopy(cfg)
@@ -4677,15 +4881,18 @@ def run_self_test(cfg):
     tdn = _mk_trim(); tdn._enter("ADVANCE", 0.0); tdn.leg_goal = [3.0, 0.0]
     _, sDn, evDn = tdn.step(0.0, _tplan(-2.05), False)     # high thr = -1.9 - 0.2*0.4 = -1.98; -2.05 < -1.98 -> DOWN
     down_fired = (sDn == "TRIM" and tdn._trim_dir == "DOWN" and "(DOWN)" in (evDn or ""))
-    saw_down_pitch, tt, cap, final_dn = False, 0.02, 0.02, None
+    saw_down_pitch, tt, cap, fid, mid_dn = False, 0.02, 0.02, 1, None
     for _ in range(300):
-        aD, sD2, _ = tdn.step(tt, _tplan(-2.05, cap=cap), False)
+        aD, sD2, _ = tdn.step(tt, _tplan(-2.05, cap=cap, fid=fid), False)
         if float(aD.get("pitch", 0.0)) > 0.0:              # +1.0 = aim DOWN
             saw_down_pitch = True
         if sD2 != "TRIM":
-            final_dn = sD2; break
-        tt += 0.02; cap += 0.02
-    down_ok = (down_fired and saw_down_pitch and final_dn == "ORIENT" and tdn.leg_goal == [3.0, 0.0])
+            mid_dn = sD2; break
+        tt += 0.02; cap += 0.02; fid += 1
+    # session 28: TRIM's exit hands off to TRIM_RESUME_WAIT (gated re-aim); resolve it here too.
+    _, final_dn, _ = _run_trim_resume_wait(tdn, tt + 0.02, cap + 0.02, fid + 1)
+    down_ok = (down_fired and saw_down_pitch and mid_dn == "TRIM_RESUME_WAIT"
+               and final_dn == "ORIENT" and tdn.leg_goal == [3.0, 0.0])
     tin = _mk_trim(); tin._enter("ADVANCE", 0.0); tin.leg_goal = [3.0, 0.0]
     _, sIn, _ = tin.step(0.0, _tplan(-1.9), False)          # exactly desired -> inside the band
     band_ok = (sIn == "ADVANCE")
@@ -5300,8 +5507,13 @@ def run_self_test(cfg):
     ch = ExploreController(cfg, no_takeoff=True)
     _, ah, sh, _ = _drive(ch, {"plan_valid": False, "goal": None, "pos": [0.0, 0.0]}, False, 3.0, 0.0, status="PLAN-LOST")
     hold_ok = (sh == "HOLD_LOST" and ah == {})
-    # (c) PLAN-STALE (with history) -> RECOVERY_REWIND; then OK -> wait for SLAM to settle -> brake -> resume.
+    # (c) PLAN-STALE (with history) + use_rewind_on_stale=True -> RECOVERY_REWIND; then OK -> wait for SLAM
+    #     to settle -> brake -> resume. REWIND is default-OFF as of session 31 (operator ask -- never once
+    #     visibly helped on a real flight), so this test opts back in explicitly to keep the (still-present,
+    #     just default-disabled) code path covered.
     cw = ExploreController(cfg, no_takeoff=True)
+    cw.use_rewind_on_stale = True
+    cw._ever_tracked = True            # a MID-FLIGHT loss, not startup warmup (that's its own WARMUP guard)
     cw.settle_gate_s = 0.05            # small physical dwell so this test's tick budget stays short
     cw.command_history.append({"kind": "forward", "value": 0.2, "duration_s": 2.0})
     cw.command_history.append({"kind": "turn", "theta": 45.0})
@@ -5313,30 +5525,33 @@ def run_self_test(cfg):
                              False, cw.settle_gate_s + 1.0, t, status="OK")
     # recovery-exit now HOLDs for SLAM to settle before braking (strengthen the solve) -> SETTLE -> replan.
     snap_ok = ("SLAM_HOLD" in st_ok) and ("SETTLE" in st_ok) and (so in ("REPLAN", "ORIENT", "ADVANCE"))
-    # (d) PLAN-STALE + EMPTY history -> RING-PICKED FALLBACK -> STUCK after cap. The sweep is UNIDIRECTIONAL
-    #     (turn always +, never <0); the push is backward-if-pushable / else strafe (NEVER forward -> no ram).
+    # (d) PLAN-STALE + EMPTY history, default use_rewind_on_stale=False -> straight to the FALLBACK sweep ->
+    #     STUCK once fallback_max_rotation_deg is reached (session 31). The turn sweep is UNIDIRECTIONAL
+    #     (turn always +, never <0); forward pushes ARE allowed (unlike normal scouting -- while blind
+    #     there's no live signal saying the back is any safer than the front), so this only checks that SOME
+    #     push happens and the turn direction never flips. Shrink every timing knob for a fast test.
     cf = ExploreController(cfg, no_takeoff=True)
-    cf.fallback_max_attempts = 3            # small cap so STUCK is reached within the drive window
+    cf.fallback_initial_wait_s = 0.02
+    cf.fallback_post_push_wait_s = 0.02
+    cf.fallback_push_fwd_back_s = 0.02
+    cf.fallback_push_strafe_s = 0.02
+    cf.fallback_max_rotation_deg = 2 * cf.recovery_turn_step_deg   # 2 cycles -> STUCK within the drive window
     cf._ever_tracked = True                 # a MID-FLIGHT loss (history wiped by a wall hit), not startup warmup
     cf.command_history.clear()
-    cf._last_ring = [[0.0, 5.0], [45.0, 5.0], [90.0, 5.0], [135.0, 1.0],
-                     [180.0, 1.0], [-135.0, 1.0], [-90.0, 5.0], [-45.0, 5.0]]   # back pushable (1.0 >= 0.7)
-    seen, saw_fwd, saw_back, saw_turn_pos, saw_turn_neg, t = set(), False, False, False, False, 0.0
-    for _ in range(int(30.0 / 0.05)):
+    seen, saw_push, saw_turn_pos, saw_turn_neg, t = set(), False, False, False, 0.0
+    for _ in range(int(5.0 / 0.02)):
         a, s, _ = cf.step(t, stale, False, status="PLAN-STALE")
         seen.add(s)
         if s == "FALLBACK":
-            if float(a.get("trigger", 0.0)) > 0:
-                saw_fwd = True                        # forward push must NEVER happen (no-ram principle)
-            if float(a.get("reverse", 0.0)) > 0:
-                saw_back = True                       # ring-picked backward push (back is pushable here)
+            if any(abs(float(a.get(k, 0.0) or 0.0)) > 0 for k in ("trigger", "reverse", "joy_horizontal")):
+                saw_push = True
             y = float(a.get("yaw", 0.0))
             if y > 0:
                 saw_turn_pos = True
             if y < 0:
                 saw_turn_neg = True                   # must NEVER happen (unidirectional sweep)
-        t += 0.05
-    fallback_ok = ("FALLBACK" in seen and "STUCK" in seen and saw_back and not saw_fwd
+        t += 0.02
+    fallback_ok = ("FALLBACK" in seen and "STUCK" in seen and saw_push
                    and saw_turn_pos and not saw_turn_neg)
     # the fallback turn is a SINGLE gentle recovery step (recovery_turn_step_deg=15), never a 90/135/180 escalation.
     fallback_le45 = (cf.recovery_turn_step_deg <= 45.0)
@@ -5359,24 +5574,32 @@ def run_self_test(cfg):
     stale_nr = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None}
     lost_nr = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0]}
     # (f) FLICKER PERSISTENCE: a PLAN-LOST<->PLAN-STALE flicker must NOT reset recovery -> STUCK stays reachable
-    #     (the flight-20260713 frantic loop). Arm recovery on STALE (fallback counter climbs), flick to LOST
-    #     (HOLD_LOST), back to STALE -> the counter PERSISTS and STUCK is reached.
+    #     (the flight-20260713 frantic loop). Arm recovery on STALE (the sweep's cycle count climbs), flick to
+    #     LOST (HOLD_LOST), back to STALE -> the cycle count + cumulative rotation PERSIST and STUCK is reached.
     cflk = ExploreController(cfg, no_takeoff=True)
-    cflk.fallback_max_attempts = 3
+    cflk.fallback_initial_wait_s = 0.02
+    cflk.fallback_post_push_wait_s = 0.02
+    cflk.fallback_push_fwd_back_s = 0.02
+    cflk.fallback_push_strafe_s = 0.02
+    cflk.fallback_max_rotation_deg = 2 * cflk.recovery_turn_step_deg   # 2 cycles -> STUCK
     cflk._ever_tracked = True
     tt = 0.0
-    tt, _, _, _ = _drive(cflk, stale_nr, False, 3.0, tt, status="PLAN-STALE")   # arm + a couple fallback attempts
-    att_mid, rec_mid = cflk._fallback_attempts, cflk._recovering
+    tt, _, _, _ = _drive(cflk, stale_nr, False, 1.0, tt, status="PLAN-STALE")   # arm + a fallback cycle or two
+    cyc_mid, rec_mid = cflk._fallback_cycle, cflk._recovering
     tt, _, _, s_lost = _drive(cflk, lost_nr, False, 1.0, tt, status="PLAN-LOST")  # flicker -> HOLD_LOST
-    att_after, rec_after = cflk._fallback_attempts, cflk._recovering              # must NOT reset
+    cyc_after, rec_after = cflk._fallback_cycle, cflk._recovering                # must NOT reset
     seen_f = set()
-    for _ in range(int(30.0 / 0.05)):
-        _a, s2, _ = cflk.step(tt, stale_nr, False, status="PLAN-STALE"); seen_f.add(s2); tt += 0.05
-    flicker_ok = (rec_mid and att_mid >= 1 and rec_after and att_after >= att_mid
+    for _ in range(int(5.0 / 0.02)):
+        _a, s2, _ = cflk.step(tt, stale_nr, False, status="PLAN-STALE"); seen_f.add(s2); tt += 0.02
+    flicker_ok = (rec_mid and rec_after and cyc_after >= cyc_mid
                   and "HOLD_LOST" in s_lost and "STUCK" in seen_f)
-    # (g) CONSUMING REWIND: each REWIND cycle pops ONE maneuver; the history DRAINS to empty then -> FALLBACK.
+    # (g) CONSUMING REWIND (use_rewind_on_stale=True -- default off as of session 31, opted back in here to
+    #     keep the code path covered): each REWIND cycle pops ONE maneuver; the history DRAINS to empty then
+    #     -> FALLBACK.
     crw = ExploreController(cfg, no_takeoff=True)
+    crw.use_rewind_on_stale = True
     crw._ever_tracked = True
+    crw.recovery_settle_max_s = 0.1         # keep the inter-step settle fast regardless of the live config
     for _ in range(4):
         crw.command_history.append({"kind": "forward", "value": 0.2, "duration_s": 0.3})
     seen_g = set(); tt = 0.0
@@ -5387,6 +5610,7 @@ def run_self_test(cfg):
     #     now-stale leftover history and jumps straight to FALLBACK (no displaced ghost-path REWIND replay).
     cgp = ExploreController(cfg, no_takeoff=True)
     cgp._ever_tracked = True
+    cgp.use_rewind_on_stale = True   # exercise the REWIND-side ghost-path guard (default-off since session 31)
     cgp._recovering = True
     cgp._history_broken = True
     cgp.command_history.append({"kind": "forward", "value": 0.2, "duration_s": 0.3})
@@ -5403,12 +5627,12 @@ def run_self_test(cfg):
     padv_c = {"plan_valid": True, "done": False, "goal": [10.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
               "forward_clearance_dist": 8.0, "pos_y": 0.0, "slam_ms": 120.0, "frame_id": 1}
     cca = ExploreController(cfg, no_takeoff=True)
-    cca._recovering = True; cca._history_broken = True; cca._fallback_attempts = 5
+    cca._recovering = True; cca._history_broken = True; cca._fallback_cycle = 5
     cca.command_history.append({"kind": "turn", "theta": 15.0})
     cca.leg_goal = [10.0, 0.0]; cca.target_altitude_y = 0.0; cca.state = "ADVANCE"
     cca.step(0.0, padv_c, False, status="OK")                                   # capture start = [0,0]
     cca.step(0.1, dict(padv_c, pos=[1.2, 0.0], frame_id=2), False, status="OK")  # moved 1.2 >= 1.0 -> confirm
-    confirm_ok = (not cca._recovering and not cca._history_broken and cca._fallback_attempts == 0
+    confirm_ok = (not cca._recovering and not cca._history_broken and cca._fallback_cycle == 0
                   and len(cca.command_history) == 0)
     ccb = ExploreController(cfg, no_takeoff=True)
     ccb._recovering = True; ccb.leg_goal = [10.0, 0.0]; ccb.target_altitude_y = 0.0; ccb.state = "ADVANCE"
@@ -5450,6 +5674,7 @@ def run_self_test(cfg):
     # (a) REWIND: with 2 flown maneuvers, a PLAN-STALE recovery must HOLD (_rec_settling) BETWEEN popping each
     #     inverse — not fire them back-to-back. Inject a live frame stream so the bounded lost-SLAM settle resolves.
     crs = ExploreController(cfg, no_takeoff=True); crs._ever_tracked = True
+    crs.use_rewind_on_stale = True   # exercise REWIND specifically (default-off since session 31)
     crs.rest_between_s = 0.1; crs.recovery_settle_frames = 2
     crs.command_history.append({"kind": "forward", "value": 0.2, "duration_s": 0.2})
     crs.command_history.append({"kind": "forward", "value": 0.2, "duration_s": 0.2})
@@ -5462,18 +5687,21 @@ def run_self_test(cfg):
             rewind_settled = True
         trs += 0.05
     rewind_settle_ok = rewind_settled and "REWIND" in seen_rw and "FALLBACK" in seen_rw
-    # (b) FALLBACK: empty history -> ring-picked sweep; consecutive attempts must be SEPARATED by a settle, and
-    #     STUCK is still reached at the cap.
+    # (b) FALLBACK: empty history -> the 4-phase sweep (session 31); consecutive pushes must be SEPARATED by
+    #     the fixed WAIT_POST phase (not back-to-back), and STUCK is still reached at the rotation cap.
     cfs = ExploreController(cfg, no_takeoff=True); cfs._ever_tracked = True
-    cfs.rest_between_s = 0.1; cfs.recovery_settle_frames = 2; cfs.fallback_max_attempts = 3
+    cfs.fallback_initial_wait_s = 0.02; cfs.fallback_post_push_wait_s = 0.05
+    cfs.fallback_push_fwd_back_s = 0.02; cfs.fallback_push_strafe_s = 0.02
+    cfs.fallback_max_rotation_deg = 2 * cfs.recovery_turn_step_deg
+    cfs.command_history.clear()
     fb_settled, seen_fb, tfs, fidfs = False, set(), 0.0, 300
-    for _ in range(int(25.0 / 0.05)):
+    for _ in range(int(5.0 / 0.02)):
         fidfs += 1
         _a, s, _ = cfs.step(tfs, dict(rec_stale, frame_id=fidfs, cap_ts=tfs, slam_ms=200.0), False, status="PLAN-STALE")
         seen_fb.add(s)
-        if s == "FALLBACK" and cfs._rec_settling:
+        if s == "FALLBACK" and cfs._fallback_phase == "WAIT_POST":
             fb_settled = True
-        tfs += 0.05
+        tfs += 0.02
     fb_settle_ok = fb_settled and "STUCK" in seen_fb
     # (c) BOUNDED escape: with NO fresh frames (frame_id absent) the recovery settle must still END at
     #     recovery_settle_max_s (dead pipeline) so a re-exposure maneuver follows — never hang.
@@ -5483,20 +5711,120 @@ def run_self_test(cfg):
     d_early, _ = cbnd._settle_poll(0.2, {"pos": [0, 0]}, require_fast=False, min_frames=4, max_hold_s=0.5)
     d_cap, capped = cbnd._settle_poll(0.6, {"pos": [0, 0]}, require_fast=False, min_frames=4, max_hold_s=0.5)
     bounded_ok = (not d_early) and d_cap and capped
-    # (d) FALLBACK step ORDER: turn (yaw) FIRST, ring-picked push (reverse/strafe) LAST -> the motion right before
-    #     the settle is a parallax translation, not a bare rotation. Back is pushable (ring None), so expect a
-    #     reverse push, and its index must be AFTER the yaw's.
-    cord = ExploreController(cfg, no_takeoff=True); cord._last_ring = None
-    cord._begin_fallback(0.0, None)
-    fsteps = cord._player.steps
-    yaw_i = next((k for k, st in enumerate(fsteps) if "yaw" in st), None)
-    push_i = next((k for k, st in enumerate(fsteps) if "reverse" in st or "joy_horizontal" in st), None)
-    order_ok = yaw_i is not None and push_i is not None and yaw_i < push_i
+    # (d) FALLBACK phase ORDER: TURN (yaw) completes FIRST, PUSH (reverse/strafe/trigger) LAST -> the motion
+    #     right before the settle is a parallax translation, not a bare rotation.
+    cord = ExploreController(cfg, no_takeoff=True)
+    cord._ever_tracked = True
+    cord.fallback_initial_wait_s = 0.02
+    cord.command_history.clear()
+    saw_turn_yaw, cum_before_push, t = False, None, 0.0
+    for _ in range(int(3.0 / 0.02)):
+        a, s, _ = cord.step(t, stale, False, status="PLAN-STALE")
+        if cord._fallback_phase == "TURN" and abs(float(a.get("yaw", 0.0) or 0.0)) > 0:
+            saw_turn_yaw = True
+        if cord._fallback_phase == "PUSH":
+            cum_before_push = cord._fallback_cum_deg
+            break
+        t += 0.02
+    order_ok = saw_turn_yaw and cum_before_push == cord.recovery_turn_step_deg
     rec_settle_ok = rewind_settle_ok and fb_settle_ok and bounded_ok and order_ok
     ok = ok and rec_settle_ok
     print(f"[self-test] {'PASS' if rec_settle_ok else 'FAIL'}  RECOVERY inter-action settles "
           f"(REWIND holds between pops={rewind_settle_ok}, FALLBACK holds between attempts+STUCK={fb_settle_ok}, "
           f"bounded-escape-when-dead={bounded_ok}, turn-before-push={order_ok})")
+
+    # ---- FALLBACK sweep (session 31, replaces the session-29 direction-cycling search) ----
+    # (a) INITIAL_WAIT holds neutral for fallback_initial_wait_s before the first TURN begins.
+    caw = ExploreController(cfg, no_takeoff=True)
+    caw._ever_tracked = True
+    caw.fallback_initial_wait_s = 0.1
+    caw.command_history.clear()
+    seen_aw, t = set(), 0.0
+    for _ in range(int(0.3 / 0.02)):
+        _a, s, _ = caw.step(t, stale, False, status="PLAN-STALE")
+        seen_aw.add((s, caw._fallback_phase))
+        t += 0.02
+    initial_wait_ok = (("FALLBACK", "INITIAL_WAIT") in seen_aw and ("FALLBACK", "TURN") in seen_aw)
+    # (b) a full cycle visits TURN -> PUSH -> WAIT_POST, accumulates _fallback_cum_deg by recovery_turn_step_deg
+    #     per cycle, and PUSH commands a FULL-magnitude move (no throttled knobs).
+    ccy = ExploreController(cfg, no_takeoff=True)
+    ccy._ever_tracked = True
+    ccy.fallback_initial_wait_s = 0.02; ccy.fallback_post_push_wait_s = 0.02
+    ccy.fallback_push_fwd_back_s = 0.02; ccy.fallback_push_strafe_s = 0.02
+    ccy.command_history.clear()
+    seen_cy, saw_push_mag, t = set(), False, 0.0
+    for _ in range(int(2.0 / 0.02)):
+        a, s, _ = ccy.step(t, stale, False, status="PLAN-STALE")
+        seen_cy.add(ccy._fallback_phase)
+        if ccy._fallback_phase == "PUSH":
+            mags = [abs(float(a.get(k, 0.0) or 0.0)) for k in ("trigger", "reverse", "joy_horizontal")]
+            if mags and max(mags) >= 0.999:
+                saw_push_mag = True
+        t += 0.02
+        if ccy._fallback_phase == "WAIT_POST":
+            break
+    cycle_ok = ({"INITIAL_WAIT", "TURN", "PUSH"} <= seen_cy and saw_push_mag
+                and ccy._fallback_cum_deg == ccy.recovery_turn_step_deg)
+    # (c) a live contact MATCHING the in-flight push direction ends that push early; a MISMATCHED contact
+    #     (e.g. backwall while pushing forward) does not.
+    ccc = ExploreController(cfg, no_takeoff=True)
+    ccc._ever_tracked = True
+    ccc.fallback_initial_wait_s = 0.0
+    ccc.fallback_push_fwd_back_s = 1.0
+    ccc._enter_fallback_sweep(0.0, None)
+    ccc._fallback_phase, ccc._fallback_phase_t0 = "PUSH", 0.0
+    ccc._fallback_push_dirn = "forward"
+    ccc.step(0.0, stale, False, status="PLAN-STALE")             # builds the push player
+    ccc.step(0.01, stale, True, status="PLAN-STALE")             # wall_contact=True mid-forward-push
+    push_aborted_ok = ccc._fallback_phase == "WAIT_POST"
+    ccm = ExploreController(cfg, no_takeoff=True)
+    ccm._ever_tracked = True
+    ccm.fallback_initial_wait_s = 0.0
+    ccm.fallback_push_fwd_back_s = 1.0
+    ccm._enter_fallback_sweep(0.0, None)
+    ccm._fallback_phase, ccm._fallback_phase_t0 = "PUSH", 0.0
+    ccm._fallback_push_dirn = "forward"
+    ccm.step(0.0, stale, False, status="PLAN-STALE")
+    ccm.step(0.01, stale, False, backwall_contact=True, status="PLAN-STALE")   # mismatched -> ignored
+    push_mismatch_ignored = ccm._fallback_phase == "PUSH"
+    contact_early_exit_ok = push_aborted_ok and push_mismatch_ignored
+    # (d) exhaustion: cumulative commanded rotation reaching fallback_max_rotation_deg -> STUCK.
+    cex = ExploreController(cfg, no_takeoff=True)
+    cex._ever_tracked = True
+    cex.fallback_initial_wait_s = 0.02; cex.fallback_post_push_wait_s = 0.02
+    cex.fallback_push_fwd_back_s = 0.02; cex.fallback_push_strafe_s = 0.02
+    cex.fallback_max_rotation_deg = 2 * cex.recovery_turn_step_deg
+    cex.command_history.clear()
+    s, t = None, 0.0
+    for _ in range(int(5.0 / 0.02)):
+        _a, s, _ = cex.step(t, stale, False, status="PLAN-STALE")
+        t += 0.02
+        if s == "STUCK":
+            break
+    exhaust_ok = (s == "STUCK" and cex._fallback_cum_deg >= cex.fallback_max_rotation_deg)
+    # (e) flicker persistence: a bounce through HOLD_LOST mid-phase and back does NOT reset
+    #     _fallback_cum_deg/_fallback_cycle (mirrors the existing _recovering flicker-persist rule).
+    cfl29 = ExploreController(cfg, no_takeoff=True)
+    cfl29._ever_tracked = True
+    cfl29.fallback_initial_wait_s = 0.02
+    cfl29._enter_fallback_sweep(0.0, None)
+    cfl29._fallback_cum_deg = 45.0
+    cfl29._fallback_cycle = 3
+    cfl29._fallback_phase = "TURN"
+    cfl29.state = "HOLD_LOST"                       # simulate the PLAN-LOST flicker bounce
+    cfl29.step(0.0, stale, False, status="PLAN-LOST")
+    cum_after_flicker, cyc_after_flicker = cfl29._fallback_cum_deg, cfl29._fallback_cycle
+    cfl29.state = "FALLBACK"                        # flicker back
+    cfl29.step(0.02, stale, False, status="PLAN-STALE")
+    flicker_persist_ok = (cum_after_flicker == 45.0 and cyc_after_flicker == 3
+                           and cfl29._fallback_cum_deg == 45.0 and cfl29._fallback_cycle == 3)
+    fallback_sweep_ok = (initial_wait_ok and cycle_ok and contact_early_exit_ok and exhaust_ok
+                          and flicker_persist_ok)
+    ok = ok and fallback_sweep_ok
+    print(f"[self-test] {'PASS' if fallback_sweep_ok else 'FAIL'}  FALLBACK sweep (session 31) "
+          f"(initial-wait={initial_wait_ok}, cycle-turn-push-wait={cycle_ok}, "
+          f"live-contact-early-exit={contact_early_exit_ok}, 720deg-exhausted->STUCK={exhaust_ok}, "
+          f"flicker-persist={flicker_persist_ok})")
 
     # ---- SLAM frame-timing settle gate (stop moving while SLAM chokes; resume once it settles) ----
     # (a) _update_slam: counts consecutive FRESH fast frames (deduped on frame_id) + feeds the rolling

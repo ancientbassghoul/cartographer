@@ -175,28 +175,53 @@ class MapStore:
         return None
 
     def clearance(self, origin, heading_deg, fan_deg: float = 15.0, fan_n: int = 3,
-                  skip: float = 0.25, min_count: int = 2, max_range: float = 10.0):
+                  skip: float = 0.25, min_count: int = 2, max_range: float = 10.0,
+                  min_hit_fraction: float = 0.0, detail: bool = False):
         """Forward stand-off distance to the nearest mapped obstacle ahead, for "stop before you ram a
         wall" navigation. Casts a small FAN of GROUND-PLANE rays (Y component zeroed, so they stay at the
         camera's height and read vertical walls, not the floor/ceiling) spread over +/- `fan_deg` around
         `heading_deg`, and returns the NEAREST hit distance (SLAM units), or None if nothing is hit within
         `max_range` (or the map is empty). Heading convention matches `heading_from_pose`: 0 = +Z,
-        +90 = +X. Taking the MIN over the fan is robust to a sparse reconstruction / off-center walls
-        (a single ray can thread between voxels). Reuses `raycast` (a non-normalized direction is fine)."""
-        if origin is None or heading_deg is None or not self._row_of:
-            return None
-        h0 = np.radians(float(heading_deg))
+        +90 = +X. Reuses `raycast` (a non-normalized direction is fine).
+
+        `min_hit_fraction` (session 28, default 0.0 = exact prior behavior): a direction only counts as
+        BLOCKED once at least this FRACTION of the fan's rays hit something within range — below it, the
+        hits are treated as sparse-reconstruction noise and the direction reads OPEN (None). At 0.0 a
+        SINGLE ray hit is enough (the original MIN-over-fan design, chosen because it's robust to a
+        thin/off-center wall a single ray could otherwise thread between). Raising it trades that
+        protection for robustness against the opposite failure: an isolated, spatially-noisy voxel (still
+        passing the per-voxel `min_count` observation filter) falsely reading an entire direction as
+        blocked. When the direction IS judged blocked, the reported distance is still the MIN (nearest)
+        hit among ALL rays that hit — same conservative distance as before, just gated by the vote first.
+
+        `detail` (session 29, default False = exact prior return shape): when True, return a stats dict
+        `{"dist", "n_hits", "n_rays", "fraction", "min_dist", "max_dist", "blocked"}` instead of a bare
+        float/None — the raw ray-hit picture behind the vote (for the replay debugger's Clearance tab),
+        not just its outcome. `dist`/`blocked` are exactly what a `detail=False` call would have returned/
+        acted on (`blocked` is `dist is not None`). `n_rays` is `fan_n` even when the map/origin/heading are
+        unusable, so a caller always gets a well-formed row; `n_hits`/`fraction`/`min_dist`/`max_dist` are
+        computed over EVERY ray that hit within range, independent of the `min_hit_fraction` vote."""
         n = max(int(fan_n), 1)
+        if origin is None or heading_deg is None or not self._row_of:
+            return ({"dist": None, "n_hits": 0, "n_rays": n, "fraction": 0.0,
+                     "min_dist": None, "max_dist": None, "blocked": False} if detail else None)
+        h0 = np.radians(float(heading_deg))
         offs = np.zeros(1) if n == 1 else np.linspace(-np.radians(float(fan_deg)),
                                                        np.radians(float(fan_deg)), n)
-        best = None
+        hits = []
         for a in offs:
             h = h0 + a
             hit = self.raycast(origin, (float(np.sin(h)), 0.0, float(np.cos(h))),
                                max_range=max_range, min_count=min_count, skip=skip)
-            if hit is not None and (best is None or hit[1] < best):
-                best = hit[1]
-        return best
+            if hit is not None:
+                hits.append(hit[1])
+        blocked = bool(hits) and len(hits) >= min_hit_fraction * n
+        dist = min(hits) if blocked else None
+        if not detail:
+            return dist
+        return {"dist": dist, "n_hits": len(hits), "n_rays": n,
+                "fraction": round(len(hits) / n, 3), "min_dist": (min(hits) if hits else None),
+                "max_dist": (max(hits) if hits else None), "blocked": blocked}
 
     def trajectory_array(self):
         return (np.asarray(self.trajectory, dtype=np.float32)
@@ -400,6 +425,82 @@ class MapStore:
 
 
 # ==============================================================================
+# Self-test: synthetic voxels (no SLAM, no hardware) — clearance()'s min_hit_fraction vote
+# (session 28).
+# ==============================================================================
+def run_self_test():
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[map_store][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    origin = (0.0, 0.0, 0.0)
+    # A wide, few-ray fan so each ray's straight-line path is unambiguous: offs = [-40,-20,0,20,40] deg
+    # around heading_deg=0 (+Z). A point placed exactly ON one ray's axis is hit ONLY by that ray -- the
+    # others diverge by >0.7u at these ranges, nowhere near a single 0.1u voxel.
+    fan_kw = dict(heading_deg=0.0, fan_deg=40.0, fan_n=5, skip=0.0, min_count=2, max_range=5.0)
+
+    def _add_twice(store, pt):
+        store.integrate(np.array([pt], np.float64))
+        store.integrate(np.array([pt], np.float64))   # 2nd observation -> passes min_count=2
+
+    # (a) ONE isolated (but min_count-qualified) hit, on-axis at Z=2.0 -> only 1/5 rays (20%) confirm it.
+    #     min_hit_fraction=0.3 (>=1.5 hits needed) -> too few -> treated as OPEN (None), not a false block.
+    sa = MapStore(voxel_size=0.1)
+    _add_twice(sa, (0.0, 0.0, 2.0))
+    isolated_ignored = sa.clearance(origin, min_hit_fraction=0.3, **fan_kw) is None
+    check("(a) isolated single-ray hit below min_hit_fraction -> ignored (open)", isolated_ignored)
+
+    # (b) a SECOND hit along the +20deg ray, CLOSER (t=1.5) -> 2/5 rays (40%) >= 0.3 -> blocked, and the
+    #     reported distance is still the MIN across all confirming hits (1.5, not the on-axis 2.0).
+    sb = MapStore(voxel_size=0.1)
+    _add_twice(sb, (0.0, 0.0, 2.0))                          # on-axis (0 deg), dist 2.0
+    h20 = np.radians(20.0)
+    _add_twice(sb, (1.5 * np.sin(h20), 0.0, 1.5 * np.cos(h20)))  # +20 deg ray, dist 1.5
+    d = sb.clearance(origin, min_hit_fraction=0.3, **fan_kw)
+    enough_hits_blocks = d is not None and abs(d - 1.5) < 0.05
+    check(f"(b) 2/5 rays hit -> blocked, MIN distance reported (dist={d})", enough_hits_blocks)
+
+    # (c) min_hit_fraction=0.0 (the default) on the SAME single-hit setup from (a) -> unchanged prior
+    #     behavior: a single ray hit is still enough to call it blocked (regression guard).
+    default_unchanged = sa.clearance(origin, min_hit_fraction=0.0, **fan_kw) is not None
+    check("(c) default min_hit_fraction=0.0 -> single-hit-blocks behavior unchanged", default_unchanged)
+    # same check with the parameter omitted entirely (its own default)
+    default_omitted = sa.clearance(origin, **fan_kw) is not None
+    check("(c2) parameter omitted -> same as 0.0 (single hit still blocks)", default_omitted)
+
+    # (d) session 29: detail=True on the (a) setup (isolated 1/5-ray hit, min_hit_fraction=0.3) -> a
+    #     well-formed stats dict that reports the RAW ray picture (n_hits=1, fraction=0.2) even though the
+    #     vote judges it OPEN (blocked=False, dist=None) -- the tab shows why, not just the outcome.
+    da = sa.clearance(origin, min_hit_fraction=0.3, detail=True, **fan_kw)
+    detail_open = (isinstance(da, dict) and da["blocked"] is False and da["dist"] is None
+                  and da["n_hits"] == 1 and da["n_rays"] == 5 and abs(da["fraction"] - 0.2) < 1e-9
+                  and abs(da["min_dist"] - 2.0) < 0.05 and abs(da["max_dist"] - 2.0) < 0.05)
+    check(f"(d) detail=True on a below-vote hit -> raw stats + blocked=False ({da})", detail_open)
+
+    # (e) detail=True on the (b) setup (2/5 rays hit, distances 2.0 and 1.5) -> blocked=True, dist is the
+    #     MIN (1.5), but min_dist/max_dist still span BOTH hits (1.5 and 2.0).
+    db = sb.clearance(origin, min_hit_fraction=0.3, detail=True, **fan_kw)
+    detail_blocked = (isinstance(db, dict) and db["blocked"] is True and abs(db["dist"] - 1.5) < 0.05
+                      and db["n_hits"] == 2 and db["n_rays"] == 5 and abs(db["fraction"] - 0.4) < 1e-9
+                      and abs(db["min_dist"] - 1.5) < 0.05 and abs(db["max_dist"] - 2.0) < 0.05)
+    check(f"(e) detail=True on a confirmed block -> raw stats span all hits ({db})", detail_blocked)
+
+    # (f) detail=True on an empty/unusable map (no voxels at all) -> a well-formed all-zero row, not None.
+    se = MapStore(voxel_size=0.1)
+    df = se.clearance(origin, min_hit_fraction=0.3, detail=True, **fan_kw)
+    detail_empty_ok = (isinstance(df, dict) and df["blocked"] is False and df["dist"] is None
+                       and df["n_hits"] == 0 and df["n_rays"] == 5 and df["fraction"] == 0.0
+                       and df["min_dist"] is None and df["max_dist"] is None)
+    check(f"(f) detail=True on an empty map -> well-formed all-zero row, not None ({df})", detail_empty_ok)
+
+    print(f"\n[map_store][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
+    return ok
+
+
+# ==============================================================================
 # Offline validation: rebuild the voxel map from a slam_offline .npz export.
 #
 # This proves the fusion + render path against the *same* 2.08 M-point cloud the offline
@@ -418,7 +519,11 @@ def main():
     ap.add_argument("--chunks", type=int, default=8,
                     help="split the cloud into N batches to simulate streaming keyframes")
     ap.add_argument("--out", default=None, help="output basename (default: <npz stem>_voxmap)")
+    ap.add_argument("--self-test", action="store_true", help="run the synthetic self-test (no hardware)")
     args = ap.parse_args()
+
+    if args.self_test:
+        raise SystemExit(0 if run_self_test() else 1)
 
     voxel_size = args.voxel_size
     if voxel_size is None:
