@@ -152,6 +152,13 @@ autonomy:
                                  #   drone CANNOT be bumped/blacklisted — a mildly-stuck-then-freed drone must not
                                  #   retire a far corner it simply hasn't reached (SLAM must stay ALLOWED to find +
                                  #   investigate frontiers en route to a corner; each hop re-picks). General param.
+                                 #   Session 24: perception overrides this LIVE with half the room's own known
+                                 #   corner-to-corner diagonal (corner_span_half) once known; this stays the
+                                 #   fallback before any corners are known.
+    corner_giveup_limit: 10      # session 24: the far-corner exemption above is NOT infinite -- this many
+                                 #   far-corner give-ups against the SAME corner (still never once close enough
+                                 #   for a real 2-bump) force-retires it (mark visited, tour moves on) instead of
+                                 #   exempting it forever. General robustness bound, NOT a room answer.
     no_goal_idle_s: 12.0         # REPLAN idle backstop: if the planner returns no goal AND not done for longer than
                                  #   this (only a startup transient with the sweep planner), raise a VISIBLE log +
                                  #   telemetry flag instead of idling dark forever (NO SILENT FALLBACK). General
@@ -203,9 +210,27 @@ autonomy:
     # during any calibration). A settled height significantly below the baseline median => the calibration SANK the
     # drone (poisoning the live-camera-Y occupancy slab) => climb to clean airspace (ASCEND_ESCAPE) -> slide 1u
     # (CALIB_TRANSLATE) -> retry. All GENERAL / LIVE-relative params -> no room-answer leak.
-    # SESSION-17: the PERIODIC per-goal-change TRIGGER was DELETED (the drone holds altitude on its own now that
-    # thrust/triggerDown is engaged) — keys calibrate_on_goal_change / calib_cooldown_s / calib_goal_change_dist
-    # are gone. The CALIBRATING_HEIGHT machinery below is RETAINED, unwired, for a future WALL-HIT trigger.
+    # SESSION-22: the PERIODIC re-tap is RETIRED (default OFF). Flight 20260717_004418 showed the re-tap is a
+    # SLAM-killer run in the worst places: the goal-change trigger fires in SLAM-hostile corners, the vertical
+    # ASCEND loses the plan mid-tap, each failed redo throws the height around and leaves the drone GLUED AT THE
+    # CEILING (ASCEND ran, DESCEND never did) — ~2¼ min loops ending in STUCK. Meanwhile SLAM's height read is
+    # STABLE within a flight (confirmed across every loss/re-lock in that log), so the FIRST-takeoff calibration's
+    # desired_y is trusted as THE height reference for the whole flight and the bidirectional TRIM (below) holds
+    # it. Y-DRIFT AUDIT posture: once TRIM proves itself, re-enable with a LONG cooldown (e.g. 600) to turn rare
+    # re-taps into drift measurements — each non-first CALIB_VERIFY PASS logs the ceiling movement vs the first
+    # tap, and the SLAM-comfort gate (calib_slam_avg_ms) ensures an audit only launches when SLAM is comfortable.
+    calibrate_on_goal_change: false  # periodic re-tap OFF (session 22); re-enable + long cooldown = drift audit
+    calib_cooldown_s: 60.0           # min seconds between ceiling taps when re-enabled (600+ for the audit posture)
+    calib_goal_change_dist: 1.0      # the goal must move MORE than this (SLAM units) to trigger a re-tap
+    # --- SLAM-COMFORT gate (session 22): launch/redo a calibration only when SLAM is COMFORTABLE, not merely
+    #     alive. The bad flight's redos fired on "6 fresh frames <1000ms" whose frames ran 616-797ms — marginal —
+    #     and died seconds into every ASCEND. Rolling average of HEALTHY-frame latencies must clear the bar
+    #     (once the window is full; a part-filled window passes). Bounded: a redo gated for calib_gate_max_s
+    #     counts ONE failed attempt -> the existing escape relocates to a fresh vantage. Platform SLAM-behavior
+    #     params (latency/frame counts), room-independent (HARD RULE). ---
+    calib_slam_avg_ms: 666           # rolling avg of healthy-frame slam_ms must be BELOW this to launch/redo a calib
+    calib_slam_avg_window: 10        # rolling window length (fresh frames, healthy only, frame_id-deduped)
+    calib_gate_max_s: 30.0           # gated-wait bound: avg stays over the bar this long -> count a failed attempt
     calib_max_retries: 2             # climb+translate+re-run attempts per calibration before abandoning (logged)
     # --- session-11 state-gated verification (CALIB_VERIFY + ASCEND_ESCAPE + CALIB_TRANSLATE) ---
     mapping_alt_history_len: 200     # rolling baseline length: samples of NORMAL flying altitude (frozen during calib)
@@ -229,6 +254,26 @@ autonomy:
     calib_escape_after: 3            # consecutive failed calibrations -> escape (first time) / STUCK (after an escape)
     calib_escape_ok_frames: 12       # consecutive fresh fast frames + status OK to declare SLAM recovered post-escape
     calib_escape_push_s: 1.0         # duration of the one ring-picked parallax push to a fresh vantage
+    # --- GRADUAL HEIGHT TRIM (session 14; BIDIRECTIONAL since session 22): the ONLY in-flight height corrector
+    #   now that the periodic re-tap is retired. joy_vertical is a DISCRETE full-thrust ±1 axis (coarse), so
+    #   TRIM uses the sim's PITCH aim instead: pitch the aim UP (or DOWN) + push forward -> the drone flies
+    #   toward the raised/lowered aim = a GRADUAL climb/descent (rate set by the push duration). Bonus: the
+    #   forward component is translation = SLAM parallax. The FIRST calibration records ceiling_y (glued),
+    #   desired_y (settled post-descend — THE flight's height reference), delta = desired_y - ceiling_y. On a
+    #   fresh healthy frame in SETTLE/ADVANCE:
+    #     too LOW  (sagged):     pos_y > ceiling_y + trim_sag_ratio*delta (== desired + 0.2*delta) -> TRIM UP
+    #     too HIGH (glued near ceiling — the 20260717 failure): pos_y < desired_y - trim_high_ratio*delta -> TRIM DOWN
+    #   All GENERAL platform params + LIVE self-calibrating references — no room answer.
+    trim_enable: true
+    trim_sag_ratio: 1.2              # too-LOW trigger: pos_y > ceiling_y + this*delta  (1.2 == desired + 0.2*delta)
+    trim_high_ratio: 0.2             # too-HIGH trigger: pos_y < desired_y - this*delta (mirror band; session 22)
+    # (trim_aim_s REMOVED session 22 — automatic: io_bridge ramps the aim ±0.05/tick @60Hz, so ±1.0 saturates in
+    #  ~0.33s; the pre-aim phase is a fixed 0.5s platform constant, and the aim is HELD through the whole push.)
+    trim_fwd_s: 0.25                 # forward push (with the aim held up/down) = the gradual climb/descent dose
+    trim_settle_s: 1.0               # WAIT for a healthy frame CAPTURED >= trim_cmd_t0 + this before logging (async-SLAM guard)
+    trim_reposition_s: 0.5           # if forward is blocked: reverse/strafe this long to open forward room, then climb
+    trim_pitch_up: -1.0              # pitch value that raises the aim = CLIMB (sign confirmed live: +1.0 aimed DOWN)
+    trim_throttle: 1.0               # forward-push magnitude during the climb (matches forward_throttle; io_bridge ramps it)
     # --- POST-MISSION FLOOR-DOCK POSTLUDE (when the all-corners tour is exhausted, planner done=True):
     #     RETURN_TO_ORIGIN -> DOCK_FLOOR (gentle PULSED descent) -> LOW_STANDOFF -> DONE. Instead of a
     #     static hover at mapping height, fly home to the take-off origin (SLAM-frame [0,0]), descend
@@ -266,9 +311,13 @@ autonomy:
                                  # to 1.0 (from 0.2) to fly like manual — io_bridge's committed ramp eases it in
                                  # over ~20 ticks and out over ~10, so each hop accelerates + eases to a stop.
                                  # Platform control magnitude (like the playbook's 0.55 cruise), NOT a room answer.
-    hop_ticks: 40                # session 20: ADVANCE hops this many controller ticks then SETTLEs (SLAM breather)
-                                 # then REPLANs (re-reads SLAM's current goal, adopts it with a parallax push if
-                                 # off-axis). 0 = disabled = cruise straight to the goal (main's original behavior).
+    hop_duration_s: 2.0          # session 20 (time-based since the 20260719 investigation): ADVANCE hops this many
+                                 # SECONDS of real flight then SETTLEs (SLAM breather) then REPLANs (re-reads SLAM's
+                                 # current goal, adopts it with a parallax push if off-axis). Was a raw tick count
+                                 # (hop_ticks) until it was found the controller loop's own tick rate is an emergent
+                                 # property of I/O timing (~30-35Hz observed, NOT a config-locked rate) -- a fixed
+                                 # tick count made the real hop duration drift with however fast the loop happened
+                                 # to iterate. 0 = disabled = cruise straight to the goal (main's original behavior).
     hop_progress_eps: 0.2        # session 20b: min distance (SLAM units) a HOP must close on its goal to count as
                                  # PROGRESS; a hop that closes less is a STALL -> a STRIKE in the goals DB (2 -> dead).
     reverse_throttle: 0.2        # reverse (0-1) for ALL backward maneuvers (back_off, reverse_probe, recovery
@@ -312,12 +361,19 @@ autonomy:
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are
     #     COMPUTE characteristics (tunable), NOT this room's geometry. ---
     slam_slow_ms: 1000.0         # a frame build >= this = SLAM choking -> stop moving and hold
-    slam_settle_frames: 6        # "stable" only after >5 consecutive FRESH frames each built under slam_slow_ms
-                                 #   (raised 3->6 in session 8 to give SLAM more margin before resuming flight)
-    settle_fresh_frames: 6       # session 15: a GOAL-FLYING SETTLE (nxt REPLAN/…) waits for this many SLAM "done"
-                                 #   frames CAPTURED AFTER the settle began (cap_ts >= entry) AND under slam_slow_ms,
-                                 #   before any flying command — no ORIENT/advance on a stale pose. Vertical routine
-                                 #   (TAKEOFF/ASCEND/DESCEND/BASELINE_NUDGE) is exempt (kept timed).
+    settle_fresh_frames: 6       # session 15/24: the SLAM FRESHNESS gate's rolling-window size -- a full window
+                                 #   of this many FRESH frames, each built under slam_slow_ms and CAPTURED after
+                                 #   the gate opened (cap_ts >= entry), before any flying command — no ORIENT/
+                                 #   advance on a stale pose. Shared by SLAM_HOLD's exit (all resume targets) and
+                                 #   the SETTLE state (session 24 unified them -- see settle_gate_s below).
+    settle_gate_s: 1.0           # session 24: the PHYSICAL MOTION half of the settle gate -- minimum real dwell
+                                 #   since the gate opened, independent of the freshness window. Opened at the
+                                 #   TRUE moment the airframe stops moving: fresh at active-motion-end (pays the
+                                 #   full dwell), or at a SLAM_HOLD's entry (a stationary hold's own duration
+                                 #   already counts, so a resume through SETTLE rarely pays it twice). Replaces
+                                 #   the old slam_settle_frames (3) + settle_fresh_frames (6) double-counted pair
+                                 #   for this pathway; the vertical prelude routine (TAKEOFF/ASCEND/DESCEND/
+                                 #   BASELINE_NUDGE) skips the freshness half and waits on this alone (kept timed).
     # SLAM-settle REWIND step-back: if SLAM stays slow in a HOLD (plan still OK), stepping one entry back
     # through the rewind queue re-exposes known-good geometry to help the solve re-lock (the user's
     # "back up until it settles" idea). Re-arm needs another full run of slow frames; capped per hold.

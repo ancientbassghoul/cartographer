@@ -168,12 +168,23 @@ class Pipeline:
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
         self._sweep_logged = False       # True while the planner is touring corners (one-shot per-corner log below)
         self._sweep_target_logged = None # last corner [x,z] we logged (re-logs on each new tour corner)
-        self.last_planner_event = None   # transient bump-outcome summary set by run()'s bump drain; ride ONE plan
+        self.last_planner_event = []     # transient bump-outcome summaries set by run()'s bump drain; ride ONE
+                                          # plan (a LIST, not a scalar: pipe.step() only runs — and drains this
+                                          # — once per SLAM solve, which can take many seconds while SLOW; a
+                                          # single overwritable slot would silently drop every message but the
+                                          # last one generated in that window. See _consume_planner_event.)
 
         # --- diagnostic CSV logging (off unless enable_diag is called) ---
         self.diag_perf = NullLog()    # per-frame SLAM/loop timing
         self.diag_lift = NullLog()    # per-detection lift geometry + estimate evolution
         self._last_step_ts = None
+        # Strictly-consecutive SLAM invocation counter (diagnostic session): increments by exactly 1 on
+        # EVERY step() call, independent of the NDI-side `frame_id` (io_bridge's raw-camera-frame counter,
+        # which jumps whenever the CONFLATEd frame bus drops frames while SLAM was busy). A gap in THIS
+        # counter, as observed downstream in autopilot.py, proves the AUTOPILOT's own "drain the plan bus
+        # to the freshest message" loop dropped a published plan -- something the NDI frame_id can't show,
+        # since that only reveals camera-side skips. Rides every plan payload as "slam_seq".
+        self._slam_seq = 0
 
     def enable_diag(self, ts=None, out_dir=None):
         """Open CSV diagnostic logs (per-frame timing + per-lift hit geometry)."""
@@ -193,6 +204,7 @@ class Pipeline:
 
     def step(self, frame_bgr, meta, state_pub=None, show=True):
         # --- SLAM every frame ---
+        self._slam_seq += 1   # one actual SLAM invocation, unconditionally -- see __init__ for why
         t_step = time.time()
         loop_dt = (t_step - self._last_step_ts) if self._last_step_ts else 0.0
         self._last_step_ts = t_step
@@ -300,10 +312,14 @@ class Pipeline:
 
     # ------------------------------------------------------------- map mode planner
     def _consume_planner_event(self):
-        """Pop the transient bump-outcome summary (set by the run() bump drain) so it rides EXACTLY ONE
-        plan then clears — a discrete event marker for the timeline, not a persistent field."""
-        ev, self.last_planner_event = self.last_planner_event, None
-        return ev
+        """Pop ALL transient bump-outcome summaries queued since the last plan (set by the run() bump
+        drain) so they ride EXACTLY ONE plan then clear — discrete event markers for the timeline, not a
+        persistent field. Joined into one string (";"-separated) rather than a single overwritable slot:
+        when a SLAM solve is slow, run()'s drain loop can process several bump/pick/loop events before
+        this is next called, and a scalar mailbox would silently keep only the LAST one (the exact "0
+        strikes to blacklisted with nothing in between" symptom diagnosed off the 20260718 flight)."""
+        evs, self.last_planner_event = self.last_planner_event, []
+        return "; ".join(evs) if evs else None
 
     def _plan_payload(self, res, meta, heading_deg, slam_ms=None):
         """TOPIC_PLAN payload: drone pose (X-Z + heading), the chosen frontier goal + bearing, the
@@ -319,6 +335,10 @@ class Pipeline:
         valid = (res.mode == "TRACKING") and pos is not None and heading_deg is not None
         payload = {
             "plan_valid": bool(valid), "mode": res.mode, "tracking_mode": res.tracking_mode,
+            # Strictly-consecutive SLAM invocation counter (diagnostic session, see __init__/step) --
+            # distinct from `frame_id` (the NDI raw-camera-frame counter, below): a gap in THIS one proves
+            # the autopilot's own plan-bus drain dropped a published plan, not a camera-frame skip.
+            "slam_seq": self._slam_seq,
             "pos": ([round(pos[0], 4), round(pos[1], 4)] if pos else None),
             "heading_deg": (round(heading_deg, 2) if heading_deg is not None else None),
             "goal": None, "bearing_deg": None, "bearing_err": None,
@@ -387,6 +407,15 @@ class Pipeline:
         # `select` still caches each corner target ONCE, so it stays STATIC while flying to it.
         reachable = self.planner.any_reachable(fr)
         corners = (self.ground.bbox_corners(inset=self.reposition_inset) if not reachable else None)
+        # Session 24: scale the autopilot's far-corner blacklist-exemption distance with the ROOM instead of
+        # a flat constant -- half the largest pairwise distance among the known corners (the true diagonal in
+        # the normal 4-corner case; degrades gracefully for a collapsed corridor/tiny-box case). None with
+        # fewer than 2 corners (no meaningful diagonal yet) -- the autopilot falls back to its config default.
+        span_half = None
+        if corners and len(corners) >= 2:
+            span_half = 0.5 * max(math.hypot(a[0] - b[0], a[1] - b[1])
+                                   for i, a in enumerate(corners) for b in corners[i + 1:])
+        payload["corner_span_half"] = span_half
         # Goal selection (blacklisting is event-driven via note_wall_hit in run(), NOT a per-select timer).
         goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, sweep_corners=corners)
         payload["n_blacklisted"] = len(self.planner._blacklist)
@@ -396,6 +425,11 @@ class Pipeline:
         # A published corner goal (sweep tour) is flagged so the autopilot can SUPPRESS a bump/strike against a
         # FAR corner (a mildly-stuck drone must not blacklist a corner it hasn't approached — session 20).
         payload["goal_is_corner"] = bool(self.planner.sweeping)
+        # Session 24: True once ANY corner was force-retired via a give-up (never reached/2-bump-confirmed).
+        # Meaningful once `done` is also True: the autopilot's REPLAN distinguishes a genuinely-exhausted
+        # mission (every corner reached/confirmed -> graceful RETURN_TO_ORIGIN) from a stuck one (at least one
+        # corner simply abandoned -> a hard STUCK hold instead).
+        payload["corner_giveup_stuck"] = bool(self.planner._gave_up_corner)
         # Persistent goals DB (per-disc picks / strikes / blacklisted) -> the replay debugger's floating table.
         # DB-blacklist events (loop/stall) are logged in the run() drain that feeds the DB, not here.
         payload["goal_db"] = self.planner.goal_db_snapshot()
@@ -554,6 +588,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
     apevent_sub = frame_bus.StateSubscriber(ctrl_port, topics=[frame_bus.TOPIC_AUTOPILOT_EVENT])
     last_bump_seq = -1
     last_pick_seq = -1
+    last_giveup_seq = -1
     print(f"[perception] frame bus SUB :{frame_port} | state PUB :{pstate_port} "
           f"(TOPIC_POSE/MAP/PLAN/TARGET) | detection SUB :{obj_port}")
     print(f"[perception] SLAM every frame ({pipe.slam.tracking_mode}); depth removed (SLAM owns the GPU)")
@@ -576,7 +611,8 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
                 seq, bg = ev.get("seq"), ev.get("bump_goal")
                 if bg is not None and seq is not None and seq != last_bump_seq:
                     last_bump_seq = seq
-                    out = pipe.planner.note_wall_hit(bg)
+                    out = pipe.planner.note_wall_hit(bg, pos=ev.get("bump_pos"),
+                                                     is_corner=bool(ev.get("bump_is_corner")))
                     # Log EVERY bump receipt (not just blacklists) so the counter's climb AND its resets are
                     # visible in perception stdout — a goal-change reset is the mechanism that defeats the
                     # blacklist, and it was previously silent. `pipe.last_planner_event` rides the next
@@ -592,18 +628,37 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
                         msg = f"BUMP goal={g} count=1/2 (armed; one more same-goal bump blacklists)"
                     else:  # increment (reached 1 already, now higher but < threshold — unreachable in a 2-gate)
                         msg = f"BUMP goal={g} count={out['count']}/2 (increment)"
-                    pipe.last_planner_event = msg
+                    pipe.last_planner_event.append(msg)
                     print(f"[perception] planner: {msg}", flush=True)
+                # Session 24: a far-corner give-up escalation (corner_giveup_limit strikes, never once close
+                # enough for a real 2-bump) -> force-retire that corner (mark visited, tour moves on). Never
+                # blacklists/ends the mission by itself -- see planner._gave_up_corner + the autopilot's REPLAN
+                # `done` branch for the all-corners-exhausted STUCK ending.
+                gseq, gg = ev.get("giveup_seq"), ev.get("corner_giveup_goal")
+                if gg is not None and gseq is not None and gseq != last_giveup_seq:
+                    last_giveup_seq = gseq
+                    pipe.planner.force_retire_corner(gg)
+                    ggr = [round(gg[0], 3), round(gg[1], 3)]
+                    gmsg = f"CORNER-GIVEUP goal={ggr} -> force-retired (never reached; tour advances)"
+                    pipe.last_planner_event.append(gmsg)
+                    print(f"[perception] planner: {gmsg}", flush=True)
                 # Goals-DB pick + previous-hop STRIKE/progress outcome (one pulse per leg). Feed the STALL guard
                 # (register_hop_outcome) then the CIRCLING guard (register_goal_pick); log any DB-blacklist.
+                # INDEPENDENT parts (session 21): a re-calibration REPLAN emits a hop-outcome-ONLY pulse
+                # (pick_goal=None) — the strike/progress still registers; the pick registers post-calib.
                 pseq, pg = ev.get("pick_seq"), ev.get("pick_goal")
-                if pg is not None and pseq is not None and pseq != last_pick_seq:
+                if pseq is not None and pseq != last_pick_seq:
                     last_pick_seq = pseq
                     prev_goal = ev.get("prev_goal")
                     if prev_goal is not None:
                         pipe.planner.register_hop_outcome(prev_goal, bool(ev.get("prev_progressed")),
-                                                          bool(ev.get("prev_strike_eligible", True)))
-                    pipe.planner.register_goal_pick(pg, ev.get("pick_pos"))
+                                                          bool(ev.get("prev_strike_eligible", True)),
+                                                          pos=ev.get("judge_pos"),
+                                                          slam_ms=ev.get("judge_slam_ms"),
+                                                          is_corner=bool(ev.get("prev_is_corner")))
+                    if pg is not None:
+                        pipe.planner.register_goal_pick(pg, ev.get("pick_pos"),
+                                                        slam_ms=ev.get("judge_slam_ms"))
                     lev = pipe.planner.last_loop_event
                     if lev is not None:
                         lg = [round(lev["goal"][0], 3), round(lev["goal"][1], 3)]
@@ -611,7 +666,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False):
                         extra = (f"strikes={lev['strikes']}" if lev.get("reason") == "stall"
                                  else f"picks={lev['picks']}")
                         msg = f"{tag} goal={lg} {extra} ({len(pipe.planner._blacklist)} total) -> reselecting"
-                        pipe.last_planner_event = msg
+                        pipe.last_planner_event.append(msg)
                         print(f"[perception] planner: {msg}", flush=True)
                         pipe.planner.last_loop_event = None
                 ap = apevent_sub.recv(timeout_ms=0)

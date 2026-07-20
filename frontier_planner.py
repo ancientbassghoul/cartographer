@@ -82,6 +82,11 @@ class FrontierPlanner:
         self.sweep_target = None       # frozen [x, z] of the current corner (cached ONCE, never recomputed mid-leg)
         self._swept_corners = []       # [x,z] of corners already reached/retired this flight (the tour's memory;
         #                                persists for the flight, self-corrects if the bbox grows past assoc_dist)
+        # Session 24: True once ANY corner was retired via force_retire_corner (the autopilot gave up on it --
+        # corner_giveup_limit far-corner strikes, never once close enough for a real 2-bump) rather than
+        # genuinely reached or 2-bump-confirmed unreachable. Distinguishes a truly-exhausted mission (every
+        # corner reached/confirmed) from a stuck one (at least one corner was simply abandoned) for the caller.
+        self._gave_up_corner = False
         self._ever_had_frontiers = False  # True once any select() saw a non-empty frontier list (distinguishes
         #                                   a still-forming startup map from a genuinely-exhausted one)
         self._best_dist = None         # closest distance achieved toward the current committed goal (round-blacklist memory)
@@ -148,13 +153,20 @@ class FrontierPlanner:
                 return True
         return False
 
-    def _blacklist_goal(self, goal, permanent=False):
+    def _blacklist_goal(self, goal, permanent=False, reason=None, evidence=None):
         """Record `goal` as unreachable, using the best (closest) distance reached this commit
         (`self._best_dist`). `permanent=True` (the stagnation watchdog) marks it dead FOR GOOD immediately —
         the drone spent the full stagnation window unable to get closer, so it is truly unreachable. Otherwise
         (re-blacklisting the same region): if we NEVER got closer than a prior round (no cross-round progress)
         -> promote to PERMANENT (two dead goals can't cycle the drone forever); if we DID get closer (a new
-        route opened) -> keep it soft/retryable. A first-ever soft blacklist stays soft."""
+        route opened) -> keep it soft/retryable. A first-ever soft blacklist stays soft.
+
+        `reason` (`"2bump"|"stall"|"loop"`, corner give-ups never call this — see force_retire_corner) and
+        `evidence` (a small dict of whatever was at hand at the call site — position, strikes/picks/spread,
+        SLAM state) are recorded on the entry so the debugger's Goals DB panel can show WHY a goal died, not
+        just THAT it died. All numeric evidence values must already be float-cast by the caller (goals-DB
+        schema split — every coordinate/distance/drift written here is a plain float/list-of-float, never a
+        raw tuple or numpy scalar, so this never trips json.dumps in the timeline logger)."""
         g = [float(goal[0]), float(goal[1])]
         best_now = self._best_dist if self._best_dist is not None else float("inf")
         for e in self._blacklist:
@@ -165,43 +177,61 @@ class FrontierPlanner:
                 e["active"] = True
                 if permanent or not improved:
                     e["permanent"] = True          # forced, or re-dead with no cross-round progress -> for good
+                if reason is not None:
+                    e["reason"] = reason
+                    e["evidence"] = dict(evidence) if evidence else {}
                 self.last_blacklist = g
                 return
-        self._blacklist.append({"goal": g, "best_ever": best_now, "permanent": bool(permanent), "active": True})
+        self._blacklist.append({"goal": g, "best_ever": best_now, "permanent": bool(permanent), "active": True,
+                                "reason": reason, "evidence": (dict(evidence) if evidence else {})})
         self.last_blacklist = g
 
     # --------------------------------------------------- goals database (persistent) + loop/stall guards
     def _db_entry(self, goal, create=True):
         """The goals-DB disc whose center is within goal_area_radius of `goal` (first match), creating a fresh
-        one when none exists (unless create=False). Discs persist for the whole flight."""
+        one when none exists (unless create=False). Discs persist for the whole flight.
+
+        Schema split (operator ask): ALL FOUR blacklist mechanisms' bookkeeping lives on this ONE per-disc
+        record now — `picks`/`drone_locs` (loop guard), `strikes` (stall guard), `bumps` (2-bump, previously
+        only the separate active `_wall_hit_count` streak), and `corner_giveups` (far-corner give-up,
+        previously only the separate `_corner_giveup_counts` list) — plus `is_corner`, since a corner disc
+        can legitimately pass through BOTH the far-exempt give-up phase and the near-bump/strike phase in one
+        flight (the far-corner guard in autopilot.py only exempts a corner while it's still far away; once
+        the drone is close, a corner is bumped/struck exactly like any frontier — see the corner audit in
+        note_wall_hit's docstring)."""
         g = [float(goal[0]), float(goal[1])]
         for e in self._goal_db:
             if self._d(e["center"], g) <= self.goal_area_radius:
                 return e
         if not create:
             return None
-        e = {"center": g, "picks": 0, "drone_locs": [], "strikes": 0}
+        e = {"center": g, "picks": 0, "drone_locs": [], "strikes": 0, "bumps": 0,
+             "corner_giveups": 0, "is_corner": False}
         self._goal_db.append(e)
         return e
 
     def _db_blacklist(self, center, reason, extra):
         """Permanently blacklist a goals-DB disc via the SAME _blacklist store _excluded reads, dropping the
         commitment if it is this region. Idempotent (skips an already-dead region so it logs once). Sets
-        last_loop_event {goal, reason, **extra} for the caller to surface. Returns True if it newly blacklisted."""
+        last_loop_event {goal, reason, **extra} for the caller to surface, and records the SAME reason +
+        evidence (`extra`) on the `_blacklist` entry (goals-DB schema split). Returns True if it newly
+        blacklisted."""
         c = [float(center[0]), float(center[1])]
         if self._excluded(c):
             return False
-        self._blacklist_goal(c, permanent=True)
+        self._blacklist_goal(c, permanent=True, reason=reason, evidence=extra)
         self.last_loop_event = dict(extra, goal=c, reason=reason)
         if self.committed_goal is not None and self._d(self.committed_goal, c) <= self.blacklist_radius:
             self.committed_goal = None          # drop the dead commitment -> the caller re-selects around it
             self._reset_progress()
         return True
 
-    def register_goal_pick(self, goal, pos):
+    def register_goal_pick(self, goal, pos, slam_ms=None):
         """Fed by the AUTOPILOT once per leg (a REPLAN commit). Increment the goal's disc pick count + record the
         pick-time drone `pos` (bounded), then run the CIRCLING/ping-pong test: picked MORE than goal_loop_min_picks
-        times with any two pick-time drone locations within goal_loop_pos_dist -> permanent blacklist."""
+        times with any two pick-time drone locations within goal_loop_pos_dist -> permanent blacklist.
+        `slam_ms` (optional) is evidence-only — the SLAM solve time at pick time, folded into the loop-
+        blacklist evidence dict below; it never affects the loop decision itself."""
         e = self._db_entry(goal)
         e["picks"] += 1
         if pos is not None:
@@ -218,14 +248,25 @@ class FrontierPlanner:
             spread = max((self._d(locs[i], locs[j])
                           for i in range(len(locs)) for j in range(i + 1, len(locs))), default=0.0)
             if len(locs) >= 2 and spread <= self.goal_loop_pos_dist:
-                self._db_blacklist(e["center"], "loop", {"picks": e["picks"], "spread": round(spread, 3)})
+                evidence = {"picks": int(e["picks"]), "spread": round(float(spread), 3)}
+                if pos is not None:
+                    evidence["pos"] = [round(float(pos[0]), 3), round(float(pos[1]), 3)]
+                if slam_ms is not None:
+                    evidence["slam_ms"] = round(float(slam_ms), 1)
+                self._db_blacklist(e["center"], "loop", evidence)
 
-    def register_hop_outcome(self, goal, progressed, strike_eligible=True):
+    def register_hop_outcome(self, goal, progressed, strike_eligible=True, pos=None, slam_ms=None, is_corner=False):
         """Fed by the AUTOPILOT once per hop (at the REPLAN that ends it). STALL guard via STRIKES: a hop that got
         meaningfully closer (`progressed=True`) RESETS the goal's strikes; one that did not adds a STRIKE; at
         goal_strike_limit strikes -> permanent blacklist. `strike_eligible=False` (a FAR corner) is a no-op —
-        neither strike nor reset (a far corner must never be retired for being stalled far from it)."""
+        neither strike nor reset (a far corner must never be retired for being stalled far from it). `pos`/
+        `slam_ms` (optional) are evidence-only — the drone position and SLAM solve time at the judging REPLAN
+        — folded into the stall-blacklist evidence dict; neither affects the strike decision itself.
+        `is_corner` (independent of `strike_eligible` — a NEAR corner IS strike-eligible but still a corner)
+        just flags the disc for the debugger; set unconditionally, even on a strike-exempt far-corner no-op."""
         e = self._db_entry(goal)
+        if is_corner:
+            e["is_corner"] = True
         if progressed:
             e["strikes"] = 0
             return
@@ -233,16 +274,41 @@ class FrontierPlanner:
             return
         e["strikes"] += 1
         if e["strikes"] >= self.goal_strike_limit:
-            self._db_blacklist(e["center"], "stall", {"strikes": e["strikes"]})
+            evidence = {"strikes": int(e["strikes"])}
+            if pos is not None:
+                evidence["pos"] = [round(float(pos[0]), 3), round(float(pos[1]), 3)]
+            if slam_ms is not None:
+                evidence["slam_ms"] = round(float(slam_ms), 1)
+            self._db_blacklist(e["center"], "stall", evidence)
 
     def goal_db_snapshot(self):
-        """Per-disc view for telemetry / the replay debugger: center, picks, strikes, the DRONE LOCATIONS at each
-        pick (what the <goal_loop_pos_dist clustering test runs on — so the operator can see whether a loop
-        blacklist was legit), and whether the disc is currently blacklisted (dead in the _blacklist store)."""
-        return [{"center": [round(e["center"][0], 3), round(e["center"][1], 3)],
-                 "picks": e["picks"], "strikes": e["strikes"],
-                 "drone_locs": [[round(p[0], 3), round(p[1], 3)] for p in e["drone_locs"]],
-                 "blacklisted": bool(self._excluded(e["center"]))} for e in self._goal_db]
+        """Per-disc view for telemetry / the replay debugger: center, picks, strikes, bumps, corner_giveups,
+        is_corner, the DRONE LOCATIONS at each pick (what the <goal_loop_pos_dist clustering test runs on —
+        so the operator can see whether a loop blacklist was legit), whether the disc is currently
+        blacklisted (dead in the _blacklist store), and — when it is — the mechanism that killed it
+        (`blacklist_reason`: "2bump"|"stall"|"loop"|None) plus its recorded `blacklist_evidence` (goals-DB
+        schema split — one place that answers "why is this goal dead", instead of three disconnected
+        counters). A corner force-retired via the far-corner give-up cap is NOT in `_blacklist` (see
+        force_retire_corner) so `blacklisted`/`blacklist_reason` reflect only 2bump/stall/loop; its
+        `corner_giveups` count is the record of that separate retirement."""
+        out = []
+        for e in self._goal_db:
+            dead = self._excluded(e["center"])
+            reason, evidence = None, {}
+            if dead:
+                for bl in self._blacklist:
+                    if self._d(bl["goal"], e["center"]) <= self.blacklist_radius:
+                        reason = bl.get("reason")
+                        evidence = bl.get("evidence") or {}
+                        break
+            out.append({
+                "center": [round(e["center"][0], 3), round(e["center"][1], 3)],
+                "picks": e["picks"], "strikes": e["strikes"], "bumps": e["bumps"],
+                "corner_giveups": e["corner_giveups"], "is_corner": bool(e["is_corner"]),
+                "drone_locs": [[round(p[0], 3), round(p[1], 3)] for p in e["drone_locs"]],
+                "blacklisted": bool(dead), "blacklist_reason": reason, "blacklist_evidence": evidence,
+            })
+        return out
 
     def _whitelist_round(self):
         """Clear the round's SOFT exclusions (set active=False on every non-permanent entry) so the
@@ -274,7 +340,7 @@ class FrontierPlanner:
         """[x,z] the current bump counter is tracking (the last counted bump's goal), or None."""
         return list(self._last_wall_hit_goal) if self._last_wall_hit_goal is not None else None
 
-    def note_wall_hit(self, goal):
+    def note_wall_hit(self, goal, pos=None, is_corner=False):
         """Register ONE advance-blocked "bump" (flow WALL / ram-guard / stand-off) against `goal`, reported by
         the autopilot. Consecutive bumps on the SAME goal region (within `assoc_dist`) accumulate; a bump on a
         DIFFERENT goal resets the counter (so only genuinely-repeated same-goal contacts count). The SECOND bump
@@ -283,9 +349,24 @@ class FrontierPlanner:
         gate. The autopilot's kinematic latch guarantees a single continuous contact is only one bump, so this
         never fires on state-machine flicker. Sets `last_blacklist` (the [x,z] just blacklisted, else None) and
         returns/stashes `last_bump`, an outcome dict {goal, count, threshold, action, prev_goal}, so the caller
-        can log EVERY bump (not just blacklists) — making the goal-change counter resets visible."""
+        can log EVERY bump (not just blacklists) — making the goal-change counter resets visible.
+
+        CORNER AUDIT (operator ask): a corner is NOT unconditionally exempt here — the autopilot's
+        `_register_bump` only calls this at all once the corner is within its (live, room-scaled)
+        far-corner exemption distance; farther than that, the autopilot diverts to the SEPARATE
+        `force_retire_corner` give-up path instead and this never fires. So a near corner is bumped/
+        blacklisted exactly like any frontier goal — `is_corner` here is passed through purely for the
+        goals-DB disc's `is_corner` flag/evidence, not to change this decision.
+
+        `pos` (optional) is evidence-only — the drone position at bump time (the autopilot's existing
+        `_last_bump_anchor`) — folded into the goals-DB disc's persistent `bumps` tally (distinct from
+        this method's own transient `_wall_hit_count` streak) and the 2-bump blacklist evidence."""
         self.last_blacklist = None
         g = [float(goal[0]), float(goal[1])]
+        e = self._db_entry(g)
+        e["bumps"] += 1
+        if is_corner:
+            e["is_corner"] = True
         prev_goal = list(self._last_wall_hit_goal) if self._last_wall_hit_goal is not None else None
         if self._last_wall_hit_goal is not None and self._d(g, self._last_wall_hit_goal) <= self.assoc_dist:
             self._wall_hit_count += 1
@@ -297,7 +378,10 @@ class FrontierPlanner:
             action = "reset" if prev_goal is not None else "arm"
         count_at_hit = self._wall_hit_count      # count reached BY this bump (before any blacklist zeroing)
         if self._wall_hit_count >= 2:
-            self._blacklist_goal(g, permanent=True)
+            evidence = {"bumps": int(e["bumps"])}
+            if pos is not None:
+                evidence["pos"] = [round(float(pos[0]), 3), round(float(pos[1]), 3)]
+            self._blacklist_goal(g, permanent=True, reason="2bump", evidence=evidence)
             if self.committed_goal is not None and self._d(self.committed_goal, g) <= self.blacklist_radius:
                 self.committed_goal = None         # drop the dead commitment -> next select() reselects
                 self._reset_progress()
@@ -368,6 +452,33 @@ class FrontierPlanner:
         cc = [float(c[0]), float(c[1])]
         if not self._corner_visited(cc):
             self._swept_corners.append(cc)
+
+    def force_retire_corner(self, goal):
+        """A corner the autopilot GAVE UP reaching (session 24: `corner_giveup_limit` far-corner strikes,
+        never once close enough for a real 2-bump) is retired anyway: mark it visited (the tour skips it,
+        moving on to the next unvisited corner exactly like a real 2-bump retirement) and remember we
+        ABANDONED it rather than reached/2-bump-confirmed it unreachable (`_gave_up_corner`), so the caller
+        can tell a genuinely-exhausted mission (every corner reached/confirmed) from a stuck one (at least
+        one corner was simply abandoned). Mirrors `note_wall_hit`'s corner-retirement branch, but without
+        requiring the drone to have ever gotten close.
+
+        Goals-DB schema split: records the give-up on the SAME per-disc entry `note_wall_hit`/
+        `register_hop_outcome` use (`corner_giveups` count + `is_corner` flag), so the debugger can see a
+        corner's full history in one place. Deliberately does NOT call `_blacklist_goal` — a force-retired
+        corner is "given up on for this tour", not declared permanently unreachable the way a 2-bump/stall/
+        loop is; `_excluded()` stays exactly as it was (corners already ignore it by design, per
+        `_pick_sweep_corner`'s docstring), so this is bookkeeping only, no behavior change."""
+        g = [float(goal[0]), float(goal[1])]
+        e = self._db_entry(g)
+        e["corner_giveups"] += 1
+        e["is_corner"] = True
+        self._mark_corner_visited(g)
+        self._gave_up_corner = True
+        if self.sweeping and self.sweep_target is not None and self._d(self.sweep_target, g) <= self.assoc_dist:
+            self.sweeping, self.sweep_target = False, None
+        if self.committed_goal is not None and self._d(self.committed_goal, g) <= self.blacklist_radius:
+            self.committed_goal = None
+            self._reset_progress()
 
     def _pick_sweep_corner(self, corners, pos):
         """The FARTHEST-from-`pos` corner that is not yet visited — and NOTHING ELSE. It MUST NOT consult
@@ -652,6 +763,29 @@ def run_self_test():
     _, _, done_none = p2.select([], [0.0, 0.0], sweep_corners=tour2)   # no unvisited corner left
     check("(A2) escape with no corner left -> done", done_none and not p2.sweeping)
 
+    # (A4, session 24) force_retire_corner: the autopilot's far-corner give-up escalation retires a corner
+    #      it never got close to (unlike note_wall_hit's 2-bump, no proximity required) -- marks it visited,
+    #      drops a matching sweep/commitment, and flags _gave_up_corner; the tour advances to the next corner.
+    p = FrontierPlanner(None)
+    tour_giveup = [[0.0, 0.0], [5.0, 0.0], [-6.0, 0.0]]
+    g0, _, _ = p.select([], [0.0, 0.0], sweep_corners=tour_giveup)   # at [0,0] -> farthest is [-6,0]
+    force_ok_before = (not p._corner_visited([-6.0, 0.0]) and not p._gave_up_corner)
+    p.force_retire_corner(g0)                                        # give up WITHOUT ever bumping it
+    g_next, _, done_gu = p.select([], [0.0, 0.0], sweep_corners=tour_giveup)
+    force_retire_ok = (force_ok_before and p._corner_visited([-6.0, 0.0]) and p._gave_up_corner
+                       and p.sweeping and not done_gu and close(g_next, [5.0, 0.0]))
+    # once EVERY corner is retired (mix of give-up + a genuine reach), the tour still correctly declares done
+    # -- and _gave_up_corner (a flight-level flag, set once) stays True, distinguishing this from a clean finish.
+    p2gu = FrontierPlanner(None); p2gu._ever_had_frontiers = True
+    tour_gu2 = [[0.0, 0.0], [5.0, 0.0]]
+    g1gu, _, _ = p2gu.select([], [0.0, 0.0], sweep_corners=tour_gu2)   # -> [5,0]
+    p2gu.force_retire_corner(g1gu)                                     # give up on it (no bumps at all)
+    _, _, done_gu2 = p2gu.select([], [0.0, 0.0], sweep_corners=tour_gu2)
+    force_retire_exhausts_ok = (done_gu2 and not p2gu.sweeping and p2gu._gave_up_corner)
+    check("(A4) force_retire_corner: give-up retires without proximity, advances tour, "
+          "exhaustion still -> done, _gave_up_corner flags it",
+          force_retire_ok and force_retire_exhausts_ok)
+
     # (opt) clearance inset: a chosen frontier goal is run through the injected clearance_fn before commit,
     #       so committed==published; a None return commits the RAW goal and flags clearance_ok=False.
     p = FrontierPlanner(None)
@@ -726,7 +860,37 @@ def run_self_test():
     check("(db5) DB persists across switches + snapshot has picks/strikes/drone_locs",
           len(snap) == 2 and a_row and a_row["picks"] == 2 and a_row["strikes"] == 1
           and a_row["drone_locs"] == [[0.0, 0.0], [0.0, 0.0]]
-          and set(a_row) == {"center", "picks", "strikes", "drone_locs", "blacklisted"})
+          and set(a_row) == {"center", "picks", "strikes", "bumps", "corner_giveups", "is_corner",
+                             "drone_locs", "blacklisted", "blacklist_reason", "blacklist_evidence"})
+
+    # (db6) goals-DB schema split (operator ask): each blacklist mechanism records its OWN reason +
+    # evidence on the disc, and a corner disc can carry BOTH a bump tally and a give-up tally.
+    p = FrontierPlanner(None)
+    p.note_wall_hit([1.0, 1.0], pos=[0.5, 0.5])
+    p.note_wall_hit([1.0, 1.0], pos=[0.6, 0.6])            # 2nd same-region bump -> 2bump blacklist
+    snap = p.goal_db_snapshot()
+    row = next(r for r in snap if abs(r["center"][0] - 1.0) < 1e-6)
+    check("(db6) 2bump: disc bumps tally + blacklist reason/evidence recorded",
+          row["bumps"] == 2 and row["blacklisted"] and row["blacklist_reason"] == "2bump"
+          and row["blacklist_evidence"].get("pos") == [0.6, 0.6])
+
+    p2 = FrontierPlanner(None)
+    p2.register_hop_outcome(A, progressed=False, pos=[2.0, 3.0], slam_ms=850.0)
+    p2.register_hop_outcome(A, progressed=False, pos=[2.1, 3.1], slam_ms=900.0)   # 2nd strike -> stall blacklist
+    row2 = next(r for r in p2.goal_db_snapshot() if abs(r["center"][0] - A[0]) < 1e-6)
+    check("(db6) stall: blacklist reason/evidence (pos+slam_ms) recorded",
+          row2["blacklisted"] and row2["blacklist_reason"] == "stall"
+          and row2["blacklist_evidence"].get("pos") == [2.1, 3.1]
+          and row2["blacklist_evidence"].get("slam_ms") == 900.0)
+
+    p3 = FrontierPlanner(None)
+    corner = [9.0, 0.0]
+    p3.force_retire_corner(corner)
+    p3.note_wall_hit(corner, pos=[8.0, 0.0], is_corner=True)      # same corner, now bumped once it's near
+    row3 = next(r for r in p3.goal_db_snapshot() if abs(r["center"][0] - corner[0]) < 1e-6)
+    check("(db6) a corner disc carries BOTH give-up + bump history, is_corner flagged, giveup not blacklisted",
+          row3["corner_giveups"] == 1 and row3["bumps"] == 1 and row3["is_corner"] is True
+          and not row3["blacklisted"])   # one bump doesn't blacklist; force_retire_corner never does either
 
     print(f"\n[frontier_planner][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

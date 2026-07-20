@@ -18,7 +18,8 @@ mechanism — a self-calibrating COLLAPSE of the relevant flow signal while the 
   * BACKWALL (while REVERSE is commanded): the mirror of WALL. Reversing makes features CONTRACT inward
     (expansion goes negative); the contraction magnitude (-expansion) collapses to ~0 when the drone stops
     — it has backed into something behind it. Same collapse logic, opposite sign. Frame-based, so it works
-    even when SLAM is dead (exactly when a reverse-into-wall jam happens). Detection-only for now (logged).
+    even when SLAM is dead (exactly when a reverse-into-wall jam happens). Consumed by autopilot.py's
+    PARALLAX_PUSH (retries a side, then gives up if boxed in) and REVERSE_PROBE (ends the push early).
 
 ================================ HARD RULE ================================
 NO MANUAL-FLIGHT DATA LEAKAGE (cartographer/CLAUDE.md "CRITICAL AUTONOMY STANDARD"). Detection is

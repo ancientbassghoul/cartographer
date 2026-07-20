@@ -10,7 +10,8 @@ Refactor of ../XLAB/Sample_Drone_Interface.py. Responsibilities:
 What was DELIBERATELY dropped vs. the sample: the YOLO 'o'-key autopilot and its
 `detect_target` try-except. That was GPU work and a silent except-and-continue —
 both forbidden here. Object detection returns later in object_worker.py (P3),
-triggered by the 'g' hotkey, which this bridge surfaces as a state-bus event.
+triggered by the 'h' hotkey (default; configurable), which this bridge surfaces as
+a state-bus event.
 
 NO SILENT FALLBACKS (per CLAUDE.md): NDI init, source discovery, and the TCP bind
 fail-fast with explicit errors instead of degrading to a control-only / no-video
@@ -35,6 +36,7 @@ import keyboard
 
 import frame_bus
 from diag_log import DiagLog, NullLog
+from flight_playbook import FlightPlaybook, RecipePlayer
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -75,10 +77,13 @@ class DroneControl:
 
     # Manual flight keys: pressing ANY of these while autonomy is active is an immediate ABORT
     # back to manual control (NO SILENT FALLBACKS — the operator override is loud and instant).
+    # 't'/'g' (the TRIM UP / TRIM DOWN macro keys) are included here too: a real flight input must
+    # always win, whether that's aborting autonomy or cancelling an in-progress trim macro.
     MANUAL_FLIGHT_KEYS = {
         "1", "2", "b", "c", "w", "s", "e", "f", "a", "d", "k",
-        "left", "right", "up", "down", "p",
+        "left", "right", "up", "down", "p", "t", "g",
     }
+    TRIM_KEYS = {"t": "trim_up", "g": "trim_down"}   # key -> flight_playbook.json recipe name
     # Fields the autopilot is permitted to drive over the control bus. Anything else (the static
     # boxes, the wire-only 'autopilot' flag) stays owned by io_bridge. btnCdown is included so the
     # autopilot can pulse the attitude/camera reset ('c') before a forward push (clean yaw/pitch so a
@@ -91,7 +96,7 @@ class DroneControl:
         "joy_vertical", "joy_horizontal", "yaw", "pitch",
     )
 
-    def __init__(self, host, port, detect_key="g", capture_key="space", debug_keys=False,
+    def __init__(self, host, port, detect_key="h", capture_key="space", debug_keys=False,
                  autonomy_enable_key="m", cmd_timeout_s=0.5, key_log=None, cmd_log=None):
         self.host = host
         self.port = port
@@ -140,10 +145,21 @@ class DroneControl:
         self._conn = None
         self._running = threading.Event()
         self._running.set()
-        self._detect_held = False          # rising-edge tracker for the 'g' key
-        self._detect_requests = 0          # incremented on each 'g' press; main loop drains it
+        self._detect_held = False          # rising-edge tracker for the detect key
+        self._detect_requests = 0          # incremented on each detect-key press; main loop drains it
         self._capture_held = False         # rising-edge tracker for the capture key (space)
         self._capture_requests = 0         # incremented on each capture press; main loop drains it
+
+        # --- Manual TRIM UP / TRIM DOWN macros ('t' / 'g'): a direct replay of the autonomous TRIM
+        # state's AIM->FWD->RESET motion (flight_playbook.json "trim_up"/"trim_down"), with the ring-gate/
+        # height-threshold DECISION logic stripped out per the operator's ask — just the motion. Manual,
+        # not tied to autonomy_active; any other manual flight key cancels it (a real stick input always
+        # wins, same philosophy as the autonomy abort below).
+        self.pb = FlightPlaybook.load()
+        self._trim_keys_down = set()       # rising-edge tracker (mirrors _keys_down but scoped to t/g)
+        self._trim_player = None           # active RecipePlayer, or None
+        self._trim_name = None             # "trim_up" | "trim_down" — which macro is playing (for logs)
+        self._trim_phase_logged = None     # last (name, step index) printed, so we log each phase once
 
         # --- Autonomy (Phase 2): a VISIBLE flag, NO SILENT FALLBACKS. autopilot (P5) PUBs a desired
         # control vector on the control bus; io_bridge applies it into control_state ONLY while
@@ -191,6 +207,8 @@ class DroneControl:
         # we want the failure to be loud, not a silently dead control surface.
         keyboard.hook(self._on_key_event)
         print("[io_bridge] Keyboard hook active. Manual flight: WASD/EF/arrows, 1=arm, b=land, c=reset cam.")
+        print("[io_bridge] 't' = TRIM UP macro, 'g' = TRIM DOWN macro (direct replay of the autonomous "
+              "TRIM motion).")
         print(f"[io_bridge] '{self.detect_key}' = request object detection (forwarded to object_worker).")
         print(f"[io_bridge] '{self.capture_key}' = save the current FULL-RES frame to the capture dir.")
 
@@ -283,6 +301,29 @@ class DroneControl:
                 cs["yaw"] = 0.0
                 cs["pitch"] = 0.0
             return
+        # TRIM UP / TRIM DOWN macro ('t' / 'g'): drive control_state from the RecipePlayer, overriding the
+        # manual key-derived values for the macro's duration — same ramp-toward-target treatment as the
+        # autonomy overlay above, so the push eases in/out instead of stepping. Independent of
+        # autonomy_active; any other manual flight key cancels it (handled in _on_key_event).
+        if self._trim_player is not None:
+            fields, done = self._trim_player.fields(time.monotonic())
+            if not done:
+                phase_key = (self._trim_name, self._trim_player.i)
+                if phase_key != self._trim_phase_logged:
+                    self._trim_phase_logged = phase_key
+                    print(f"[io_bridge] TRIM {self._trim_name} phase {self._trim_player.i + 1}/"
+                          f"{len(self._trim_player.steps)}: {fields}")
+                cs["trigger"] = _ramp(cs["trigger"], float(fields.get("trigger", 0.0)), 0.05, 0.1)
+                cs["trigger_down"] = bool(fields.get("trigger_down", False))
+                cs["pitch"] = float(fields.get("pitch", 0.0))
+                cs["btnCdown"] = bool(fields.get("btnCdown", False))
+                return
+            print(f"[io_bridge] TRIM {self._trim_name} complete.")
+            cs["btnCdown"] = False
+            self._trim_player = None
+            self._trim_name = None
+            self._trim_phase_logged = None
+            # fall through to normal manual handling this same tick — the macro just ended
         # MANUAL: behaviour IDENTICAL to the sample (key-gated ramp; persisting yaw/pitch aim). UNCHANGED.
         # Smooth Trigger (gas)
         if cs["trigger"] > 0 and not cs["trigger_down"]:
@@ -402,6 +443,14 @@ class DroneControl:
             self._neutralize_autonomy()
             print(f"[io_bridge] AUTONOMY ABORTED by manual key '{key}' — manual control restored.")
             # fall through so this same press also takes effect as a normal manual input
+        # A real flight input always wins: any OTHER manual flight key cancels an in-progress trim macro
+        # (no blending — the operator's direct stick input takes over immediately, same philosophy as
+        # the autonomy abort above).
+        if is_down and key in self.MANUAL_FLIGHT_KEYS and key not in self.TRIM_KEYS and self._trim_player is not None:
+            print(f"[io_bridge] TRIM ({self._trim_name}) cancelled by manual key '{key}'.")
+            self._trim_player = None
+            self._trim_name = None
+            self._trim_phase_logged = None
 
         if key == "2": cs["btnAdown"] = is_down
         if key == "b": cs["btnBdown"] = is_down
@@ -433,6 +482,27 @@ class DroneControl:
             if is_down and not self._capture_held:
                 self._capture_requests += 1
             self._capture_held = is_down
+
+        # TRIM UP / TRIM DOWN macro hotkeys: rising edge only (starts fresh each press; re-pressing the
+        # SAME key while it's already playing just restarts it — pressing the OTHER trim key cancels and
+        # starts the new one, same as any manual key would above).
+        if key in self.TRIM_KEYS:
+            if is_down and key not in self._trim_keys_down:
+                self._start_trim_macro(key)
+            self._trim_keys_down.add(key) if is_down else self._trim_keys_down.discard(key)
+
+    def _start_trim_macro(self, key):
+        """Begin playing the TRIM UP ('t') / TRIM DOWN ('g') macro: a direct replay of the autonomous
+        TRIM state's motion (see flight_playbook.json), independent of autonomy_active. `_step_controls`
+        drives control_state from it every 60 Hz tick until it completes."""
+        name = self.TRIM_KEYS[key]
+        self._trim_player = self.pb.player(name)
+        self._trim_name = name
+        self._trim_phase_logged = None
+        cs = self.control_state
+        # Clean slate: a forward-pitching climb/descend shouldn't fight a lingering reverse hold.
+        cs["reverse"], cs["reverse_down"] = 0.0, False
+        print(f"[io_bridge] TRIM macro '{name}' started ('{key}').")
 
     def set_autonomy_command(self, cmd: dict):
         """Store the latest control vector from the control bus (applied only while autonomy_active)."""
@@ -644,7 +714,7 @@ def main():
     proc_h = cfg["perception"]["processing_height"]
     object_frame_h = int(cfg["perception"].get("object_frame_height", 720))
     target_fps = cfg["perception"]["target_processing_fps"]
-    detect_key = cfg["models"]["qwen_vl"].get("object_trigger_key", "g")
+    detect_key = cfg["models"]["qwen_vl"].get("object_trigger_key", "h")
     capture_key = cfg["perception"].get("capture_key", "space")
     capture_dir = os.path.join(REPO, cfg["perception"].get("capture_dir", "test_assets/captures"))
     publish_interval = 1.0 / float(target_fps)

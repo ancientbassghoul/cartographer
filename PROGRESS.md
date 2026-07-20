@@ -1,8 +1,171 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-16** (session 20b **BUILT on `leg-hops-and-goal-commit-fix` — all 6 module self-tests
-green; UNCOMMITTED; LIVE-FLY PENDING**). Resume from THIS file. Plan of record:
-**`plans/session20-goal-db-loop-blacklist.md`**._
+_Last updated **2026-07-20** (session 26 **BUILT on `leg-hops-and-goal-commit-fix` — all module self-tests
+green; COMMITTED; LIVE-FLY PENDING**). Resume from THIS file. Plan of record:
+**`plans/session26-homing-backoff-settle-freshness-pick-dedup.md`** (+
+`plans/session25-trim-macros-recovery-fixes-goaldb-schema-debugger-nav.md`,
+`plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
+parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
+`plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 26 — homing back-off + settle-gate stale-frame fix + postlude recovery budget + pick-dedup
+fix (BUILT — self-tests green).** Two more flights, diagnosed the same way as before (line-by-line off
+the raw `_timeline.jsonl`, not the console `.log` — a couple of early wrong conclusions this session
+came from under-checking a hypothesis, corrected once verified against the jsonl directly). Flight
+`20260719_233845`: the drone hopelessly bounced a wall at the very end of `RETURN_TO_ORIGIN` homing (7
+PLAN-LOST/OK flips in ~1m45s, pinned at clearance 0.25) and, mid-flight, repeated the same wall-bump
+3× in a row on a corner goal. Three compounding causes: (1) homing's own `ADVANCE` sub-phase had NO
+`back_off` reaction to a clearance stop (unlike explore's `ADVANCE->BACKOFF`) — new
+`_home_phase=="BACKOFF"` sub-phase fixes it; (2) `SETTLE`'s "prequalified" freshness shortcut let it
+finish having seen ZERO frames captured after the maneuver it was judging — `_slam_window_ready`
+gained a `latest_since` check (keeps the shortcut for the bulk of the window, but the newest frame
+must still postdate the gate); (3) the `home_max_s` safety cap couldn't fire because
+`POSTLUDE_LOST_HOLD`'s stricter recovery-streak gate never got satisfied while SLAM kept flickering —
+rejected forcing a blind state transition (would livelock against the `POSTLUDE_STATES` router +
+violates no-blind-recovery) in favor of relaxing the streak requirement itself once a new
+`postlude_recover_budget_s` is blown, still gated on `status=="OK"`. Flight `20260720_024455`: a
+SEPARATE bug — the drone "reached" the same frontier 40+ times in a row without ever advancing,
+because reaching a goal is unconditional progress (never a strike) and the ONE mechanism that could
+have broken the loop (the goals-DB's picks-based circling guard) was starved — `REPLAN`'s pick-dedup
+(session 24) suppressed every one of those 40+ genuinely-completed hops as if they were a single leg's
+own re-orient sub-steps, since it only checked goal POSITION, not whether a hop had actually been
+judged. Fixed by consulting `prev_goal` (`_hop_start_goal`), already computed right there. Found +
+fixed two pre-existing self-tests that had baked each bug in as "expected" (`settle-gate two-gate
+design (g2)`, `PICK DEDUP dup_suppressed_ok`) — both updated to verify the corrected behavior instead.
+All self-tests green. See `plans/session26-homing-backoff-settle-freshness-pick-dedup.md` for the full
+trace + evidence. **NEXT = LIVE-FLY** (alongside the still-pending sessions 20b-25 checklist)._
+
+_**Session 25 — manual TRIM key-macros + three recovery-FSM bugs diagnosed off the `20260718_010045`
+flight + goals-DB mechanism-split schema + debugger event-log navigation.** The operator flagged seven
+things after replaying that flight; three turned out to be genuine bugs found by tracing the actual
+timeline JSONL + autopilot.log line-by-line (not guesses). (1) **Manual `t`/`g` TRIM UP/DOWN key macros** —
+new `trim_up`/`trim_down` recipes in `flight_playbook.json` (mirror the autonomous TRIM's AIM→FWD→RESET
+motion, ring-gate/height-threshold decision stripped) played by `io_bridge.py` independent of
+`autonomy_active`; freed `g` by rebinding object-detect to `h` (any manual flight key cancels an
+in-progress macro). (2) **Lossy planner-event mailbox**: `perception_worker.py`'s `last_planner_event` was
+a single overwritable string, destructively read-and-cleared once per SLAM solve — during a slow solve
+(5-8s+), an earlier bump/strike message could be silently clobbered before ever being logged, which is
+exactly the "goal jumps from 0 strikes straight to BLACKLISTED with nothing in between" the operator saw
+at 01:05:07. Now an accumulating list, joined on consume; nothing is dropped. (3) **Blind-hold wall
+contact was ignored**: the clearance/back-off check only ran from inside ADVANCE; a drone parked in
+HOLD_LOST/SLAM_HOLD for 30-40s during a bad SLAM patch (confirmed 01:17:19-01:18:07) never got a chance to
+react even though the flow contact detector (SLAM-independent) was firing the whole time. New
+`BLIND_BACKOFF` state (owns every status while it plays, like CALIB_ESCAPE) reacts to a live wall/backwall
+contact from either hold, plays `back_off`, then resumes the SAME hold — edge-triggered so a sustained pin
+doesn't replay it every tick. (4) **SLAM_STEPBACK counter never escalated**: `_slam_stepback_count` reset
+on every fresh `_enter_slam_hold`, but a genuinely bad SLAM patch always bounces PLAN-LOST→HOLD_LOST→OK
+before the next hold (confirmed 01:31:09-01:32:33: `#1/3` fired three times running, never reaching `#2`
+or `#3`). Now persists across that bounce, resetting only at a trusted REPLAN or a genuinely new committed
+goal. (5) **Goals-DB mechanism-split schema** (operator ask, after auditing the corner exemption — it's
+already proximity-gated, not blanket: a NEAR corner is bumped/struck exactly like a frontier, only a FAR
+one gets the give-up counter) — every `_goal_db` disc now also carries `bumps`/`corner_giveups`/
+`is_corner`, and every `_blacklist` entry records WHICH mechanism (`2bump`/`stall`/`loop`) killed it plus a
+float-cast evidence dict (position/strikes/picks/spread/slam_ms); the debugger's Goals DB panel shows the
+new columns + reason + evidence. (6) **Debugger event-log navigation** — a global `ALL_EVENTS` list (state/
+planner/missed-bump/SLAM records, built once) makes every log line clickable (jumps the scrubber to its
+time) and adds Prev/Next message buttons + an "incl. SLAM msgs" checkbox (off by default), so scrubbing
+between the non-SLAM lines — previously the hard part — takes seconds instead of hours. New self-tests for
+all of the above; all 6 module self-tests green. See
+`plans/session25-trim-macros-recovery-fixes-goaldb-schema-debugger-nav.md` for the full design + file
+list. **NEXT = LIVE-FLY** (alongside the still-pending sessions 20b/21/22/23/24 checklist) — watch for:
+intermediate strike/bump messages now visible in the event log (no more single-tick blacklist jumps); a
+`back_off` firing during a HOLD_LOST/SLAM_HOLD stretch if genuinely near a wall; `SLAM_STEPBACK #2/3`/
+`#3/3` reachable on a sustained bad patch; the Goals DB panel's new bumps/giveups/reason columns; click/
+Prev/Next navigation in the replay debugger; `t`/`g` trim macros in manual flight._
+
+_**Session 24 — settle-gate rewrite (rolling-window two-gate design), pick-pulse dedup, bounded/scaled
+far-corner exemption.** Four more issues off the same `20260717_102403` flight, independent of session 23.
+(1) **Double SETTLE wait after a SLAM-loss recovery**: `SLAM_HOLD`'s exit (3 fast frames) already proved SLAM
+healthy WHILE STATIONARY, but entering `SETTLE` then re-demanded 6 BRAND-NEW frames from scratch — a genuine
+architecture problem (a single streak counter conflating "is SLAM healthy" with "has the airframe rested long
+enough"), not a two-site patch. Rebuilt as a rolling `(slam_ms, cap_ts)` window decoupled into a FRESHNESS
+gate (full + healthy + capture-timestamped — a stale/timestamp-less stream can never look "already clean",
+caught in review) and a PHYSICAL-MOTION gate (`settle_gate_s` dwell, opened at the TRUE stationary-start
+instant so a hold's own duration already counts toward it); `SLAM_HOLD`'s exit now uses this gate for EVERY
+resume target (`SETTLE`, and — newly gated, previously a weaker no-dwell 3-frame check — `ADVANCE`/
+`PARALLAX_PUSH`). Deliberately scoped OFF the calibration-recovery holds (`CALIB_LOST_HOLD`/`CALIB_ESCAPE`/
+`POSTLUDE_LOST_HOLD` keep the old counter, per the operator — separate, already-validated mechanism).
+(2/3) **LOOP-blacklist fired on a multi-step turn's own re-orient sub-steps**: every `REPLAN` re-commit
+(including a same-goal one mid multi-turn ORIENT→PARALLAX_PUSH→SETTLE→REPLAN cycle) counted as a fresh
+goals-DB "pick" — confirmed as the exact cause of `goal=[4.65, 8.25]` (a sweep corner) getting
+`LOOP-BLACKLIST`ed while the drone kept flying toward it (corners ignore `_excluded()` by design, so the
+blacklist was real but inert — just a misleading log line). Fixed per the operator's own proposed rule: a
+same-goal re-commit (reusing the existing `goal_moved` check) suppresses only the PICK half of the pulse; the
+hop-outcome/strike half still judges every hop. (4) **Far-corner exemption smarter + bounded**:
+`corner_no_blacklist_dist` (flat 1.0u) is now overridden live by `corner_span_half` (half the room's own known
+corner-to-corner diagonal, from `perception_worker`'s `bbox_corners`); a NEW persistent, proximity-keyed
+give-up counter (not a single reset-on-switch slot — a reviewer caught that oscillating between two
+unreachable corners would defeat that) force-retires a corner after `corner_giveup_limit` (10) give-ups,
+same as a real 2-bump, without ending the mission by itself; the mission only ends in a HARD STUCK hold (not
+the graceful dock) once EVERY corner is exhausted this way — caught a real bug while testing this: the
+generic step()-top recovery convergence would otherwise immediately bounce this new terminal STUCK back out
+since `done` stays permanently True, needed a `_corner_giveup_stuck` guard on BOTH that convergence and
+STUCK's own resume check. New self-tests for every fix above; all 6 module suites green. See
+`plans/session24-settle-gate-pick-dedup-corner-giveup.md` for the full design + file list.
+**NEXT = LIVE-FLY** (alongside the still-pending sessions 20b/21/22/23 checklist)._
+
+_**Session 23 — wired the flow BACKWALL detector into a real decision (was DETECTION-ONLY); PARALLAX_PUSH now
+retries a side + remembers a give-up.** Diagnosed a ~30s stuck loop in flight `20260717_102403` (starts
+`10:27:09.454`, ends `10:27:37`–`10:27:39` when an unrelated height-TRIM branch happened to break it): the
+drone oriented away from a wall SLAM hadn't mapped yet, so the clearance ring at 180° read "open" and
+`PARALLAX_PUSH` picked BACKWARD — the log's own BACKWALL detector fired twice (`10:27:23`, `10:27:35`) but was
+logged `"detection-only, no reaction yet"`; every push instead ran the full 2.0s reverse timer into the wall,
+re-oriented, and repeated (heading swung 132°→70°→93°, SLAM died twice, position barely moved). Built: (1)
+`backwall_contact` is now a real `ExploreController.step()` input, mirroring `ceiling_contact`; (2)
+`PARALLAX_PUSH`'s backward branch, on a ring block OR a live BACKWALL contact, calls a new shared
+`_pick_ring_direction()` helper (extracted from the existing entry-tick backward/strafe/give-up pick)
+EXCLUDING backward, and hands off to a side strafe IN-PLACE (same episode, no settle/replan/re-turn) — this
+also upgrades the EXISTING ring-based mid-push block, which previously bailed straight to settle/replan
+without ever trying a side; (3) `REVERSE_PROBE` (default-enabled on a forward WALL hit) now ends its reverse
+recipe early on a live BACKWALL contact instead of only its fixed 4.0s timeout; (4) a give-up (backward AND
+both sides blocked) LATCHES the drone's position (`_parallax_back_blocked`) so the next pick — even a leg
+later, after settle/replan/re-orient — doesn't immediately retry backward at the same spot just because the
+ring still (falsely) reads it as open; cleared once the drone has moved `parallax_min_clear` away
+(SLAM-freeze-safe, mirrors `rearm_bump_if_disengaged`). New self-tests (retry->strafe, both-sides-blocked->
+give-up, ring-only block also retries, give-up memory latch+clear, REVERSE-PROBE-BACKWALL); all 6 module
+suites green. **NEXT = LIVE-FLY** (alongside the still-pending sessions 20b/21/22 checklist below) — watch
+for a `parallax backward blocked (...) -> strafe_...` / `-> no room back/left/right either` line instead of
+the old silent `"(timer)"` grind._
+
+_**Session 22 — fixed height reference + BIDIRECTIONAL TRIM; the mid-flight ceiling re-tap is RETIRED.** The
+session-21 live-fly (`20260717_004418`) hit a calibration death-loop (~2¼ min): the goal-change re-tap fired in
+a SLAM-hostile corner, the vertical ASCEND lost the plan on EVERY attempt, each redo threw the height around,
+and the drone ended GLUED AT THE CEILING (y≈-2.30 ≈ ceiling; desired was -1.855) with NOTHING able to bring it
+down (altitude lock injects UP only; TRIM climbed only) — while the rolling median followed the error. The log
+also CONFIRMED the operator's key hypothesis: SLAM's height read is STABLE within a flight (consistent pos_y
+across every loss/re-lock). Rebuilt on that: (1) the periodic re-tap is OFF by default (code kept) — the
+FIRST-takeoff calibration's `desired_y` is THE flight's height reference; (2) TRIM is now BIDIRECTIONAL — TRIM
+UP on a sag (`pos_y > ceiling+1.2·delta`), TRIM DOWN when glued high (`pos_y < desired−0.2·delta`, new
+`trim_high_ratio`), same goal-preserving machine with a mirrored pitch aim (+1.0), and `trim_aim_s` is now an
+automatic 0.5 s platform constant (io_bridge's ±0.05/tick aim ramp saturates in ~0.33 s; the aim is held through
+the push); (3) a **SLAM-COMFORT gate** — calibration redo/retry (and any re-enabled periodic tap) requires the
+rolling average of healthy-frame latencies < `calib_slam_avg_ms` (666) on a full window, not merely "6 alive
+frames" (the bad flight's redos passed on 616–797 ms marginal frames and died in every ASCEND); a redo gated
+past `calib_gate_max_s` counts a failed attempt WITHOUT launching (escalates to CALIB_ESCAPE = relocate);
+(4) **Y-DRIFT audit posture** — re-enable later with `calib_cooldown_s: 600` and every non-first PASS logs the
+ceiling movement vs the first tap; (5) CALIB_VERIFY PASS latches `target_altitude_y = settled_y` (one verified
+reference everywhere) + a once-per-flight LOUD `HEIGHT-REFERENCE DISAGREEMENT` notice if the median wanders >
+delta from desired (visible drift backstop); (6) the debugger HEIGHT panel shows the full band (`trim-at-high` /
+`trim-at-low`, pos_y red outside either side). New SESSION-22 self-test block (7 asserts); all 6 module suites
+green. **NEXT = LIVE-FLY.**_
+
+_**Session 21 — RESTORED the periodic height re-calibration + gradual TRIM + the height debugger panel.** The
+drone does NOT hold altitude — it sags, wrecking flights. Session 17 deleted this machinery believing the sag
+was self-inflicted (the unset `triggerDown`); live flights proved it real. Restored from `44b4fa6` and adapted
+to the current branch: (1) the **periodic re-tap** — a genuine goal change (>1u) past a configurable
+`calib_cooldown_s` (60 s) → `CALIBRATING_HEIGHT` → CALIB_VERIFY, whose PASS re-measures the three LIVE
+references (ceiling_y from the ASCEND climb peak, desired_y = the settled post-descend pose, delta) and logs
+them LOUD; (2) the **gradual TRIM** — pos_y sinking past `ceiling + 1.2·delta` in SETTLE/ADVANCE fires a
+ring-gated PITCH-aim + forward climb (guards stay active; triggerDown derives centrally) that re-aims the SAME
+snapshotted goal on exit; (3) the **debugger HEIGHT panel** — live pos_y (red past the sag threshold),
+ceiling/desired/delta, the `trim-at` threshold, median, and a TRIM/CALIB activity flag. Session-20b
+integrations: a recalib REPLAN emits a hop-outcome-ONLY pulse (the pick registers post-calib, once per leg);
+TRIM entry clears the pending per-hop eval (a trimmed hop takes no strike). Review hardening: never-calibrated
+(`_last_calib_t is None`, e.g. `--no-takeoff`) ALLOWS calibration instead of locking it out; the TRIM trigger
+None-guards its refs (can't fire pre-calibration); the WAIT gate is phase-relative on cap_ts (stale frames can't
+exit early); the post-calib resume is a θ≈0 'c'-only ORIENT (no thrash). New self-tests: HEIGHT-TRIM (9 asserts)
++ PERIODIC-RECALIB (4) — the harness disables the trigger globally so unrelated leg tests aren't diverted.
+**NEXT = LIVE-FLY.**_
 
 _**Session 20b — per-hop progress + strikes (kill the instant-stall death-loop) + goals DB in the debugger.**
 Flight `20260716_140437` froze re-picking one goal forever ("leg STALL … 75.0s" every leg, never blacklisted).
@@ -167,9 +330,101 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ## Next (resume after a context clear)
 
-_**NEXT = LIVE-FLY SESSION 20b** (BUILT on `leg-hops-and-goal-commit-fix`; all 6 module self-tests green;
-UNCOMMITTED. Plan: `plans/session20-goal-db-loop-blacklist.md`). `main` is the clean fallback — DO NOT touch it.
-Run `python fly.py`, press `m`, and watch:_
+_**NEXT = LIVE-FLY SESSIONS 26 + 25 + 24 + 23 + 22 + 20b together** (BUILT on
+`leg-hops-and-goal-commit-fix`; all module self-tests green; sessions 20b-26 all COMMITTED as of
+2026-07-20. Plans: `plans/session26-homing-backoff-settle-freshness-pick-dedup.md` +
+`plans/session25-trim-macros-recovery-fixes-goaldb-schema-debugger-nav.md` +
+`plans/session24-settle-gate-pick-dedup-corner-giveup.md` + `plans/session23-backwall-reaction-and-
+parallax-retry.md` + `plans/session22-fixed-height-ref-and-bidirectional-trim.md` +
+`plans/session20-goal-db-loop-blacklist.md`). `main` is the clean fallback — DO NOT touch it. Run
+`python fly.py`, press `m`, and watch:_
+
+_**Session 26 (homing back-off + settle-gate freshness + postlude budget + pick-dedup) checklist:**_
+- _**Homing that hits a wall should back off, not sit pinned.** During `RETURN_TO_ORIGIN`, a
+  `"homing: wall ahead ... -> back off -> settle -> re-aim toward origin"` line should be followed by
+  `fwd_clear`/`ring_clear` recovering off ~the stand-off floor, and a visibly different `pos` on the
+  next re-aim — not the same position/heading repeating._
+- _**No more REPLAN off a stale pre-maneuver frame.** Every `"settled: SLAM window clean (...) -> ..."`
+  should be preceded, within that same settle window, by at least one NEW `frame_id` captured after
+  the settle began — watch for the old symptom (repeating the identical `ORIENT`/`ADVANCE` bearing 2-3
+  times against the same spot) being gone._
+- _**Postlude ending should not stall for minutes if SLAM keeps flickering near the end.** If
+  `POSTLUDE_LOST_HOLD` cycles OK/PLAN-LOST without ever recovering cleanly, total time to reach
+  `ORIENT_HOME`/`DONE` should stay roughly bounded near `postlude_recover_budget_s`(30s), not run 4-5x
+  over it._
+- _**A frontier the drone keeps "reaching" from ~the same spot should get blacklisted, not loop
+  forever.** Watch the Goals DB panel: `picks` should now climb past 1 on repeated genuine hops toward
+  the same close-by goal (not frozen), and once `> goal_loop_min_picks` with clustered drone
+  positions, `LOOP-BLACKLIST` should fire instead of the drone re-picking it indefinitely._
+
+_**Session 25 (trim macros + recovery-FSM fixes + goals-DB schema + debugger nav) checklist:**_
+- _Press `t` / `g` in MANUAL flight (autonomy off) — watch the console print each macro phase
+  (aim → push → reset) while the drone visibly pitches, pushes forward briefly, then resets attitude,
+  matching the autonomous TRIM's motion. Any other flight key should cancel it instantly._
+- _Watch the replay debugger's event log during a SLAM-loss stretch: intermediate strike/bump/loop
+  messages should now show up individually (no more a goal silently jumping from 0 strikes straight to
+  `STRIKE-BLACKLIST` with nothing in between)._
+- _If the drone is genuinely near a wall during a `HOLD_LOST`/`SLAM_HOLD` stretch, watch for a
+  `BLIND_BACKOFF` reaction (`flow WALL/BACKWALL contact while blind ... -> back off, then resume ...`) —
+  it should back off ONCE, not repeatedly while still touching the wall._
+- _On a sustained bad-SLAM patch, `SLAM_STEPBACK` should be able to reach `#2/3`/`#3/3` (and the give-up
+  log) instead of re-arming at `#1/3` forever every time the plan flickers LOST/OK._
+- _Open the Goals DB floating panel in the replay debugger — new `bumps`/`giveups` columns + a
+  blacklist-reason (`2bump`/`stall`/`loop`) and evidence string on dead rows; a corner disc should show
+  both a give-up count and (once close) a bump count._
+- _In the replay debugger: click a log line to jump the scrubber to it; use the new Prev/Next buttons to
+  step message-by-message; toggle "incl. SLAM msgs" to include/exclude the orange/green SLAM lines from
+  that navigation._
+
+_**Session 24 (settle-gate + pick-dedup + corner give-up) checklist:**_
+- _**No more double settle wait after a SLAM-loss recovery.** A `SLAM_HOLD` that clears should reach `SETTLE`
+  and pass on its very FIRST tick (watch for the resume log immediately followed by
+  `settled: SLAM window clean (...) + ...s dwell -> REPLAN` with no second multi-second gap)._
+  A mid-leg `SLAM_HOLD` resuming to `ADVANCE`/`PARALLAX_PUSH` should also properly wait for a clean rolling
+  window now (previously ungated) — should not visibly change normal flight, only bound a prior gap._
+- _**A multi-step turn toward one far goal should NOT trip LOOP-BLACKLIST from its own re-orient sub-steps.**
+  Watch the goals-DB floating table: `picks` should stay at 1 across an ORIENT→PARALLAX_PUSH→SETTLE→REPLAN
+  cycle that keeps re-committing the SAME goal; only a genuinely different goal bumps `picks`._
+- _**A distant corner the drone can't approach** should log an increasing give-up count
+  (`N/corner_giveup_limit`) instead of the same MISSED-BUMP forever, then retire (mark visited, tour advances
+  to the next corner) at the cap — watch for `CORNER-GIVEUP pulse ... -> planner force-retires it`._
+- _**If EVERY corner ends up retired via give-up** (never all reached/2-bump-confirmed), the flight should end
+  in a stationary STUCK hold (logging paused) — `mission ABANDONED: ... -> STUCK` — NOT the graceful
+  RETURN_TO_ORIGIN dock sequence. A normal explore-complete (frontiers genuinely exhausted, corners reached)
+  should still dock as before._
+
+_**Session 23 (parallax backward-block reaction) checklist:**_
+- _**A parallax scout that finds a wall SLAM hasn't mapped yet no longer grinds a blind 2.0s reverse timer.**
+  Watch for `parallax backward blocked (flow BACKWALL contact) -> strafe_left/right` (or `-> reposition
+  forward ... then strafe`) — the push should redirect to a side WITHIN THE SAME episode (no re-settle/
+  re-orient) well under 1s after contact._
+- _If BOTH the ring and a live BACKWALL contact ever show backward blocked with no side open either:
+  `parallax backward blocked (...) -> no room back/left/right either -> settle -> replan`, and the goal's
+  MISSED-BUMP log should mention "no room"/"back+sides"._
+- _**No immediate re-try ping-pong**: after a give-up, the NEXT re-orient at roughly the same spot should NOT
+  immediately re-attempt backward (it should go straight to a side check or turn again) — this is the
+  `_parallax_back_blocked` memory latch; it should clear (allow backward again) once the drone has genuinely
+  moved away._
+- _`REVERSE_PROBE` (fires on a forward WALL hit, default-enabled) should likewise cut a backward-into-another-
+  wall probe short instead of running its full ~4.0s recipe._
+
+_**Session 22 (height) checklist:**_
+- _**ONE calibration only** — the takeoff prelude. Its PASS prints `HEIGHT-CALIB values: … (TRIM band: … (high)
+  .. … (low))` and the HEIGHT panel fills (pos_y / ceiling / desired / delta / trim-at-high / trim-at-low /
+  median). NO `CALIBRATING_HEIGHT` after that (the periodic re-tap is retired; no calibration loops)._
+- _**Height held by TRIM alone, both directions**: pos_y RED past `trim-at-low` → `TRIM enter (UP)` (pitch-up +
+  forward, with triggerDown); pos_y RED past `trim-at-high` (glued near the ceiling — the 20260717 failure) →
+  `TRIM enter (DOWN)` (pitch-DOWN +1.0 + forward). Both end `TRIM done (UP/DOWN): post pos_y=…` and re-aim the
+  SAME goal. Altitude should stay inside the band all flight; the aim pre-hold is an automatic 0.5 s._
+- _**SLAM-comfort gate** (matters if a prelude redo happens / re-tap re-enabled): a redo waits for the healthy-
+  frame latency AVERAGE < 666 ms (not just 6 alive frames); log lines `NOT comfortable (avg …ms)` →
+  `comfort gate timeout … KEEP HOLDING` → escalation relocates via CALIB_ESCAPE._
+- _**Watch for**: the once-per-flight `*** HEIGHT-REFERENCE DISAGREEMENT …` notice (median vs desired > delta) —
+  if it fires while TRIM reports on-height flight, SLAM Y may actually be drifting → consider the Y-DRIFT audit
+  posture (`calibrate_on_goal_change: true` + `calib_cooldown_s: 600`; each rare PASS logs `Y-DRIFT check`)._
+- _**Interactions**: a trimmed hop takes NO strike; TRIM fires only from SETTLE/ADVANCE between hops._
+
+_**Session 20b checklist:**_
 - _**No more freeze on one goal.** The drone actually ADVANCEs each hop (the instant-stall guard is gone). A goal
   it can't get ≥0.2u closer on takes a STRIKE; TWO strikes → `[perception] planner: STRIKE-BLACKLIST goal=…
   strikes=2` and it reselects. A ping-pong/circling still logs `LOOP-BLACKLIST … picks=N`._
@@ -344,6 +599,23 @@ _Session-9 items below BUILT + flew OK (`20260709_091706`, recoveries fine):_
 ---
 
 ## Future (backlog)
+- **Session-22 — fixed height reference + BIDIRECTIONAL TRIM; mid-flight re-tap RETIRED — BUILT
+  (`leg-hops-and-goal-commit-fix`), all 6 module self-tests green, UNCOMMITTED, LIVE-FLY PENDING**
+  (`plans/session22-fixed-height-ref-and-bidirectional-trim.md`): the 20260717_004418 calibration death-loop +
+  glued-at-ceiling diagnosis; `calibrate_on_goal_change: false` (first-takeoff `desired_y` = THE flight
+  reference — SLAM Y stability confirmed in the log); TRIM DOWN (`trim_high_ratio` 0.2, mirrored pitch +1.0);
+  `trim_aim_s` automatic (0.5 s platform constant); SLAM-COMFORT gate (`calib_slam_avg_ms` 666 on a 10-frame
+  healthy-latency window, `calib_gate_max_s` 30 → escalate WITHOUT redo); Y-DRIFT audit posture (re-enable +
+  `calib_cooldown_s` 600; non-first PASS logs the ceiling movement); PASS latches `target_altitude_y`; LOUD
+  once-per-flight median-vs-desired disagreement notice; debugger trim-at-high/low band. **NEXT = live-fly.**
+- **Session-21 — periodic height re-calibration + gradual TRIM + height debugger RESTORED — BUILT, then the
+  re-tap RETIRED by session 22 after its live-fly (kept configurable)**
+  (`plans/session21-restore-height-calib-and-trim.md`): goal-change re-tap (configurable `calib_cooldown_s` 60 s,
+  `calib_goal_change_dist` 1.0); live refs ceiling_y/desired_y/delta re-measured each CALIB_VERIFY PASS; TRIM
+  (pitch-aim + forward climb, ring-gated, goal-preserving) on `pos_y > ceiling + 1.2·delta` in SETTLE/ADVANCE;
+  HEIGHT panel (pos_y/ceiling/desired/delta/trim-at/median/active). Session-20b integrations: recalib pulse is
+  hop-outcome-only; TRIM clears the pending hop eval. Review hardening: never-calibrated allowed; None-guarded
+  trigger; phase-relative WAIT gate; θ≈0 'c'-only resume. **NEXT = live-fly (with the 20b checklist).**
 - **Session-20 REV — de-commit hops + persistent goals DB + corner safety — BUILT (`leg-hops-and-goal-commit-fix`),
   all 6 module self-tests green, UNCOMMITTED, LIVE-FLY PENDING** (`plans/session20-goal-db-loop-blacklist.md`):
   hop→REPLAN (re-pick every hop, adopt SLAM's new goal with parallax; `_settle_to="REPLAN"`); `frontier_planner`

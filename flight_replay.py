@@ -109,7 +109,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #slamwrap { padding: 8px 10px; border-bottom: 1px solid #333; }
   #slamval { font-size: 12px; margin-bottom: 4px; }
   #events { flex: 1 1 auto; overflow-y: auto; padding: 6px 10px; font-size: 11px; line-height: 1.45; }
-  #events .ev { white-space: pre-wrap; }
+  #events .ev { white-space: pre-wrap; cursor: pointer; }   /* clickable -> jumps the scrubber to it */
+  #events .ev:hover { background: #262626; }
+  #events .ev.navsel { outline: 1px solid #567; }           /* the Prev/Next pointer's current position */
   #events .cur { color: #fff; }
   #events .old { color: #777; }
   #events .plan { color: #c58bff; }          /* planner bump outcome (count / reset) */
@@ -117,6 +119,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #events .miss { color: #e0a020; }          /* a real contact that emitted no bump */
   #events .slam_start  { color: #e8891a; }    /* SLAM_ENGINE  [START]  frame ingested (orange) */
   #events .slam_finish { color: #33cc55; }    /* SLAM_TRACKER [FINISH] pose accepted + latency (green) */
+  #events .trigger_event { color: #33cccc; }  /* TRIGGER engaged/released/hop-end (cyan) */
+  #events .hop_baseline  { color: #6fa8ff; }  /* HOP_BASELINE: hop-start position bind (light blue) */
+  #events .hop_judge     { color: #e0c020; font-weight: bold; }  /* HOP_JUDGE: the verdict line (gold) */
+  #events .slam_gap      { color: #ff2b2b; font-weight: bold; }  /* SLAM_GAP: a dropped plan (warning red) */
   .legend { font-size: 11px; color: #999; padding: 6px 10px; border-bottom: 1px solid #333; }
   .sw { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: middle; }
   /* Floating goals-DB table (toggled by the Goals DB button; draggable by its header) */
@@ -161,6 +167,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         </select>
       </label>
       <button id="dbBtn" title="Persistent goals database (picks / strikes / blacklist) at the cursor">Goals DB</button>
+      <button id="evPrev" title="Jump to the previous log message">&#9664; Msg</button>
+      <button id="evNext" title="Jump to the next log message">Msg &#9654;</button>
+      <label style="font-size:12px;color:#999">
+        <input id="slamFilter" type="checkbox"> incl. SLAM msgs
+      </label>
       <span id="clock"></span>
     </div>
   </div>
@@ -195,6 +206,51 @@ const SLAM_SLOW_MS = __SLAM_SLOW_MS__;
 const STEPS  = RECORDS.filter(r => r.state !== undefined);
 const MAPS   = RECORDS.filter(r => r.map !== undefined);
 const SLAMEV = RECORDS.filter(r => r.ev_kind === 'slam_start' || r.ev_kind === 'slam_finish');  // chronological
+// Diagnostic-session markers (TRIGGER engage/release/hop-end, a dropped-plan SLAM_GAP warning, and the
+// HOP_BASELINE/HOP_JUDGE position-state instants) — same "not a STEPS record" shape as the SLAM pair
+// above, carried on a `msg` field instead of `slam`. Kept as a separate list from SLAMEV (rather than
+// widening that filter) so the name stays accurate and the two remain independently maintainable.
+const DIAG_EVENTS = RECORDS.filter(r => ['trigger_event', 'slam_gap', 'hop_baseline', 'hop_judge'].includes(r.ev_kind));
+
+// Every navigable/loggable event across the WHOLE flight (state events, planner bump/strike/loop outcomes,
+// missed-bump markers, and the paired SLAM start/finish records), built ONCE at load — not per-render — and
+// sorted by time. Each entry carries `stepIdx` (the nearest STEPS index at-or-before its time, i.e. where
+// the scrubber jumps to) and `isSlam`, so the event log (render(), filtered up to the cursor), the
+// clickable-message jump, and the Prev/Next navigation all read from this ONE list instead of three
+// separate ad-hoc scans.
+const ALL_EVENTS = (function () {
+  const out = [];
+  for (let i = 0; i < STEPS.length; i++) {
+    const st = STEPS[i], tw = st.t_wall || '';
+    if (st.event) out.push({t: st.t_mono, stepIdx: i, isSlam: false, cls: '',
+                            html: `${tw} ${st.state}: ${st.event}`});
+    if (st.planner_event) {
+      const bl = /BLACKLIST/.test(st.planner_event) ? ' bl' : '';
+      out.push({t: st.t_mono, stepIdx: i, isSlam: false, cls: 'plan' + bl,
+                html: `${tw} PLANNER: ${st.planner_event}`});
+    }
+    if (st.missed_bump) out.push({t: st.t_mono, stepIdx: i, isSlam: false, cls: 'miss',
+                                  html: `${tw} MISSED-BUMP: ${st.missed_bump}`});
+  }
+  // SLAM start/finish records aren't STEPS entries; map each to the nearest STEPS index at-or-before its
+  // capture time (SLAMEV and STEPS are both already chronological, so a single forward pointer suffices).
+  let si = 0;
+  for (const sv of SLAMEV) {
+    while (si + 1 < STEPS.length && STEPS[si + 1].t_mono <= sv.t_mono) si++;
+    out.push({t: sv.t_mono, stepIdx: si, isSlam: true, cls: sv.ev_kind,
+              html: `${sv.t_wall ? sv.t_wall + ' ' : ''}${sv.slam}`});
+  }
+  // Diagnostic markers (TRIGGER/SLAM_GAP/HOP_BASELINE/HOP_JUDGE) get their own forward pointer — a
+  // separate array from SLAMEV, so it must walk STEPS independently rather than share `si`.
+  let di = 0;
+  for (const sv of DIAG_EVENTS) {
+    while (di + 1 < STEPS.length && STEPS[di + 1].t_mono <= sv.t_mono) di++;
+    out.push({t: sv.t_mono, stepIdx: di, isSlam: false, cls: sv.ev_kind,
+              html: `${sv.t_wall ? sv.t_wall + ' ' : ''}${sv.msg}`});
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out;
+})();
 
 // ---- static world extent (fit once so scrubbing never jumps the view) ----
 function computeExtent() {
@@ -331,8 +387,12 @@ function render(idx) {
   updateGoalDb(idx);
 }
 
-// Floating goals-DB table: the planner's persistent per-disc picks / strikes / blacklist state at the cursor
-// (rides each step record as `goal_db`). Updates live while scrubbing/playing — each new pick/strike shows.
+// Floating goals-DB table: the planner's persistent per-disc picks / strikes / bumps / corner-giveups /
+// blacklist state at the cursor (rides each step record as `goal_db`, schema-split per mechanism so the
+// operator can see WHICH one killed a goal and on what evidence, not just that it's dead). Updates live
+// while scrubbing/playing. `bumps`/`corner_giveups`/`is_corner`/`blacklist_reason`/`blacklist_evidence`
+// are undefined on an OLDER log (pre schema-split) — every read below is optional-chained/defaulted so
+// those logs still render (just without the new columns' detail).
 function updateGoalDb(idx) {
   const panel = document.getElementById('goaldb');
   if (panel.style.display !== 'flex') return;          // skip work while hidden
@@ -348,23 +408,40 @@ function updateGoalDb(idx) {
   // (loop fires only when this is <= goal_loop_pos_dist, i.e. ALL locs clustered); null if <2 locs.
   const maxSpread = (L) => { let m = null; for (let i=0;i<L.length;i++) for (let j=i+1;j<L.length;j++) {
     const d = Math.hypot(L[i][0]-L[j][0], L[i][1]-L[j][1]); if (m===null||d>m) m=d; } return m; };
+  // A short inline rendering of the blacklist evidence dict — whatever the mechanism recorded (pos,
+  // strikes/picks/spread/bumps, slam_ms) — so the reason a goal died is visible without opening a console.
+  const evidenceTxt = (ev) => {
+    if (!ev) return '';
+    const parts = [];
+    if (ev.pos) parts.push(`pos [${fmt(ev.pos[0])}, ${fmt(ev.pos[1])}]`);
+    if (ev.slam_ms != null) parts.push(`slam ${fmt(ev.slam_ms, 0)}ms`);
+    if (ev.spread != null) parts.push(`spread ${fmt(ev.spread)}u`);
+    return parts.length ? ` (${parts.join(', ')})` : '';
+  };
   let rows = '';
   for (const e of db) {
     const dead = e.blacklisted ? ' dead' : '', cur = near(e.center) ? ' cur' : '';
     const locs = e.drone_locs || [];
     const mp = maxSpread(locs), mpTxt = (mp===null) ? '' : ` spread ${fmt(mp)}u`;
-    // goal (parent) row: center · picks · strikes · status
-    rows += `<tr class="goal${dead+cur}"><td class="c">[${fmt(e.center[0])}, ${fmt(e.center[1])}]</td>` +
-            `<td>${e.picks}</td><td>${e.strikes}</td>` +
-            `<td>${e.blacklisted ? 'BLACKLIST' : 'active'}<span class="mp">${mpTxt}</span></td></tr>`;
+    const cornerTag = e.is_corner ? ' <span class="mp">corner</span>' : '';
+    const bumps = e.bumps != null ? e.bumps : '—', giveups = e.corner_giveups != null ? e.corner_giveups : '—';
+    const status = e.blacklisted
+      ? `BLACKLIST${e.blacklist_reason ? ' (' + e.blacklist_reason + ')' : ''}` +
+        `<span class="mp">${evidenceTxt(e.blacklist_evidence)}</span>`
+      : `active<span class="mp">${mpTxt}</span>`;
+    // goal (parent) row: center(+corner tag) · picks · strikes · bumps · giveups · status(+reason/evidence)
+    rows += `<tr class="goal${dead+cur}"><td class="c">[${fmt(e.center[0])}, ${fmt(e.center[1])}]${cornerTag}</td>` +
+            `<td>${e.picks}</td><td>${e.strikes}</td><td>${bumps}</td><td>${giveups}</td>` +
+            `<td>${status}</td></tr>`;
     // one sub-row per DRONE LOCATION at a pick (what the <1u clustering test runs on)
     for (let i=0;i<locs.length;i++) {
       rows += `<tr class="loc${dead}"><td class="c">&#8627; loc ${i+1}</td>` +
-              `<td colspan="3">[${fmt(locs[i][0])}, ${fmt(locs[i][1])}]</td></tr>`;
+              `<td colspan="5">[${fmt(locs[i][0])}, ${fmt(locs[i][1])}]</td></tr>`;
     }
   }
   body.innerHTML = '<table><thead><tr><th class="c">goal center (x,z) / drone loc</th><th>picks</th>' +
-                   '<th>strikes</th><th>status</th></tr></thead><tbody>' + rows + '</tbody></table>';
+                   '<th>strikes</th><th>bumps</th><th>giveups</th><th>status</th></tr></thead><tbody>' +
+                   rows + '</tbody></table>';
 }
 
 const fmt = (v, d=2) => (v === null || v === undefined) ? '—' : (+v).toFixed(d);
@@ -399,29 +476,21 @@ function updatePanel(idx) {
     // 2-bump blacklist counter: how close the CURRENT goal region is to being retired (2 = blacklist).
     `<span class="k">bump</span> ${(s.wall_hit_count!=null?s.wall_hit_count:0)}/2` +
     ` ${s.wall_hit_goal?('@['+fmt(s.wall_hit_goal[0])+', '+fmt(s.wall_hit_goal[1])+']'):''}`;
-  // event log up to the cursor: state events + the planner's bump outcomes (PLANNER) + un-counted
-  // contacts (MISSED-BUMP), so the blacklist mechanism the flight log used to hide is now visible.
+  // event log up to the cursor, read from the single global ALL_EVENTS list (state events + the planner's
+  // bump outcomes (PLANNER) + un-counted contacts (MISSED-BUMP) + the interleaved paired SLAM start/finish
+  // records), so the blacklist mechanism the flight log used to hide is visible AND every entry is
+  // clickable (data-gidx indexes back into ALL_EVENTS for the jump-to-message handler below).
   const ev = document.getElementById('events');
   const tCur = STEPS[idx] ? STEPS[idx].t_mono : Infinity;
-  const entries = [];
-  for (let i = 0; i <= idx; i++) {
-    const st = STEPS[i], cls = (i === idx) ? 'cur' : 'old', tw = st.t_wall || '';
-    if (st.event) entries.push({t: st.t_mono, html: `<div class="ev ${cls}">${tw} ${st.state}: ${st.event}</div>`});
-    if (st.planner_event) {
-      const bl = /BLACKLIST/.test(st.planner_event) ? ' bl' : '';
-      entries.push({t: st.t_mono, html: `<div class="ev ${cls} plan${bl}">${tw} PLANNER: ${st.planner_event}</div>`});
-    }
-    if (st.missed_bump) entries.push({t: st.t_mono, html: `<div class="ev ${cls} miss">${tw} MISSED-BUMP: ${st.missed_bump}</div>`});
+  let evHtml = '';
+  for (let gi = 0; gi < ALL_EVENTS.length; gi++) {
+    const e = ALL_EVENTS[gi];
+    if (e.t > tCur) break;   // ALL_EVENTS is sorted by time, so the rest are all still in the future
+    const cls = (e.stepIdx === idx) ? 'cur' : 'old';
+    const sel = (gi === navPos) ? ' navsel' : '';
+    evHtml += `<div class="ev ${cls}${e.cls ? ' ' + e.cls : ''}${sel}" data-gidx="${gi}">${e.html}</div>`;
   }
-  // Interleave the paired SLAM logs up to the cursor time (orange START / green FINISH), so the ~2 Hz
-  // pipeline spans sit between the state events chronologically instead of scrolling past in the terminal.
-  for (const sv of SLAMEV) {
-    if (sv.t_mono > tCur) break;
-    // The paired-SLAM string carries its own bracketed wall-time, so t_wall is "" (no double timestamp).
-    entries.push({t: sv.t_mono, html: `<div class="ev ${sv.ev_kind}">${sv.t_wall ? sv.t_wall + ' ' : ''}${sv.slam}</div>`});
-  }
-  entries.sort((a, b) => a.t - b.t);
-  ev.innerHTML = entries.map(e => e.html).join('');
+  ev.innerHTML = evHtml;
   ev.scrollTop = ev.scrollHeight;
 }
 
@@ -440,6 +509,13 @@ function updateTelemetry(idx) {
         .map(([k, v]) => `<span class="k">${k}</span> <span class="cmd">${(typeof v === 'number') ? (+v).toFixed(2) : v}</span>`)
         .join('  ');
   const stCol = (s.status === 'OK' || s.status == null) ? 'v' : (s.status === 'PLAN-LOST' ? 'bad' : 'warn');
+  // TRIM band (session 22, bidirectional): LOW threshold = ceiling + 1.2*delta (sagged -> TRIM UP), HIGH
+  // threshold = desired - 0.2*delta (glued near the ceiling -> TRIM DOWN). Ratios mirror the config defaults
+  // (trim_sag_ratio 1.2 / trim_high_ratio 0.2). pos_y reddens when OUTSIDE the band on either side.
+  const sagThr = (s.alt_ceiling != null && s.alt_delta != null) ? (s.alt_ceiling + 1.2 * s.alt_delta) : null;
+  const sagHThr = (s.alt_desired != null && s.alt_delta != null) ? (s.alt_desired - 0.2 * s.alt_delta) : null;
+  const sagBad = (s.pos_y != null && ((sagThr != null && s.pos_y > sagThr)
+                                      || (sagHThr != null && s.pos_y < sagHThr)));
   const t = document.getElementById('telemetry');
   t.innerHTML =
     `<div class="grp">RAW TRANSLATION (world, +Y DOWN)</div>` +
@@ -457,7 +533,18 @@ function updateTelemetry(idx) {
     `<span class="k">ram&lt;33%</span> <span class="${(s.speed!=null&&s.nominal_speed!=null&&s.speed<0.33*s.nominal_speed)?'bad':'v'}">` +
       `${(s.nominal_speed!=null)?(s.speed!=null?((s.speed<0.33*s.nominal_speed)?'STALLED':'ok'):'—'):'calibrating'}</span>` +
     `<div class="grp">HEIGHT CALIBRATION (+Y DOWN)</div>` +
-    `<span class="k">drone-height median (all-flight)</span> <span class="v">${fmt(s.alt_median,3)}</span>` +
+    // Live pos_y vs the three per-calibration references (ceiling/desired/delta) + the TRIM sag threshold
+    // (ceiling + 1.2*delta): pos_y beyond the threshold = the drone SANK enough that a TRIM should fire.
+    // trim_on/calib_on flag the machinery actually running at this frame. Old logs (no fields) show —.
+    `<span class="k">pos_y</span> <span class="${sagBad?'bad':'v'}">${fmt(s.pos_y,3)}</span>  ` +
+    `<span class="k">ceiling</span> <span class="v">${fmt(s.alt_ceiling,3)}</span>  ` +
+    `<span class="k">desired</span> <span class="v">${fmt(s.alt_desired,3)}</span>  ` +
+    `<span class="k">delta</span> <span class="v">${fmt(s.alt_delta,3)}</span><br>` +
+    `<span class="k">trim-at-high</span> <span class="v">${fmt(sagHThr,3)}</span>  ` +
+    `<span class="k">trim-at-low</span> <span class="v">${fmt(sagThr,3)}</span>  ` +
+    `<span class="k">median</span> <span class="v">${fmt(s.alt_median,3)}</span>  ` +
+    `<span class="k">active</span> <span class="${(s.trim_on||s.calib_on)?'warn':'v'}">` +
+      `${s.trim_on?'TRIM':(s.calib_on?'CALIB':'—')}</span>` +
     `<div class="grp">PLAN STATUS</div>` +
     `<span class="${stCol}">${s.status || 'OK'}</span>`;
 }
@@ -516,6 +603,48 @@ function setPlaying(p) {
 document.getElementById('play').addEventListener('click', () => setPlaying(!playing));
 window.addEventListener('resize', fit);
 
+// ---- Event-log navigation: click a message to jump to its wall-clock time; Prev/Next step message-by-
+// message (optionally skipping SLAM start/finish records via the checkbox), all reading from ALL_EVENTS. ----
+let navPos = -1;   // pointer into ALL_EVENTS (the Prev/Next cursor); -1 = nothing selected yet
+const slamFilter = document.getElementById('slamFilter');
+function includeSlam() { return slamFilter.checked; }
+function jumpToEvent(gi) {
+  const e = ALL_EVENTS[gi];
+  if (!e) return;
+  navPos = gi;
+  cur = e.stepIdx;
+  scrub.value = cur;
+  render(cur);
+}
+document.getElementById('events').addEventListener('click', (e) => {
+  const div = e.target.closest('[data-gidx]');
+  if (!div) return;
+  jumpToEvent(+div.dataset.gidx);
+});
+function navStep(dir) {   // dir = +1 (next) or -1 (prev); scans past entries the SLAM filter excludes
+  let i = navPos;
+  for (;;) {
+    i += dir;
+    if (i < 0 || i >= ALL_EVENTS.length) return;   // nothing further in that direction
+    if (includeSlam() || !ALL_EVENTS[i].isSlam) { jumpToEvent(i); return; }
+  }
+}
+document.getElementById('evPrev').addEventListener('click', () => navStep(-1));
+document.getElementById('evNext').addEventListener('click', () => navStep(1));
+// Toggling the filter re-anchors the pointer to whichever (now-eligible) entry is closest to the CURRENT
+// cursor position, so Prev/Next never jumps wildly to wherever navPos happened to sit before the toggle.
+slamFilter.addEventListener('change', () => {
+  const inc = includeSlam();
+  let best = -1, bestDist = Infinity;
+  for (let i = 0; i < ALL_EVENTS.length; i++) {
+    if (!inc && ALL_EVENTS[i].isSlam) continue;
+    const d = Math.abs(ALL_EVENTS[i].stepIdx - cur);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  navPos = best;
+  render(cur);   // refresh the .navsel highlight in the event log
+});
+
 // ---- Goals-DB floating panel: toggle + drag by its header ----
 const dbPanel = document.getElementById('goaldb');
 function toggleDb() {
@@ -571,15 +700,27 @@ def _self_test():
          "plan_goal": [2.5, 0.5], "dist_to_goal": 0.99, "plan_age_s": 0.2, "frame_id": 5,
          "goals": [{"xz": [1.0, 1.0], "state": "active"}, {"xz": [2.5, 0.5], "state": "plan_pick"}],
          "cmd": {"trigger": 0.2}, "speed": 0.42, "nominal_speed": 0.45,
-         "goal_db": [{"center": [1.0, 1.0], "picks": 2, "strikes": 1,
-                      "drone_locs": [[0.30, 0.30], [0.34, 0.28]], "blacklisted": False},
-                     {"center": [2.5, 0.5], "picks": 1, "strikes": 0,
-                      "drone_locs": [[0.30, 0.30]], "blacklisted": True}]},
+         "alt_median": -1.85, "alt_ceiling": -2.2, "alt_desired": -1.9, "alt_delta": 0.3,
+         "trim_on": False, "calib_on": False,
+         "goal_db": [{"center": [1.0, 1.0], "picks": 2, "strikes": 1, "bumps": 1, "corner_giveups": 0,
+                      "is_corner": False, "drone_locs": [[0.30, 0.30], [0.34, 0.28]],
+                      "blacklisted": False, "blacklist_reason": None, "blacklist_evidence": {}},
+                     {"center": [2.5, 0.5], "picks": 1, "strikes": 0, "bumps": 2, "corner_giveups": 3,
+                      "is_corner": True, "drone_locs": [[0.30, 0.30]], "blacklisted": True,
+                      "blacklist_reason": "2bump", "blacklist_evidence": {"pos": [2.4, 0.6]}}]},
         {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
         {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.800]. SLAM had just finished working on the frame #6 from: [00:00:01.100]. "
                  "The deltas are: (dx: +0.10 dy: +0.03) Latency: 700ms."},
+        {"t_wall": "00:00:00.400", "t_mono": 0.4, "ev_kind": "trigger_event", "msg": "[TRIGGER] engaged"},
+        {"t_wall": "00:00:00.900", "t_mono": 0.9, "ev_kind": "hop_baseline",
+         "msg": "[HOP_BASELINE] pos=[0.30, 0.30] cap_ts=0.90 frame_id=5 bound against goal=[1.0, 1.0] dist=0.99"},
+        {"t_wall": "00:00:01.700", "t_mono": 1.7, "ev_kind": "slam_gap",
+         "msg": "[SLAM_GAP] slam_seq jumped 6 -> 8 (2 dropped plans)"},
+        {"t_wall": "00:00:02.500", "t_mono": 2.5, "ev_kind": "hop_judge",
+         "msg": "[HOP_JUDGE] pos=[0.60, 0.60] cap_ts=2.50 frame_id=8 prev_goal=[1.0, 1.0] start_dist=0.99 "
+                "end_dist=0.50 closed=0.49 progressed=True"},
         {"t_wall": "00:00:02.000", "t_mono": 2.0, "rec_frame": 10, "state": "SETTLE",
          "event": "SLAM spike", "status": "PLAN-STALE", "pos": [0.6, 0.6], "heading": 45.0,
          "pos_y": -1.0, "slam_ms": 2200.0, "fwd_clear": 0.5, "goal": [1.0, 1.0],
@@ -642,6 +783,18 @@ def _self_test():
         print(f"[self-test] {'PASS' if c_db else 'FAIL'}  goals-DB table (drone_locs survive + loc-rows render)")
         ok = ok and c_db
 
+        # goals-DB schema split: bumps/corner_giveups/is_corner/blacklist_reason/evidence survive load +
+        # the new columns' render code is wired in (corner tag, reason-in-status, evidence text).
+        c_db2 = (db_rec["goal_db"][1]["bumps"] == 2 and db_rec["goal_db"][1]["corner_giveups"] == 3
+                 and db_rec["goal_db"][1]["is_corner"] is True
+                 and db_rec["goal_db"][1]["blacklist_reason"] == "2bump"
+                 and db_rec["goal_db"][1]["blacklist_evidence"]["pos"] == [2.4, 0.6]
+                 and "e.corner_giveups" in html and "e.blacklist_reason" in html
+                 and "evidenceTxt" in html and "corner</span>" in html)
+        print(f"[self-test] {'PASS' if c_db2 else 'FAIL'}  goals-DB schema split "
+              f"(bumps/corner_giveups/is_corner/reason/evidence survive + render code wired)")
+        ok = ok and c_db2
+
         # Paired SLAM logs (ev_kind:"slam_start"/"slam_finish") carried + the orange/green interleave render path
         n_slam = sum(1 for r in embedded if r.get("ev_kind") in ("slam_start", "slam_finish"))
         c_slam = (n_slam == 2 and "SLAM had currently began working" in html
@@ -663,7 +816,10 @@ def _self_test():
               and by_frame[5].get("speed") == 0.42 and by_frame[5].get("nominal_speed") == 0.45
               and "updateTelemetry" in html and "RAW TRANSLATION" in html and "RAW COMMAND" in html
               and "HEIGHT CALIBRATION (+Y DOWN)" in html and 'id="telemetry"' in html
-              and "drone-height median (all-flight)" in html
+              # session 21/22: the ceiling/desired/delta references survive load + BOTH trim thresholds render
+              and by_frame[5].get("alt_ceiling") == -2.2 and by_frame[5].get("alt_delta") == 0.3
+              and "alt_ceiling" in html and "alt_desired" in html and "alt_delta" in html
+              and "trim-at-low" in html and "trim-at-high" in html and "sagThr" in html and "sagHThr" in html
               and "DIST &rarr; GOAL (SLAM units)" in html and "SPEED (world, u/s)" in html)
         print(f"[self-test] {'PASS' if c7 else 'FAIL'}  raw telemetry panel (translation/cmd/dist/speed/height-calib) wired")
         ok = ok and c7
@@ -675,6 +831,28 @@ def _self_test():
               and "plan_pick" in html and "plan_age" in html and "STALE" in html and "plan_berr" in html)
         print(f"[self-test] {'PASS' if c8 else 'FAIL'}  committed-goal vs plan_pick + staleness (plan_age/frame_id/STALE) render")
         ok = ok and c8
+
+        # NEW: event-log navigation — the global ALL_EVENTS list, clickable-message wiring (data-gidx +
+        # delegated click handler), Prev/Next buttons, and the SLAM-filter checkbox are all present.
+        c9 = ("const ALL_EVENTS" in html and "stepIdx" in html and "isSlam" in html
+              and "data-gidx" in html and "jumpToEvent" in html and "function navStep" in html
+              and 'id="evPrev"' in html and 'id="evNext"' in html and 'id="slamFilter"' in html
+              and "navPos" in html)
+        print(f"[self-test] {'PASS' if c9 else 'FAIL'}  event-log navigation (ALL_EVENTS + click-to-jump + "
+              f"Prev/Next + SLAM-filter checkbox wired)")
+        ok = ok and c9
+
+        # NEW: diagnostic-session markers (trigger_event/hop_baseline/slam_gap/hop_judge) carried through
+        # load, and DIAG_EVENTS + the per-kind CSS classes are wired into the generated HTML.
+        n_diag = sum(1 for r in embedded if r.get("ev_kind") in
+                     ("trigger_event", "hop_baseline", "slam_gap", "hop_judge"))
+        c10 = (n_diag == 4 and "[TRIGGER] engaged" in html and "[HOP_BASELINE]" in html
+               and "[SLAM_GAP]" in html and "[HOP_JUDGE]" in html and "const DIAG_EVENTS" in html
+               and "#events .trigger_event" in html and "#events .hop_baseline" in html
+               and "#events .slam_gap" in html and "#events .hop_judge" in html)
+        print(f"[self-test] {'PASS' if c10 else 'FAIL'}  diagnostic markers (TRIGGER/HOP_BASELINE/SLAM_GAP/"
+              f"HOP_JUDGE) carried ({n_diag}) + DIAG_EVENTS/CSS wired")
+        ok = ok and c10
 
     print(f"[self-test] {'ALL PASS' if ok else 'FAILURES'} (flight_replay)")
     return ok

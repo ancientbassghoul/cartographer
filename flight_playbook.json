@@ -44,7 +44,13 @@
     "  strafe  = a short lateral scoot for parallax between turns (joy_horizontal +1 right / -1 left; the",
     "             autopilot flips the sign per side). Strafe is the MOST responsive axis (near-zero warm-up,",
     "             more than backward, much more than forward), so a 0.25s TIMED hold gives the slight scoot",
-    "             we want (operator-measured). Platform control dynamic, TUNABLE live; NOT a room distance."
+    "             we want (operator-measured). Platform control dynamic, TUNABLE live; NOT a room distance.",
+    "  trim_up/trim_down = the manual 't'/'g' io_bridge macro keys. Mirrors the autonomous TRIM state's",
+    "             AIM->FWD->RESET sub-phases (autopilot.py) with the ring-gate/reposition decision and the",
+    "             height-threshold trigger removed -- a direct replay of the motion only. Values are a",
+    "             literal snapshot of the autonomy.explore config defaults (trim_pitch_up -1.0, trim_throttle",
+    "             1.0, trim_aim_s 0.5, trim_fwd_s 0.25, trim_reset_s 0.15); like back_off's reverse=0.7 vs",
+    "             config's reverse_throttle, this is an independent baseline, not a live read of config.yaml."
   ],
 
   "presets": {
@@ -76,7 +82,17 @@
     ],
     "back_off": [{"reverse": 0.7, "duration_s": 0.3}],
     "reverse_probe": [{"reverse": 0.7, "duration_s": 4.0}],
-    "strafe": [{"joy_horizontal": 1.0, "duration_s": 0.25}]
+    "strafe": [{"joy_horizontal": 1.0, "duration_s": 0.25}],
+    "trim_up": [
+      {"pitch": -1.0, "duration_s": 0.5},
+      {"pitch": -1.0, "trigger": 1.0, "trigger_down": true, "duration_s": 0.25},
+      {"btnCdown": true, "duration_s": 0.15}
+    ],
+    "trim_down": [
+      {"pitch": 1.0, "duration_s": 0.5},
+      {"pitch": 1.0, "trigger": 1.0, "trigger_down": true, "duration_s": 0.25},
+      {"btnCdown": true, "duration_s": 0.15}
+    ]
   },
 
   "rules": {
