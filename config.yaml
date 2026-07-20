@@ -302,8 +302,22 @@ autonomy:
     home_reach_dist: 0.5             # "reached the origin" test (SLAM units) — tightened 1.0->0.5 so the drone actually
                                      #   flies home at altitude before docking (a general tolerance, NOT a room answer)
     home_max_s: 30.0                 # SAFETY: cap the homing; then dock HERE (logged, NO SILENT FALLBACK)
+    # ORIENT_HOME: converge on the take-off heading using the REAL bearing error each turn (clamped to one
+    # turn_step_deg per turn, but no longer forced to a multiple of it — that quantization could ping-pong
+    # forever whenever the residual sat near half a step). orient_home_tol_deg is a general control-loop
+    # tolerance (like home_reach_dist), NOT a room answer.
+    orient_home_tol_deg: 5.0         # "facing the take-off heading" convergence tolerance (deg)
+    orient_home_max_s: 60.0          # SAFETY: cap ORIENT_HOME; then refine/dock HERE (logged, NO SILENT FALLBACK)
+    # HOME_REFINE: after ORIENT_HOME, tighten the resting POSITION against the true origin using short,
+    # full-throttle push pulses (not a continuous ADVANCE), picked by body-frame quadrant each cycle and
+    # settled between pushes. General platform/robustness params, NOT a room answer.
+    home_fine_reach_dist: 0.15       # "good enough" origin radius (SLAM units) for HOME_REFINE
+    home_refine_fwd_s: 0.32          # forward/backward full-throttle pulse hold (trigger/reverse ramp as usual)
+    home_refine_strafe_s: 0.16       # left/right full-throttle pulse hold (joy_horizontal — never ramped)
+    home_refine_max_s: 45.0          # SAFETY: cap HOME_REFINE; then dock HERE (logged, NO SILENT FALLBACK)
     dock_pulse_s: 0.1               # Phase-1: DOWN micro-pulse length (near-zero momentum; mirrors ascend_micro_pulse_s)
-    dock_rest_s: 1.0                # Phase-1: rest after each DOWN pulse (momentum bleed + a clean pose to read dZ)
+    # dock_rest_s removed: Phase-1's post-pulse rest is now a real settle-gate (settle_fresh_frames), not a
+    # fixed timer (see autopilot.py DOCK_FLOOR).
     dock_max_s: 20.0                 # SAFETY: cap the descent even if no FLOOR latches, then proceed (logged)
     floor_standoff_nudge: 0.5        # LOW_STANDOFF: UP-nudge duration (s) to clear the ground before standby
     # (the descent reuses the ascend gain/stall/latch knobs: ascend_gain_eps / ascend_stall_cycles / ascend_latch_hold_s)
@@ -374,14 +388,14 @@ autonomy:
                                      #   exits the sweep immediately regardless, via the generic recovery convergence -- this
                                      #   wait is only ever fully spent while still genuinely stale)
     fallback_max_rotation_deg: 720.0 # exhaustion cap: 2 full rotations (48 cycles @ 15deg) with no recovery -> STUCK
-    fallback_push_fwd_back_s: 2.0    # forward/backward push: FULL throttle (1.0), held this long INCLUDING ramp-up
+    fallback_push_fwd_back_s: 1.0    # forward/backward push: FULL throttle (1.0), held this long INCLUDING ramp-up
                                      #   (operator-measured: ~2s of held full reverse is what it actually takes to matter)
-    fallback_push_strafe_s: 0.5      # left/right push: FULL magnitude (+-1.0); joy_horizontal isn't ramped at all
+    fallback_push_strafe_s: 0.25      # left/right push: FULL magnitude (+-1.0); joy_horizontal isn't ramped at all
                                      #   (unlike trigger/reverse), so there's no ramp-up time to fold into this duration
     recovery_confirm_dist: 1.0   # a post-recovery ADVANCE must travel >= this (SLAM units) to CONFIRM the re-lock is trustworthy
                                  #   (then: drop _recovering, reset the give-up counter, clear the stale reverse-list, resume logging).
                                  #   Progress-gated so a re-lock that instantly bumps a wall at ~0 distance does NOT falsely confirm.
-    recovery_turn_step_deg: 15.0 # gentler turn step for the recovery FALLBACK sweep (vs turn_step_deg for normal flight): a
+    recovery_turn_step_deg: 22.5 # gentler turn step for the recovery FALLBACK sweep (vs turn_step_deg for normal flight): a
                                  #   fragile re-lock survives a smaller open-loop turn; more cycles still cover a full sweep.
     recovery_settle_frames: 4    # a SETTLE between every REWIND inverse maneuver (only relevant when use_rewind_on_stale is
                                  #   true -- the FALLBACK sweep uses its own fixed fallback_post_push_wait_s instead): hold

@@ -1,9 +1,11 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-21** (session 31 **BUILT — self-tests green, NOT YET live-flown**). Resume from
-THIS file. **Session 31 killed REWIND (config-gated off, not deleted) and replaced FALLBACK's direction-
-cycling search with a simple 4-phase wait→turn→push→wait sweep — see "Next" below.** Plan of record:
-**`plans/session31-rewind-off-simple-fallback-sweep.md`** (+ `plans/session30-backoff-hard-gate.md`,
+_Last updated **2026-07-21** (session 33 **BUILT — self-tests green, NOT YET live-flown**). Resume from
+THIS file. **Session 33 fixed a goal-selection bug (diagnosed off flight `20260721_005658`) where a
+permanently-blacklisted goal kept getting re-picked 49x because the clearance inset ran AFTER the exclusion
+check — see "Next" below.** Plan of record: **`plans/session33-goal-loop-clearance-inset-fix.md`** (+
+`plans/session32-orient-home-ping-pong-and-home-refine.md`,
+`plans/session31-rewind-off-simple-fallback-sweep.md`, `plans/session30-backoff-hard-gate.md`,
 `plans/session29-clearance-tab-direction-cycling-fallback.md`,
 `plans/session28-trim-resume-gate-clearance-vote.md`,
 `plans/session27-video-recording-pointcloud-export-graceful-shutdown.md`,
@@ -12,6 +14,75 @@ cycling search with a simple 4-phase wait→turn→push→wait sweep — see "Ne
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
 parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
 `plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 33 — a permanently-blacklisted goal kept getting re-picked because the clearance inset ran AFTER
+the exclusion check (diagnosed off flight `20260721_005658`) (BUILT — self-tests green, live-fly PENDING).**
+The operator flagged the end of that flight's timeline: an endless "goal reached → re-picked → reached
+again" loop, and the Goals DB showed one disc with **49 picks** despite the loop guard correctly firing and
+PERMANENTLY blacklisting it after just the 3rd pick. Traced it end to end in `frontier_planner.py`:
+`_select_reachable()` filters candidate frontiers by `_excluded()` against each frontier's RAW centroid,
+then runs the chosen one through the clearance-inset function (`ground_grid.inset_to_clearance`, wired up in
+`perception_worker.py`), which walks the goal back TOWARD THE DRONE until it finds a free, buffered cell —
+and that adjusted point, not the raw centroid, is what actually gets committed/published/logged. The
+exclusion check never re-ran against it. In this flight the drone was pinned in one spot with its entire
+reachable free space in that direction pinched into one small pocket — exactly where the already-dead
+frontier sat — so every "different" (technically not-excluded) raw candidate the utility function turned up
+got inset right back onto that same dead cell, defeating the blacklist entirely: each cycle looked like a
+fresh pick, was already almost on top of the drone (`goal_reach_dist: 1.0` is generous) so it read as
+instantly "reached," then REPLAN picked "again." Confirmed via the timeline's millimeter-scale `plan_goal`
+drift cycle to cycle, and via the Goals DB's `is_corner` flag staying `False` throughout — ruling out the
+corner-sweep tour (which deliberately bypasses `_excluded` by design, a different and intentional escape
+hatch) as the source. **Fix:** `_select_reachable()` now re-checks `_excluded()` against the POST-inset
+point; if it's still dead, that candidate is dropped and the next-best reachable frontier is tried instead,
+looping until a genuinely clear one is found or the list is exhausted (falls through exactly as if nothing
+had been reachable that cycle). Also added a structured `WARNING` `planner_event` (not a bare `print()` —
+routed through the same mechanism `LOOP-BLACKLIST`/`BUMP` events use, so it shows up in both the console and
+the timeline/`flight_replay.py` debugger) if a pick ever lands on an already-excluded goal again — a loud
+canary rather than a silent repeat of this bug, per the operator's explicit ask. New self-tests in
+`frontier_planner.py` reproduce the exact failure (a blacklisted dead spot + a genuinely-reachable candidate
+whose injected clearance_fn collapses onto it) and confirm the fix drops it for the next-best candidate,
+plus the all-candidates-collapse case correctly reports nothing reachable. `python frontier_planner.py
+--self-test`, `python autopilot.py --self-test`, `python perception_worker.py --self-test`, and `python
+ground_grid.py --self-test`: ALL PASS. See `plans/session33-goal-loop-clearance-inset-fix.md` for the full
+trace + design. **NEXT = LIVE-FLY** — does a drone pinned in a corner with no genuinely reachable space now
+fall through to the corner-sweep tour instead of looping; does any blacklisted disc's pick count stay flat
+after being blacklisted; the new WARNING event should never fire._
+
+_**Session 32 — ORIENT_HOME real-angle convergence (fixes a diagnosed live ping-pong) + a new HOME_REFINE
+position-tightening stage + DOCK_FLOOR real settle-gate (BUILT — self-tests green, live-fly PENDING).**
+The operator pointed at the tail of flight `20260720_223555`'s raw timeline: from `22:55:37.228`,
+`ORIENT_HOME` alternated `turn +30 deg (err +15.1)` / `turn -30 deg (err -17.4)` / ... forever, never
+reaching `DOCK_FLOOR`. Root cause: `ORIENT_HOME`'s turn command went through `_quantize_turn`, which snaps
+the bearing error to the nearest whole `turn_step_deg` (30) — it could only ever command 0° or ±30°, never
+the actual residual. Once that residual sat near half a step (~15°, exactly what the log shows), each
+open-loop 30° turn overshot to the OTHER side by a similar margin, and the "done" check (`|err| < 15`) sat
+on that same knife-edge — so it could loop forever. Fixed per the operator's own two-part diagnosis: (a)
+turn by the REAL (still clamped to `turn_step_deg` for the same SLAM-survives-a-turn safety, but no longer
+forced to a multiple of it) bearing error — the open-loop recipe already supported a continuous angle, the
+quantization was self-imposed; (b) an explicit `orient_home_tol_deg` (5°) convergence tolerance, decoupled
+from the turn clamp. Also added, per the operator's explicit request, a bounded `orient_home_max_s` (60s)
+give-up cap mirroring `RETURN_TO_ORIGIN`'s own `home_max_s` idiom (VISIBLE, no silent fallback) so a
+persistently-noisy heading can't hang the ending forever either. Explained to the operator what happens
+next if this had resolved: `ORIENT_HOME` → `DOCK_FLOOR` (pulsed descent) → `LOW_STANDOFF` (up-nudge) →
+`DONE` (terminal hover) — the "come home and land" tail; target localization itself already happened
+earlier during mapping. Two follow-up asks landed in the same session: (1) a new **`HOME_REFINE`** state,
+inserted between `ORIENT_HOME` and `DOCK_FLOOR`, that tightens the resting POSITION against the true origin
+(config `home_fine_reach_dist`, 0.15) using ONLY short full-throttle push pulses — never a continuous
+ADVANCE — picked by body-frame quadrant each cycle (forward/backward `home_refine_fwd_s`=0.32s, ramps as
+usual; left/right strafe `home_refine_strafe_s`=0.16s, never ramped, per the operator's exact numbers),
+settled between pushes, with its own `home_refine_max_s` (45s) give-up cap; (2) **`DOCK_FLOOR`** now settles
+(6 fresh frames, the same primitive every other maneuver-loop already uses) after each descent micro-pulse
+instead of waiting a fixed `dock_rest_s` timer and reading whatever pose happened to be sitting in `plan` —
+the same class of stale-frame gap session 24's settle-gate rewrite fixed everywhere else, just never applied
+here since `DOCK_FLOOR` was added later (mirroring `ASCEND`, which keeps its own fixed-timer REST — not
+touched, not asked for, flagged as the same class of gap for later). New self-tests reproduce the diagnosed
+bug directly (a bearing error starting just past half a turn step, under a REALISTIC noisy 1.4x-overshoot
+open-loop turn model, converges in 2 turns instead of oscillating forever) plus quadrant-pick/convergence/
+cap coverage for `HOME_REFINE`; three pre-existing postlude tests needed small `_max_s=0` overrides so their
+synthetic (non-physical) drive loops don't burn their tick budget on a give-up cap that isn't what they're
+testing. `python autopilot.py --self-test`: ALL PASS. See
+`plans/session32-orient-home-ping-pong-and-home-refine.md` for the full trace + design. **NEXT = LIVE-FLY**
+— none of this can be exercised without hardware in this dev environment._
 
 _**Session 31 — REWIND killed (config-gated off), FALLBACK rebuilt as a simple 4-phase sweep, operator ask
 off many real flights (BUILT — self-tests green, live-fly PENDING).** The operator: "That REWIND mechanism
@@ -485,12 +556,35 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ### >>> IMMEDIATE NEXT TASK <<<
 
-**LIVE-FLY the session-31 build** (`python fly.py`, press `m`) — this stacks session 31 (REWIND killed via
-config gate, FALLBACK rebuilt as a simple 4-phase wait→turn→push→wait sweep) on top of session 30 (BACKOFF
-hard-gate phase-timer) on top of session 29 (Clearance tab) on top of session 28 (TRIM resume gate +
-clearance min-hit-fraction vote), and NONE of sessions 28-31 have been live-flown yet. No hardware/GPU in
-the dev environment, so all were BUILT + self-tested only; live confirmation is the very next thing to do.
-Watch specifically for:
+**LIVE-FLY the session-33 build** (`python fly.py`, press `m`) — this stacks session 33 (goal-selection fix:
+the clearance inset can no longer commit onto an already-blacklisted goal) on top of session 32 (ORIENT_HOME
+real-angle convergence, new HOME_REFINE position-tightening stage, DOCK_FLOOR real settle-gate) on top of
+session 31 (REWIND killed via config gate, FALLBACK rebuilt as a simple 4-phase wait→turn→push→wait sweep)
+on top of session 30 (BACKOFF hard-gate phase-timer) on top of session 29 (Clearance tab) on top of session
+28 (TRIM resume gate + clearance min-hit-fraction vote), and NONE of sessions 28-33 have been live-flown
+yet. No hardware/GPU in the dev environment, so all were BUILT + self-tested only; live confirmation is the
+very next thing to do. Watch specifically for:
+- **A drone pinned in a corner/pocket with no genuinely reachable free space should fall through to the
+  corner-sweep tour (or `STUCK`/`done`) instead of looping on a dead goal** — the exact failure mode from
+  `20260721_005658` (one disc racked up 49 picks after being permanently blacklisted at pick 3). Watch the
+  Goals DB panel in the replay debugger: a blacklisted disc's pick count should go FLAT the moment it's
+  blacklisted, never keep climbing. If the new `WARNING: pick landed on an ALREADY-excluded goal...`
+  `planner_event` ever appears (console or the timeline/replay debugger), that means some OTHER path is
+  still bypassing exclusion — flag it immediately, it should never fire.
+- **The ending should reach `DONE` at all now** — the flight that triggered this session
+  (`20260720_223555`) never got past `ORIENT_HOME`'s turn ping-pong. Confirm `ORIENT_HOME` now converges
+  (a handful of `turn ... (err ...)` lines settling toward 0, not alternating sign forever) and the replay
+  debugger shows a NEW `HOME_REFINE` state after it (a few `push {forward|backward|strafe_left|strafe_right}
+  ...s (d=..., err ...)` lines) before `DOCK_FLOOR`.
+- **`HOME_REFINE`'s push magnitudes are unverified live** (`home_refine_fwd_s`=0.32s / full throttle,
+  `home_refine_strafe_s`=0.16s / full throttle — the operator's own manual-flight numbers, same category as
+  session-31's FALLBACK push durations) — watch whether the drone's final resting spot actually tightens
+  toward the origin, or whether these pulses over/undershoot `home_fine_reach_dist` (0.15u) and just burn
+  the `home_refine_max_s` (45s) cap instead. No clearance/wall gating on these pushes (matches the literal
+  ask) — worth noting if the drone drifted somewhere tight before returning.
+- **`DOCK_FLOOR`'s descent should look unchanged in FEEL** (still gentle micro-pulses) but now waits for a
+  real settle between each — if the descent looks noticeably slower/choppier than before, the settle
+  (6 frames) may be taking longer than the old fixed `dock_rest_s` (1.0s) ever did; worth timing.
 - **A PLAN-STALE episode should go straight into the turn/push/wait cycle, no REWIND detour** — confirm the
   console/replay debugger never shows a `REWIND` state (it's config-gated off by default now,
   `use_rewind_on_stale: false`). If REWIND genuinely never helped, this should be invisible; if the operator

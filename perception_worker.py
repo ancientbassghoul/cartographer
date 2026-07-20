@@ -688,6 +688,19 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
                                                           slam_ms=ev.get("judge_slam_ms"),
                                                           is_corner=bool(ev.get("prev_is_corner")))
                     if pg is not None:
+                        # Defense in depth (NOT a fallback -- just visibility): a genuinely new pick landing on
+                        # an ALREADY-excluded goal would silently defeat the loop/2-bump/stall blacklist (this
+                        # is exactly the bug found off flight 20260721_005658 -- a clearance-inset candidate
+                        # collapsing onto a dead disc kept re-picking it 49x after it was permanently
+                        # blacklisted at pick 3, since exclusion was only ever checked pre-inset). The fix lives
+                        # in frontier_planner._select_reachable (re-checks _excluded AFTER the inset), so this
+                        # should never fire again -- if it ever does, surface it loudly as a structured
+                        # planner_event (console + the timeline/flight_replay debugger), not a silent no-op.
+                        if pipe.planner.is_excluded(pg):
+                            wg = [round(float(pg[0]), 3), round(float(pg[1]), 3)]
+                            wmsg = f"WARNING: pick landed on an ALREADY-excluded goal={wg} -> blacklist bypassed"
+                            pipe.last_planner_event.append(wmsg)
+                            print(f"[perception] planner: {wmsg}", flush=True)
                         pipe.planner.register_goal_pick(pg, ev.get("pick_pos"),
                                                         slam_ms=ev.get("judge_slam_ms"))
                     lev = pipe.planner.last_loop_event

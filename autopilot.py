@@ -971,11 +971,26 @@ class ExploreController:
         # detected LIVE by the flow FLOOR collapse). A continuous hold-down is FORBIDDEN (see DOCK_FLOOR).
         self.home_reach_dist = float(e.get("home_reach_dist", self.goal_reach_dist))  # "reached origin" test
         self.home_max_s = float(e.get("home_max_s", 30.0))          # SAFETY cap on homing (then dock here; logged)
+        # ORIENT_HOME: converge on the take-off heading to within a real tolerance (NOT "quantized turn rounds
+        # to 0", which knife-edges into a side-to-side ping-pong whenever the residual sits near half a turn
+        # step — see the 20260720 diagnosis) using the ACTUAL bearing error each turn (still clamped to one
+        # turn_step_deg per turn for the same SLAM-survives-a-small-turn reason as everywhere else).
+        self.orient_home_tol_deg = float(e.get("orient_home_tol_deg", 5.0))    # "facing the take-off heading" tolerance
+        self.orient_home_max_s = float(e.get("orient_home_max_s", 60.0))  # SAFETY cap (then refine/dock HERE; logged)
+        # HOME_REFINE: after ORIENT_HOME, tighten the resting POSITION against the true origin using fixed,
+        # full-throttle push pulses (not a continuous ADVANCE) picked by body-frame quadrant each cycle, settled
+        # between pushes. General platform/robustness params, NOT a room answer.
+        self.home_fine_reach_dist = float(e.get("home_fine_reach_dist", 0.15))   # "good enough" origin radius
+        self.home_refine_fwd_s = float(e.get("home_refine_fwd_s", 0.32))    # forward/backward pulse hold (ramps as usual)
+        self.home_refine_strafe_s = float(e.get("home_refine_strafe_s", 0.16))  # left/right pulse hold (never ramped)
+        self.home_refine_max_s = float(e.get("home_refine_max_s", 45.0))    # SAFETY cap (then dock HERE; logged)
         self.postlude_recover_budget_s = float(e.get("postlude_recover_budget_s", 30.0))  # SAFETY: total wall-clock
         #        budget for POSTLUDE_LOST_HOLD to demand a full clean streak before relaxing the recovery gate (still
         #        only ever resumes on a status=="OK" tick -- never blind; see _step_postlude_lost)
         self.dock_pulse_s = float(e.get("dock_pulse_s", self.ascend_micro_pulse_s))   # Phase-1 DOWN micro-pulse length
-        self.dock_rest_s = float(e.get("dock_rest_s", self.ascend_rest_s))            # Phase-1 rest (momentum bleed + pose read)
+        # Phase-1 rest after each DOWN pulse is a REAL settle-gate (settle_fresh_frames), not a fixed timer —
+        # the old dock_rest_s timer read whatever pose happened to be in `plan` when it expired, the same
+        # stale-frame gap session 24's settle-gate rewrite fixed everywhere else.
         self.dock_max_s = float(e.get("dock_max_s", 20.0))          # SAFETY cap on the descent (then proceed; logged)
         self.floor_standoff_nudge = float(e.get("floor_standoff_nudge", 0.5))  # LOW_STANDOFF up-nudge duration (s)
         # --- GRADUAL HEIGHT TRIM (session 14, RESTORED session 21): a fine PITCH-aim + forward climb BETWEEN
@@ -1148,6 +1163,9 @@ class ExploreController:
         self._home_settle_to = None     # which homing phase the SETTLE routes back to ("ADVANCE" after a turn, "PLAN" after an advance)
         self._takeoff_heading = None    # SLAM heading_deg captured once airborne+healthy = the take-off heading (ORIENT_HOME target)
         self._orient_home_phase = None  # None | "PLAN" | "TURN" | "SETTLE" within ORIENT_HOME
+        self._orient_home_t0 = None     # ORIENT_HOME entry time (orient_home_max_s cap)
+        self._home_refine_phase = None  # None | "PLAN" | "PUSH" | "SETTLE" within HOME_REFINE
+        self._home_refine_t0 = None     # HOME_REFINE entry time (home_refine_max_s cap)
         self._dock_phase = None         # None | "PULSE" | "REST" | "LATCH" within DOCK_FLOOR (mirrors ASCEND)
         self._dock_phase_t0 = None      # entry time of the current dock sub-phase
         self._dock_prev_y = None        # last valid pos_y sample (per-cycle descent gain dZ)
@@ -1628,6 +1646,8 @@ class ExploreController:
                 self._home_phase = "PLAN"
             elif resume == "ORIENT_HOME":
                 self._orient_home_phase = "PLAN"
+            elif resume == "HOME_REFINE":
+                self._home_refine_phase = "PLAN"
             self._postlude_resume = None
             self._postlude_t0 = None
             self._enter(resume, now)
@@ -3477,31 +3497,41 @@ class ExploreController:
 
         elif st == "ORIENT_HOME":
             # Postlude leg 1b: face the recorded take-off heading before the final dock — a controlled reverse of
-            # take-off. Open-loop <=turn_step_deg turns with a SETTLE between (no spin on a stale pose), then ->
-            # DOCK_FLOOR. Clears the flying-height altitude lock on the handoff so the descent can't be fought /
-            # re-inflated. If no take-off heading was ever captured, skip straight to the dock (VISIBLE).
+            # take-off. Open-loop turns (clamped to <=turn_step_deg per turn, but NOT quantized to it — the
+            # open-loop recipe already scales continuously; forcing a fixed step here made the residual error
+            # overshoot side-to-side forever whenever it landed near half a step, see the 20260720 ping-pong)
+            # with a SETTLE between (no spin on a stale pose), converging to within orient_home_tol_deg, then ->
+            # HOME_REFINE. Bounded by orient_home_max_s -> proceed anyway (VISIBLE; no silent fallback). Clears
+            # the flying-height altitude lock on the handoff so the descent can't be fought / re-inflated. If no
+            # take-off heading was ever captured, skip straight to HOME_REFINE (VISIBLE).
             if self._orient_home_phase is None:
-                self._orient_home_phase = "PLAN"
+                self._orient_home_phase, self._orient_home_t0 = "PLAN", now
             if self._takeoff_heading is None:
-                self._dock_phase = None
-                self.target_altitude_y = None
-                self._enter("DOCK_FLOOR", now)
-                event = "ORIENT_HOME: no take-off heading recorded -> DOCK_FLOOR"
+                self._orient_home_phase, self._orient_home_t0 = None, None
+                self._home_refine_phase = None
+                self._enter("HOME_REFINE", now)
+                event = "ORIENT_HOME: no take-off heading recorded -> HOME_REFINE"
+            elif (now - self._orient_home_t0) >= self.orient_home_max_s:
+                self._orient_home_phase, self._orient_home_t0 = None, None
+                self._home_refine_phase = None
+                self._enter("HOME_REFINE", now)
+                event = (f"ORIENT_HOME orient_home_max_s ({self.orient_home_max_s:.0f}s) cap — couldn't converge "
+                         "on take-off heading, proceeding HERE (VISIBLE; no silent fallback) -> HOME_REFINE")
             elif self._orient_home_phase == "PLAN":
                 if plan.get("plan_valid") and plan.get("heading_deg") is not None:
                     be = ((self._takeoff_heading - float(plan["heading_deg"]) + 180.0) % 360.0) - 180.0
-                    theta = self._quantize_turn(be)
-                    if self.clamp_leg_turn:
-                        theta = max(-self.turn_step_deg, min(self.turn_step_deg, theta))
-                    if abs(theta) < 1e-6:                   # within half a turn step of the take-off heading -> dock
-                        self._dock_phase = None
-                        self.target_altitude_y = None       # drop the flying-height lock before descending
-                        self._enter("DOCK_FLOOR", now)
-                        event = f"ORIENT_HOME: facing take-off heading (err {self._fmt(be)}) -> DOCK_FLOOR"
+                    if abs(be) <= self.orient_home_tol_deg:     # within tolerance of the take-off heading -> refine position
+                        self._orient_home_phase, self._orient_home_t0 = None, None
+                        self._home_refine_phase = None
+                        self._enter("HOME_REFINE", now)
+                        event = f"ORIENT_HOME: facing take-off heading (err {self._fmt(be)}) -> HOME_REFINE"
                     else:
+                        theta = be
+                        if self.clamp_leg_turn:
+                            theta = max(-self.turn_step_deg, min(self.turn_step_deg, theta))
                         self._player = self._build_turn(theta)
                         self._orient_home_phase = "TURN"
-                        event = f"ORIENT_HOME: turn {theta:+.0f} deg toward take-off heading (err {self._fmt(be)})"
+                        event = f"ORIENT_HOME: turn {theta:+.1f} deg toward take-off heading (err {self._fmt(be)})"
                 else:
                     event = "ORIENT_HOME: pose invalid -> hold (wait for SLAM)"
             elif self._orient_home_phase == "TURN":
@@ -3515,6 +3545,63 @@ class ExploreController:
                                                 min_frames=self.settle_fresh_frames, max_hold_s=None)
                 if sdone:
                     self._orient_home_phase = "PLAN"
+
+        elif st == "HOME_REFINE":
+            # Postlude leg 1c: now that the drone FACES the take-off heading (ORIENT_HOME), nudge the residual
+            # POSITION closer to the true origin using short, FIXED-magnitude push pulses — not a continuous
+            # ADVANCE — so the final resting spot is tighter than home_reach_dist without re-opening the
+            # turning machinery. Each cycle: read the live bearing-to-origin in the CURRENT body frame and pick
+            # ONE of forward/backward/strafe-left/strafe-right (full throttle; forward/back RAMP as usual,
+            # strafe is never ramped — same as every other strafe in this codebase), play it, then a real
+            # SETTLE (6 fresh frames) before re-measuring — never chains pushes blind. Bounded by
+            # home_refine_max_s -> proceed to dock anyway (VISIBLE; no silent fallback), same idiom as
+            # home_max_s/orient_home_max_s.
+            if self._home_refine_phase is None:
+                self._home_refine_phase, self._home_refine_t0 = "PLAN", now
+            pos = plan.get("pos")
+            reached = self._dist(pos, [0.0, 0.0])
+            if reached is not None and reached <= self.home_fine_reach_dist:
+                self._home_refine_phase, self._home_refine_t0 = None, None
+                self._dock_phase = None
+                self.target_altitude_y = None       # drop the flying-height lock before descending
+                self._enter("DOCK_FLOOR", now)
+                event = f"HOME_REFINE: within {self.home_fine_reach_dist:.2f}u of origin (d={reached:.2f}) -> DOCK_FLOOR"
+            elif (now - self._home_refine_t0) >= self.home_refine_max_s:
+                self._home_refine_phase, self._home_refine_t0 = None, None
+                self._dock_phase = None
+                self.target_altitude_y = None
+                self._enter("DOCK_FLOOR", now)
+                event = (f"HOME_REFINE home_refine_max_s ({self.home_refine_max_s:.0f}s) cap — couldn't tighten "
+                         f"within {self.home_fine_reach_dist:.2f}u (d={self._fmt(reached)}), proceeding HERE "
+                         "(VISIBLE; no silent fallback) -> DOCK_FLOOR")
+            elif self._home_refine_phase == "PLAN":
+                if plan.get("plan_valid") and pos is not None and plan.get("heading_deg") is not None:
+                    bearing = math.degrees(math.atan2(0.0 - pos[0], 0.0 - pos[1]))   # 0=+Z, +90=+X (matches homing)
+                    be = ((bearing - float(plan["heading_deg"]) + 180.0) % 360.0) - 180.0   # wrap to (-180,180]
+                    if abs(be) <= 45.0:
+                        push, dur, dirn = {"trigger": 1.0}, self.home_refine_fwd_s, "forward"
+                    elif abs(be) >= 135.0:
+                        push, dur, dirn = {"reverse": 1.0}, self.home_refine_fwd_s, "backward"
+                    elif be > 0.0:
+                        push, dur, dirn = {"joy_horizontal": 1.0}, self.home_refine_strafe_s, "strafe_right"
+                    else:
+                        push, dur, dirn = {"joy_horizontal": -1.0}, self.home_refine_strafe_s, "strafe_left"
+                    self._player = RecipePlayer([dict(push, duration_s=dur)], name=f"refine_{dirn}")
+                    self._home_refine_phase = "PUSH"
+                    event = f"HOME_REFINE: push {dirn} {dur:.2f}s (d={reached:.2f}, err {self._fmt(be)}) toward origin"
+                else:
+                    event = "HOME_REFINE: pose invalid -> hold (wait for SLAM)"
+            elif self._home_refine_phase == "PUSH":
+                active, pdone = self._player.fields(now)
+                if pdone:
+                    self._player = None
+                    self._home_refine_phase = "SETTLE"
+                    self._settle_begin(now)
+            else:   # SETTLE -> re-measure distance/bearing to origin (push again or dock)
+                sdone, _cap = self._settle_poll(now, plan, require_fast=False,
+                                                min_frames=self.settle_fresh_frames, max_hold_s=None)
+                if sdone:
+                    self._home_refine_phase = "PLAN"
 
         elif st == "DOCK_FLOOR":
             # Postlude leg 2: a gentle PULSED (two-phase) descent to the floor — the MIRROR of the two-phase
@@ -3556,12 +3643,19 @@ class ExploreController:
                 active = {"joy_vertical": 1}               # a short DOWN micro-pulse (near-zero momentum)
                 if (now - self._dock_phase_t0) >= self.dock_pulse_s:
                     self._dock_phase, self._dock_phase_t0 = "REST", now
-            else:   # REST: neutral (momentum bleeds); at the end sample the SLAM descent gain this cycle
-                if (now - self._dock_phase_t0) >= self.dock_rest_s:
+                    self._settle_begin(now)
+            else:   # REST: neutral (momentum bleeds) while a REAL settle-gate (6 fresh frames, the same
+                    # primitive every other maneuver-loop in this file uses) proves the pose we're about to
+                    # read is a genuine POST-pulse frame — not whatever `plan` happened to hold when a fixed
+                    # timer expired (the same class of stale-frame gap session 24's settle-gate rewrite fixed
+                    # everywhere else; DOCK_FLOOR, added later mirroring ASCEND, never got it).
+                sdone, _cap = self._settle_poll(now, plan, require_fast=False,
+                                                min_frames=self.settle_fresh_frames, max_hold_s=None)
+                if sdone:
                     valid = plan.get("plan_valid") and plan.get("pos_y") is not None and not self._slam_slow
                     if not valid:
-                        self._dock_phase_t0 = now         # no trustworthy pose -> PAUSE (hold); dock_max_s backstops
-                        event = "dock: pose invalid/slow -> pause (hold) until SLAM recovers"
+                        self._settle_begin(now)           # not trustworthy yet -> re-open the gate, keep waiting (dock_max_s backstops)
+                        event = "dock: pose invalid/slow after settle -> re-wait for SLAM"
                     else:
                         y = float(plan["pos_y"])
                         dz = None if self._dock_prev_y is None else (y - self._dock_prev_y)   # +Y down: sinking => +dz
@@ -3618,10 +3712,10 @@ _RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK", "WARMUP"}
 
 # Post-mission ending states. A plan loss WHILE in one of these diverts to the dedicated POSTLUDE_LOST_HOLD
 # (mirror of CALIB_LOST_HOLD) instead of the generic recovery, so the ending survives a SLAM loss and resumes.
-POSTLUDE_STATES = {"RETURN_TO_ORIGIN", "ORIENT_HOME", "DOCK_FLOOR", "LOW_STANDOFF"}
+POSTLUDE_STATES = {"RETURN_TO_ORIGIN", "ORIENT_HOME", "HOME_REFINE", "DOCK_FLOOR", "LOW_STANDOFF"}
 # Postlude states where the flying-height altitude lock must be OFF (the descent + standby) — clearing
 # target_altitude_y on DOCK_FLOOR entry could otherwise be re-cached next tick and re-inflate a floor-level drone.
-# RETURN_TO_ORIGIN / ORIENT_HOME are NOT here: they home + orient AT altitude, lock on.
+# RETURN_TO_ORIGIN / ORIENT_HOME / HOME_REFINE are NOT here: they home + orient + reposition AT altitude, lock on.
 _POSTLUDE_NOLOCK = {"DOCK_FLOOR", "LOW_STANDOFF", "DONE", "POSTLUDE_LOST_HOLD"}
 
 # SESSION 18: the old MAPPING_ALT_STATES state-gate for the altitude baseline is retired. The baseline now
@@ -4306,11 +4400,14 @@ def run_self_test(cfg):
     post_ok = (saw_down_pulse and saw_up_nudge and cpost.state == "DONE"
                and _is_subsequence(["RETURN_TO_ORIGIN", "DOCK_FLOOR", "LOW_STANDOFF", "DONE"], porder))
     # home_max_s cap: the drone is NOT at the origin and can't get there -> dock HERE (no infinite homing).
+    # home_refine_max_s=0 too: HOME_REFINE has its own bounded give-up (same idiom) and would otherwise keep
+    # pushing forever at this same far-from-origin pose (no takeoff heading -> ORIENT_HOME is skipped).
     chome = ExploreController(cfg, no_takeoff=True)
     chome.home_max_s = 0.0
+    chome.home_refine_max_s = 0.0
     far_done = dict(plan_done, pos=[9.0, 9.0])
     _, _, _, sthome = _drive(chome, far_done, False, 0.3, 0.0)
-    home_cap_ok = _is_subsequence(["RETURN_TO_ORIGIN", "DOCK_FLOOR"], sthome)
+    home_cap_ok = _is_subsequence(["RETURN_TO_ORIGIN", "HOME_REFINE", "DOCK_FLOOR"], sthome)
     # dock_max_s cap: the floor never latches (floor_contact False) -> still proceed to LOW_STANDOFF.
     cdock = ExploreController(cfg, no_takeoff=True)
     cdock.dock_max_s = 0.0
@@ -4323,6 +4420,9 @@ def run_self_test(cfg):
     # (like _drive) so the settles resolve.
     chomeloop = ExploreController(cfg, no_takeoff=True)
     chomeloop.rest_between_s = 0.1; chomeloop.settle_fresh_frames = 2
+    chomeloop.home_refine_max_s = 0.1  # this test only simulates position closing DURING RETURN_TO_ORIGIN's
+                                        # own forward push, not HOME_REFINE's -- give it up fast so the test
+                                        # still measures what it's actually testing (the homing loop itself)
     hx, saw_home_push, reached_dock, saw_home_settle = 3.0, False, False, False
     th, fidh = 0.0, 5000
     hplan = {"plan_valid": True, "done": True, "goal": None, "heading_deg": 0.0, "bearing_err": None,
@@ -4343,8 +4443,8 @@ def run_self_test(cfg):
     postlude_ok = post_ok and home_cap_ok and dock_cap_ok and home_loop_ok
     ok = ok and postlude_ok
     print(f"[self-test] {'PASS' if postlude_ok else 'FAIL'}  POSTLUDE (done->RETURN_TO_ORIGIN->ORIENT_HOME->"
-          f"DOCK_FLOOR(down-pulse)->LOW_STANDOFF(up-nudge)->DONE={post_ok}, home_max_s cap={home_cap_ok}, "
-          f"dock_max_s cap={dock_cap_ok}, homing turn+SETTLE+advance={home_loop_ok})  visited {porder}")
+          f"HOME_REFINE->DOCK_FLOOR(down-pulse)->LOW_STANDOFF(up-nudge)->DONE={post_ok}, home_max_s cap="
+          f"{home_cap_ok}, dock_max_s cap={dock_cap_ok}, homing turn+SETTLE+advance={home_loop_ok})  visited {porder}")
 
     # ---- Postlude session-16 additions: ORIENT_HOME bearing-wrap, DOCK survives a SLAM loss, no re-inflate ----
     # (a) ORIENT_HOME: at the origin with a take-off heading OFFSET from the current heading -> it must TURN
@@ -4419,6 +4519,102 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if postlude2_ok else 'FAIL'}  POSTLUDE loss-survival + orient "
           f"(ORIENT_HOME short-way turn+dock={orient_ok}, DOCK survives loss->hold->resume={dock_loss_ok}, "
           f"no floor re-inflate={no_reinflate})")
+
+    # ---- ORIENT_HOME real-angle convergence (the 20260720 ping-pong) + orient_home_max_s cap ----
+    # (a) Reproduce the diagnosed bug's shape: a bearing error starting just past HALF a turn_step_deg (the
+    #     exact knife-edge that made the OLD quantized-to-a-fixed-step logic overshoot side-to-side forever),
+    #     with a REALISTIC noisy open-loop turn (actual rotation = 1.2x the commanded angle, never exact).
+    #     The fix (turn by the real, clamped-not-quantized angle) must still converge within a bounded number
+    #     of turn+settle cycles instead of oscillating indefinitely.
+    coh = ExploreController(cfg, no_takeoff=True)
+    coh.rest_between_s = 0.1; coh.settle_fresh_frames = 2
+    coh._takeoff_heading = 0.0
+    OVERSHOOT = 1.4
+    saw_oh_turn = converged_oh = False
+    toh, fidoh, ohh, last_turn_oh, turns_taken = 0.0, 9500, coh.turn_step_deg / 2.0 + 1.0, None, 0
+    for _ in range(int(20.0 / 0.05)):
+        fidoh += 1
+        a, s, _ = coh.step(toh, {"plan_valid": True, "done": True, "goal": None, "pos": [0.0, 0.0],
+                                  "heading_deg": ohh, "bearing_err": None, "pos_y": 0.0,
+                                  "forward_clearance_dist": 5.0, "frame_id": fidoh, "cap_ts": toh,
+                                  "slam_ms": 200.0}, False)
+        if s == "ORIENT_HOME" and coh._orient_home_phase == "TURN" and coh._player is not None:
+            saw_oh_turn = True
+            nm = coh._player.name
+            if nm != last_turn_oh and nm.startswith("turn"):
+                last_turn_oh = nm
+                turns_taken += 1
+                delta = float(nm[4:]) * OVERSHOOT     # the ACTUAL rotation overshoots the commanded angle
+                ohh = ((ohh + delta + 180.0) % 360.0) - 180.0
+        if s == "HOME_REFINE":
+            converged_oh = True
+            break
+        toh += 0.05
+    orient_converge_ok = saw_oh_turn and converged_oh and turns_taken <= 6
+    # (b) orient_home_max_s cap: pose stays invalid forever (never converges) -> proceed anyway (VISIBLE).
+    coc = ExploreController(cfg, no_takeoff=True)
+    coc._takeoff_heading = 90.0
+    coc.orient_home_max_s = 0.0
+    coc.home_refine_max_s = 0.0
+    _, _, _, stoc = _drive(coc, dict(dplan, plan_valid=False), False, 0.3, 0.0, floor=False)
+    orient_cap_ok = _is_subsequence(["RETURN_TO_ORIGIN", "ORIENT_HOME", "DOCK_FLOOR"], stoc)
+    orient_fix_ok = orient_converge_ok and orient_cap_ok
+    ok = ok and orient_fix_ok
+    print(f"[self-test] {'PASS' if orient_fix_ok else 'FAIL'}  ORIENT_HOME real-angle convergence "
+          f"(converges from a half-step residual under noisy overshoot in {turns_taken} turn(s)="
+          f"{orient_converge_ok}, orient_home_max_s cap={orient_cap_ok})")
+
+    # ---- HOME_REFINE: quadrant push-pick + convergence + home_refine_max_s cap ----
+    def _refine_pick(pos):
+        c = ExploreController(cfg, no_takeoff=True)
+        c.rest_between_s = 0.1; c.settle_fresh_frames = 2
+        c.state = "HOME_REFINE"
+        p = {"plan_valid": True, "done": True, "goal": None, "pos": pos, "heading_deg": 0.0,
+             "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 5.0,
+             "frame_id": 1, "cap_ts": 0.0, "slam_ms": 200.0}
+        c.step(0.0, p, False)                                          # PLAN -> picks + builds the push player
+        name0 = c._player.name if c._player is not None else None
+        a, _s, _e = c.step(0.01, dict(p, frame_id=2, cap_ts=0.01), False)   # PUSH -> emits the actual push fields
+        return name0, a
+    nfwd, afwd = _refine_pick([0.0, -5.0])      # origin dead ahead (heading 0 = +Z)
+    nback, aback = _refine_pick([0.0, 5.0])     # origin dead behind
+    nright, aright = _refine_pick([-5.0, 0.0])  # origin to the body-right
+    nleft, aleft = _refine_pick([5.0, 0.0])     # origin to the body-left
+    quadrant_ok = (nfwd == "refine_forward" and float(afwd.get("trigger", 0.0) or 0.0) == 1.0
+                   and nback == "refine_backward" and float(aback.get("reverse", 0.0) or 0.0) == 1.0
+                   and nright == "refine_strafe_right" and float(aright.get("joy_horizontal", 0.0) or 0.0) > 0
+                   and nleft == "refine_strafe_left" and float(aleft.get("joy_horizontal", 0.0) or 0.0) < 0)
+    # Convergence: position genuinely closes on each forward push -> reaches DOCK_FLOOR.
+    crf = ExploreController(cfg, no_takeoff=True)
+    crf.rest_between_s = 0.1; crf.settle_fresh_frames = 2
+    crf.state = "HOME_REFINE"
+    trf, fidrf, posrf, reached_dockrf = 0.0, 9800, [0.0, -1.0], False
+    for _ in range(int(20.0 / 0.05)):
+        fidrf += 1
+        a, s, _ = crf.step(trf, {"plan_valid": True, "done": True, "goal": None, "pos": list(posrf),
+                                  "heading_deg": 0.0, "bearing_err": None, "pos_y": 0.0,
+                                  "forward_clearance_dist": 5.0, "frame_id": fidrf, "cap_ts": trf,
+                                  "slam_ms": 200.0}, False)
+        if s == "HOME_REFINE" and crf._home_refine_phase == "PUSH" and float(a.get("trigger", 0.0) or 0.0) > 0:
+            posrf[1] = min(0.0, posrf[1] + 0.3)   # simulate the push closing distance toward the origin
+        if s == "DOCK_FLOOR":
+            reached_dockrf = True
+            break
+        trf += 0.05
+    refine_converge_ok = reached_dockrf
+    # home_refine_max_s cap: position never improves -> proceed anyway (VISIBLE).
+    crc = ExploreController(cfg, no_takeoff=True)
+    crc.home_refine_max_s = 0.0
+    crc.state = "HOME_REFINE"
+    _, _, _, strc = _drive(crc, {"plan_valid": True, "done": True, "goal": None, "pos": [0.0, -5.0],
+                                  "heading_deg": 0.0, "bearing_err": None, "pos_y": 0.0,
+                                  "forward_clearance_dist": 5.0}, False, 0.3, 0.0, floor=False)
+    refine_cap_ok = "DOCK_FLOOR" in strc
+    refine_ok = quadrant_ok and refine_converge_ok and refine_cap_ok
+    ok = ok and refine_ok
+    print(f"[self-test] {'PASS' if refine_ok else 'FAIL'}  HOME_REFINE (quadrant push-pick fwd/back/left/right="
+          f"{quadrant_ok}, converges as position closes={refine_converge_ok}, home_refine_max_s cap="
+          f"{refine_cap_ok})")
 
     # ---- Map mode: reverse-probe EXPERIMENT (flag on) — clamp leg turn to ONE step; WALL -> reverse probe ----
     # With reverse_probe_on_wall: a big bearing err is clamped to ONE turn_step (SLAM stays alive at the

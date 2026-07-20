@@ -491,28 +491,45 @@ class FrontierPlanner:
         return max(cand, key=lambda c: self._d(c, pos))
 
     def _select_reachable(self, frontiers, pos, heading_deg):
-        """Choose + commit among the currently non-excluded frontiers, clearing any verify state."""
-        reachable = [f for f in frontiers
+        """Choose + commit among the currently non-excluded frontiers, clearing any verify state.
+
+        The clearance inset (below) can pull a genuinely non-excluded raw frontier BACK onto a spot that IS
+        excluded — the inset walks from the goal toward `pos` to the first FREE buffered cell, so when the
+        drone's own reachable free space in that direction is pinched down to one small pocket, EVERY nearby
+        candidate's inset collapses onto the SAME pocket, which can be the very spot a prior 2-bump/loop/stall
+        blacklist already condemned. Committing there would silently defeat the blacklist (operator-reported
+        endless reselect-same-spot loop, flight 20260721_005658: a permanently-blacklisted disc racked up 49
+        more picks after being blacklisted at pick 3). So the adjusted goal is ALSO checked against
+        `_excluded`: a candidate whose inset lands in a dead zone is dropped and the next-best remaining
+        candidate is tried, same as if that frontier had never been reachable at all. Bounded — each pass
+        removes at least the one rejected candidate."""
+        remaining = [f for f in frontiers
                      if not self._excluded((float(f["center"][0]), float(f["center"][1])))]
-        if not reachable:
-            return None
-        self.sweeping = False                          # something to chase -> not done, not sweeping
-        self.sweep_target = None
-        goal = self._choose(reachable, pos, heading_deg)
-        # Map-validated clearance inset: pull a goal that hugs an obstacle/corner back along the drone->goal
-        # axis to a FREE buffered cell before we commit (so committed == published; bump association holds).
-        if self._clearance_fn is not None:
-            adjusted = self._clearance_fn(goal, pos)
-            if adjusted is not None:
-                goal = (float(adjusted[0]), float(adjusted[1]))
-                self.clearance_ok = True
-            else:
-                # NO SILENT FALLBACK: no FREE buffered cell on the segment -> commit the raw goal but flag it.
-                self.clearance_ok = False
-                print(f"[planner] clearance inset found no FREE buffered cell for goal {goal} "
-                      f"(pos {pos}) -> committing raw goal, clearance_ok=False", flush=True)
-        self._commit(goal)
-        return self.committed_goal
+        while remaining:
+            self.sweeping = False                          # something to chase -> not done, not sweeping
+            self.sweep_target = None
+            goal = self._choose(remaining, pos, heading_deg)
+            # Map-validated clearance inset: pull a goal that hugs an obstacle/corner back along the
+            # drone->goal axis to a FREE buffered cell before we commit (so committed == published; bump
+            # association holds).
+            if self._clearance_fn is not None:
+                adjusted = self._clearance_fn(goal, pos)
+                if adjusted is None:
+                    # NO SILENT FALLBACK: no FREE buffered cell on the segment -> commit the raw goal but flag it.
+                    self.clearance_ok = False
+                    print(f"[planner] clearance inset found no FREE buffered cell for goal {goal} "
+                          f"(pos {pos}) -> committing raw goal, clearance_ok=False", flush=True)
+                else:
+                    adj = (float(adjusted[0]), float(adjusted[1]))
+                    if self._excluded(adj):
+                        # This candidate's inset collapsed onto a dead zone -- drop it, try the next-best.
+                        remaining = [f for f in remaining
+                                     if self._d((float(f["center"][0]), float(f["center"][1])), goal) > 1e-6]
+                        continue
+                    goal, self.clearance_ok = adj, True
+            self._commit(goal)
+            return self.committed_goal
+        return None
 
     def select(self, frontiers, pos, heading_deg=None, sweep_corners=None):
         """Returns (goal [x,z] | None, n_frontiers, done). Unreachable-goal blacklisting is event-driven
@@ -798,6 +815,29 @@ def run_self_test():
     g_c2, _, _ = p.select([A], [0.0, 0.0], heading_deg=0.0)
     check("(opt) clearance inset None -> commit raw goal + clearance_ok=False (visible, no silent fallback)",
           close(g_c2, [0.0, 3.0]) and p.clearance_ok is False)
+
+    # (opt2, session 32) clearance inset must NOT be allowed to commit onto an ALREADY-excluded spot: a raw
+    #      frontier that is genuinely reachable can still inset onto a permanently-dead zone (operator-found
+    #      bug, flight 20260721_005658 -- a disc racked up 49 more picks after being permanently blacklisted,
+    #      because exclusion was only ever checked against the raw frontier center, never the post-inset
+    #      commit). `_select_reachable` must drop such a candidate and try the next-best reachable one instead.
+    dead = [0.0, 2.0]
+    F1 = {"center": [0.0, 4.0], "size": 10}    # big + straight ahead -> normally top utility
+    F2 = {"center": [3.0, 0.0], "size": 1}     # small, off-axis -> only chosen once F1 is rejected
+    p = FrontierPlanner(None)
+    p._blacklist_goal(dead, permanent=True)
+    p.set_clearance_fn(lambda goal, pos: dead if close(list(goal), F1["center"]) else list(goal))
+    g_skip, _, done_skip = p.select([F1, F2], [0.0, 0.0], heading_deg=0.0)
+    check("(opt2) a candidate whose inset collapses onto a dead zone is dropped -> next-best is committed",
+          close(g_skip, [3.0, 0.0]) and not done_skip and not close(g_skip, dead))
+    # …and when EVERY reachable candidate collapses onto the dead zone, select() correctly reports nothing
+    # reachable (falls through exactly as if no frontier existed) rather than ever committing to `dead`.
+    p2 = FrontierPlanner(None)
+    p2._blacklist_goal(dead, permanent=True)
+    p2.set_clearance_fn(lambda goal, pos: dead)      # every candidate collapses onto the same dead spot
+    g_none, _, done_none2 = p2.select([F1], [0.0, 0.0], heading_deg=0.0)
+    check("(opt2) every reachable candidate collapsing onto the dead zone -> no commit (falls through, done)",
+          g_none is None and done_none2 and p2.committed_goal is None)
 
     # ---- (session 20) GOALS DATABASE + circling-LOOP blacklist ----
     # Each PICKED goal is a DISC (radius goal_area_radius=0.5). A pick registers only on a genuine goal-SWITCH
