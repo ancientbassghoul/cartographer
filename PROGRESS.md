@@ -1,9 +1,12 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-21** (session 33 **BUILT — self-tests green, NOT YET live-flown**). Resume from
-THIS file. **Session 33 fixed a goal-selection bug (diagnosed off flight `20260721_005658`) where a
-permanently-blacklisted goal kept getting re-picked 49x because the clearance inset ran AFTER the exclusion
-check — see "Next" below.** Plan of record: **`plans/session33-goal-loop-clearance-inset-fix.md`** (+
+_Last updated **2026-07-21** (session 35 **BUILT — self-tests green, NOT YET live-flown**). Resume from
+THIS file. **Session 35 fixed a real bug in `_recovering` trust restoration (it could get structurally
+stuck for the rest of a flight) and added a config switch between the classic SLAM-slow step-back and a new
+forced-hop escape, default to the new one — see "Next" below.** Plan of record:
+**`plans/session35-slam-slow-strategy-switch-and-recovering-fix.md`** (+
+`plans/session34-proactive-clearance-while-blind.md`,
+`plans/session33-goal-loop-clearance-inset-fix.md`,
 `plans/session32-orient-home-ping-pong-and-home-refine.md`,
 `plans/session31-rewind-off-simple-fallback-sweep.md`, `plans/session30-backoff-hard-gate.md`,
 `plans/session29-clearance-tab-direction-cycling-fallback.md`,
@@ -14,6 +17,69 @@ check — see "Next" below.** Plan of record: **`plans/session33-goal-loop-clear
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
 parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
 `plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 35 — fixed a real bug where `_recovering` could get structurally stuck for the rest of a flight,
+plus a config switch between the classic SLAM-slow step-back and a new forced-hop escape (BUILT — self-tests
+green, live-fly PENDING).** The operator asked why the "SLAM slow → REWIND step-back" mechanism had produced
+zero events across the last 11 flights. Traced it: `_recovering` (armed on the first `PLAN-STALE` of a loss)
+was only ever cleared by a confirmed `>=1.0u` displacement measured from `_recovery_adv_start` inside
+`ADVANCE` — but `_enter()` wiped that anchor on every transition that wasn't `"ADVANCE"`/`"SLAM_HOLD"`,
+which includes `SETTLE`/`REPLAN`/`ORIENT` — i.e. every ordinary hop boundary (`hop_duration_s`=2.0s). So the
+confirm distance could only ever be measured within a SINGLE hop, never accumulated across several.
+Verified directly against `20260721_134052`: 80 separate `ADVANCE` runs after the first `PLAN-STALE`, and in
+every one the logged `pos` was identical start-to-end — confirmation was structurally impossible for the
+rest of that flight, and since step-back is gated on `not self._recovering`, it stayed jammed for the same
+reason. Discussed the fix with the operator and simplified rather than patched: `_recovering`/
+`_history_broken` now clear as soon as a loss recovers to a genuinely SETTLED `OK` (the existing settle-gate
+— several consecutive fast, fresh frames — already runs first regardless), not a further confirmed-motion
+step on top of it — judged acceptable since `use_rewind_on_stale` already defaults off (session 31) so the
+history-freeze protection this gates isn't consuming much today anyway, and the confirm-distance check
+wasn't delivering it regardless (the bug above). Separately, added the earlier-discussed "SLAM slow + plan
+OK for 30s → force one hop toward the current goal" idea as a genuine alternative to step-back, selected by
+a new `use_slam_stepback_on_slow` switch (default `false`, mirrors `use_rewind_on_stale`'s exact pattern —
+operator: "I want to eventually throw out that REWIND bullshit... but we might also want to bring it
+back"). Found + fixed a real bug while building the forced-hop's self-expiring bypass window: setting
+`_slam_slow_hop_deadline` before calling `_enter("REPLAN", now)` had it immediately wiped by that same call
+(`"REPLAN"` isn't in `_enter()`'s exemption list) — fixed by reordering. Also closed a related leak: a
+physical guard (clearance stand-off) cutting a forced hop short into `BACKOFF` now clears the deadline
+immediately, so it can't linger into an unrelated later leg. `python autopilot.py --self-test`: ALL PASS.
+See `plans/session35-slam-slow-strategy-switch-and-recovering-fix.md` for the full trace + design.
+**NEXT = LIVE-FLY** — does `_recovering` now visibly clear at "SLAM settled" instead of staying stuck; does
+a slow-but-OK patch force a hop after ~30s; flip the switch on one test flight to confirm step-back still
+works now that trust restores faster._
+
+_**Session 34 — two proactive clearance checks so nothing is ever completely blind to a close wall (diagnosed
+off flight `20260721_014631`) (BUILT — self-tests green, live-fly PENDING).** The operator asked why the
+drone sat 0.25-0.5 units from a wall (well inside `stop_clearance_dist: 1.0`) for minutes without the
+clearance stand-off/BACKOFF ever re-firing, and whether the "SLAM too slow -> step back" protection had been
+removed. Traced it: the clearance stand-off check lives entirely inside the `ADVANCE` state handler; that
+flight spent almost no time in `ADVANCE` (336 ticks) and nearly all of it cycling
+`SLAM_HOLD`/`HOLD_LOST`/`FALLBACK` (12893/3624/2787 ticks) — being that close to a wall degrades SLAM, which
+keeps the drone bouncing through holds instead of ever completing a clean ADVANCE where the stand-off could
+re-check. Nothing else watches wall proximity while holding — the flow contact detector needs ~1.2s of
+*sustained motion* to latch, so a stationary, hovering drone never trips it either. (Separately confirmed the
+SLAM-too-slow step-back is intact, not removed — it's gated by `not self._recovering`, and `_recovering` only
+clears on a confirmed 1.0u ADVANCE, which the drone never achieved during the constant OK/LOST/STALE flicker
+near this wall, so the gate silently suppressed it the whole time; a real gap, but a different, deliberate
+one than "removed.") The operator proposed two ideas, both built this session: **Idea A** — at the exact
+moment the post-recovery settle gate clears (the SAME "pose is trustworthy enough to resume" boundary the
+code already uses), check the now-live clearance and back off immediately instead of falling through
+SETTLE→REPLAN→ORIENT and only re-checking once ADVANCE resumes. **Idea B** — cache the last-known-good
+position + clearance every valid tick (the map itself is already frozen the instant tracking drops, so it's
+inherently still current); the INSTANT a loss is first detected, run one check against that cached snapshot
+and back off right away, rather than waiting out a possibly-long blind period for a re-lock at all — scoped
+to a single one-shot attempt at the very first tick of the loss episode (before any hold/recovery logic has
+had a chance to command motion), which sidesteps needing to track every possible motion-causing state.
+Both reuse the EXACT existing clearance-stand-off action ADVANCE already runs (`_register_bump` + `BACKOFF`)
+— no new stopping mechanism, just two new trigger points. Idea B keeps `perception_worker.py`'s own
+no-silent-fallback invariant untouched (perception still honestly reports nothing new during a loss) — the
+caching + decision to act on an explicitly-labeled stale snapshot ("stale pose @ loss" in the event string)
+is a distinct, visibly-logged autopilot-side judgment call. New self-test block covers both ideas plus two
+regression cases (a plain mid-leg SLAM-slow hold resuming to ADVANCE is unaffected; a clear reading at the
+recovery settle-gate-clear still resumes normally). `python autopilot.py --self-test`: ALL PASS. See
+`plans/session34-proactive-clearance-while-blind.md` for the full trace + design. **NEXT = LIVE-FLY** — does
+a loss near a wall now back off immediately instead of sitting through the blind period; watch for any
+BACKOFF firing off a stale cached pose that turns out to be wrong (the one accepted risk from Idea B)._
 
 _**Session 33 — a permanently-blacklisted goal kept getting re-picked because the clearance inset ran AFTER
 the exclusion check (diagnosed off flight `20260721_005658`) (BUILT — self-tests green, live-fly PENDING).**
@@ -556,14 +622,44 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ### >>> IMMEDIATE NEXT TASK <<<
 
-**LIVE-FLY the session-33 build** (`python fly.py`, press `m`) — this stacks session 33 (goal-selection fix:
-the clearance inset can no longer commit onto an already-blacklisted goal) on top of session 32 (ORIENT_HOME
-real-angle convergence, new HOME_REFINE position-tightening stage, DOCK_FLOOR real settle-gate) on top of
-session 31 (REWIND killed via config gate, FALLBACK rebuilt as a simple 4-phase wait→turn→push→wait sweep)
-on top of session 30 (BACKOFF hard-gate phase-timer) on top of session 29 (Clearance tab) on top of session
-28 (TRIM resume gate + clearance min-hit-fraction vote), and NONE of sessions 28-33 have been live-flown
-yet. No hardware/GPU in the dev environment, so all were BUILT + self-tested only; live confirmation is the
-very next thing to do. Watch specifically for:
+**LIVE-FLY the session-35 build** (`python fly.py`, press `m`) — this stacks session 35 (`_recovering` now
+clears at the SLAM-settle boundary instead of a confirm-distance check that was structurally stuck; new
+`use_slam_stepback_on_slow` switch, default routes a sustained slow-but-OK hold through a forced hop instead
+of the classic step-back) on top of session 34 (two proactive clearance checks: immediate stand-off backoff
+on the cached last-good pose the instant a loss is detected, and a live clearance check right when the
+post-recovery settle gate clears) on top of session 33 (goal-selection fix: the clearance inset can no
+longer commit onto an already-blacklisted goal) on top of session 32 (ORIENT_HOME real-angle convergence,
+new HOME_REFINE position-tightening stage, DOCK_FLOOR real settle-gate) on top of session 31 (REWIND killed
+via config gate, FALLBACK rebuilt as a simple 4-phase wait→turn→push→wait sweep) on top of session 30
+(BACKOFF hard-gate phase-timer) on top of session 29 (Clearance tab) on top of session 28 (TRIM resume gate
++ clearance min-hit-fraction vote), and NONE of sessions 28-35 have been live-flown yet. No hardware/GPU in
+the dev environment, so all were BUILT + self-tested only; live confirmation is the very next thing to do.
+Watch specifically for:
+- **`_recovering` should visibly clear right when the console/replay debugger shows "SLAM settled ... ->
+  recovery trust restored"**, not stay stuck for the rest of the flight. This directly un-jams both step-back
+  (if `use_slam_stepback_on_slow: true`) and the default forced-hop escape — confirm at least one of them
+  actually fires on a flight with a genuinely bad SLAM patch, unlike the last 11 flights.
+- **With the default switch, a slow-but-OK patch should force one hop after ~30s** ("SLAM still slow after
+  ...but plan OK -> forcing one hop toward the current goal") instead of holding indefinitely. Watch it
+  doesn't repeat too aggressively (it can re-trigger every ~30s if still slow — that's intended, but confirm
+  it doesn't feel thrashy in practice).
+- **Flip `use_slam_stepback_on_slow: true` on one test flight** to confirm the classic step-back path still
+  works end-to-end now that `_recovering` clears faster — it should fire far more often than it has recently.
+- **A loss that happens while already close to a wall should back off immediately** instead of sitting
+  through the whole blind period the way flight `20260721_014631` did (0.25-0.5u from a wall for minutes,
+  continuously in `SLAM_HOLD`, with zero re-fires of the stand-off). Watch the console/replay debugger for a
+  `BACKOFF` entry with the event text `"stale pose @ loss"` firing right at the moment a `PLAN-LOST`/
+  `PLAN-STALE` begins, using the cached (not live) position.
+- **A recovery that re-locks close to a wall should back off before ever reaching REPLAN/ORIENT** — watch
+  for a `BACKOFF` firing right at a `SLAM_HOLD` settle-gate-clear, event text mentioning "SLAM settled...but
+  clearance...standoff", instead of the normal "SLAM settled...resume SETTLE" message.
+- **This is the one accepted risk from Idea B**: the cached-pose backoff acts on a snapshot that could be
+  stale if the drone actually moved before the check fires (scoped to a one-shot at the very first tick of a
+  loss specifically to minimize this) — watch whether it ever fires off a clearance reading that turns out
+  to be wrong, and how often, to judge whether the one-shot scoping is tight enough in practice.
+- **Confirm no regression in the ordinary ADVANCE-triggered stand-off** or in a plain mid-leg SLAM-slow
+  hold-and-resume (a hold that resumes straight into ADVANCE/PARALLAX_PUSH, not through a full recovery,
+  should behave exactly as before — session 34's Idea A only touches the recovery-resume-to-SETTLE path).
 - **A drone pinned in a corner/pocket with no genuinely reachable free space should fall through to the
   corner-sweep tour (or `STUCK`/`done`) instead of looping on a dead goal** — the exact failure mode from
   `20260721_005658` (one disc racked up 49 picks after being permanently blacklisted at pick 3). Watch the

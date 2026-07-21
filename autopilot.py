@@ -772,12 +772,20 @@ class ExploreController:
         # --- SESSION 12 recovery redesign (see plans/strafe-throttle-and-recovery-loop.md D5) ---
         # A flickering SLAM status (PLAN-LOST<->PLAN-STALE) used to RESET recovery every ~3s, so STUCK was
         # unreachable and the rewind never emptied (flight 20260713 frantic loop). Fix: `_recovering` PERSISTS
-        # across the flicker; the rewind CONSUMES command_history one maneuver at a time; the give-up counter is
-        # reset ONLY by a confirming ADVANCE (>= recovery_confirm_dist of real forward progress), never by a bare
-        # OK. And a re-locked drone is NOT trusted until it flies that ADVANCE: while `_recovering`, appends to
-        # command_history are frozen and moving post-relock sets `_history_broken` so the now spatially-stale
-        # leftover history is cleared + bypassed straight to FALLBACK (no displaced "ghost path" replay).
-        self.recovery_confirm_dist = float(e.get("recovery_confirm_dist", 1.0))  # >=this ADVANCE progress = trust restored
+        # across the flicker; the rewind CONSUMES command_history one maneuver at a time; the give-up counter
+        # is reset only on a genuinely trusted recovery. While `_recovering`, appends to command_history are
+        # frozen and moving post-relock sets `_history_broken` so the now spatially-stale leftover history is
+        # cleared + bypassed straight to FALLBACK (no displaced "ghost path" replay).
+        #
+        # Session 35 (operator ask, diagnosed off 11 flights with zero step-back events): trust restoration
+        # used to require a CONFIRMED >=1u ADVANCE (`recovery_confirm_dist`, now removed) measured from
+        # `_recovery_adv_start` -- but that anchor was wiped on every hop boundary (SETTLE/REPLAN/ORIENT are
+        # not `_enter()`'s ("ADVANCE","SLAM_HOLD") exemption), so confirmation could only ever be measured
+        # WITHIN one `hop_duration_s` (2.0s) -- structurally impossible once SLAM couldn't even deliver two
+        # fresh poses that fast. Simplified: `_recovering`/`_history_broken` now clear as soon as a loss
+        # recovers to a genuinely SETTLED `OK` (`SLAM_HOLD`'s existing settle-gate -- several consecutive
+        # fast, fresh frames -- already runs first regardless of this change), not a further confirmed-motion
+        # step on top of it. See the settle-gate-clear branch below for where this actually happens.
         self.recovery_turn_step_deg = float(e.get("recovery_turn_step_deg", 15.0))  # gentler sweep step in recovery
         # A settle BETWEEN every recovery action (REWIND inverse maneuvers + spin FALLBACK attempts): back-to-back
         # commands never gave monocular SLAM a still moment to re-lock (the "firing/spinning with no settles"
@@ -829,6 +837,19 @@ class ExploreController:
         # heuristic). Re-arm needs another full run of slow frames; capped per hold. Platform params.
         self.slam_stepback_after_frames = int(e.get("slam_stepback_after_frames", 10))
         self.slam_stepback_max_steps = int(e.get("slam_stepback_max_steps", 3))
+        # Session 35 (operator ask): TWO mutually-exclusive strategies for "SLAM is slow but the plan is
+        # still OK" -- the classic REWIND step-back above, or a simpler forward escape: after
+        # `slam_slow_hop_after_s` of continuous slow-but-OK holding, stop waiting and force one hop toward
+        # the CURRENT goal anyway (re-reads it via REPLAN), instead of holding indefinitely. Diagnosed off
+        # 11 consecutive flights with zero step-back events (last seen 20260720_123903): step-back's own
+        # `not self._recovering` gate was almost always false because of a SEPARATE bug (see the
+        # `_recovering` simplification below) -- kept step-back fully intact behind this switch (operator:
+        # "I want to eventually throw out that REWIND bullshit... but we might also want to bring it back"),
+        # default OFF in favor of the new forward-hop strategy.
+        self.use_slam_stepback_on_slow = bool(e.get("use_slam_stepback_on_slow", False))
+        self.slam_slow_hop_after_s = float(e.get("slam_slow_hop_after_s", 30.0))
+        self.slam_slow_hop_grace_s = float(e.get("slam_slow_hop_grace_s", 8.0))  # one turn + one hop_duration_s, with margin
+        self._slam_slow_hop_deadline = None  # 'now' past which a forced hop's SLAM-slow bypass no longer applies
         # PERSISTS across a PLAN-LOST/HOLD_LOST bounce within one bad SLAM patch (mirrors the
         # `_recovering`/FALLBACK-sweep persistence rule) -- a solve slow enough to trip this almost
         # always exceeds `plan_timeout_s` before it finishes, so the FSM bounces HOLD_LOST -> OK -> a FRESH
@@ -1144,8 +1165,15 @@ class ExploreController:
         # recovery, so clear them here; DURING a flight they persist across the PLAN-LOST/PLAN-STALE flicker.
         self._recovering = False       # True from the first PLAN-STALE of a loss until a confirming ADVANCE (>=1u)
         self._history_broken = False   # True once a re-locked-but-unconfirmed drone moves -> leftover history is stale
+        # Session 34: proactive clearance checks that don't wait for ADVANCE to re-check. `_last_good_pos`/
+        # `_last_good_clearance` cache the most recent VALID plan's position/forward-clearance (refreshed every
+        # tick in step()); `_was_lost`/`_loss_snapshot_checked` gate the one-shot check fired at the instant a
+        # loss episode begins (Idea B) -- see `_maybe_loss_snapshot_backoff`.
+        self._last_good_pos = None
+        self._last_good_clearance = None
+        self._was_lost = False
+        self._loss_snapshot_checked = False
         self._rec_settling = False     # not mid an inter-action recovery settle
-        self._recovery_adv_start = None  # pos at the start of a post-recovery ADVANCE leg (the >=1u progress gauge)
         self._slam_resume = None    # SLAM streak/latest persist (health is flight-level); only the pending resume clears
         self._slam_stepback_count = 0   # per-hold step-back counter + timer clear on interruption
         self._slam_hold_start = None
@@ -1428,6 +1456,10 @@ class ExploreController:
             # ADVANCE — never reset by a bare OK or by a LOST/STALE flicker (that was the loop bug).
             self._recovering = True
             self._history_broken = False
+        if not self._loss_snapshot_checked:
+            snap = self._maybe_loss_snapshot_backoff(plan, now)
+            if snap is not None:
+                return snap
         if not self._ever_tracked:
             # STARTUP: SLAM has never TRACKED yet (the prelude finishes on the FLOW ceiling detector, not on
             # SLAM). Don't spin a blind fallback into an unmapped room — HOLD and wait for SLAM to initialize.
@@ -1777,6 +1809,14 @@ class ExploreController:
         """The most recent FRESH frame took too long to build (SLAM choking; its pose is untrustworthy)."""
         return self._slam_ms_latest is not None and self._slam_ms_latest >= self.slam_slow_ms
 
+    def _slam_slow_hop_active(self, now):
+        """Session 35: True while a forced SLAM-slow-hop's bypass window is still open -- `ORIENT`'s and
+        `ADVANCE`'s own `if self._slam_slow:` gates skip re-entering `SLAM_HOLD` for exactly this bounded
+        window, so the one forced hop can actually complete despite SLAM staying slow throughout. Self-
+        expiring by wall-clock time; ALSO cleared immediately on entering any state besides "ADVANCE"/
+        "ORIENT" (see `_enter()`), so it can never leak into an unrelated later leg."""
+        return self._slam_slow_hop_deadline is not None and now < self._slam_slow_hop_deadline
+
     @property
     def _slam_ms_avg(self):
         """Rolling average of the last calib_slam_avg_window HEALTHY-frame SLAM latencies (None if empty)."""
@@ -1946,10 +1986,13 @@ class ExploreController:
         # direction-search FALLBACK sweep instead of replaying a displaced ghost path.
         if self._recovering and state in ("ORIENT", "PARALLAX_PUSH", "ADVANCE"):
             self._history_broken = True
-        # The post-recovery ADVANCE progress gauge is captured lazily in the ADVANCE handler; drop it when leaving
-        # an advance (so the NEXT advance re-measures from its own start), but NOT across a mid-leg SLAM_HOLD.
-        if state not in ("ADVANCE", "SLAM_HOLD"):
-            self._recovery_adv_start = None
+        # Session 35: a forced SLAM-slow-hop's bypass window (see `_slam_slow_hop_deadline` /
+        # `_slam_slow_hop_active`) is only ever meant to cover ONE turn + ONE hop. "ADVANCE"/"ORIENT" are the
+        # only two states that legitimately spend it; entering ANYTHING else -- a physical guard cutting the
+        # hop short into BACKOFF, a clean hop-done into SETTLE, a fresh SLAM_HOLD, HOLD_LOST, whatever -- ends
+        # the grace immediately rather than letting it linger (time-based) into an unrelated LATER leg.
+        if state not in ("ADVANCE", "ORIENT"):
+            self._slam_slow_hop_deadline = None
         # Session 20: every ADVANCE entry (a fresh leg OR a resume after a hop-SETTLE / SLAM_HOLD) starts a fresh
         # hop tick count + a FRESH per-hop progress snapshot: clear _hop_start_goal here so the ADVANCE handler
         # re-captures the start distance on its first posed tick (each hop is judged from its OWN start).
@@ -2094,6 +2137,34 @@ class ExploreController:
         self._bump_armed = False                           # returned above) -- evidence for the goals-DB
         pos = plan.get("pos")
         self._last_bump_anchor = list(pos) if pos is not None else None
+
+    def _maybe_loss_snapshot_backoff(self, plan, now):
+        """Session 34, Idea B: the ONE-SHOT check at the instant a loss episode begins. Marks the one-shot
+        spent immediately (so a LOST<->STALE flicker within the same episode can't fire twice), then — if a
+        last-known-good clearance was cached (see `step()`'s per-tick cache) and it reads too close — backs
+        off using that CACHED position (the live `plan['pos']` is unavailable during a loss), exactly like
+        ADVANCE's own clearance stand-off. Returns the (active, state, event) tuple to return immediately, or
+        `None` if the caller should fall through to its normal loss-entry behavior (nothing cached yet, or
+        the cached reading isn't close). Deliberately scoped to ONE attempt at the very first tick of the
+        episode -- before that boundary nothing has moved yet, so the cached snapshot is trustworthy; ANY
+        later tick could include motion from a reactive maneuver (BLIND_BACKOFF, etc.), which is why this is
+        never re-tried mid-episode."""
+        self._loss_snapshot_checked = True
+        if self._last_good_clearance is None or self._last_good_clearance > self.stop_clearance_dist:
+            return None
+        self._register_bump(dict(plan, pos=self._last_good_pos),
+                            "clearance stand-off (stale pose @ loss)")
+        clr = self._last_good_clearance
+        if self.backoff_on_standoff:
+            self._player = None
+            self._backoff_t0 = now
+            self._enter("BACKOFF", now)
+            return {}, "BACKOFF", (f"loss detected with cached clearance {clr:.2f} <= "
+                                   f"{self.stop_clearance_dist:.2f} (stale pose) -> immediate standoff "
+                                   "back off (re-arm bump latch) -> settle")
+        self._enter("SETTLE", now)
+        return {}, "SETTLE", (f"loss detected with cached clearance {clr:.2f} <= "
+                              f"{self.stop_clearance_dist:.2f} (stale pose) -> immediate standoff settle")
 
     def take_missed_bump(self):
         """Pop the pending MISSED-BUMP marker (a real contact that emitted no pulse), or None."""
@@ -2258,6 +2329,15 @@ class ExploreController:
         self._update_slam(plan)   # track SLAM frame-build time for the settle gate (below + at the gate sites)
         if plan.get("plan_valid"):
             self._ever_tracked = True   # SLAM has tracked at least once -> a later empty-history STALE is a real loss, not warmup
+            # Session 34: cache the last-known-good position + forward clearance every valid tick. The map
+            # itself is frozen (no new integration) the instant tracking drops, so this snapshot stays a
+            # reasonable proxy for "what's near us right now" for as long as the drone hasn't actually moved
+            # since it was taken -- see the one-shot loss-instant check below, which is the only consumer and
+            # enforces that "hasn't moved" boundary itself.
+            if plan.get("pos") is not None:
+                self._last_good_pos = list(plan["pos"])
+            if plan.get("forward_clearance_dist") is not None:
+                self._last_good_clearance = float(plan["forward_clearance_dist"])
         # Continuous rolling baseline of NORMAL flying altitude (the median CALIB_VERIFY judges against + the
         # debugger's live drone-height number). Session 18: measure only AFTER the first calibration reports
         # height-OK (`_height_calibrated`), NEVER during a calibration (_calib_active freeze), at healthy SLAM,
@@ -2287,6 +2367,13 @@ class ExploreController:
         # --- status-gated SLAM-loss recovery (CONTROL-SPACE); active only in the explore phase ---
         if self._explore_started:
             lost = status in ("PLAN-LOST", "NO-PLAN", "PLAN-STALE")
+            # Session 34: a FRESH loss (this tick lost, last tick wasn't) arms the one-shot loss-instant
+            # clearance check (see the PLAN-LOST/PLAN-STALE fresh-entry branches below) exactly once per
+            # episode -- reset here, independent of `_recovering` (which only the PLAN-STALE path sets), so a
+            # loss that starts as PLAN-LOST gets the same one-shot chance a PLAN-STALE start would.
+            if lost and not self._was_lost:
+                self._loss_snapshot_checked = False
+            self._was_lost = lost
             # A plan loss DURING a height calibration must NOT drop us into the normal recovery (which forgets
             # the calibration and leaves the drone glued near the ceiling). Latch "interrupted", release
             # controls, and hold in a DEDICATED state; on recovery REDO the calibration. Covers LOST/NO-PLAN/
@@ -2326,6 +2413,10 @@ class ExploreController:
                 # Perception is SILENT. HARD HOVER-HOLD indefinitely — never move on a clock while we're
                 # blind. Wait for perception to speak; the branch below (OK/STALE) then decides.
                 if st != "HOLD_LOST":
+                    if not self._loss_snapshot_checked:
+                        snap = self._maybe_loss_snapshot_backoff(plan, now)
+                        if snap is not None:
+                            return snap
                     self._player = None
                     self._enter("HOLD_LOST", now)
                     return {}, "HOLD_LOST", ("PLAN-LOST -> HARD HOVER-HOLD (indefinite; waiting for "
@@ -2341,8 +2432,9 @@ class ExploreController:
                 return self._step_stale(now, plan, wall_contact, backwall_contact)
             # status OK: if we were recovering, perception is TRACKING again -> DON'T fly on the first frame
             # back (a fresh RELOC pose is shaky). Hold until SLAM settles (>N fast frames), THEN brake + REPLAN.
-            # NOTE: `_recovering` + the give-up counter are NOT cleared here — a bare OK is not yet trusted; only a
-            # confirming ADVANCE (>= recovery_confirm_dist, in the ADVANCE handler) restores trust (D5).
+            # NOTE: `_recovering` + the give-up counter are NOT cleared here — a bare, un-settled OK is not yet
+            # trusted; trust restores in SLAM_HOLD's settle-gate-clear branch below, once genuinely settled
+            # (session 35 D5 simplification).
             # Session 24: a corner-giveup-terminal STUCK (see the REPLAN `done` branch) must NOT be swept into
             # this generic "recovery -> OK -> settle -> replan" convergence -- it has nothing to recover INTO
             # (every corner is exhausted); the drone is meant to hold here for good, not bounce back out the
@@ -2362,21 +2454,72 @@ class ExploreController:
                 nxt = self._slam_resume or "REPLAN"
                 self._slam_resume = None
                 waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
+                trust_note = ""
+                # Session 35: settle-gate-based trust restoration. Gated STRICTLY on nxt == "SETTLE" (the
+                # recovery-resume path) -- every other resume target ("ADVANCE"/"PARALLAX_PUSH", a plain
+                # mid-leg/post-turn slow hold) is untouched, so an un-settled or non-recovery transition can
+                # never clear these flags. MUST run before the Idea-A clearance check right below (not
+                # because Idea-A reads `_recovering` -- it doesn't, it reads the live clearance directly --
+                # but so trust is established first, then a decision is made using the now-trusted pose,
+                # unambiguous on inspection).
+                if nxt == "SETTLE" and self._recovering:
+                    self._recovering = False
+                    self._history_broken = False
+                    self._reset_fallback_sweep()
+                    self.command_history.clear()
+                    trust_note = " -> recovery trust restored (SLAM settled)"
+                # Session 34, Idea A: at this recovery trust boundary (only for the RECOVERY resume target,
+                # "SETTLE" -- a plain mid-leg SLAM-slow hold resuming straight into ADVANCE/PARALLAX_PUSH gets
+                # its own per-tick clearance check moments later anyway, so re-checking here would just be
+                # redundant), check the now-LIVE clearance before resuming -- don't wait out SETTLE -> REPLAN
+                # -> ORIENT -> ADVANCE to notice we re-locked right on top of a wall.
+                if nxt == "SETTLE":
+                    clr = plan.get("forward_clearance_dist")
+                    if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
+                        self._register_bump(plan, "clearance stand-off (post-recovery settle)")
+                        if self.backoff_on_standoff:
+                            self._player = None
+                            self._backoff_t0 = now
+                            self._enter("BACKOFF", now)
+                            return {}, "BACKOFF", (f"SLAM settled after {waited:.1f}s but clearance {clr:.2f} "
+                                                   f"<= {self.stop_clearance_dist:.2f}{trust_note} -> standoff "
+                                                   "back off (re-arm bump latch) -> settle, before resuming REPLAN")
+                        self._enter("SETTLE", now)
+                        return {}, "SETTLE", (f"SLAM settled after {waited:.1f}s but clearance {clr:.2f} <= "
+                                              f"{self.stop_clearance_dist:.2f}{trust_note} -> standoff settle "
+                                              "before REPLAN")
                 self._enter(nxt, now)
                 return {}, nxt, (f"SLAM settled after {waited:.1f}s ({self._slam_fast_streak} fast frames, "
-                                 f"last {self._slam_ms_latest:.0f}ms) -> resume {nxt}")
+                                 f"last {self._slam_ms_latest:.0f}ms){trust_note} -> resume {nxt}")
             # Still waiting on the settle gate — blind, same as HOLD_LOST. React to a live wall/backwall
-            # contact the same way (see _blind_contact_backoff) before falling through to the step-back logic.
+            # contact the same way (see _blind_contact_backoff) before falling through to the slow-SLAM
+            # escape below.
             reaction = self._blind_contact_backoff(now, wall_contact, backwall_contact, "SLAM_HOLD")
             if reaction is not None:
                 return reaction
-            # SLAM is still choking. If it has been slow for a sustained run (and the plan is OK — LOST/STALE
-            # are handled at the step() top), step one entry back through the rewind queue to re-expose
-            # known-good geometry so the solve can re-lock. Re-arm needs another full run of slow frames.
-            # SKIP while `_recovering`: the history is frozen/possibly spatially stale during an untrusted re-lock,
-            # so popping it for a step-back could fly a ghost path — just keep holding until a confirming ADVANCE.
+            waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
+            if not self.use_slam_stepback_on_slow:
+                # Session 35 default: SLAM has been slow (and the plan stayed OK -- LOST/STALE are handled
+                # at the step() top) for a sustained run. Stop waiting and force one hop toward the CURRENT
+                # goal instead, rather than holding indefinitely (or until the classic step-back's cap).
+                # Scoped to a plain mid-leg/post-turn slow hold ("ADVANCE" resume, not "SETTLE" -- a recovery
+                # settle hasn't earned trust yet) and `not self._recovering` (belt-and-suspenders: trust now
+                # clears at the settle-gate boundary above, so this should already always hold true here).
+                if (self._slam_resume == "ADVANCE" and not self._recovering and self._slam_slow
+                        and waited >= self.slam_slow_hop_after_s):
+                    # NOTE: set the deadline AFTER _enter() -- "REPLAN" is not in _enter()'s ("ADVANCE",
+                    # "ORIENT") exemption (it's a one-tick pass-through, not a state that itself spends the
+                    # grace window), so setting it BEFORE would have it wiped by that same call.
+                    self._enter("REPLAN", now)
+                    self._slam_slow_hop_deadline = now + self.slam_slow_hop_grace_s
+                    return {}, "REPLAN", (f"SLAM still slow after {waited:.1f}s but plan OK -> forcing one "
+                                          f"hop toward the current goal (grace {self.slam_slow_hop_grace_s:.0f}s)")
+                return {}, "SLAM_HOLD", None
+            # Legacy (use_slam_stepback_on_slow=true): step one entry back through the rewind queue to
+            # re-expose known-good geometry so the solve can re-lock. Re-arm needs another full run of slow
+            # frames. SKIP while `_recovering`: the history is frozen/possibly spatially stale during an
+            # untrusted re-lock, so popping it for a step-back could fly a ghost path.
             if self._slam_slow_streak >= self.slam_stepback_after_frames and not self._recovering:
-                waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
                 if self._slam_stepback_count >= self.slam_stepback_max_steps:
                     self._slam_slow_streak = 0            # stop re-checking every frame; keep holding (visible)
                     return {}, "SLAM_HOLD", (f"SLAM still slow after {waited:.1f}s and "
@@ -3016,7 +3159,8 @@ class ExploreController:
                     self._push_dir = None     # choose the push axis fresh from the post-turn ring
                 # Turns are the hardest thing for monocular SLAM; if the solve is still choking, HOLD before
                 # flying on a shaky post-turn pose (the ~45deg heading gap). Settle first, then proceed to nxt.
-                if self._slam_slow:
+                # Session 35: a forced SLAM-slow-hop in progress bypasses this for its bounded grace window.
+                if self._slam_slow and not self._slam_slow_hop_active(now):
                     return self._enter_slam_hold(nxt, now,
                                                  f"turn complete, SLAM slow ({self._slam_ms_latest:.0f}ms "
                                                  f">= {self.slam_slow_ms:.0f}) -> hold to settle before {nxt}")
@@ -3036,28 +3180,11 @@ class ExploreController:
                 self._hop_baseline_msg = (
                     f"[HOP_BASELINE] pos={plan.get('pos')} cap_ts={plan.get('cap_ts')} "
                     f"frame_id={plan.get('frame_id')} bound against goal={self.leg_goal} dist={reached:.3f}")
-            # CONFIRMING ADVANCE (D5): a re-locked drone is trusted again ONLY after it flies a genuine leg. Gauge
-            # progress from this leg's start; once it has advanced >= recovery_confirm_dist, RESTORE trust — drop
-            # `_recovering`/`_history_broken`, reset the give-up counter, and CLEAR the (now-stale) reverse-list so
-            # logging resumes from a fresh, coherent chain. Progress-gated, NOT "the ADVANCE state ran": a re-lock
-            # that instantly bumps a wall at ~0 distance must NOT count.
-            if self._recovering:
-                if self._recovery_adv_start is None:
-                    self._recovery_adv_start = plan.get("pos")
-                else:
-                    moved = self._dist(plan.get("pos"), self._recovery_adv_start)
-                    if moved is not None and moved >= self.recovery_confirm_dist:
-                        self._recovering = False
-                        self._history_broken = False
-                        self._reset_fallback_sweep()
-                        self.command_history.clear()
-                        self._recovery_adv_start = None
-                        event = (f"recovery CONFIRMED: advanced {moved:.2f}u >= {self.recovery_confirm_dist:g}u "
-                                 "-> trust restored (counter reset, reverse-list cleared, logging resumed)")
-            if self._slam_slow:
+            if self._slam_slow and not self._slam_slow_hop_active(now):
                 # SLAM started choking mid-leg -> STOP moving and let it settle before it loses the track.
                 # Log the clean sub-leg flown so far (also keeps translations in the rewind history), then hold
                 # and resume ADVANCE (leg_goal persists) once stable. (No speed sample on a choking frame.)
+                # Session 35: a forced SLAM-slow-hop in progress bypasses this for its bounded grace window.
                 self._log_move("forward", fwd_val, fwd_dur)
                 return self._enter_slam_hold("ADVANCE", now,
                                              f"ADVANCE: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
@@ -5818,23 +5945,32 @@ def run_self_test(cfg):
     chb = ExploreController(cfg, no_takeoff=True); chb._recovering = True; chb._enter("ORIENT", 0.0)
     chb2 = ExploreController(cfg, no_takeoff=True); chb2._recovering = True; chb2._enter("SETTLE", 0.0)
     hb_ok = (chb._history_broken is True and chb2._history_broken is False)
-    # (j) CONFIRMING ADVANCE: >= recovery_confirm_dist of progress restores trust (drop flags, reset counter,
-    #     clear history); a sub-threshold bump does NOT confirm.
+    # (j) CONFIRMING RECOVERY (session 35): trust restores the moment a loss recovers to a genuinely SETTLED
+    #     OK (SLAM_HOLD's settle-gate-clear, resume target "SETTLE") -- drop flags, reset the fallback-sweep
+    #     counter, clear the (now-stale) history. An UN-settled OK tick (still mid-gate) does NOT confirm.
     padv_c = {"plan_valid": True, "done": False, "goal": [10.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
               "forward_clearance_dist": 8.0, "pos_y": 0.0, "slam_ms": 120.0, "frame_id": 1}
     cca = ExploreController(cfg, no_takeoff=True)
+    cca.settle_gate_s = 0.02
     cca._recovering = True; cca._history_broken = True; cca._fallback_cycle = 5
     cca.command_history.append({"kind": "turn", "theta": 15.0})
-    cca.leg_goal = [10.0, 0.0]; cca.target_altitude_y = 0.0; cca.state = "ADVANCE"
-    cca.step(0.0, padv_c, False, status="OK")                                   # capture start = [0,0]
-    cca.step(0.1, dict(padv_c, pos=[1.2, 0.0], frame_id=2), False, status="OK")  # moved 1.2 >= 1.0 -> confirm
-    confirm_ok = (not cca._recovering and not cca._history_broken and cca._fallback_cycle == 0
-                  and len(cca.command_history) == 0)
+    cca.leg_goal = [10.0, 0.0]; cca.target_altitude_y = 0.0
+    cca._enter("HOLD_LOST", 0.0)
+    t = 0.0
+    _a, s, _ = cca.step(t, dict(padv_c, frame_id=1), False, status="OK"); t += 0.05
+    entered_hold_ok = (s == "SLAM_HOLD" and cca._slam_resume == "SETTLE")
+    s_final = s
+    for i in range(2, 2 + cca.settle_fresh_frames + 4):
+        _a, s_final, _ = cca.step(t, dict(padv_c, frame_id=i, cap_ts=t), False, status="OK"); t += 0.05
+        if s_final != "SLAM_HOLD":
+            break
+    confirm_ok = (entered_hold_ok and s_final == "SETTLE" and not cca._recovering and not cca._history_broken
+                  and cca._fallback_cycle == 0 and len(cca.command_history) == 0)
     ccb = ExploreController(cfg, no_takeoff=True)
-    ccb._recovering = True; ccb.leg_goal = [10.0, 0.0]; ccb.target_altitude_y = 0.0; ccb.state = "ADVANCE"
-    ccb.step(0.0, padv_c, False, status="OK")
-    ccb.step(0.1, dict(padv_c, pos=[0.5, 0.0], frame_id=2), False, status="OK")  # only 0.5u -> NOT confirmed
-    noconfirm_ok = (ccb._recovering is True)
+    ccb._recovering = True; ccb.leg_goal = [10.0, 0.0]; ccb.target_altitude_y = 0.0
+    ccb._enter("HOLD_LOST", 0.0)
+    _a, s_b, _ = ccb.step(0.0, dict(padv_c, frame_id=1), False, status="OK")   # one tick -> not yet settled
+    noconfirm_ok = (ccb._recovering is True and s_b == "SLAM_HOLD")
     # (k) D2 SCRAPE GUARD: a strafe pick while pinned close behind + forward clearly open -> reposition_fwd
     #     (drives FORWARD) then hands off to the queued strafe.
     crp = ExploreController(cfg, no_takeoff=True)
@@ -6193,6 +6329,7 @@ def run_self_test(cfg):
     # (b) ADVANCE -> a slow frame -> SLAM_HOLD; sustained slow -> SLAM_STEPBACK pops the forward move and
     #     plays its inverse (a reverse), then returns to SLAM_HOLD to keep waiting.
     csb2 = ExploreController(cfg, no_takeoff=True)
+    csb2.use_slam_stepback_on_slow = True   # exercise the legacy step-back path (default-off since session 35)
     csb2.slam_stepback_after_frames, csb2.slam_stepback_max_steps = 4, 2
     tb, fb = 0.0, 0
     reached = False
@@ -6220,6 +6357,7 @@ def run_self_test(cfg):
 
     # (c) cap: a longer pre-seeded history + sustained slow -> at most slam_stepback_max_steps step-backs.
     csb3 = ExploreController(cfg, no_takeoff=True)
+    csb3.use_slam_stepback_on_slow = True
     csb3.slam_stepback_after_frames, csb3.slam_stepback_max_steps = 3, 2
     for _ in range(4):
         csb3._log_move("forward", 0.2, 0.05)
@@ -6232,6 +6370,7 @@ def run_self_test(cfg):
 
     # (d) empty rewind queue -> never enters SLAM_STEPBACK, just keeps holding (no silent fallback / crash).
     csb4 = ExploreController(cfg, no_takeoff=True)
+    csb4.use_slam_stepback_on_slow = True
     csb4.slam_stepback_after_frames = 3
     csb4._enter_slam_hold("ADVANCE", 0.0, "test")     # command_history is empty
     tb, fb, empty_ok = 0.05, 0, True
@@ -6243,6 +6382,7 @@ def run_self_test(cfg):
 
     # (e) PLAN-LOST while holding -> HOLD_LOST (the step-back is OK-only; recovery owns the loss path).
     csb5 = ExploreController(cfg, no_takeoff=True)
+    csb5.use_slam_stepback_on_slow = True
     for _ in range(3):
         csb5._log_move("forward", 0.2, 0.05)
     csb5._enter_slam_hold("ADVANCE", 0.0, "test")
@@ -6264,6 +6404,7 @@ def run_self_test(cfg):
     padv6 = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
              "forward_clearance_dist": 9.0}
     csp = ExploreController(cfg, no_takeoff=True)
+    csp.use_slam_stepback_on_slow = True
     csp.slam_stepback_after_frames, csp.slam_stepback_max_steps = 3, 3
     for _ in range(6):
         csp._log_move("forward", 0.2, 0.05)
@@ -6309,6 +6450,220 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if stepback_persist_ok else 'FAIL'}  SLAM-STEPBACK counter PERSISTENCE "
           f"(first={sb1_ok}, bounce-preserves={bounce_ok}, fresh-hold-preserves={fresh_hold_ok}, "
           f"escalates-to-2={escalate_ok}, goal-change-resets={goal_reset_ok})")
+
+    # ---- Session 35: forced-hop escape (default) vs legacy step-back, selected by use_slam_stepback_on_slow ----
+    padv35 = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+              "forward_clearance_dist": 9.0}
+
+    def _drive_to_advance(ctrl, tb=0.0, fb=0):
+        reached = False
+        for _ in range(40):
+            _a, s, _ = ctrl.step(tb, dict(padv35, frame_id=fb, slam_ms=200.0), False, status="OK")
+            tb += 0.05; fb += 1
+            if s == "ADVANCE":
+                reached = True
+                break
+        return reached, tb, fb
+
+    # (a) default (use_slam_stepback_on_slow=False): a sustained slow-but-OK hold forces a hop (REPLAN), and
+    #     NEVER falls into SLAM_STEPBACK even well past slam_stepback_after_frames.
+    c35a = ExploreController(cfg, no_takeoff=True)
+    c35a.slam_slow_hop_after_s = 0.05
+    c35a.slam_stepback_after_frames = 3
+    reached_a, tb, fb = _drive_to_advance(c35a)
+    saw_stepback_a, saw_hop_a = False, False
+    for _ in range(15):
+        _a, s, _ = c35a.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "SLAM_STEPBACK":
+            saw_stepback_a = True
+        if s == "REPLAN":
+            saw_hop_a = True
+            break
+    default_hops_ok = reached_a and saw_hop_a and not saw_stepback_a
+
+    # (b) use_slam_stepback_on_slow=True: the SAME sustained slow-but-OK hold now goes through step-back, and
+    #     NEVER forces a hop (REPLAN) even with slam_slow_hop_after_s set to fire almost instantly.
+    c35b = ExploreController(cfg, no_takeoff=True)
+    c35b.use_slam_stepback_on_slow = True
+    c35b.slam_slow_hop_after_s = 0.05
+    reached_b, tb, fb = _drive_to_advance(c35b)
+    saw_replan_b, saw_stepback_b = False, False
+    for _ in range(15):
+        _a, s, _ = c35b.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "REPLAN":
+            saw_replan_b = True
+            break
+        if s == "SLAM_STEPBACK":
+            saw_stepback_b = True
+            break
+    legacy_never_hops_ok = reached_b and saw_stepback_b and not saw_replan_b
+
+    # (c) the forced hop fires only for a plain mid-leg/post-turn hold (`_slam_resume == "ADVANCE"`) -- NOT
+    #     for a recovery-settle hold (`_slam_resume == "SETTLE"`), even well past slam_slow_hop_after_s.
+    c35c = ExploreController(cfg, no_takeoff=True)
+    c35c.slam_slow_hop_after_s = 0.05
+    c35c._enter("HOLD_LOST", 0.0)
+    _a, s_c, _ = c35c.step(0.0, dict(padv35, frame_id=1, slam_ms=1500.0), False, status="OK")
+    resume_settle_ok = (s_c == "SLAM_HOLD" and c35c._slam_resume == "SETTLE")
+    saw_hop_c, t = False, 0.05
+    for i in range(2, 12):
+        _a, s, _ = c35c.step(t, dict(padv35, frame_id=i, slam_ms=1500.0), False, status="OK"); t += 0.05
+        if s == "REPLAN":
+            saw_hop_c = True
+            break
+    recovery_never_hops_ok = resume_settle_ok and not saw_hop_c
+
+    # (d) grace-window leak fix: a physical guard (clearance stand-off) cutting the forced hop short into
+    #     BACKOFF must clear `_slam_slow_hop_deadline` immediately -- a LATER, unrelated ADVANCE (still slow)
+    #     must NOT inherit the bypass and must correctly re-enter SLAM_HOLD.
+    c35d = ExploreController(cfg, no_takeoff=True)
+    c35d.slam_slow_hop_after_s = 0.05
+    c35d.slam_slow_hop_grace_s = 5.0
+    reached_d, tb, fb = _drive_to_advance(c35d)
+    for _ in range(15):     # go slow -> SLAM_HOLD(resume=ADVANCE) -> waited>=0.05s -> forces the hop (REPLAN)
+        _a, s, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "REPLAN":
+            break
+    for _ in range(15):     # drive REPLAN -> ORIENT -> ADVANCE (still slow, riding the grace bypass)
+        _a, s, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        if s == "ADVANCE":
+            break
+    deadline_active_ok = (c35d._slam_slow_hop_deadline is not None and tb < c35d._slam_slow_hop_deadline
+                          and s == "ADVANCE")
+    _a, s_bo, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0, forward_clearance_dist=0.5),
+                            False, status="OK")
+    backoff_ok = (s_bo == "BACKOFF")
+    deadline_cleared_ok = c35d._slam_slow_hop_deadline is None
+    # a later, unrelated ADVANCE (simulating a fresh leg reached after BACKOFF/SETTLE/REPLAN resolve) must
+    # NOT inherit the cleared bypass -- still slow -> correctly re-enters SLAM_HOLD.
+    c35d.state = "ADVANCE"
+    c35d._player = None
+    c35d.t_state = tb
+    _a, s_new, _ = c35d.step(tb + 0.1, dict(padv35, frame_id=fb + 1, slam_ms=1500.0), False, status="OK")
+    no_leak_ok = (s_new == "SLAM_HOLD")
+
+    grace_leak_ok = (deadline_active_ok and backoff_ok and deadline_cleared_ok and no_leak_ok)
+    switch_ok = default_hops_ok and legacy_never_hops_ok and recovery_never_hops_ok and grace_leak_ok
+    ok = ok and switch_ok
+    print(f"[self-test] {'PASS' if switch_ok else 'FAIL'}  SLAM-slow strategy switch (session 35) "
+          f"(default->hop-not-stepback={default_hops_ok}, stepback-mode->never-hops={legacy_never_hops_ok}, "
+          f"recovery-settle-never-hops={recovery_never_hops_ok}, grace-window-leak-fix={grace_leak_ok})")
+
+    # ---- Session 34: proactive clearance checks that don't wait for ADVANCE to re-check ----
+    # (a) Idea B: a fresh PLAN-LOST with a cached close last-good clearance -> immediate BACKOFF, using the
+    #     CACHED position (the live plan's pos is None during a loss).
+    c34a = ExploreController(cfg, no_takeoff=True)
+    c34a.leg_goal = [5.0, 5.0]
+    ok_plan_close = {"plan_valid": True, "pos": [1.0, 1.0], "forward_clearance_dist": 0.5,
+                      "goal": [5.0, 5.0], "done": False, "bearing_err": 0.0, "slam_ms": 100.0, "frame_id": 1}
+    c34a.step(0.0, ok_plan_close, False, status="OK")             # caches last-good pos/clearance
+    _a, s34a, ev34a = c34a.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")
+    lost_immediate_ok = (s34a == "BACKOFF" and c34a._last_bump_anchor == [1.0, 1.0]
+                          and ev34a is not None and "stale pose" in ev34a)
+
+    # (b) Idea B: same, but the episode STARTS as PLAN-STALE (perception publishing, SLAM not TRACKING).
+    c34b = ExploreController(cfg, no_takeoff=True)
+    c34b.leg_goal = [5.0, 5.0]
+    c34b._ever_tracked = True     # a MID-FLIGHT loss, not startup warmup
+    c34b.step(0.0, ok_plan_close, False, status="OK")
+    _a, s34b, _ = c34b.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE")
+    stale_immediate_ok = (s34b == "BACKOFF" and c34b._last_bump_anchor == [1.0, 1.0])
+
+    # (c) a LOST->STALE flicker within the SAME episode fires the one-shot only ONCE (one bump, not two).
+    c34c = ExploreController(cfg, no_takeoff=True)
+    c34c.leg_goal = [5.0, 5.0]
+    c34c.step(0.0, ok_plan_close, False, status="OK")
+    _a, s34c1, _ = c34c.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")   # 1st -> fires BACKOFF
+    g1, _r1, _p1, _ic1 = c34c.take_bump_pulse()
+    first_fire_ok = (s34c1 == "BACKOFF" and g1 is not None)
+    c34c._bump_armed = True     # re-arm the SEPARATE bump latch, to isolate the one-shot flag under test
+    c34c.state = "HOLD_LOST"    # simulate falling back to HOLD_LOST, then flickering to STALE (same episode)
+    _a, s34c2, _ = c34c.step(0.05, {"plan_valid": False}, False, status="PLAN-STALE")
+    g2, _r2, _p2, _ic2 = c34c.take_bump_pulse()
+    no_double_fire_ok = (first_fire_ok and s34c2 != "BACKOFF" and g2 is None)
+
+    # (d) a cached clearance that ISN'T close -> falls through to the normal HOLD_LOST entry unchanged.
+    c34d = ExploreController(cfg, no_takeoff=True)
+    c34d.leg_goal = [5.0, 5.0]
+    ok_plan_clear = dict(ok_plan_close, forward_clearance_dist=5.0)
+    c34d.step(0.0, ok_plan_clear, False, status="OK")
+    _a, s34d, _ = c34d.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")
+    clear_no_fire_ok = (s34d == "HOLD_LOST")
+
+    # (e) no cached pose yet (a loss before any valid plan, e.g. at startup) -> no-op, normal HOLD_LOST entry.
+    c34e = ExploreController(cfg, no_takeoff=True)
+    _a, s34e, _ = c34e.step(0.0, {"plan_valid": False}, False, status="PLAN-LOST")
+    no_cache_ok = (s34e == "HOLD_LOST" and c34e._last_good_clearance is None)
+
+    ideaB_ok = (lost_immediate_ok and stale_immediate_ok and no_double_fire_ok
+                and clear_no_fire_ok and no_cache_ok)
+
+    # (f) Idea A: at the recovery settle-gate-clear (resume target "SETTLE"), a too-close LIVE clearance ->
+    #     BACKOFF instead of resuming to SETTLE/REPLAN.
+    c34f = ExploreController(cfg, no_takeoff=True)
+    c34f.settle_gate_s = 0.02
+    c34f.leg_goal = [5.0, 5.0]
+    c34f._enter("HOLD_LOST", 0.0)
+    padv_rec = {"plan_valid": True, "done": False, "goal": [5.0, 5.0], "pos": [1.0, 1.0], "bearing_err": 0.0,
+                "forward_clearance_dist": 0.5, "slam_ms": 100.0}
+    t = 0.0
+    _a, s_hold, _ = c34f.step(t, dict(padv_rec, frame_id=1), False, status="OK"); t += 0.05
+    entered_slam_hold_ok = (s_hold == "SLAM_HOLD" and c34f._slam_resume == "SETTLE")
+    s_final = s_hold
+    for i in range(2, 2 + c34f.settle_fresh_frames + 4):
+        _a, s_final, _ = c34f.step(t, dict(padv_rec, frame_id=i, cap_ts=t), False, status="OK"); t += 0.05
+        if s_final != "SLAM_HOLD":
+            break
+    recovery_backoff_ok = (entered_slam_hold_ok and s_final == "BACKOFF")
+
+    # (g) regression: the SAME too-close clearance during a PLAIN mid-leg SLAM-slow hold (resume target
+    #     "ADVANCE", not a recovery) must NOT be affected -- resumes to ADVANCE unchanged (ADVANCE's own
+    #     per-tick stand-off check, unrelated to this session, would catch it moments later anyway).
+    c34g = ExploreController(cfg, no_takeoff=True)
+    c34g.settle_gate_s = 0.02
+    padv2g = {"plan_valid": True, "done": False, "goal": [5.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+              "forward_clearance_dist": 5.0}
+    t = 0.0
+    for i in range(30):
+        _a, s, _ = c34g.step(t, dict(padv2g, frame_id=i, slam_ms=200.0, cap_ts=t), False, status="OK"); t += 0.05
+        if s == "ADVANCE":
+            break
+    _a, s_hold2, _ = c34g.step(t, dict(padv2g, frame_id=100, slam_ms=1500.0, forward_clearance_dist=0.5,
+                                       cap_ts=t), False, status="OK"); t += 0.05
+    resume_target_ok = (s_hold2 == "SLAM_HOLD" and c34g._slam_resume == "ADVANCE")
+    s_final2 = s_hold2
+    for i in range(101, 101 + c34g.settle_fresh_frames + 4):
+        _a, s_final2, _ = c34g.step(t, dict(padv2g, frame_id=i, slam_ms=200.0, forward_clearance_dist=0.5,
+                                            cap_ts=t), False, status="OK"); t += 0.05
+        if s_final2 != "SLAM_HOLD":
+            break
+    plain_hold_unaffected_ok = (resume_target_ok and s_final2 == "ADVANCE")
+
+    # (h) regression: a CLEAR live reading at the recovery settle-gate-clear -> resumes to SETTLE as before.
+    c34h = ExploreController(cfg, no_takeoff=True)
+    c34h.settle_gate_s = 0.02
+    c34h.leg_goal = [5.0, 5.0]
+    c34h._enter("HOLD_LOST", 0.0)
+    padv_clear = dict(padv_rec, forward_clearance_dist=5.0)
+    t = 0.0
+    _a, s_hold3, _ = c34h.step(t, dict(padv_clear, frame_id=1), False, status="OK"); t += 0.05
+    s_final3 = s_hold3
+    for i in range(2, 2 + c34h.settle_fresh_frames + 4):
+        _a, s_final3, _ = c34h.step(t, dict(padv_clear, frame_id=i, cap_ts=t), False, status="OK"); t += 0.05
+        if s_final3 != "SLAM_HOLD":
+            break
+    recovery_clear_regression_ok = (s_final3 == "SETTLE")
+
+    ideaA_ok = recovery_backoff_ok and plain_hold_unaffected_ok and recovery_clear_regression_ok
+
+    proactive_ok = ideaB_ok and ideaA_ok
+    ok = ok and proactive_ok
+    print(f"[self-test] {'PASS' if proactive_ok else 'FAIL'}  PROACTIVE CLEARANCE while blind (session 34) "
+          f"(loss-instant PLAN-LOST={lost_immediate_ok}, loss-instant PLAN-STALE={stale_immediate_ok}, "
+          f"no-double-fire-on-flicker={no_double_fire_ok}, clear-no-fire={clear_no_fire_ok}, "
+          f"no-cache-startup={no_cache_ok}, recovery-settle-backoff={recovery_backoff_ok}, "
+          f"plain-hold-unaffected={plain_hold_unaffected_ok}, "
+          f"recovery-settle-clear-regression={recovery_clear_regression_ok})")
 
     # ---- Reactive blind-hold back_off on a flow wall/backwall contact (HOLD_LOST / waiting SLAM_HOLD) ----
     # (a) HOLD_LOST + a live wall contact -> BLIND_BACKOFF plays back_off, then resumes HOLD_LOST; a

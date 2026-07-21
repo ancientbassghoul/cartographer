@@ -392,9 +392,6 @@ autonomy:
                                      #   (operator-measured: ~2s of held full reverse is what it actually takes to matter)
     fallback_push_strafe_s: 0.25      # left/right push: FULL magnitude (+-1.0); joy_horizontal isn't ramped at all
                                      #   (unlike trigger/reverse), so there's no ramp-up time to fold into this duration
-    recovery_confirm_dist: 1.0   # a post-recovery ADVANCE must travel >= this (SLAM units) to CONFIRM the re-lock is trustworthy
-                                 #   (then: drop _recovering, reset the give-up counter, clear the stale reverse-list, resume logging).
-                                 #   Progress-gated so a re-lock that instantly bumps a wall at ~0 distance does NOT falsely confirm.
     recovery_turn_step_deg: 22.5 # gentler turn step for the recovery FALLBACK sweep (vs turn_step_deg for normal flight): a
                                  #   fragile re-lock survives a smaller open-loop turn; more cycles still cover a full sweep.
     recovery_settle_frames: 4    # a SETTLE between every REWIND inverse maneuver (only relevant when use_rewind_on_stale is
@@ -427,6 +424,15 @@ autonomy:
     # "back up until it settles" idea). Re-arm needs another full run of slow frames; capped per hold.
     slam_stepback_after_frames: 10   # consecutive slow FRESH frames in a HOLD before a rewind step-back
     slam_stepback_max_steps: 3       # max step-backs per SLAM_HOLD (then just keep holding)
+    # Session 35: TWO mutually-exclusive strategies for "SLAM slow but plan OK" -- the classic step-back
+    # above, or a simpler forward escape (default): after slam_slow_hop_after_s of continuous slow-but-OK
+    # holding, stop waiting and force one hop toward the CURRENT goal instead. Diagnosed off 11 flights with
+    # zero step-back events -- kept step-back fully intact behind this switch, default OFF (one edit to
+    # bring it back).
+    use_slam_stepback_on_slow: false # true = classic REWIND step-back; false (default) = forced-hop escape
+    slam_slow_hop_after_s: 30.0      # force one hop after this much continuous slow-but-OK holding
+    slam_slow_hop_grace_s: 8.0       # self-expiring window the forced hop's ORIENT/ADVANCE get to bypass the
+                                     #   SLAM-slow hold (one turn + one hop_duration_s, with margin)
     # --- altitude lock (hold the LIVE-cached mapping height; counters the forward-push sink that drifts the
     #     drone into inner walls). target altitude is cached LIVE from this flight's pose (self-calibrating,
     #     NOT a baked room value); the floor/threshold are general margins. World frame is +Y DOWN. ---
