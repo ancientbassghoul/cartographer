@@ -164,6 +164,21 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #clrdet td.c { text-align: left; color: #ccc; }
   #clrdet tr.blocked td { color: #ff5b5b; }
   #clrdet .empty { padding: 10px; color: #777; }
+  /* Floating visual-recovery panel (session 35 ALT): the 15° probe's phase + the last SIFT match verdict
+     against F_LKG -- mirrors #clrdet's shell. */
+  #visrec { position: fixed; top: 64px; left: 720px; width: 280px; max-height: 40vh; display: none;
+            flex-direction: column; background: #141414; border: 1px solid #555; border-radius: 4px;
+            box-shadow: 0 6px 24px rgba(0,0,0,.6); z-index: 50; font-size: 11px; }
+  #visrec h4 { margin: 0; padding: 6px 10px; background: #242424; border-bottom: 1px solid #444; cursor: move;
+               font-size: 12px; color: #9ad; display: flex; justify-content: space-between; align-items: center; }
+  #visrec h4 .x { cursor: pointer; color: #888; padding: 0 4px; }
+  #visrec h4 .x:hover { color: #fff; }
+  #visrec .body { overflow: auto; padding: 8px 10px; line-height: 1.7; }
+  #visrec .k { color: #888; }
+  #visrec .v { color: #ddd; }
+  #visrec .yes { color: #7fd97f; }
+  #visrec .no { color: #ff5b5b; }
+  #visrec .empty { padding: 10px; color: #777; }
 </style>
 </head>
 <body>
@@ -184,6 +199,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       </label>
       <button id="dbBtn" title="Persistent goals database (picks / strikes / blacklist) at the cursor">Goals DB</button>
       <button id="clrBtn" title="Fwd/back/left/right clearance ray-hit detail at the cursor">Clearance</button>
+      <button id="visrecBtn" title="Visual recovery probe phase + SIFT match verdict against F_LKG at the cursor">Visual Recovery</button>
       <button id="evPrev" title="Jump to the previous log message">&#9664; Msg</button>
       <button id="evNext" title="Jump to the next log message">Msg &#9654;</button>
       <label style="font-size:12px;color:#999">
@@ -215,6 +231,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div id="clrdet">
   <h4><span>Clearance</span><span class="x" id="clrClose">&times;</span></h4>
   <div class="body" id="clrBody"></div>
+</div>
+<div id="visrec">
+  <h4><span>Visual Recovery</span><span class="x" id="visrecClose">&times;</span></h4>
+  <div class="body" id="visrecBody"></div>
 </div>
 <script>
 const RECORDS = __DATA__;
@@ -407,6 +427,28 @@ function render(idx) {
   drawSlam(idx);
   updateGoalDb(idx);
   updateClearanceDetail(idx);
+  updateVisualRecovery(idx);
+}
+
+// Floating visual-recovery panel (session 35 ALT): the 15° probe's phase (TURN/MATCH/WAIT_RECOVER) +
+// the last SIFT match verdict against F_LKG (matched/inliers/contained/planar_like/scale) -- rides each
+// step record as `visual_recovery_detail`. None/undefined -> feature off or an older log.
+function updateVisualRecovery(idx) {
+  const panel = document.getElementById('visrec');
+  if (panel.style.display !== 'flex') return;          // skip work while hidden
+  const s = STEPS[idx] || {};
+  const vr = s.visual_recovery_detail;
+  const body = document.getElementById('visrecBody');
+  if (!vr) { body.innerHTML = '<div class="empty">no visual_recovery_detail (feature off, or an older flight log)</div>'; return; }
+  const yn = (b) => b === null || b === undefined ? '<span class="v">—</span>'
+                   : `<span class="${b ? 'yes' : 'no'}">${b ? 'yes' : 'no'}</span>`;
+  body.innerHTML =
+    `<span class="k">phase</span> <span class="v">${vr.phase || '—'}</span><br>` +
+    `<span class="k">cum. turn</span> <span class="v">${fmt(vr.cum_deg, 1)}&deg;</span><br>` +
+    `<span class="k">F_LKG cached</span> ${yn(vr.has_lkg)}<br>` +
+    `<span class="k">matched</span> ${yn(vr.matched)} <span class="k">inliers</span> <span class="v">${vr.inliers != null ? vr.inliers : '—'}</span><br>` +
+    `<span class="k">contained</span> ${yn(vr.contained)}  <span class="k">planar-like</span> ${yn(vr.planar_like)}<br>` +
+    `<span class="k">scale</span> <span class="v">${fmt(vr.scale, 2)}</span>`;
 }
 
 // Floating clearance-detail table (session 29): the raw ray-hit picture (hits / total rays / fraction /
@@ -743,6 +785,31 @@ document.getElementById('clrClose').addEventListener('click', () => { clrPanel.s
   window.addEventListener('mouseup', () => { drag = false; });
 })();
 
+// ---- Visual-recovery floating panel (session 35 ALT): toggle + drag by its header ----
+const visrecPanel = document.getElementById('visrec');
+function toggleVisrec() {
+  visrecPanel.style.display = (visrecPanel.style.display === 'flex') ? 'none' : 'flex';
+  updateVisualRecovery(cur);
+}
+document.getElementById('visrecBtn').addEventListener('click', toggleVisrec);
+document.getElementById('visrecClose').addEventListener('click', () => { visrecPanel.style.display = 'none'; });
+(function () {
+  const h = visrecPanel.querySelector('h4');
+  let dx = 0, dy = 0, drag = false;
+  h.addEventListener('mousedown', (e) => {
+    if (e.target.classList.contains('x')) return;
+    drag = true; const r = visrecPanel.getBoundingClientRect();
+    dx = e.clientX - r.left; dy = e.clientY - r.top;
+    visrecPanel.style.right = 'auto'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    visrecPanel.style.left = Math.max(0, e.clientX - dx) + 'px';
+    visrecPanel.style.top = Math.max(0, e.clientY - dy) + 'px';
+  });
+  window.addEventListener('mouseup', () => { drag = false; });
+})();
+
 if (STEPS.length === 0) {
   document.getElementById('hud').textContent = 'No step records in this timeline.';
 } else {
@@ -789,7 +856,9 @@ def _self_test():
              "left": {"dist": None, "n_hits": 0, "n_rays": 10, "fraction": 0.0, "min_dist": None,
                       "max_dist": None, "blocked": False},
              "right": {"dist": 1.1, "n_hits": 5, "n_rays": 10, "fraction": 0.5, "min_dist": 1.1,
-                       "max_dist": 1.4, "blocked": True}}},
+                       "max_dist": 1.4, "blocked": True}},
+         "visual_recovery_detail": {"phase": "MATCH", "cum_deg": 15.0, "has_lkg": True, "matched": True,
+                                    "inliers": 34, "contained": False, "planar_like": True, "scale": 1.02}},
         {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
         {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
@@ -888,6 +957,18 @@ def _self_test():
         print(f"[self-test] {'PASS' if c_clr else 'FAIL'}  clearance-detail table "
               f"(fwd/back/left/right ray stats survive + render code wired)")
         ok = ok and c_clr
+
+        # Visual-recovery floating panel (session 35 ALT): phase + SIFT match verdict survive load + the
+        # render/toggle code is wired in.
+        vr_rec = next((r for r in embedded if r.get("visual_recovery_detail")), None)
+        c_visrec = (vr_rec is not None and vr_rec["visual_recovery_detail"]["phase"] == "MATCH"
+                    and vr_rec["visual_recovery_detail"]["planar_like"] is True
+                    and vr_rec["visual_recovery_detail"]["scale"] == 1.02
+                    and "updateVisualRecovery" in html and 'id="visrec"' in html and 'id="visrecBtn"' in html
+                    and "vr.matched" in html and "vr.scale" in html and "F_LKG cached" in html)
+        print(f"[self-test] {'PASS' if c_visrec else 'FAIL'}  visual-recovery panel "
+              f"(phase/match verdict survive + render code wired)")
+        ok = ok and c_visrec
 
         # Paired SLAM logs (ev_kind:"slam_start"/"slam_finish") carried + the orange/green interleave render path
         n_slam = sum(1 for r in embedded if r.get("ev_kind") in ("slam_start", "slam_finish"))

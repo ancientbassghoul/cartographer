@@ -1,10 +1,12 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-21** (session 35 **BUILT — self-tests green, NOT YET live-flown**). Resume from
-THIS file. **Session 35 fixed a real bug in `_recovering` trust restoration (it could get structurally
-stuck for the rest of a flight) and added a config switch between the classic SLAM-slow step-back and a new
-forced-hop escape, default to the new one — see "Next" below.** Plan of record:
-**`plans/session35-slam-slow-strategy-switch-and-recovering-fix.md`** (+
+_Last updated **2026-07-21** (session 36 **BUILT — self-tests green, NOT YET live-flown**). Resume from
+THIS file. **Session 36 added image-based visual recovery on a PLAN-STALE: a loss-instant SIFT check
+against the last-known-good frame (catches an unmapped wall geometry alone would miss), and — if that's
+inconclusive too — a first-class 15° rotational turn-probe that runs BEFORE the blind FALLBACK sweep.
+Config-gated OFF by default (`use_visual_recovery_on_stale`) — see "Next" below.** Plan of record:
+**`plans/session36-visual-recovery-15deg-probe.md`** (+
+`plans/session35-slam-slow-strategy-switch-and-recovering-fix.md`,
 `plans/session34-proactive-clearance-while-blind.md`,
 `plans/session33-goal-loop-clearance-inset-fix.md`,
 `plans/session32-orient-home-ping-pong-and-home-refine.md`,
@@ -17,6 +19,39 @@ forced-hop escape, default to the new one — see "Next" below.** Plan of record
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
 parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
 `plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 36 — image-based visual recovery on PLAN-STALE: a loss-instant SIFT check + a first-class 15°
+rotational turn-probe, BUILT per an operator-approved design (self-tests green, live-fly PENDING).** The
+operator's framing: FALLBACK's blind wait→turn→push sweep recovers a stale plan unreliably, and the answer
+to "why did tracking drop and what do I do about it" is sitting in the live NDI image, never used for
+recovery before this session. Two agents drafted competing plans (a "Sonnet" plan and this "ALT" one, see
+`plans/session36-visual-recovery-15deg-probe.md` for the divergence notes); the operator picked the ALT for
+its tighter integration with session 34's existing loss-instant check, its default-OFF safety, and its
+independent 15° step structure. Built new `visual_recovery.py` (CPU-only SIFT+RANSAC — copied, not imported,
+from `benchmark_detectors.SiftDetector`, so no torch/LightGlue loads for a module that must stay light while
+SLAM is busy relocalizing): caches the last frame SLAM was TRACKING on ("F_LKG") every tick, and on request
+matches a live frame against it (`matched`/`contained`/`planar_like`/`scale`). Wired into TWO points, per the
+operator's decision tree: (1) `_maybe_loss_snapshot_backoff` (session 34's "Idea B") gains a visual clause
+alongside its cached-clearance one — a CONTAINED (zoomed-in crop) or PLANAR-LIKE (flat-surface) match at the
+loss instant is the same "too close" verdict, closing the exact gap Idea B's geometry-only check couldn't
+(an unmapped wall reads "clear" by ray-cast clearance alone); (2) if THAT is also inconclusive, a new
+`VISUAL_RECOVERY` state runs an explicit 15°-step open-loop turn-probe (re-matching after each turn) BEFORE
+ever falling to the blind FALLBACK sweep — a re-match that reads CLOSER (scale ≥ 1.15) backs off, FARTHER
+waits (bounded) for SLAM to re-anchor, and an exhausted budget (720° with no re-acquire) hands off to
+FALLBACK with a LOUD event. Found + fixed two real bugs while building it: the visual "too-close" clause was
+initially gated only on `visual_match is not None`, not on the `use_visual_recovery_on_stale` flag itself —
+harmless in practice (the flag already gates whether `run_explore` ever computes a match) but broke the
+flag-off regression as an explicit property of the function; and a TRUE-fresh `VISUAL_RECOVERY` entry
+inherited whatever maneuver's `self._player` was mid-flight when the loss hit (e.g. an in-progress ORIENT
+turn), silently skipping the probe's own 15° turn — fixed by clearing `self._player` on a genuinely fresh
+episode, mirroring how BACKOFF/SETTLE already do this. Default OFF (`use_visual_recovery_on_stale`, mirrors
+`use_rewind_on_stale`'s precedent). New `flight_replay.py` "Visual Recovery" floating panel (session-29
+Clearance-tab pattern) shows the probe's phase + last match verdict at the cursor. `python
+visual_recovery.py --self-test`, `python autopilot.py --self-test`, `python flight_replay.py --self-test`:
+ALL PASS (plus `perception_worker.py`/`frontier_planner.py`/`map_store.py`/`io_bridge.py`/
+`flow_contact_detector.py` confirmed unaffected). See `plans/session36-visual-recovery-15deg-probe.md` for
+the full decision tree + design + divergence notes. **NEXT = LIVE-FLY** (flag OFF by default — flip
+`use_visual_recovery_on_stale: true` for the first test flight) — see "Next" below._
 
 _**Session 35 — fixed a real bug where `_recovering` could get structurally stuck for the rest of a flight,
 plus a config switch between the classic SLAM-slow step-back and a new forced-hop escape (BUILT — self-tests
@@ -622,7 +657,37 @@ blocks). Keep the Documentation half narrative — detailed designs live in `pla
 
 ### >>> IMMEDIATE NEXT TASK <<<
 
-**LIVE-FLY the session-35 build** (`python fly.py`, press `m`) — this stacks session 35 (`_recovering` now
+**LIVE-FLY the session-36 build** (`python fly.py`, press `m`) — session 36 (image-based visual recovery on
+PLAN-STALE) ships with `use_visual_recovery_on_stale: false` in `config.yaml`, so a flight with NO edits at
+all just exercises sessions 28-35 exactly as before (see the chained checklist below) — the visual path is
+inert. To actually test session 36 itself, flip `use_visual_recovery_on_stale: true` first. Watch for:
+- **A loss near an UNMAPPED wall (SLAM never integrated it, so `forward_clearance_dist` reads clear/None)
+  should still back off immediately** via the visual loss-instant check — the exact gap session 34's
+  clearance-only check couldn't cover. Console/replay debugger: a `BACKOFF` with event text mentioning
+  "visual match against F_LKG (contained crop..." or "...(planar/flat surface...", firing at the very start
+  of the loss episode, same timing as session 34's existing `"stale pose @ loss"` case.
+- **When loss-instant is inconclusive, a `VISUAL_RECOVERY` state should appear** (not straight to
+  `FALLBACK`) with `turned +15° ... -> matching against F_LKG` lines advancing in 15° steps. Confirm the
+  drone visibly turns a small amount, pauses (settle), then holds again — not a single big spin.
+- **A re-match at CLOSER scale (≥1.15) should back off**; a re-match at FARTHER/SAME scale should enter a
+  bounded `WAIT_RECOVER` hover — confirm the console shows the scale number and which branch it took.
+- **If SLAM re-locks while `VISUAL_RECOVERY` is waiting (any sub-phase), it should snap out immediately**
+  into the normal `SLAM_HOLD -> SETTLE -> REPLAN` convergence — same generic behavior FALLBACK already has.
+- **If the probe never re-acquires F_LKG within 720° of cumulative turning, it should hand off to `FALLBACK`**
+  with a LOUD "visual turn search exhausted" line — confirm FALLBACK's own wait→turn→push sweep picks up
+  from there as if visual recovery had never run.
+- **The new "Visual Recovery" panel in `flight_replay.py`** (button next to "Clearance") should show the
+  probe's phase + last match verdict (matched/inliers/contained/planar_like/scale) at the cursor, and go
+  empty/"feature off" outside a `VISUAL_RECOVERY` episode when the flag is off.
+- **This is a brand-new SIFT-on-live-image mechanism, entirely unvalidated on real footage** — the biggest
+  open question is whether `visrec_min_inliers`/`visrec_planar_inlier_ratio`/`visrec_close_scale` (borrowed
+  from `benchmark_detectors.py`'s already-validated object-detection thresholds, but never tried on generic
+  wall/room texture at recovery range) actually discriminate correctly on the XLAB's real surfaces — watch
+  for false BACKOFFs (bad match read as "closer") and false pass-throughs (a real close wall read as
+  "no match" -> wasted turns before FALLBACK). If the flag stays off for now, the pending session 28-35
+  checklist below is still what to fly.
+
+_**NEXT (after the above) = LIVE-FLY session 35 (+ 34 + 33 + 32 + 31 + 30 + 29 + 28)** — this stacks session 35 (`_recovering` now
 clears at the SLAM-settle boundary instead of a confirm-distance check that was structurally stuck; new
 `use_slam_stepback_on_slow` switch, default routes a sustained slow-but-OK hold through a forced hop instead
 of the classic step-back) on top of session 34 (two proactive clearance checks: immediate stand-off backoff

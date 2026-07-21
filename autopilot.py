@@ -47,6 +47,7 @@ from diag_log import DiagLog, NullLog
 from flow_contact_detector import (FlowContactDetector, detector_from_cfg, FlowVerdict,
                                     CMD_UP, CMD_FWD, CMD_BACK, CMD_DOWN)
 from flight_playbook import FlightPlaybook, RecipePlayer
+from visual_recovery import VisualRecoveryProbe, VisualMatch
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -142,7 +143,7 @@ def _timeline_goals(plan: dict, leg_goal=None) -> list:
 
 
 def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict, cmd=None,
-                          leg_goal=None, plan_age_s=None, alt=None) -> dict:
+                          leg_goal=None, plan_age_s=None, alt=None, visrec=None) -> dict:
     """One structured replay record per explore step. Pose/heading/slam come straight off the plan payload
     (perception_worker._plan_payload, published ~2 Hz on a SLAM-paced pose), but the GOAL fields reflect
     what the CONTROLLER is actually doing: `goal` is the committed `leg_goal` (what "goal reached" is
@@ -200,6 +201,9 @@ def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan:
         "alt_delta": (alt or {}).get("delta"),
         "trim_on": (alt or {}).get("trim_on"),
         "calib_on": (alt or {}).get("calib_on"),
+        # Session 35 ALT: the visual-recovery probe's phase + last match verdict against F_LKG (None when the
+        # feature is off / no probe built) -> the replay's Visual Recovery floating panel.
+        "visual_recovery_detail": visrec,
     }
 
 
@@ -752,6 +756,27 @@ class ExploreController:
         # Session 31 (operator ask): REWIND never once visibly helped recover a stale plan across many real
         # flights -- config-gated off rather than deleted, so it's one edit to bring back if that changes.
         self.use_rewind_on_stale = bool(e.get("use_rewind_on_stale", False))
+        # --- VISUAL RECOVERY (session 35 ALT, operator vision: "the live NDI image tells us why tracking
+        # dropped and what to do about it"). Two integration points, both reusing EXISTING machinery: (1)
+        # the loss-instant snapshot check (`_maybe_loss_snapshot_backoff`, session 34 Idea B) gains a visual
+        # clause alongside its existing cached-clearance one — catches the case geometry can't (a wall SLAM
+        # never integrated reads "clear" by ray-cast clearance alone, but the live image shows we're nose-to
+        # -it); (2) if visual is ALSO inconclusive, an explicit 15° rotational turn-probe (VISUAL_RECOVERY
+        # state, `_step_visual_recovery`) runs BEFORE the blind FALLBACK sweep, re-matching the image after
+        # each turn step. Config-gated (mirrors `use_rewind_on_stale`'s exact pattern), default OFF —
+        # live-fly-untested, per this project's standing convention for a brand-new stale-recovery path.
+        self.use_visual_recovery_on_stale = bool(e.get("use_visual_recovery_on_stale", False))
+        self.visrec_min_inliers = int(e.get("visrec_min_inliers", 12))          # reuse the project's already-validated SIFT/RANSAC inlier threshold
+        self.visrec_planar_inlier_ratio = float(e.get("visrec_planar_inlier_ratio", 0.85))  # inlier fraction to call a match "planar-like" (Step 2b)
+        self.visrec_contain_margin_frac = float(e.get("visrec_contain_margin_frac", 0.02))   # slack for the corner-containment test (Step 2a)
+        self.visrec_close_scale = float(e.get("visrec_close_scale", 1.15))      # homography linear scale >= this => zoomed-in => closer (Step 2c BACKOFF)
+        self.visrec_turn_step_deg = float(e.get("visrec_turn_step_deg", 15.0))  # the probe's discrete rotation step (operator's exact value; independent of FALLBACK's own recovery_turn_step_deg)
+        self.visrec_max_rotation_deg = float(e.get("visrec_max_rotation_deg", 720.0))  # cumulative probe budget before "exhausted" -> FALLBACK
+        self.visrec_wait_recover_s = float(e.get("visrec_wait_recover_s", 30.0))       # bounded wait for a SLAM re-anchor after a farther re-match
+        self._visrec_phase = None           # None | "TURN" | "MATCH" | "WAIT_RECOVER"
+        self._visrec_phase_t0 = None
+        self._visrec_cum_deg = 0.0          # cumulative commanded turn this probe episode (exhaustion criterion)
+        self._visrec_wait_t0 = None         # WAIT_RECOVER entry time (visrec_wait_recover_s cap)
         # --- FALLBACK sweep (session 31, replaces session 29's shuffled-direction-queue-with-per-direction-
         # tries-and-opposite-phase search -- operator ask, after live flights showed LOCKING a push direction
         # across several tries produced bad, unpredictable results). Deliberately simple, 4-phase cycle:
@@ -1161,6 +1186,7 @@ class ExploreController:
         self._backoff_t0 = None
         self._fallback_retreat_forward = None
         self._reset_fallback_sweep()
+        self._reset_visual_recovery()
         # Session-12 recovery flags. A manual takeover (the only caller of reset_leg) invalidates any in-flight
         # recovery, so clear them here; DURING a flight they persist across the PLAN-LOST/PLAN-STALE flicker.
         self._recovering = False       # True from the first PLAN-STALE of a loss until a confirming ADVANCE (>=1u)
@@ -1403,7 +1429,7 @@ class ExploreController:
                 return steps
         return None
 
-    def _step_stale(self, now, plan, wall_contact, backwall_contact=False):
+    def _step_stale(self, now, plan, wall_contact, backwall_contact=False, visual_match=None):
         """PLAN-STALE (SLAM not TRACKING, perception publishing). If `use_rewind_on_stale` is True: a
         CONSUMING control-space rewind — pop the inverse of the recently-flown maneuvers ONE at a time
         (watching for OK at the step() top), draining the history to empty, then the FALLBACK sweep (session
@@ -1450,6 +1476,8 @@ class ExploreController:
             return {}, "REWIND", "rewind step done -> settle (let SLAM breathe / re-lock) before the next inverse"
         if st == "FALLBACK":
             return self._step_fallback_sweep(now, wall_contact, backwall_contact)
+        if st == "VISUAL_RECOVERY":
+            return self._step_visual_recovery(now, plan, visual_match)
         # ---- fresh entry (first PLAN-STALE of this loss) OR re-entry after a HOLD_LOST flicker ----
         if not self._recovering:
             # The FIRST PLAN-STALE of this loss episode arms recovery. The flags PERSIST until a confirming
@@ -1457,7 +1485,7 @@ class ExploreController:
             self._recovering = True
             self._history_broken = False
         if not self._loss_snapshot_checked:
-            snap = self._maybe_loss_snapshot_backoff(plan, now)
+            snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match)
             if snap is not None:
                 return snap
         if not self._ever_tracked:
@@ -1698,6 +1726,107 @@ class ExploreController:
         self._fallback_cum_deg = 0.0
         self._fallback_cycle = 0
         self._fallback_push_dirn = None
+
+    def _reset_visual_recovery(self):
+        """Clear VISUAL_RECOVERY's phase-timer state (session 35 ALT; mirrors `_reset_fallback_sweep`).
+        Called wherever a fresh loss episode is armed, a recovery is confirmed, or a manual takeover resets
+        the leg — so a NEW blind episode always starts a fresh 15° probe rather than resuming mid-probe
+        from a stale prior episode."""
+        self._visrec_phase = None
+        self._visrec_phase_t0 = None
+        self._visrec_cum_deg = 0.0
+        self._visrec_wait_t0 = None
+
+    def _enter_visual_recovery(self, now, event):
+        """Route into the 15° visual recovery probe (session 35 ALT; mirrors `_enter_fallback_sweep`). A
+        TRUE fresh episode (`_visrec_phase is None`) starts at TURN; a RESUME after a PLAN-LOST/PLAN-STALE
+        flicker (which bounces the drone through HOLD_LOST, a separate top-level branch, abandoning
+        whatever sub-phase was in progress, then flickers back to PLAN-STALE) just re-enters
+        VISUAL_RECOVERY and continues from wherever `_visrec_phase` already was — the exact
+        flicker-persistence rule `_fallback_phase`/`_recovering` already use."""
+        if self._visrec_phase is None:
+            self._visrec_phase = "TURN"
+            self._visrec_phase_t0 = now
+            self._player = None    # a TRUE fresh episode must not inherit whatever maneuver was mid-flight
+                                    # when the loss hit (e.g. an in-progress ORIENT turn) -- the TURN phase
+                                    # below builds its OWN 15° turn player from scratch (build-if-None).
+        self._enter("VISUAL_RECOVERY", now)
+        return {}, "VISUAL_RECOVERY", event
+
+    def _step_visual_recovery(self, now, plan, visual_match):
+        """Per-tick VISUAL_RECOVERY dispatch (session 35 ALT), on `self._visrec_phase`:
+          TURN -> (visrec_turn_step_deg open-loop turn, then a brief lost-SLAM settle so the match frame is
+            clean) -> MATCH -> (consume the freshest `visual_match`: no match -> back to TURN for the next
+            15° step; matched + scale >= visrec_close_scale (closer) -> BACKOFF; matched + scale < close
+            (farther/same) -> WAIT_RECOVER) -> hover, bounded by visrec_wait_recover_s (the generic
+            OK-convergence in `step()`'s _RECOVERY_STATES check breaks this out for free the instant SLAM
+            re-anchors, exactly like HOLD_LOST/REWIND/FALLBACK).
+        TURN rebuilds `self._player`/settle if `None` (build-if-None, the same pattern REWIND/FALLBACK
+        already use) so a resume after a PLAN-LOST/HOLD_LOST flicker cleanly restarts just the CURRENT
+        sub-step, not the whole probe; `_visrec_cum_deg` persists across the flicker like `_fallback_cum_deg`.
+        """
+        phase = self._visrec_phase
+        if phase == "TURN":
+            if self._rec_settling:
+                sdone, capped = self._settle_poll(now, plan, require_fast=False,
+                                                  min_frames=self.recovery_settle_frames,
+                                                  max_hold_s=self.recovery_settle_max_s)
+                if not sdone:
+                    return {}, "VISUAL_RECOVERY", None
+                self._rec_settling = False
+                self._visrec_phase = "MATCH"
+                cap = " (settle timed out, no fresh frames)" if capped else ""
+                return {}, "VISUAL_RECOVERY", (f"visual probe: turned {self.visrec_turn_step_deg:+.0f}° "
+                                               f"(cum {self._visrec_cum_deg:.0f}/{self.visrec_max_rotation_deg:.0f}), "
+                                               f"settled{cap} -> matching against F_LKG")
+            if self._player is None:
+                self._player = self._build_turn(self.visrec_turn_step_deg)
+            active, done = self._player.fields(now)
+            if not done:
+                return active, "VISUAL_RECOVERY", None
+            self._player = None
+            self._visrec_cum_deg += self.visrec_turn_step_deg
+            if self._visrec_cum_deg >= self.visrec_max_rotation_deg:
+                return self._enter_fallback_sweep(now, (f"visual turn search exhausted "
+                                                        f"({self._visrec_cum_deg:.0f}° with no F_LKG "
+                                                        "re-acquire) -> FALLBACK sweep"))
+            self._rec_settling = True
+            self._settle_begin(now)
+            return {}, "VISUAL_RECOVERY", "visual probe: turn done -> settle before matching"
+        if phase == "MATCH":
+            vm = visual_match
+            if vm is None or not vm.matched:
+                self._visrec_phase = "TURN"
+                return {}, "VISUAL_RECOVERY", "visual probe: no match against F_LKG -> next 15° turn step"
+            if vm.scale is not None and vm.scale >= self.visrec_close_scale:
+                self._register_bump(dict(plan, pos=self._last_good_pos),
+                                    f"visual probe closer @ +{self._visrec_cum_deg:.0f}°")
+                if self.backoff_on_standoff:
+                    self._player = None
+                    self._backoff_t0 = now
+                    self._enter("BACKOFF", now)
+                    return {}, "BACKOFF", (f"visual probe re-matched F_LKG at +{self._visrec_cum_deg:.0f}° "
+                                           f"with scale {vm.scale:.2f} >= {self.visrec_close_scale:.2f} "
+                                           "(closer) -> standoff back off (re-arm bump latch) -> settle")
+                self._enter("SETTLE", now)
+                return {}, "SETTLE", (f"visual probe re-matched F_LKG at +{self._visrec_cum_deg:.0f}° "
+                                      f"with scale {vm.scale:.2f} >= {self.visrec_close_scale:.2f} "
+                                      "(closer) -> standoff settle")
+            self._visrec_phase = "WAIT_RECOVER"
+            self._visrec_wait_t0 = now
+            scale_txt = f"{vm.scale:.2f}" if vm.scale is not None else "n/a"
+            return {}, "VISUAL_RECOVERY", (f"visual probe re-matched F_LKG at +{self._visrec_cum_deg:.0f}° "
+                                           f"with scale {scale_txt} < {self.visrec_close_scale:.2f} "
+                                           f"(farther/same) -> wait up to {self.visrec_wait_recover_s:.0f}s "
+                                           "for SLAM to re-anchor")
+        # WAIT_RECOVER: hover; the generic OK-convergence (step()'s _RECOVERY_STATES check) breaks this out
+        # the instant status reads OK, same as every other recovery state -- this branch only ever handles
+        # the bounded give-up.
+        if (now - self._visrec_wait_t0) >= self.visrec_wait_recover_s:
+            self._enter("STUCK", now)
+            return {}, "STUCK", (f"visual probe re-acquired F_LKG farther at +{self._visrec_cum_deg:.0f}°, "
+                                 f"waited {self.visrec_wait_recover_s:.0f}s, no SLAM re-anchor -> STUCK")
+        return {}, "VISUAL_RECOVERY", None
 
     def _enter_fallback_sweep(self, now, event):
         """Route into the FALLBACK sweep (session 31: wait -> turn -> push a FRESH random direction -> wait
@@ -2138,33 +2267,63 @@ class ExploreController:
         pos = plan.get("pos")
         self._last_bump_anchor = list(pos) if pos is not None else None
 
-    def _maybe_loss_snapshot_backoff(self, plan, now):
-        """Session 34, Idea B: the ONE-SHOT check at the instant a loss episode begins. Marks the one-shot
-        spent immediately (so a LOST<->STALE flicker within the same episode can't fire twice), then — if a
-        last-known-good clearance was cached (see `step()`'s per-tick cache) and it reads too close — backs
-        off using that CACHED position (the live `plan['pos']` is unavailable during a loss), exactly like
-        ADVANCE's own clearance stand-off. Returns the (active, state, event) tuple to return immediately, or
-        `None` if the caller should fall through to its normal loss-entry behavior (nothing cached yet, or
-        the cached reading isn't close). Deliberately scoped to ONE attempt at the very first tick of the
-        episode -- before that boundary nothing has moved yet, so the cached snapshot is trustworthy; ANY
-        later tick could include motion from a reactive maneuver (BLIND_BACKOFF, etc.), which is why this is
-        never re-tried mid-episode."""
+    def _maybe_loss_snapshot_backoff(self, plan, now, visual_match=None):
+        """Session 34, Idea B (Step 1) + session 35 ALT (Step 2/2c): the ONE-SHOT check at the instant a
+        loss episode begins. Marks the one-shot spent immediately (so a LOST<->STALE flicker within the
+        same episode can't fire twice), then runs a short decision tree and returns the (active, state,
+        event) tuple to return immediately, or `None` if the caller should fall through to its normal
+        loss-entry behavior (REWIND/FALLBACK):
+          Step 1 (geometric, UNCHANGED): a last-known-good clearance was cached (see `step()`'s per-tick
+            cache) and it reads too close -> back off using that CACHED position (the live `plan['pos']` is
+            unavailable during a loss), exactly like ADVANCE's own clearance stand-off.
+          Step 2 (visual, session 35 ALT): Step 1 was inconclusive (clearance clear or never cached — the
+            case geometry can't cover, e.g. SLAM never integrated the wall we flew into) -- a CONTAINED
+            (zoomed-in crop) or PLANAR-LIKE (flat-surface) match of the live frame against F_LKG is the same
+            "too close" verdict, reusing the identical bump+BACKOFF action.
+          Step 2c (session 35 ALT): both loss-instant checks were inconclusive -- if
+            `use_visual_recovery_on_stale`, hand off to the 15° rotational visual probe (VISUAL_RECOVERY)
+            instead of falling straight to the blind FALLBACK sweep; otherwise return None as before.
+        Deliberately scoped to ONE attempt at the very first tick of the episode -- before that boundary
+        nothing has moved yet, so the cached snapshot / F_LKG are trustworthy; ANY later tick could include
+        motion from a reactive maneuver (BLIND_BACKOFF, etc.), which is why this is never re-tried
+        mid-episode (the probe itself, once entered, runs its own multi-tick loop separately)."""
         self._loss_snapshot_checked = True
-        if self._last_good_clearance is None or self._last_good_clearance > self.stop_clearance_dist:
+        if self._last_good_clearance is not None and self._last_good_clearance <= self.stop_clearance_dist:
+            self._register_bump(dict(plan, pos=self._last_good_pos),
+                                "clearance stand-off (stale pose @ loss)")
+            clr = self._last_good_clearance
+            if self.backoff_on_standoff:
+                self._player = None
+                self._backoff_t0 = now
+                self._enter("BACKOFF", now)
+                return {}, "BACKOFF", (f"loss detected with cached clearance {clr:.2f} <= "
+                                       f"{self.stop_clearance_dist:.2f} (stale pose) -> immediate standoff "
+                                       "back off (re-arm bump latch) -> settle")
+            self._enter("SETTLE", now)
+            return {}, "SETTLE", (f"loss detected with cached clearance {clr:.2f} <= "
+                                  f"{self.stop_clearance_dist:.2f} (stale pose) -> immediate standoff settle")
+        # Everything past this point is the session-35-ALT visual path, gated as ONE unit behind
+        # `use_visual_recovery_on_stale` -- flag False reproduces today's (session 34) behavior
+        # byte-for-byte: `visual_match` is only ever non-None here because `run_explore` only builds the
+        # probe / computes a match when this same flag is on, but gating it here too keeps that an
+        # explicit invariant of this function rather than an implicit contract with its one caller.
+        if not self.use_visual_recovery_on_stale:
             return None
-        self._register_bump(dict(plan, pos=self._last_good_pos),
-                            "clearance stand-off (stale pose @ loss)")
-        clr = self._last_good_clearance
-        if self.backoff_on_standoff:
-            self._player = None
-            self._backoff_t0 = now
-            self._enter("BACKOFF", now)
-            return {}, "BACKOFF", (f"loss detected with cached clearance {clr:.2f} <= "
-                                   f"{self.stop_clearance_dist:.2f} (stale pose) -> immediate standoff "
-                                   "back off (re-arm bump latch) -> settle")
-        self._enter("SETTLE", now)
-        return {}, "SETTLE", (f"loss detected with cached clearance {clr:.2f} <= "
-                              f"{self.stop_clearance_dist:.2f} (stale pose) -> immediate standoff settle")
+        if visual_match is not None and visual_match.matched and (visual_match.contained or visual_match.planar_like):
+            self._register_bump(dict(plan, pos=self._last_good_pos), "visual too-close @ loss")
+            kind = "contained crop" if visual_match.contained else "planar/flat surface"
+            if self.backoff_on_standoff:
+                self._player = None
+                self._backoff_t0 = now
+                self._enter("BACKOFF", now)
+                return {}, "BACKOFF", (f"loss detected with a visual match against F_LKG ({kind}, "
+                                       f"{visual_match.inliers} inliers) -> immediate standoff back off "
+                                       "(re-arm bump latch) -> settle")
+            self._enter("SETTLE", now)
+            return {}, "SETTLE", (f"loss detected with a visual match against F_LKG ({kind}, "
+                                  f"{visual_match.inliers} inliers) -> immediate standoff settle")
+        return self._enter_visual_recovery(now, "loss detected, clearance + visual loss-instant checks "
+                                                 "both inconclusive -> 15° visual recovery probe")
 
     def take_missed_bump(self):
         """Pop the pending MISSED-BUMP marker (a real contact that emitted no pulse), or None."""
@@ -2305,7 +2464,7 @@ class ExploreController:
         return None, None, None
 
     def step(self, now, plan, wall_contact, ceiling_contact=False, floor_contact=False,
-             backwall_contact=False, status="OK"):
+             backwall_contact=False, status="OK", visual_match=None):
         event = None
         active = {}
         st = self.state
@@ -2414,7 +2573,7 @@ class ExploreController:
                 # blind. Wait for perception to speak; the branch below (OK/STALE) then decides.
                 if st != "HOLD_LOST":
                     if not self._loss_snapshot_checked:
-                        snap = self._maybe_loss_snapshot_backoff(plan, now)
+                        snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match)
                         if snap is not None:
                             return snap
                     self._player = None
@@ -2429,7 +2588,7 @@ class ExploreController:
                 return {}, "HOLD_LOST", None
             if status == "PLAN-STALE":
                 # Perception is publishing but SLAM is not TRACKING -> retrace to re-expose keyframes.
-                return self._step_stale(now, plan, wall_contact, backwall_contact)
+                return self._step_stale(now, plan, wall_contact, backwall_contact, visual_match)
             # status OK: if we were recovering, perception is TRACKING again -> DON'T fly on the first frame
             # back (a fresh RELOC pose is shaky). Hold until SLAM settles (>N fast frames), THEN brake + REPLAN.
             # NOTE: `_recovering` + the give-up counter are NOT cleared here — a bare, un-settled OK is not yet
@@ -2466,6 +2625,7 @@ class ExploreController:
                     self._recovering = False
                     self._history_broken = False
                     self._reset_fallback_sweep()
+                    self._reset_visual_recovery()
                     self.command_history.clear()
                     trust_note = " -> recovery trust restored (SLAM settled)"
                 # Session 34, Idea A: at this recovery trust boundary (only for the RECOVERY resume target,
@@ -3835,7 +3995,7 @@ def _detector_command(active):
 
 
 # Recovery states (SLAM-loss). The step() top snaps out of these to a brake+REPLAN when the plan returns OK.
-_RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK", "WARMUP"}
+_RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK", "WARMUP", "VISUAL_RECOVERY"}
 
 # Post-mission ending states. A plan loss WHILE in one of these diverts to the dedicated POSTLUDE_LOST_HOLD
 # (mirror of CALIB_LOST_HOLD) instead of the generic recovery, so the ending survives a SLAM loss and resumes.
@@ -3893,6 +4053,11 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     plan_timeout_s = float(e.get("plan_timeout_s", 2.0))
     detector = detector_from_cfg(cfg)
     ctrl = ExploreController(cfg, no_takeoff=no_takeoff)
+    # Session 35 ALT: only build the visual-recovery probe (SIFT model load + per-tick reference cache) when
+    # the config flag is actually on -- an idle unused probe still shouldn't pay SIFT's init cost.
+    visrec_probe = VisualRecoveryProbe(
+        min_inliers=ctrl.visrec_min_inliers, planar_inlier_ratio=ctrl.visrec_planar_inlier_ratio,
+        contain_margin_frac=ctrl.visrec_contain_margin_frac) if ctrl.use_visual_recovery_on_stale else None
 
     frame_port = cfg["network"]["frame_bus_port"]
     pstate_port = cfg["network"]["perception_state_port"]
@@ -3925,6 +4090,8 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     last_status = None
     last_cmd_key = None
     last_label = None
+    last_visrec_label = None    # dedup/throttle for [VISREC] match-verdict log lines (session 35 ALT)
+    last_visrec_log = 0.0
     # [TRIGGER] tracking (diagnostic session): the exact wall-time the forward-push command engages/
     # releases, tracked purely from the published command vector -- decoupled from FSM state or SLAM.
     # `_trig_release_t` derives a "hop-end" marker at release + 1.0s ease-down (a fixed diagnostic bound
@@ -4175,9 +4342,32 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 else:
                     backwall_active = False
 
+            # ---- visual recovery (session 35 ALT): cache F_LKG every tick (cheap -- a copy); only run the
+            # SIFT match when it could matter (the loss-instant check, or while the 15° probe is actively
+            # re-testing after a turn) -- no reason to pay match cost on every healthy tracking frame. ----
+            visual_match = None
+            if visrec_probe is not None:
+                if frame is not None:
+                    visrec_probe.update_reference(frame, bool(plan_for_step.get("plan_valid")))
+                needs_match = (status in ("PLAN-LOST", "NO-PLAN", "PLAN-STALE") or ctrl.state == "VISUAL_RECOVERY")
+                if needs_match and frame is not None:
+                    visual_match = visrec_probe.match(frame)
+                    vlabel = (visual_match.has_lkg, visual_match.matched, visual_match.contained,
+                             visual_match.planar_like, round(visual_match.scale, 2) if visual_match.scale else None)
+                    if vlabel != last_visrec_label or (now - last_visrec_log) >= 0.5:
+                        scale_txt = f"{visual_match.scale:.2f}" if visual_match.scale is not None else "n/a"
+                        vline = (f"{_rec_prefix(last_rec_frame)} [autopilot][explore][{ctrl.state}] [VISREC] "
+                                 f"has_lkg={visual_match.has_lkg} matched={visual_match.matched} "
+                                 f"inliers={visual_match.inliers} contained={visual_match.contained} "
+                                 f"planar_like={visual_match.planar_like} scale={scale_txt}")
+                        print(vline, flush=True)
+                        diag.line(vline)
+                        last_visrec_label, last_visrec_log = vlabel, now
+
             # ---- step the controller + publish ----
             active, state, event = ctrl.step(now, plan_for_step, wall_contact, ceiling_contact,
                                              floor_contact=floor_contact, backwall_contact=backwall_contact,
+                                             visual_match=visual_match,
                                              status=status)
             if state == "ADVANCE" and prev_ctrl_state != "ADVANCE":
                 detector.reset_forward_ref()   # each leg recalibrates its own free-forward looming
@@ -4276,13 +4466,28 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             # newest ground summary and emit it once at shutdown as a static backdrop for the whole replay.
             if log and not suppress_step:
                 t_wall = now_wall.strftime("%H:%M:%S.%f")[:-3]   # same instant as `now` (unified at the loop top)
+                visrec_detail = None
+                if visrec_probe is not None:
+                    visrec_detail = {
+                        "phase": ctrl._visrec_phase,
+                        "cum_deg": round(ctrl._visrec_cum_deg, 1),
+                        "has_lkg": (visual_match.has_lkg if visual_match is not None
+                                   else visrec_probe._lkg is not None),
+                        "matched": (visual_match.matched if visual_match is not None else None),
+                        "inliers": (visual_match.inliers if visual_match is not None else None),
+                        "contained": (visual_match.contained if visual_match is not None else None),
+                        "planar_like": (visual_match.planar_like if visual_match is not None else None),
+                        "scale": (round(visual_match.scale, 3)
+                                 if visual_match is not None and visual_match.scale is not None else None),
+                    }
                 rec = _timeline_step_record(t_wall, now, last_rec_frame, state, event,
                                             status, plan_for_step, cmd=active,
                                             leg_goal=ctrl.leg_goal, plan_age_s=(now - last_plan_t),
                                             alt={"median": ctrl._alt_median,
                                                  "ceiling": ctrl._ceiling_y, "desired": ctrl._desired_y,
                                                  "delta": ctrl._trim_delta,
-                                                 "trim_on": ctrl._trimming, "calib_on": ctrl._calib_active})
+                                                 "trim_on": ctrl._trimming, "calib_on": ctrl._calib_active},
+                                            visrec=visrec_detail)
                 # The transient planner_event was captured during the drain (the freshest plan may have
                 # already cleared it) and the un-counted contact from the controller — stitch both onto THIS
                 # step's record so the replay marks the exact frame of each.
@@ -6664,6 +6869,157 @@ def run_self_test(cfg):
           f"no-cache-startup={no_cache_ok}, recovery-settle-backoff={recovery_backoff_ok}, "
           f"plain-hold-unaffected={plain_hold_unaffected_ok}, "
           f"recovery-settle-clear-regression={recovery_clear_regression_ok})")
+
+    # ---- VISUAL RECOVERY: 15° rotational probe on PLAN-STALE (session 35 ALT) ----
+    cfg_vr = copy.deepcopy(cfg)
+    cfg_vr["autonomy"]["explore"]["use_visual_recovery_on_stale"] = True
+
+    # (a) Step 2 loss-instant: cached clearance CLEAR + a CONTAINED visual match -> BACKOFF (the exact
+    #     Idea-B gap this session closes: geometry alone reads "clear" when SLAM never mapped the wall).
+    cva = ExploreController(cfg_vr, no_takeoff=True)
+    cva.leg_goal = [5.0, 5.0]
+    p_clear = {"plan_valid": True, "pos": [1.0, 1.0], "forward_clearance_dist": 5.0,
+              "goal": [5.0, 5.0], "done": False, "bearing_err": 0.0, "slam_ms": 100.0, "frame_id": 1}
+    cva.step(0.0, p_clear, False, status="OK")
+    vm_contained = VisualMatch(has_lkg=True, matched=True, inliers=40, contained=True, planar_like=False, scale=1.8)
+    _a, s_va, ev_va = cva.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_contained)
+    visual_contained_ok = (s_va == "BACKOFF" and ev_va is not None and "visual" in ev_va.lower())
+
+    # (b) same, but PLANAR-LIKE (flat-surface) instead of a contained crop -> also BACKOFF.
+    cvb = ExploreController(cfg_vr, no_takeoff=True)
+    cvb.leg_goal = [5.0, 5.0]
+    cvb.step(0.0, p_clear, False, status="OK")
+    vm_planar = VisualMatch(has_lkg=True, matched=True, inliers=55, contained=False, planar_like=True, scale=1.0)
+    _a, s_vb, _ = cvb.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_planar)
+    visual_planar_ok = (s_vb == "BACKOFF")
+
+    # (c) a close CACHED CLEARANCE still wins first — visual is never even consulted, even when it would
+    #     have said something else (an inconclusive no-match here).
+    p_close = {"plan_valid": True, "pos": [1.0, 1.0], "forward_clearance_dist": 0.5,
+              "goal": [5.0, 5.0], "done": False, "bearing_err": 0.0, "slam_ms": 100.0, "frame_id": 1}
+    cvc = ExploreController(cfg_vr, no_takeoff=True)
+    cvc.leg_goal = [5.0, 5.0]
+    cvc.step(0.0, p_close, False, status="OK")
+    vm_none = VisualMatch(has_lkg=True, matched=False)
+    _a, s_vc, ev_vc = cvc.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_none)
+    clearance_wins_first_ok = (s_vc == "BACKOFF" and ev_vc is not None and "stale pose" in ev_vc)
+
+    # (d) both loss-instant checks inconclusive (clear cache + no visual match) -> hands off into the 15°
+    #     VISUAL_RECOVERY probe (not straight to FALLBACK) since the flag is on.
+    cvd = ExploreController(cfg_vr, no_takeoff=True); cvd._ever_tracked = True
+    cvd.leg_goal = [5.0, 5.0]
+    cvd.step(0.0, p_clear, False, status="OK")
+    _a, s_vd, ev_vd = cvd.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_none)
+    probe_entered_ok = (s_vd == "VISUAL_RECOVERY" and cvd._visrec_phase == "TURN"
+                        and ev_vd is not None and "probe" in ev_vd.lower())
+
+    def _drive_visrec_turn(ctrl, t0, fid0):
+        """Step an in-progress VISUAL_RECOVERY controller through its current TURN sub-phase (turn player +
+        inter-action settle, feeding a live fresh-frame stream throughout) until it reaches MATCH awaiting a
+        verdict, or falls out of VISUAL_RECOVERY entirely. Returns (t, fid, state)."""
+        t, fid = t0, fid0
+        for _ in range(4000):
+            fid += 1
+            p = {"plan_valid": False, "goal": None, "pos": None, "frame_id": fid, "cap_ts": t, "slam_ms": 200.0}
+            _a, s, _ = ctrl.step(t, p, False, status="PLAN-STALE", visual_match=vm_none)
+            t += 0.02
+            if s != "VISUAL_RECOVERY" or ctrl._visrec_phase == "MATCH":
+                return t, fid, s
+        raise RuntimeError("visrec TURN never reached MATCH")
+
+    # (e) TURN actually commands a real turn (yaw observed), accumulates visrec_turn_step_deg, settles, then
+    #     reaches MATCH awaiting a verdict.
+    cve = ExploreController(cfg_vr, no_takeoff=True); cve._ever_tracked = True
+    cve.leg_goal = [5.0, 5.0]; cve.recovery_settle_frames = 2
+    cve.step(0.0, p_clear, False, status="OK")
+    cve.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_none)   # enters TURN
+    saw_yaw, t, fid = False, 0.04, 100
+    s_e = "VISUAL_RECOVERY"
+    for _ in range(300):
+        fid += 1
+        p = {"plan_valid": False, "goal": None, "pos": None, "frame_id": fid, "cap_ts": t, "slam_ms": 200.0}
+        a, s_e, _ = cve.step(t, p, False, status="PLAN-STALE", visual_match=vm_none)
+        if abs(float(a.get("yaw", 0.0) or 0.0)) > 0:
+            saw_yaw = True
+        t += 0.02
+        if s_e != "VISUAL_RECOVERY" or cve._visrec_phase == "MATCH":
+            break
+    turn_reached_match_ok = (saw_yaw and s_e == "VISUAL_RECOVERY" and cve._visrec_phase == "MATCH"
+                             and cve._visrec_cum_deg == cve.visrec_turn_step_deg)
+
+    # (f) MATCH: a re-match with scale >= visrec_close_scale (closer) -> BACKOFF.
+    p_match_f = {"plan_valid": False, "goal": None, "pos": None, "frame_id": fid + 1, "cap_ts": t, "slam_ms": 200.0}
+    vm_closer = VisualMatch(has_lkg=True, matched=True, inliers=30, contained=False, planar_like=False, scale=1.5)
+    _a, s_close, ev_close = cve.step(t, p_match_f, False, status="PLAN-STALE", visual_match=vm_closer)
+    match_closer_backoff_ok = (s_close == "BACKOFF" and ev_close is not None and "closer" in ev_close.lower())
+
+    # (g) MATCH: a re-match with scale < visrec_close_scale (farther/same) -> WAIT_RECOVER, which the
+    #     generic OK-convergence (step()'s _RECOVERY_STATES check) breaks out of instantly once status OK.
+    cvg = ExploreController(cfg_vr, no_takeoff=True); cvg._ever_tracked = True
+    cvg.leg_goal = [5.0, 5.0]; cvg.recovery_settle_frames = 2
+    cvg.step(0.0, p_clear, False, status="OK")
+    cvg.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_none)
+    t, fid, s_g = _drive_visrec_turn(cvg, 0.04, 100)
+    vm_farther = VisualMatch(has_lkg=True, matched=True, inliers=20, contained=False, planar_like=False, scale=0.9)
+    p_match_g = {"plan_valid": False, "goal": None, "pos": None, "frame_id": fid + 1, "cap_ts": t, "slam_ms": 200.0}
+    _a, s_wait, _ = cvg.step(t, p_match_g, False, status="PLAN-STALE", visual_match=vm_farther)
+    wait_entered_ok = (s_wait == "VISUAL_RECOVERY" and cvg._visrec_phase == "WAIT_RECOVER")
+    p_ok = {"plan_valid": True, "pos": [1.0, 1.0], "goal": [5.0, 5.0], "bearing_err": 0.0,
+           "forward_clearance_dist": 5.0, "frame_id": fid + 2, "cap_ts": t + 0.02, "slam_ms": 100.0}
+    _a, s_ok_break, _ = cvg.step(t + 0.02, p_ok, False, status="OK")
+    wait_breaks_on_ok_ok = (s_ok_break == "SLAM_HOLD" and cvg._slam_resume == "SETTLE")
+    wait_recover_ok = wait_entered_ok and wait_breaks_on_ok_ok
+
+    # (h) WAIT_RECOVER timeout with no re-anchor -> STUCK.
+    cvh = ExploreController(cfg_vr, no_takeoff=True); cvh._ever_tracked = True
+    cvh.leg_goal = [5.0, 5.0]; cvh.recovery_settle_frames = 2; cvh.visrec_wait_recover_s = 0.05
+    cvh.step(0.0, p_clear, False, status="OK")
+    cvh.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_none)
+    t, fid, s_h = _drive_visrec_turn(cvh, 0.04, 100)
+    p_match_h = {"plan_valid": False, "goal": None, "pos": None, "frame_id": fid + 1, "cap_ts": t, "slam_ms": 200.0}
+    _a, s_wait2, _ = cvh.step(t, p_match_h, False, status="PLAN-STALE", visual_match=vm_farther)
+    t += 0.1   # exceed visrec_wait_recover_s
+    _a, s_stuck, ev_stuck = cvh.step(t, {"plan_valid": False}, False, status="PLAN-STALE")
+    wait_timeout_stuck_ok = (s_wait2 == "VISUAL_RECOVERY" and s_stuck == "STUCK"
+                             and ev_stuck is not None and "no slam re-anchor" in ev_stuck.lower())
+
+    # (i) turn-budget exhausted (never re-acquires F_LKG — always no-match) -> LOUD event -> FALLBACK hand-off.
+    cvi = ExploreController(cfg_vr, no_takeoff=True); cvi._ever_tracked = True
+    cvi.leg_goal = [5.0, 5.0]; cvi.recovery_settle_frames = 2
+    cvi.visrec_max_rotation_deg = 2 * cvi.visrec_turn_step_deg   # exhaust after 2 turn steps
+    cvi.step(0.0, p_clear, False, status="OK")
+    t, fid = 0.02, 200
+    _a, s_i, _ = cvi.step(t, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_none)
+    last_ev = None
+    for _ in range(4000):
+        fid += 1
+        p = {"plan_valid": False, "goal": None, "pos": None, "frame_id": fid, "cap_ts": t, "slam_ms": 200.0}
+        _a, s_i, ev_i = cvi.step(t, p, False, status="PLAN-STALE", visual_match=vm_none)
+        if ev_i:
+            last_ev = ev_i
+        t += 0.02
+        if s_i == "FALLBACK":
+            break
+    exhausted_fallback_ok = (s_i == "FALLBACK" and last_ev is not None and "exhausted" in last_ev.lower())
+
+    # (j) regression: flag OFF reproduces today's (session 34) behavior byte-for-byte — a visual clause
+    #     never fires and the probe never enters, even given the SAME too-close visual match as (a).
+    cvj = ExploreController(cfg, no_takeoff=True)   # `cfg`, NOT `cfg_vr` -- flag stays at its False default
+    cvj.leg_goal = [5.0, 5.0]
+    cvj.step(0.0, p_clear, False, status="OK")
+    _a, s_vj, _ = cvj.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_contained)
+    regression_off_ok = (s_vj == "HOLD_LOST")
+
+    visrec_ok = (visual_contained_ok and visual_planar_ok and clearance_wins_first_ok and probe_entered_ok
+                and turn_reached_match_ok and match_closer_backoff_ok and wait_recover_ok
+                and wait_timeout_stuck_ok and exhausted_fallback_ok and regression_off_ok)
+    ok = ok and visrec_ok
+    print(f"[self-test] {'PASS' if visrec_ok else 'FAIL'}  VISUAL RECOVERY 15° probe (session 35 ALT) "
+          f"(loss-instant contained={visual_contained_ok}, loss-instant planar={visual_planar_ok}, "
+          f"clearance-wins-first={clearance_wins_first_ok}, probe-entered={probe_entered_ok}, "
+          f"turn->match={turn_reached_match_ok}, match-closer->backoff={match_closer_backoff_ok}, "
+          f"wait-recover-breaks-on-ok={wait_recover_ok}, wait-timeout->stuck={wait_timeout_stuck_ok}, "
+          f"exhausted->fallback={exhausted_fallback_ok}, flag-off-regression={regression_off_ok})")
 
     # ---- Reactive blind-hold back_off on a flow wall/backwall contact (HOLD_LOST / waiting SLAM_HOLD) ----
     # (a) HOLD_LOST + a live wall contact -> BLIND_BACKOFF plays back_off, then resumes HOLD_LOST; a

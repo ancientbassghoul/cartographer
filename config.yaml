@@ -186,7 +186,7 @@ autonomy:
     clearance_max_range: 10.0    # cap the ray length (SLAM units) for the FORWARD-CRUISE stand-off; beyond -> "open"
     ring_max_range: 1.5          # NEAR-FIELD cap for the parallax clearance RING only (a scoot moves ~parallax_push_dist,
                                  #   so far walls are irrelevant to "can I translate a bit here"): beyond this reads None=room.
-    stop_clearance_dist: 1.0     # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
+    stop_clearance_dist: 1.25    # STOP the leg when the nearest forward hit is within this (SLAM units; general stand-off, TUNABLE live)
                                  #   (raised 0.6->1.0 in session 8: stop before the wall fills the FOV -> keeps SLAM richer)
     backoff_on_standoff: true    # after a clearance stand-off stop, play the BACKOFF phase-timer (below) before
                                  #   settling: it re-arms the 2-bump latch so a stand-off pin can still blacklist an
@@ -378,6 +378,23 @@ autonomy:
     use_rewind_on_stale: false   # session 31 (operator ask): REWIND never once visibly helped recover a stale plan across
                                  #   many real flights -- config-gated OFF rather than deleted; flip true to bring it back.
     command_history_s: 12.0      # (legacy) full-rewind horizon; the consuming rewind now drains the whole queue (maxlen 100)
+    # --- VISUAL RECOVERY (session 35 ALT): "the live NDI image tells us why tracking dropped and what to do
+    #     about it." At the exact loss-instant check session 34 already runs (cached clearance), a CONTAINED
+    #     (zoomed-in crop) or PLANAR-LIKE (flat-surface) SIFT match of the live frame against F_LKG (the last
+    #     frame SLAM was TRACKING on) is the same "too close" verdict -- catches the case geometry can't (SLAM
+    #     never integrated the wall we flew into, so the cached ray-cast clearance reads "clear"). If THAT is
+    #     also inconclusive, an explicit 15° open-loop turn-probe (VISUAL_RECOVERY) re-tests the image after
+    #     each step, BEFORE ever falling to the blind FALLBACK sweep. Config-gated, default OFF -- ships
+    #     live-fly-untested, same convention as use_rewind_on_stale above. ---
+    use_visual_recovery_on_stale: false   # off by default; live-fly-untested
+    visrec_min_inliers: 12                # reuse the project's already-validated SIFT/RANSAC inlier threshold (benchmark_detectors.py)
+    visrec_planar_inlier_ratio: 0.85      # inlier fraction of all good matches to call a match "planar-like" (nose-to-a-flat-surface)
+    visrec_contain_margin_frac: 0.02      # slack (fraction of frame size) for the corner-containment test (zoomed-in-crop verdict)
+    visrec_close_scale: 1.15              # homography linear scale >= this => the live frame is magnified (closer) => BACKOFF
+    visrec_turn_step_deg: 15.0            # the probe's discrete open-loop rotation step (operator's exact value; independent of
+                                          #   recovery_turn_step_deg below, so FALLBACK's own sweep structure is never altered)
+    visrec_max_rotation_deg: 720.0        # cumulative probe budget (2 full rotations) before "exhausted" -> hand off to FALLBACK
+    visrec_wait_recover_s: 30.0           # bounded wait for a SLAM re-anchor after a farther/same re-match, before giving up -> STUCK
     # --- FALLBACK sweep (session 31, replaces the session-29 shuffled-direction-queue-with-per-direction-
     #     tries-and-opposite-phase search -- live flights showed LOCKING a push direction across several tries
     #     produced bad, unpredictable results). Deliberately simple 4-phase cycle: wait -> turn -> push (a
