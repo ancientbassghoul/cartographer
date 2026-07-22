@@ -86,7 +86,7 @@ _NEUTRAL = {
 }
 
 
-def _full_vector(active: dict, seq: int, now: float, state: str) -> dict:
+def _full_vector(active: dict, seq: int, now: float, state: str, target_altitude_y=None) -> dict:
     v = {"seq": seq, "mono_ts": now, "state": state}
     v.update(_NEUTRAL)
     v.update(active or {})
@@ -97,6 +97,10 @@ def _full_vector(active: dict, seq: int, now: float, state: str) -> dict:
     # leave a boolean stuck on from a previous tick.
     v["trigger_down"] = float(v.get("trigger", 0.0) or 0.0) > 0.0
     v["reverse_down"] = float(v.get("reverse", 0.0) or 0.0) > 0.0
+    # ExploreController's live-calibrated altitude-lock hold target (None before the first
+    # calibration latches it) -- rides TOPIC_CONTROL so the visualizer can show it next to the
+    # live pos_y (which already rides TOPIC_PLAN) without a third bus/port.
+    v["target_altitude_y"] = (round(float(target_altitude_y), 4) if target_altitude_y is not None else None)
     return v
 
 
@@ -934,6 +938,13 @@ class ExploreController:
         self.altitude_lock = bool(e.get("altitude_lock", True))
         self.alt_drift_floor = float(e.get("alt_drift_floor", 0.3))
         self.target_altitude_y = None        # cached lazily; PERSISTS across reset_leg (flight-level hold target)
+        # Operator testing override (0 = disabled): forces the desired flying height to a fixed value instead
+        # of the live CALIB_VERIFY measurement, so a test flight can hold a known/repeatable height regardless
+        # of where DESCEND happens to settle. World frame is +Y DOWN, so a flying height is a NEGATIVE value
+        # (e.g. -1.9). Explicit, visible, opt-in (default 0 = today's full self-calibration; NOT autonomous
+        # decision-making) -- the ceiling itself (_ceiling_y, below) is still measured LIVE regardless, so
+        # TRIM's sag/high band still tracks the real room.
+        self.desired_height_override_y = float(e.get("desired_height_override_y", 0.0))
         # Two-Phase Hybrid Ascent (Part 2): approach the ceiling with short SLAM-metered UP micro-pulses
         # (near-zero momentum), then a single continuous hold to cleanly latch the flow CEILING detector.
         # joy_vertical is a DISCRETE -1/0/+1 axis (io_bridge) so the "gradual" climb is keystroke pulses,
@@ -2479,7 +2490,10 @@ class ExploreController:
         if (self.altitude_lock and self.airborne_done and self.target_altitude_y is None
                 and st not in _POSTLUDE_NOLOCK
                 and plan.get("plan_valid") and plan.get("pos_y") is not None):
-            self.target_altitude_y = float(plan["pos_y"])
+            # Same operator override as CALIB_VERIFY's latch (only reached here if CALIB_VERIFY never ran
+            # at all, e.g. --no-takeoff) -- keeps the override consistent regardless of prelude path.
+            self.target_altitude_y = (self.desired_height_override_y if self.desired_height_override_y
+                                      else float(plan["pos_y"]))
         # Record the TAKE-OFF heading once: the first healthy SLAM heading after the prelude completes. General
         # (whatever heading the drone armed at — not a room answer); ORIENT_HOME faces it before the final dock.
         if (self.airborne_done and self._takeoff_heading is None
@@ -2947,15 +2961,22 @@ class ExploreController:
                 # timeout-PASS (no settled_y) keeps the last good references. Logged LOUD (terminal + HTML).
                 calib_log = ""
                 if settled_y is not None and self._ceiling_y is not None:
-                    self._desired_y = settled_y
+                    # Operator override (desired_height_override_y, 0 = disabled): use the fixed value in
+                    # place of the MEASURED settle instead -- _ceiling_y stays live either way, so
+                    # _trim_delta (and TRIM's band) still tracks the real room.
+                    override = self.desired_height_override_y
+                    self._desired_y = override if override else settled_y
                     self._trim_delta = self._desired_y - self._ceiling_y
                     # Session 22: the altitude lock holds the SAME verified height TRIM defends (previously it
                     # lazily cached whatever pos_y came first post-prelude).
-                    self.target_altitude_y = settled_y
+                    self.target_altitude_y = self._desired_y
                     calib_log = (f" | HEIGHT-CALIB values: ceiling_y={self._ceiling_y:+.3f} "
                                  f"desired_y={self._desired_y:+.3f} delta={self._trim_delta:.3f} "
                                  f"(TRIM band: {self._desired_y - self.trim_high_ratio * self._trim_delta:+.3f} "
                                  f"(high) .. {self._ceiling_y + self.trim_sag_ratio * self._trim_delta:+.3f} (low))")
+                    if override:
+                        calib_log += (f" | DESIRED-HEIGHT OVERRIDE: {override:+.3f} (config, "
+                                      f"NOT measured; settled_y was {settled_y:+.3f})")
                     # Y-DRIFT AUDIT (session 22): any non-first tap measures how far the ceiling reading moved
                     # since the FIRST calibration — with SLAM height stable this should be ~0; a real drift is
                     # VISIBLE here (the whole point of a rare re-enabled re-tap).
@@ -3750,28 +3771,14 @@ class ExploreController:
                         self._home_adv_start_pos = pos
                     else:
                         self._home_phase = "PLAN"
-            elif self._home_phase == "BACKOFF":
-                # A clearance stop while homing gets the SAME physical reaction as the main explore ADVANCE ->
-                # BACKOFF path (session 20260720): reverse off the wall before settling/re-aiming, instead of
-                # sitting flush against it and re-aiming from the same pinned pose (the "hopeless bounce" bug —
-                # a wall-jammed drone can't hold a clean SLAM lock long enough to ever re-plan a way around it).
-                active, bdone = self._player.fields(now)
-                if bdone:
-                    self._player = None
-                    self._home_phase, self._home_settle_to = "SETTLE", "PLAN"
-                    self._settle_begin(now)
             else:   # ADVANCE: push forward toward the aim for a bounded sub-leg, then SETTLE -> re-aim (PLAN)
-                clr = plan.get("forward_clearance_dist")
-                blocked = self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist
+                # No clearance stand-off/BACKOFF here (operator's call, session 39): homing always turns to
+                # face the true origin before advancing, so a properly-oriented leg isn't expected to run into
+                # a wall the way frontier-exploration's ADVANCE can — that stage keeps its own BACKOFF.
                 moved = self._dist(pos, self._home_adv_start_pos)
                 reaim = moved is not None and moved >= self.goal_reach_dist
                 adv_timeout = (now - self._home_adv_t0) >= self.leg_max_s
-                if blocked:
-                    self._home_adv_start_pos = None
-                    self._player = self.pb.player("back_off")
-                    self._home_phase = "BACKOFF"
-                    event = f"homing: wall ahead (clr {clr:.2f}) -> back off -> settle -> re-aim toward origin"
-                elif reaim or adv_timeout or self._slam_slow:
+                if reaim or adv_timeout or self._slam_slow:
                     self._home_adv_start_pos = None
                     self._home_phase, self._home_settle_to = "SETTLE", "PLAN"   # settle, then re-aim
                     self._settle_begin(now)
@@ -3999,7 +4006,14 @@ _RECOVERY_STATES = {"HOLD_LOST", "REWIND", "FALLBACK", "STUCK", "WARMUP", "VISUA
 
 # Post-mission ending states. A plan loss WHILE in one of these diverts to the dedicated POSTLUDE_LOST_HOLD
 # (mirror of CALIB_LOST_HOLD) instead of the generic recovery, so the ending survives a SLAM loss and resumes.
-POSTLUDE_STATES = {"RETURN_TO_ORIGIN", "ORIENT_HOME", "HOME_REFINE", "DOCK_FLOOR", "LOW_STANDOFF"}
+# DONE included (session 39 fix): without it, a loss after mission-complete fell through to the ordinary
+# explore recovery path, which on recovering forces a REPLAN -> resurrects the whole explore FSM (BUMP/
+# BACKOFF/BLACKLIST/TRIM chasing a stale goal) instead of quietly resuming DONE (diagnosed off flight
+# 20260721_233244: DONE at 23:53:58.784, PLAN-LOST at 23:54:02.747, HOLD_LOST -> SLAM_HOLD -> REPLAN ->
+# BUMP/BACKOFF against corner [-1.6, 8.1] from 23:54:13 on, TRIM-DOWN at 23:55:03 with pos_y already near
+# ceiling territory). DONE has no sub-phase, so _step_postlude_lost's generic "_enter(resume, now)" resume
+# path (no special-case needed) just re-enters DONE — _done_logged is already True, so nothing re-announces.
+POSTLUDE_STATES = {"RETURN_TO_ORIGIN", "ORIENT_HOME", "HOME_REFINE", "DOCK_FLOOR", "LOW_STANDOFF", "DONE"}
 # Postlude states where the flying-height altitude lock must be OFF (the descent + standby) — clearing
 # target_altitude_y on DOCK_FLOOR entry could otherwise be re-cached next tick and re-inflate a floor-level drone.
 # RETURN_TO_ORIGIN / ORIENT_HOME / HOME_REFINE are NOT here: they home + orient + reposition AT altitude, lock on.
@@ -4166,7 +4180,8 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
         now = time.monotonic()
         if (now - last_pub) >= pub_dt:
             log_cmd(active, state)
-            pub.publish(frame_bus.TOPIC_CONTROL, _full_vector(active, seq, now, state))
+            pub.publish(frame_bus.TOPIC_CONTROL,
+                        _full_vector(active, seq, now, state, ctrl.target_altitude_y))
             seq += 1
             last_pub = now
 
@@ -4560,6 +4575,11 @@ def run_self_test(cfg):
     # `hop_duration_s = 0` in the ram tests); the dedicated PERIODIC-RECALIB tests below re-enable it explicitly.
     cfg = copy.deepcopy(cfg)
     cfg.setdefault("autonomy", {}).setdefault("explore", {})["calibrate_on_goal_change"] = False
+    # Session 38: same isolation for `use_visual_recovery_on_stale` -- a live config.yaml retune (operator
+    # testing the new path) would otherwise divert every unrelated loss/recovery test below into
+    # VISUAL_RECOVERY instead of REWIND/FALLBACK. The dedicated VISUAL RECOVERY tests re-enable it
+    # explicitly on their OWN deepcopy (`cfg_vr`, below) — this harness-wide default stays OFF regardless.
+    cfg["autonomy"]["explore"]["use_visual_recovery_on_stale"] = False
 
     # F8 replay timeline: the JSONL sink is --log-gated, so a disabled AutopilotLog must swallow
     # .timeline()/.line() as no-ops (no file, no crash) — the path taken when self-test/dry constructs run.
@@ -4851,6 +4871,60 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if postlude2_ok else 'FAIL'}  POSTLUDE loss-survival + orient "
           f"(ORIENT_HOME short-way turn+dock={orient_ok}, DOCK survives loss->hold->resume={dock_loss_ok}, "
           f"no floor re-inflate={no_reinflate})")
+
+    # ---- Session 39: DONE must survive a plan loss too (not just RETURN_TO_ORIGIN/ORIENT_HOME/HOME_REFINE/
+    #      DOCK_FLOOR/LOW_STANDOFF) -- diagnosed off flight 20260721_233244: a loss after mission-complete fell
+    #      through to the generic explore recovery path, which on recovering forced a REPLAN and resurrected
+    #      the whole explore FSM (BUMP/BACKOFF/BLACKLIST/TRIM chasing a stale goal) instead of quietly resuming
+    #      DONE. Fix: DONE added to POSTLUDE_STATES -> a loss diverts to the existing POSTLUDE_LOST_HOLD and
+    #      resumes DONE directly (no new resume-phase branch needed; DONE has no sub-phase).
+    cdone = ExploreController(cfg, no_takeoff=True)
+    dplan2 = {"plan_valid": True, "done": True, "goal": None, "pos": [0.0, 0.0], "heading_deg": 0.0,
+              "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 5.0}
+    _drive(cdone, dplan2, False, 40.0, 0.0, floor=True)          # happy path all the way to DONE
+    reached_done = cdone.state == "DONE"
+    tld, fidld = 45.0, 9000
+    for _ in range(6):                                          # inject a loss while parked in DONE
+        fidld += 1
+        cdone.step(tld, dict(dplan2, plan_valid=False, frame_id=fidld, cap_ts=tld, slam_ms=200.0),
+                   False, status="PLAN-STALE")
+        tld += 0.05
+    done_diverts = cdone.state == "POSTLUDE_LOST_HOLD" and cdone._postlude_resume == "DONE"
+    touched_recovery = False                                    # recover: OK + fresh fast frames -> resume DONE,
+    for _ in range(cdone.calib_lost_recover_frames + 2):        # NEVER touch REPLAN or any _RECOVERY_STATES member
+        fidld += 1
+        _, s, _ = cdone.step(tld, dict(dplan2, frame_id=fidld, cap_ts=tld, slam_ms=200.0), False, status="OK")
+        if s in _RECOVERY_STATES or s == "REPLAN":
+            touched_recovery = True
+        tld += 0.05
+    done_resumes = cdone.state == "DONE" and not touched_recovery
+    done_survives_ok = reached_done and done_diverts and done_resumes
+    ok = ok and done_survives_ok
+    print(f"[self-test] {'PASS' if done_survives_ok else 'FAIL'}  DONE survives a plan loss (reached DONE="
+          f"{reached_done}, diverts to POSTLUDE_LOST_HOLD={done_diverts}, resumes DONE without touching "
+          f"REPLAN/recovery states={done_resumes})")
+
+    # ---- Session 39: RETURN_TO_ORIGIN's ADVANCE no longer reacts to a blocked forward clearance with BACKOFF
+    #      (operator's call: a properly-oriented homing leg isn't expected to hit a wall the way frontier
+    #      exploration's own ADVANCE can; that stage keeps its own BACKOFF untouched). _home_phase must never
+    #      become "BACKOFF" during RETURN_TO_ORIGIN, no matter how tight the reported forward clearance is.
+    cnb = ExploreController(cfg, no_takeoff=True)
+    cnb.leg_max_s = 1000.0    # keep ADVANCE running the whole test window (isolates the clearance reaction)
+    blocked_plan = {"plan_valid": True, "done": True, "goal": None, "pos": [5.0, 5.0], "heading_deg": 0.0,
+                    "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 0.1}   # << inside stop_clearance_dist
+    saw_backoff = False
+    tnb, fidnb = 0.0, 10000
+    for _ in range(int(10.0 / 0.05)):
+        fidnb += 1
+        a, s, _ = cnb.step(tnb, dict(blocked_plan, frame_id=fidnb, cap_ts=tnb, slam_ms=200.0), False)
+        if s == "BACKOFF" or cnb._home_phase == "BACKOFF":
+            saw_backoff = True
+        tnb += 0.05
+    no_home_backoff_ok = (not saw_backoff
+                          and cnb.state in ("RETURN_TO_ORIGIN", "ORIENT_HOME", "HOME_REFINE", "DOCK_FLOOR"))
+    ok = ok and no_home_backoff_ok
+    print(f"[self-test] {'PASS' if no_home_backoff_ok else 'FAIL'}  RETURN_TO_ORIGIN ADVANCE no longer backs "
+          f"off a blocked clearance (saw_backoff={saw_backoff}, ended state={cnb.state})")
 
     # ---- ORIENT_HOME real-angle convergence (the 20260720 ping-pong) + orient_home_max_s cap ----
     # (a) Reproduce the diagnosed bug's shape: a bearing error starting just past HALF a turn_step_deg (the
@@ -5458,9 +5532,10 @@ def run_self_test(cfg):
     default_off = (coff.calibrate_on_goal_change is False and sOff == "ORIENT")
     # (d) CALIB_VERIFY PASS latches target_altitude_y = the settled desired height + captures the Y-DRIFT
     #     baseline on the FIRST pass; a LATER pass logs the ceiling movement (the rare-tap drift audit).
-    def _vpass(ceiling, first):
+    def _vpass(ceiling, first, override=0.0):
         c = ExploreController(cfg, no_takeoff=True)
         c._ceiling_y, c._first_ceiling_y = ceiling, first
+        c.desired_height_override_y = override
         c._calib_active = True; c._descend_issue_t = 0.0
         c._enter("CALIB_VERIFY", 0.0)
         _a, sV, evV = c.step(0.2, {"plan_valid": True, "done": False, "goal": None, "pos": [0.0, 0.0],
@@ -5469,9 +5544,17 @@ def run_self_test(cfg):
         return c, (evV or "")
     cv1, ev1 = _vpass(-2.3, None)
     latch_ok = (cv1.target_altitude_y == -1.9 and cv1._desired_y == -1.9
-                and cv1._first_ceiling_y == -2.3 and "Y-DRIFT" not in ev1)
+                and cv1._first_ceiling_y == -2.3 and "Y-DRIFT" not in ev1
+                and "OVERRIDE" not in ev1)
     cv2, ev2 = _vpass(-2.25, -2.3)
     ydrift_ok = ("Y-DRIFT check" in ev2 and "+0.050" in ev2)
+    # (d2) desired_height_override_y session 38: a non-zero override replaces the MEASURED settle (-1.9) with
+    # the fixed value, while _ceiling_y stays LIVE so _trim_delta still tracks the real room, and the log
+    # names the override explicitly (never a silent substitution).
+    cv3, ev3 = _vpass(-2.3, None, override=-1.5)
+    override_ok = (cv3.target_altitude_y == -1.5 and cv3._desired_y == -1.5
+                   and abs(cv3._trim_delta - (-1.5 - -2.3)) < 1e-9
+                   and "DESIRED-HEIGHT OVERRIDE: -1.500" in ev3 and "settled_y was -1.900" in ev3)
     # (e) reference-disagreement warning: the rolling median wandering > delta from desired_y raises ONE loud
     #     notice (take_notice pops it once; display-only, no behavior change).
     cw = ExploreController(cfg, no_takeoff=True)
@@ -5481,12 +5564,12 @@ def run_self_test(cfg):
                            "pos_y": -1.3, "slam_ms": 200.0, "frame_id": 500 + i, "cap_ts": i * 0.05}, False)
     n1 = cw.take_notice()
     warn_ok = (n1 is not None and "DISAGREEMENT" in n1 and cw.take_notice() is None)
-    s22_ok = down_ok and band_ok and gate_ok and default_off and latch_ok and ydrift_ok and warn_ok
+    s22_ok = down_ok and band_ok and gate_ok and default_off and latch_ok and ydrift_ok and warn_ok and override_ok
     ok = ok and s22_ok
     print(f"[self-test] {'PASS' if s22_ok else 'FAIL'}  SESSION-22 (TRIM DOWN fires+pitch+re-aim={down_ok}, "
           f"in-band no-fire={band_ok}, comfort gate hold/timeout/release={gate_ok}, re-tap default OFF="
           f"{default_off}, PASS latches target+drift baseline={latch_ok}, Y-DRIFT audit line={ydrift_ok}, "
-          f"median-disagreement notice={warn_ok})")
+          f"median-disagreement notice={warn_ok}, desired-height override (session 38)={override_ok})")
 
     # Negative bearing error -> open-loop turn yaw NEGATIVE (turn left).
     c2 = ExploreController(cfg, no_takeoff=True)

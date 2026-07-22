@@ -239,6 +239,12 @@ autonomy:
     calibrate_on_goal_change: false  # periodic re-tap OFF (session 22); re-enable + long cooldown = drift audit
     calib_cooldown_s: 60.0           # min seconds between ceiling taps when re-enabled (600+ for the audit posture)
     calib_goal_change_dist: 1.0      # the goal must move MORE than this (SLAM units) to trigger a re-tap
+    # OPERATOR TESTING OVERRIDE (session 38): 0 = disabled, use live CALIB_VERIFY self-calibration as usual.
+    # Any other value = use it DIRECTLY as the desired flying height instead of the measured settle (the
+    # ceiling itself is still measured live, so TRIM's band still tracks the real room). World frame is +Y
+    # DOWN, so a flying height is a NEGATIVE value (e.g. -1.9). Explicit opt-in, NOT autonomous — for
+    # repeatable test flights, never left non-zero for a real autonomous survey.
+    desired_height_override_y: -1.85
     # --- SLAM-COMFORT gate (session 22): launch/redo a calibration only when SLAM is COMFORTABLE, not merely
     #     alive. The bad flight's redos fired on "6 fresh frames <1000ms" whose frames ran 616-797ms — marginal —
     #     and died seconds into every ASCEND. Rolling average of HEALTHY-frame latencies must clear the bar
@@ -301,7 +307,7 @@ autonomy:
     #     continuous latch hold to catch a clean FLOOR. FLOOR detection is NEW/unvalidated -> dock_max_s caps it. ---
     home_reach_dist: 0.5             # "reached the origin" test (SLAM units) — tightened 1.0->0.5 so the drone actually
                                      #   flies home at altitude before docking (a general tolerance, NOT a room answer)
-    home_max_s: 30.0                 # SAFETY: cap the homing; then dock HERE (logged, NO SILENT FALLBACK)
+    home_max_s: 300.0                 # SAFETY: cap the homing; then dock HERE (logged, NO SILENT FALLBACK)
     # ORIENT_HOME: converge on the take-off heading using the REAL bearing error each turn (clamped to one
     # turn_step_deg per turn, but no longer forced to a multiple of it — that quantization could ping-pong
     # forever whenever the residual sat near half a step). orient_home_tol_deg is a general control-loop
@@ -386,7 +392,7 @@ autonomy:
     #     also inconclusive, an explicit 15° open-loop turn-probe (VISUAL_RECOVERY) re-tests the image after
     #     each step, BEFORE ever falling to the blind FALLBACK sweep. Config-gated, default OFF -- ships
     #     live-fly-untested, same convention as use_rewind_on_stale above. ---
-    use_visual_recovery_on_stale: false   # off by default; live-fly-untested
+    use_visual_recovery_on_stale: true   # off by default; live-fly-untested
     visrec_min_inliers: 12                # reuse the project's already-validated SIFT/RANSAC inlier threshold (benchmark_detectors.py)
     visrec_planar_inlier_ratio: 0.85      # inlier fraction of all good matches to call a match "planar-like" (nose-to-a-flat-surface)
     visrec_contain_margin_frac: 0.02      # slack (fraction of frame size) for the corner-containment test (zoomed-in-crop verdict)

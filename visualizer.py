@@ -1,7 +1,7 @@
 """visualizer.py — Process P3: the live dashboard (M4 Task 3).
 
 A read-only consumer that subscribes to the perception state bus (`perception_state_port`,
-default :5603) and composes a single OpenCV window from three topics published by
+default :5603) and composes a single OpenCV window from four topics published by
 `perception_worker`:
 
   * TOPIC_MAP   -> the growing top-down (X-Z) occupancy map + camera trajectory. The worker
@@ -11,11 +11,20 @@ default :5603) and composes a single OpenCV window from three topics published b
                    coords (see MapStore.topdown_summary). Each message is a full snapshot, so
                    joining late just means catching up on the next keyframe.
   * TOPIC_POSE  -> SLAM mode, tracking_mode, keyframe/voxel counts, reloc events.
-  * TOPIC_PLAN  -> the frontier goal + SLAM-raycast forward clearance (drawn on the map).
+  * TOPIC_PLAN  -> the frontier goal + SLAM-raycast forward clearance (drawn on the map), plus
+                   the live pos_y (drone height) and plan-status fields shown in the telemetry
+                   panel below.
   * TOPIC_TARGET-> the lifted 3D target position + uncertainty (drawn as a marker on the map
                    and summarized in the status strip).
 
-(DA-V2 depth / TOPIC_DEPTH was removed 2026-07-07; the depth slot shows a DISABLED placeholder.)
+It ALSO subscribes to `autopilot.py`'s own control bus (`autonomy_control_port`, default :5606,
+TOPIC_CONTROL) — the same PUB `io_bridge.py` already reads to actually drive Unity — purely to
+read the live FSM `state` (ADVANCE/TRIM/SETTLE/...) and `target_altitude_y` (the autopilot's
+self-calibrated desired-height hold target) for display. An extra ZeroMQ SUB on an existing PUB
+is free and steals nothing (same reasoning as the frame-bus subscription below).
+
+(DA-V2 depth / TOPIC_DEPTH was removed 2026-07-07; that panel slot now shows autopilot
+telemetry instead of a depth placeholder — see `render_telemetry_panel`.)
 
 It also (optionally) subscribes to the frame bus (`frame_bus_port`, default :5601) to show the
 live input frame — the frame bus is conflated PUB/SUB, so an extra subscriber is free and never
@@ -28,7 +37,7 @@ panels say so rather than faking content.
 
 Layout:  [ status strip                         ]
          [ input frame    ] [                     ]
-         [ depth DISABLED ] [   top-down map + traj  ]
+         [ telemetry panel] [   top-down map + traj  ]
 """
 
 import argparse
@@ -46,7 +55,7 @@ import frame_bus
 REPO = os.path.dirname(os.path.abspath(__file__))
 WINDOW = "Cartographer — live dashboard"
 
-PANEL_W, PANEL_H = 416, 234   # the two 16:9 left-column panels (input + depth)
+PANEL_W, PANEL_H = 416, 234   # the two 16:9 left-column panels (input + telemetry)
 GAP = 12
 MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left column
 STATUS_H = 48                 # two lines: SLAM state + target estimate
@@ -76,13 +85,45 @@ def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
     return p
 
 
-def render_depth_panel(depth, w=PANEL_W, h=PANEL_H):
-    """DA-V2 depth was removed (2026-07-07): this slot now shows an explicit DISABLED placeholder
-    (NO SILENT FALLBACK — an empty panel must read as intentional, not a hung/waiting feed). The
-    autopilot's wall stand-off uses the SLAM raycast (forward_clearance_dist), drawn on the map."""
-    panel = _placeholder(w, h, "DEPTH DISABLED")
-    cv2.putText(panel, "(SLAM raycast clearance -> map)", (6, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)
+def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
+    """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
+    FSM state, current vs. desired (autopilot-locked) height, and plan status, so the operator
+    always has these visible instead of only on the map's transient overlay text. `control` is
+    the latest TOPIC_CONTROL payload (autopilot -> io_bridge, state + target_altitude_y); `plan`
+    is the latest TOPIC_PLAN payload (perception_worker, pos_y + plan-status fields). NO SILENT
+    FALLBACK: an unavailable reading prints as `--`, never a stale or guessed number, and the
+    whole panel says so explicitly if autopilot.py isn't running at all."""
+    if control is None:
+        return _placeholder(w, h, "waiting for autopilot on the control bus ...")
+    panel = np.full((h, w, 3), 30, np.uint8)
+    cv2.putText(panel, "telemetry", (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    state = control.get("state")
+    cv2.putText(panel, f"STATE: {state}", (8, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    plan = plan or {}
+    pos_y = plan.get("pos_y")
+    desired_y = control.get("target_altitude_y")
+    hy = f"{pos_y:+.3f}u" if pos_y is not None else "--"
+    hd = f"{desired_y:+.3f}u" if desired_y is not None else "--"
+    delta = (f"{pos_y - desired_y:+.3f}u" if pos_y is not None and desired_y is not None else "--")
+    cv2.putText(panel, f"HEIGHT   pos_y={hy}  desired={hd}  delta={delta}", (8, 78),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+    if not plan.get("plan_valid"):
+        cv2.putText(panel, f"PLAN     STALE (SLAM {plan.get('mode')})", (8, 102),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
+    else:
+        clr = plan.get("forward_clearance_dist")
+        be = plan.get("bearing_err")
+        cv2.putText(panel,
+                    f"PLAN     valid  done={plan.get('done')}  frontiers={plan.get('n_frontiers')}",
+                    (8, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        cv2.putText(panel,
+                    f"         blacklisted={plan.get('n_blacklisted') or 0}  "
+                    f"bearing_err={be if be is not None else '--'}  "
+                    f"clear={f'{clr:.2f}u' if clr is not None else '--'}",
+                    (8, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
     return panel
 
 
@@ -268,9 +309,8 @@ def render_map_panel(m, size=MAP_SIZE, target=None):
     return img
 
 
-def render_status(pose, depth, width, reloc_active, target=None):
-    # Two-line strip: SLAM state on top, the target estimate below. (`depth` retained for signature
-    # symmetry; DA-V2 depth was removed so it is always None — the SLAM raycast clearance is on the map.)
+def render_status(pose, width, reloc_active, target=None):
+    # Two-line strip: SLAM state on top, the target estimate below.
     strip = np.full((STATUS_H, width, 3), 45, np.uint8)
     if pose is None:
         cv2.putText(strip, "waiting for perception_worker on the state bus ...", (8, 20),
@@ -311,16 +351,16 @@ class Dashboard:
     """Holds the latest payload per topic + the latest frame, and composes the window.
 
     The map panel is cached and only re-rendered when a new TOPIC_MAP snapshot arrives
-    (~once per keyframe); the cheap frame + depth-placeholder panels redraw every tick.
+    (~once per keyframe); the cheap frame + telemetry panels redraw every tick.
     """
 
     def __init__(self):
         self.frame = None
         self.pose = None
-        self.depth = None
         self.map = None
         self.target = None
         self.plan = None
+        self.control = None    # latest TOPIC_CONTROL payload (autopilot's own control bus)
         self.cam_track = deque(maxlen=600)   # recent world camera centers (live, per-frame)
         self._map_img = None
         self._map_sig = None
@@ -342,6 +382,8 @@ class Dashboard:
             self._map_img = None  # redraw map with the updated target marker
         elif topic == "plan":
             self.plan = payload   # drawn live on the map copy each tick (no cache invalidation)
+        elif topic == "control":
+            self.control = payload   # autopilot FSM state + target_altitude_y (telemetry panel)
 
     def _map_image(self):
         tpos = tuple(tuple(t.get("position") or ()) for t in _target_list(self.target))
@@ -353,19 +395,19 @@ class Dashboard:
 
     def render(self):
         frame_p = render_frame_panel(self.frame)
-        depth_p = render_depth_panel(self.depth)
+        tel_p = render_telemetry_panel(self.control, self.plan)
         # Cached voxel/keyframe base + live camera overlay (per-frame, so position feels live).
         map_p = self._map_image().copy()
         overlay_live_camera(map_p, self.map, self.cam_track, map_p.shape[0])
         overlay_plan(map_p, self.plan, self.map, map_p.shape[0])
 
         col_gap = np.zeros((GAP, PANEL_W, 3), np.uint8)
-        left = np.vstack([frame_p, col_gap, depth_p])          # (MAP_SIZE, PANEL_W)
+        left = np.vstack([frame_p, col_gap, tel_p])            # (MAP_SIZE, PANEL_W)
         row_gap = np.zeros((left.shape[0], GAP, 3), np.uint8)
         body = np.hstack([left, row_gap, map_p])               # (MAP_SIZE, width)
 
         reloc_active = (time.monotonic() - self._last_reloc) < RELOC_FLASH_S
-        status = render_status(self.pose, self.depth, body.shape[1], reloc_active, self.target)
+        status = render_status(self.pose, body.shape[1], reloc_active, self.target)
         return np.vstack([status, body])
 
 
@@ -394,11 +436,17 @@ def _open_video_writer(fps):
 def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
     pstate_port = cfg["network"]["perception_state_port"]
     frame_port = cfg["network"]["frame_bus_port"]
+    ctrl_port = cfg["network"]["autonomy_control_port"]
     state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/map/plan/target)
     frame_sub = frame_bus.FrameSubscriber(frame_port) if show_frame else None
+    # A second, independent SUB on autopilot.py's own control bus (io_bridge already reads this
+    # to drive Unity) -- purely to read `state`/`target_altitude_y` for the telemetry panel.
+    # Lazy-connect: fine whether or not autopilot.py is running yet.
+    ctrl_sub = frame_bus.StateSubscriber(ctrl_port, topics=[frame_bus.TOPIC_CONTROL])
 
     print(f"[visualizer] state bus SUB :{pstate_port} (pose+map+plan+target)"
-          + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF"))
+          + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF")
+          + f" | control bus SUB :{ctrl_port} (autopilot state+target_altitude_y)")
     print("[visualizer] === READY === waiting for perception_worker ('q' to quit).\n")
 
     writer = _open_video_writer(record_fps) if record else None
@@ -422,6 +470,12 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
             while got is not None:
                 dash.update(*got)
                 got = state_sub.recv(timeout_ms=0)
+            # Drain the control bus the same way (autopilot publishes at 20 Hz; we only want the
+            # freshest state/target_altitude_y reading each render tick).
+            got = ctrl_sub.recv(timeout_ms=0)
+            while got is not None:
+                dash.update(*got)
+                got = ctrl_sub.recv(timeout_ms=0)
             if frame_sub is not None:
                 fr = frame_sub.recv(timeout_ms=0)
                 if fr is not None:
@@ -442,6 +496,7 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
     finally:
         print("[visualizer] shutting down ...")
         state_sub.close()
+        ctrl_sub.close()
         if frame_sub is not None:
             frame_sub.close()
         if writer is not None:
@@ -453,7 +508,7 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Cartographer visualizer (P3): live map + depth dashboard")
+    ap = argparse.ArgumentParser(description="Cartographer visualizer (P3): live map + telemetry dashboard")
     ap.add_argument("--config", default=None)
     ap.add_argument("--no-frame", action="store_true",
                     help="don't subscribe to the frame bus (skip the live input panel)")

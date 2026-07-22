@@ -1,11 +1,12 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-07-21** (session 36 **BUILT — self-tests green, NOT YET live-flown**). Resume from
-THIS file. **Session 36 added image-based visual recovery on a PLAN-STALE: a loss-instant SIFT check
-against the last-known-good frame (catches an unmapped wall geometry alone would miss), and — if that's
-inconclusive too — a first-class 15° rotational turn-probe that runs BEFORE the blind FALLBACK sweep.
-Config-gated OFF by default (`use_visual_recovery_on_stale`) — see "Next" below.** Plan of record:
-**`plans/session36-visual-recovery-15deg-probe.md`** (+
+_Last updated **2026-07-22** (session 39 **BUILT — self-tests green, NOT YET watched on a live
+flight**). Resume from THIS file. **Session 39 removed `RETURN_TO_ORIGIN`'s `BACKOFF` sub-phase
+(operator's call) and fixed a real bug where `DONE` didn't survive a plan loss, letting the mission
+un-retire itself — see "Next" below.** Plan of record:
+**`plans/session39-return-to-origin-backoff-removal-and-done-loss-fix.md`** (+
+`plans/session38-desired-height-override.md`, `plans/session37-visualizer-telemetry-panel.md`,
+`plans/session36-visual-recovery-15deg-probe.md`,
 `plans/session35-slam-slow-strategy-switch-and-recovering-fix.md`,
 `plans/session34-proactive-clearance-while-blind.md`,
 `plans/session33-goal-loop-clearance-inset-fix.md`,
@@ -19,6 +20,88 @@ Config-gated OFF by default (`use_visual_recovery_on_stale`) — see "Next" belo
 `plans/session24-settle-gate-pick-dedup-corner-giveup.md`, `plans/session23-backwall-reaction-and-
 parallax-retry.md`, `plans/session22-fixed-height-ref-and-bidirectional-trim.md`,
 `plans/session21-restore-height-calib-and-trim.md`, `plans/session20-goal-db-loop-blacklist.md`)._
+
+_**Session 39 — removed `RETURN_TO_ORIGIN`'s `BACKOFF` sub-phase (operator's call) + fixed DONE
+resurrecting the whole mission after a plan loss (diagnosed off flight `20260721_233244`) (BUILT —
+self-tests green, live-fly PENDING).** Walked the operator through what the postlude ending
+(`RETURN_TO_ORIGIN`→`ORIENT_HOME`→`HOME_REFINE`→`DOCK_FLOOR`→`LOW_STANDOFF`→`DONE`) actually does
+after he flagged it "acting up." Two things came out of it. (1) **Removed homing's `BACKOFF`
+sub-phase**: session 26 added a clearance-stand-off reaction to `RETURN_TO_ORIGIN`'s `ADVANCE`,
+mirroring explore's own `ADVANCE->BACKOFF` — the operator's call: homing always turns to face the
+true origin before advancing, so a properly-oriented leg isn't expected to hit a wall the way
+frontier exploration can; removed the check and the sub-phase entirely (explore's own
+`ADVANCE->BACKOFF` untouched). (2) **A real bug**: last night's flight reached `DONE` cleanly at
+`23:53:58.784` ("EXPLORE COMPLETE" logged once), but a `PLAN-LOST` four seconds later (plausible
+near the floor) fell through to the *generic* explore recovery path instead of the dedicated
+`POSTLUDE_LOST_HOLD` every other postlude stage already uses — because `DONE` was missing from
+`POSTLUDE_STATES`. Once `status` read `OK` again, the generic recovery convergence forced a
+`REPLAN`, which re-committed a corner goal and resumed the *entire* explore FSM: the log shows
+repeated `BUMP`/`BACKOFF` reverse-thrust cycles from `23:54:13` on (the operator's reported "flying
+backwards like a maniac") and a `TRIM enter (DOWN)` at `23:55:03` firing because `pos_y` was
+already near ceiling territory (the reported "jumped to the ceiling") — the mission un-retired
+itself after already declaring itself complete. Fixed by adding `"DONE"` to `POSTLUDE_STATES`; the
+existing `_step_postlude_lost` machinery already resumes whatever state it diverted from, so a
+loss in `DONE` now just holds and quietly resumes `DONE` (no new resume-phase branch needed,
+mirroring the session-24 `STUCK` corner-giveup precedent for a state that must own its own
+recovery). New self-tests for both fixes; cross-checked by reverting both edits in a scratch copy
+and confirming the new tests correctly flip to FAIL there, while two *pre-existing, unrelated*
+failures (`explore ALTITUDE-LOCK`, `explore PRELUDE arm+takeoff+...`) reproduced identically on the
+reverted copy too — confirming those predate this session and aren't a regression introduced here
+(still open, still need their own diagnosis). `python autopilot.py --self-test`: all touched tests
+PASS. See `plans/session39-return-to-origin-backoff-removal-and-done-loss-fix.md` for the full
+trace + design. **NEXT = LIVE-FLY** — watch for: no `BACKOFF` phase logged during homing; a loss
+while parked in `DONE` now logs "plan loss DURING DONE" and quietly resumes `DONE`, never
+re-entering `REPLAN`/`BUMP`/`BACKOFF`/`TRIM`. Also still open: the two pre-existing self-test
+failures above, unrelated to this session._
+
+_**Session 38 — config override to force a fixed desired flying height instead of live calibration
+(BUILT — self-tests green (incl. a fixed pre-existing config-drift regression), live-fly PENDING).** The
+operator wanted a knob for repeatable test flights: `desired_height_override_y` (0 = disabled, use
+`CALIB_VERIFY`'s live measurement as usual; non-zero = use that value directly). Design: override the
+VALUE, not the calibration PROCESS — the ceiling-tap (ASCEND/DESCEND/`CALIB_VERIFY`) still runs and
+`_ceiling_y` is still measured live (a legitimate self-calibrating platform signal TRIM's sag/high band
+needs regardless), only the *desired_y* half of the measurement (`settled_y`) gets replaced when the
+override is non-zero, so `_trim_delta = override - ceiling_y` still tracks the real room. Applied at both
+places `target_altitude_y`/`_desired_y` get set (the primary `CALIB_VERIFY` PASS latch, and the rarely-hit
+fallback latch used only when `CALIB_VERIFY` never ran, e.g. `--no-takeoff`). Flagged the tension with
+CLAUDE.md's "NO MANUAL-FLIGHT DATA LEAKAGE" standard explicitly (a fixed height IS a room-specific answer)
+— proceeding because it's an explicit, visible, opt-in OPERATOR override (default 0, same pattern as
+`use_rewind_on_stale`/`use_visual_recovery_on_stale`), for testing only, never left on for a real survey.
+While verifying, found + fixed an UNRELATED pre-existing regression: the operator had separately flipped
+`use_visual_recovery_on_stale` true in `config.yaml` (to live-test session 36's path), and 8 legacy
+recovery self-tests silently assumed the shipped-off default via the shared `cfg` — the exact "config-drift"
+class of gap session 30 already hit once with `calibrate_on_goal_change`. Fixed the same way: force the
+flag OFF on the self-test's own `copy.deepcopy(cfg)`, right next to session 30's identical fix for the other
+knob (the dedicated VISUAL RECOVERY tests already use their own separate deepcopy forced back to `True`, so
+their coverage is unaffected). `python autopilot.py --self-test` and `python flight_replay.py --self-test`:
+ALL PASS. See `plans/session38-desired-height-override.md` for the full design. **NEXT = LIVE-FLY** — set
+`desired_height_override_y` to a plausible negative value (e.g. -1.9) and confirm `target_altitude_y` reads
+it immediately post-calibration instead of the measured settle, and that TRIM still corrects sag/high
+relative to it._
+
+_**Session 37 — replaced the visualizer's dead "DEPTH DISABLED" panel with live autopilot telemetry, built
+on a separate branch/worktree while session 36 (above) ran concurrently in the main checkout (BUILT —
+self-tests + rendering smoke-tests green, live-fly PENDING).** The operator wanted height (actual +
+desired), plan status, and the current FSM state (`ADVANCE`/`TRIM`/`SETTLE`/...) visible at all times,
+in the space DA-V2 depth used to occupy. Traced why none of it already reached `visualizer.py`: it only
+ever subscribed to `perception_state_port` (pose/map/plan/target); the FSM state string and the
+self-calibrated altitude-lock hold target (`ExploreController.target_altitude_y`) only ever rode
+`TOPIC_CONTROL` on `autonomy_control_port`, read only by `io_bridge.py` (to drive Unity) — pos_y and
+plan-status were already there via `TOPIC_PLAN`. Fix, no new bus/port: `autopilot.py`'s `_full_vector()`
+now also carries `target_altitude_y`; `visualizer.py` opens a second, independent subscriber on the same
+control-bus port (ZMQ PUB/SUB gives extra subscribers for free, same pattern already used for the frame
+bus) and a new `render_telemetry_panel()` replaces `render_depth_panel()`. Built in a git worktree
+(`worktree-visualizer-telemetry-panel`, branched from `leg-hops-and-goal-commit-fix`@`801e2f8`) to avoid
+fighting the other session over the one checkout; merged `new-visual-recovery` in afterward via a clean
+fast-forward + stash-pop once that session's work landed as a real commit (only conflict: both sessions
+had written a "session 36" entry in this exact file — resolved by renumbering this one to 37). `python
+autopilot.py --self-test`: ALL PASS (the new parameter is additive). `visualizer.py` has no self-test
+scaffold; verified instead with a standalone script rendering the new panel against synthetic
+control/plan payloads (no-control placeholder, control-without-plan, valid plan, `PLAN-STALE` plan) — all
+composed without error. See `plans/session37-visualizer-telemetry-panel.md` for the full design. **NEXT =
+LIVE-FLY** — does the panel visibly track FSM-state transitions and TRIM's height correction in real
+time; does the "waiting for autopilot on the control bus" placeholder show correctly if `visualizer.py`
+starts before `autopilot.py`._
 
 _**Session 36 — image-based visual recovery on PLAN-STALE: a loss-instant SIFT check + a first-class 15°
 rotational turn-probe, BUILT per an operator-approved design (self-tests green, live-fly PENDING).** The
