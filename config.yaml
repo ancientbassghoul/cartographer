@@ -244,7 +244,7 @@ autonomy:
     # ceiling itself is still measured live, so TRIM's band still tracks the real room). World frame is +Y
     # DOWN, so a flying height is a NEGATIVE value (e.g. -1.9). Explicit opt-in, NOT autonomous — for
     # repeatable test flights, never left non-zero for a real autonomous survey.
-    desired_height_override_y: -1.85
+    desired_height_override_y: -1.9
     # --- SLAM-COMFORT gate (session 22): launch/redo a calibration only when SLAM is COMFORTABLE, not merely
     #     alive. The bad flight's redos fired on "6 fresh frames <1000ms" whose frames ran 616-797ms — marginal —
     #     and died seconds into every ASCEND. Rolling average of HEALTHY-frame latencies must clear the bar
@@ -277,26 +277,26 @@ autonomy:
     calib_escape_after: 3            # consecutive failed calibrations -> escape (first time) / STUCK (after an escape)
     calib_escape_ok_frames: 12       # consecutive fresh fast frames + status OK to declare SLAM recovered post-escape
     calib_escape_push_s: 1.0         # duration of the one ring-picked parallax push to a fresh vantage
-    # --- GRADUAL HEIGHT TRIM (session 14; BIDIRECTIONAL since session 22): the ONLY in-flight height corrector
-    #   now that the periodic re-tap is retired. joy_vertical is a DISCRETE full-thrust ±1 axis (coarse), so
-    #   TRIM uses the sim's PITCH aim instead: pitch the aim UP (or DOWN) + push forward -> the drone flies
-    #   toward the raised/lowered aim = a GRADUAL climb/descent (rate set by the push duration). Bonus: the
-    #   forward component is translation = SLAM parallax. The FIRST calibration records ceiling_y (glued),
-    #   desired_y (settled post-descend — THE flight's height reference), delta = desired_y - ceiling_y. On a
-    #   fresh healthy frame in SETTLE/ADVANCE:
+    # --- GRADUAL HEIGHT TRIM (session 14; BIDIRECTIONAL since session 22; VERTICAL PULSE since session 40):
+    #   the ONLY in-flight height corrector now that the periodic re-tap is retired. joy_vertical is a DISCRETE
+    #   full-thrust ±1 axis (coarse) -- session 14 avoided it via a pitch-aim + forward-push trick because a
+    #   CONTINUOUS/un-gated vertical thrust was observed to stretch vertical visual features and choke SLAM.
+    #   Session 40: DOCK_FLOOR already proves a BRIEF joy_vertical pulse + a real settle-gate before the next
+    #   decision is SLAM-safe (it's the same "continuous vs. gated pulse" distinction, not "vertical is unsafe"
+    #   full stop) -- TRIM now uses that exact, already-validated pattern: one short joy_vertical pulse straight
+    #   into the existing WAIT/settle-gate. No forward/lateral room is needed at all, so the old ring-gate/
+    #   reposition/"ring blocked -> skip trim (pray)" abort (which could retry indefinitely -- diagnosed off
+    #   flight 20260722_124351) is gone structurally, not just patched. The FIRST calibration records ceiling_y
+    #   (glued), desired_y (settled post-descend — THE flight's height reference), delta = desired_y - ceiling_y.
+    #   On a fresh healthy frame in SETTLE/ADVANCE:
     #     too LOW  (sagged):     pos_y > ceiling_y + trim_sag_ratio*delta (== desired + 0.2*delta) -> TRIM UP
     #     too HIGH (glued near ceiling — the 20260717 failure): pos_y < desired_y - trim_high_ratio*delta -> TRIM DOWN
     #   All GENERAL platform params + LIVE self-calibrating references — no room answer.
     trim_enable: true
     trim_sag_ratio: 1.2              # too-LOW trigger: pos_y > ceiling_y + this*delta  (1.2 == desired + 0.2*delta)
     trim_high_ratio: 0.2             # too-HIGH trigger: pos_y < desired_y - this*delta (mirror band; session 22)
-    # (trim_aim_s REMOVED session 22 — automatic: io_bridge ramps the aim ±0.05/tick @60Hz, so ±1.0 saturates in
-    #  ~0.33s; the pre-aim phase is a fixed 0.5s platform constant, and the aim is HELD through the whole push.)
-    trim_fwd_s: 0.25                 # forward push (with the aim held up/down) = the gradual climb/descent dose
+    trim_pulse_s: 0.01               # full-magnitude joy_vertical pulse duration (unramped, like home_refine_strafe_s)
     trim_settle_s: 1.0               # WAIT for a healthy frame CAPTURED >= trim_cmd_t0 + this before logging (async-SLAM guard)
-    trim_reposition_s: 0.5           # if forward is blocked: reverse/strafe this long to open forward room, then climb
-    trim_pitch_up: -1.0              # pitch value that raises the aim = CLIMB (sign confirmed live: +1.0 aimed DOWN)
-    trim_throttle: 1.0               # forward-push magnitude during the climb (matches forward_throttle; io_bridge ramps it)
     # --- POST-MISSION FLOOR-DOCK POSTLUDE (when the all-corners tour is exhausted, planner done=True):
     #     RETURN_TO_ORIGIN -> DOCK_FLOOR (gentle PULSED descent) -> LOW_STANDOFF -> DONE. Instead of a
     #     static hover at mapping height, fly home to the take-off origin (SLAM-frame [0,0]), descend
@@ -453,7 +453,7 @@ autonomy:
     # zero step-back events -- kept step-back fully intact behind this switch, default OFF (one edit to
     # bring it back).
     use_slam_stepback_on_slow: false # true = classic REWIND step-back; false (default) = forced-hop escape
-    slam_slow_hop_after_s: 30.0      # force one hop after this much continuous slow-but-OK holding
+    slam_slow_hop_after_s: 15.0      # force one hop after this much continuous slow-but-OK holding
     slam_slow_hop_grace_s: 8.0       # self-expiring window the forced hop's ORIENT/ADVANCE get to bypass the
                                      #   SLAM-slow hold (one turn + one hop_duration_s, with margin)
     # --- altitude lock (hold the LIVE-cached mapping height; counters the forward-push sink that drifts the

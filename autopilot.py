@@ -769,6 +769,10 @@ class ExploreController:
         # state, `_step_visual_recovery`) runs BEFORE the blind FALLBACK sweep, re-matching the image after
         # each turn step. Config-gated (mirrors `use_rewind_on_stale`'s exact pattern), default OFF —
         # live-fly-untested, per this project's standing convention for a brand-new stale-recovery path.
+        # Session 42: integration point (2), the turn-probe hand-off, is PLAN-STALE-only (perception alive,
+        # SLAM confused) — a PLAN-LOST/NO-PLAN loss (perception itself silent, e.g. a slow SLAM solve
+        # backlog per session 28) never hands off into the probe, only ever the plain hard-hover-hold;
+        # integration point (1)'s two BACKOFF reactions are unaffected and still fire for any status.
         self.use_visual_recovery_on_stale = bool(e.get("use_visual_recovery_on_stale", False))
         self.visrec_min_inliers = int(e.get("visrec_min_inliers", 12))          # reuse the project's already-validated SIFT/RANSAC inlier threshold
         self.visrec_planar_inlier_ratio = float(e.get("visrec_planar_inlier_ratio", 0.85))  # inlier fraction to call a match "planar-like" (Step 2b)
@@ -1052,23 +1056,17 @@ class ExploreController:
         self.floor_standoff_nudge = float(e.get("floor_standoff_nudge", 0.5))  # LOW_STANDOFF up-nudge duration (s)
         # --- GRADUAL HEIGHT TRIM (session 14, RESTORED session 21): a fine PITCH-aim + forward climb BETWEEN
         # calibrations. (Session 17 deleted it as "a self-inflicted sag"; live flights proved the sag is real.)
-        # joy_vertical is a DISCRETE full-thrust axis; TRIM instead pitches the aim UP and pushes forward so
-        # the drone flies toward the raised aim = a gradual climb (rate = push duration), the forward part
-        # feeding SLAM parallax. Trigger: pos_y sank past ceiling_y + trim_sag_ratio*delta. All GENERAL params;
-        # the 3 references (_ceiling_y/_desired_y/_trim_delta) are re-measured LIVE at every calibration.
+        # Session 40: a single short joy_vertical pulse (mirrors DOCK_FLOOR's already-proven pulse+settle-gate
+        # primitive) straight into the existing WAIT phase -- no forward/lateral room needed at all, unlike the
+        # old pitch-aim+forward-push+ring-gate mechanism it replaced. Trigger: pos_y sank past
+        # ceiling_y + trim_sag_ratio*delta. All GENERAL params; the 3 references (_ceiling_y/_desired_y/
+        # _trim_delta) are re-measured LIVE at every calibration.
         self.trim_enable = bool(e.get("trim_enable", True))
         self.trim_sag_ratio = float(e.get("trim_sag_ratio", 1.2))
         self.trim_high_ratio = float(e.get("trim_high_ratio", 0.2))  # too-HIGH mirror band (session 22): TRIM
         #                                    DOWN when pos_y < desired_y - this*delta (glued near the ceiling)
-        self.trim_aim_s = 0.5        # AUTOMATIC (session 22): io_bridge ramps the aim ±0.05/tick @60Hz -> ±1.0
-        #                              saturates in ~0.33s; 0.5s is a platform constant with margin (not a knob).
-        #                              The aim is then HELD at ±1 through the entire FWD push (re-emitted per tick).
-        self.trim_fwd_s = float(e.get("trim_fwd_s", 0.5))
+        self.trim_pulse_s = float(e.get("trim_pulse_s", 0.16))   # full-magnitude joy_vertical pulse (unramped)
         self.trim_settle_s = float(e.get("trim_settle_s", 1.0))
-        self.trim_reposition_s = float(e.get("trim_reposition_s", 0.5))
-        self.trim_pitch_up = float(e.get("trim_pitch_up", -1.0))   # -1 aims UP = climb (confirmed live; +1 aimed DOWN)
-        self.trim_throttle = float(e.get("trim_throttle", 0.4))   # brisk forward push, like the parallax scoot
-        self.trim_reset_s = 0.15     # brief 'c' aim-reset pulse after the climb (platform action, like a turn's 'c')
         # The three calibration references (FLIGHT-level, persist across reset_leg like target_altitude_y).
         # Captured ONLY at a settled CALIB_VERIFY pass (Trap D: never the raw tap / post-bump wobble). +Y DOWN,
         # so _desired_y > _ceiling_y and _trim_delta > 0.
@@ -1243,12 +1241,11 @@ class ExploreController:
         self._postlude_t0 = None        # wall-clock start of the whole postlude ending (postlude_recover_budget_s cap)
         # Gradual height TRIM runtime (per-episode; the 3 references are flight-level and set in __init__).
         self._trim_dir = "UP"           # "UP" (sagged low -> climb) | "DOWN" (glued high -> descend); session 22
-        self._trim_phase = None         # None | "REPOS" | "AIM" | "FWD" | "RESET" | "WAIT" within TRIM
+        self._trim_phase = None         # None | "PULSE" | "WAIT" within TRIM
         self._trim_phase_t0 = None      # entry time of the current TRIM sub-phase
-        self._trim_cmd_t0 = None        # 'now' the climb command issued (WAIT settle-gate origin; same clock as cap_ts)
+        self._trim_cmd_t0 = None        # 'now' the pulse command issued (WAIT settle-gate origin; same clock as cap_ts)
         self._trim_resume_goal = None   # the committed leg_goal snapshotted on TRIM entry (Trap B: re-aim at it, don't re-pick)
         self._trim_exit_msg = None      # the TRIM-end reason string, stashed across TRIM_RESUME_WAIT for the final event line
-        self._trim_repos_move = None    # the reposition control dict (reverse/strafe) chosen by the ring gate
         self._trim_sag_y = None         # pos_y that tripped the sag trigger (for the entry log)
         self._trimming = False          # telemetry: True while a TRIM is running
         # Calibration escape runtime (a manual takeover invalidates a stuck-calibration episode).
@@ -1496,7 +1493,7 @@ class ExploreController:
             self._recovering = True
             self._history_broken = False
         if not self._loss_snapshot_checked:
-            snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match)
+            snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match, status="PLAN-STALE")
             if snap is not None:
                 return snap
         if not self._ever_tracked:
@@ -2278,22 +2275,34 @@ class ExploreController:
         pos = plan.get("pos")
         self._last_bump_anchor = list(pos) if pos is not None else None
 
-    def _maybe_loss_snapshot_backoff(self, plan, now, visual_match=None):
+    def _maybe_loss_snapshot_backoff(self, plan, now, visual_match=None, status=None):
         """Session 34, Idea B (Step 1) + session 35 ALT (Step 2/2c): the ONE-SHOT check at the instant a
         loss episode begins. Marks the one-shot spent immediately (so a LOST<->STALE flicker within the
         same episode can't fire twice), then runs a short decision tree and returns the (active, state,
         event) tuple to return immediately, or `None` if the caller should fall through to its normal
-        loss-entry behavior (REWIND/FALLBACK):
+        loss-entry behavior (REWIND/FALLBACK/plain hard-hover):
           Step 1 (geometric, UNCHANGED): a last-known-good clearance was cached (see `step()`'s per-tick
             cache) and it reads too close -> back off using that CACHED position (the live `plan['pos']` is
-            unavailable during a loss), exactly like ADVANCE's own clearance stand-off.
+            unavailable during a loss), exactly like ADVANCE's own clearance stand-off. Fires for ANY status.
           Step 2 (visual, session 35 ALT): Step 1 was inconclusive (clearance clear or never cached — the
             case geometry can't cover, e.g. SLAM never integrated the wall we flew into) -- a CONTAINED
             (zoomed-in crop) or PLANAR-LIKE (flat-surface) match of the live frame against F_LKG is the same
-            "too close" verdict, reusing the identical bump+BACKOFF action.
-          Step 2c (session 35 ALT): both loss-instant checks were inconclusive -- if
-            `use_visual_recovery_on_stale`, hand off to the 15° rotational visual probe (VISUAL_RECOVERY)
-            instead of falling straight to the blind FALLBACK sweep; otherwise return None as before.
+            "too close" verdict, reusing the identical bump+BACKOFF action. Also fires for ANY status --
+            both Step 1 and Step 2 are one-shot DEFENSIVE reactions to an already-known reading, not an
+            active search, so they stay available regardless of why perception went quiet.
+          Step 2c (session 35 ALT; session 42 scoped it to PLAN-STALE only): both loss-instant checks were
+            inconclusive -- if `use_visual_recovery_on_stale` AND `status == "PLAN-STALE"`, hand off to the
+            15° rotational visual probe (VISUAL_RECOVERY); otherwise return None (falls through to the
+            caller's plain hard-hover-hold). Diagnosed off two real flights (`20260721_233244`,
+            `20260722_124351`): every VISUAL_RECOVERY entry in both (62 total) was actually triggered by
+            PLAN-LOST, never PLAN-STALE, and every one reverted to HOLD_LOST one tick later (a separate,
+            now-fixed dispatch gap -- `_step_visual_recovery` was only ever reachable from PLAN-STALE's
+            `_step_stale`). PLAN-LOST/NO-PLAN means perception itself stopped publishing -- a throughput/
+            backlog problem (session 28 diagnosed exactly this: a synchronous SLAM solve blocking the loop
+            for 9-10s), not a "this viewpoint is confusing" problem -- so an active turn-search isn't a
+            coherent remedy and the operator's call is to always just hold still and wait for perception to
+            speak again. PLAN-STALE (perception alive, SLAM explicitly reports not-tracking) is the case
+            where a different viewpoint is a coherent remedy, and stays the only entry into the probe.
         Deliberately scoped to ONE attempt at the very first tick of the episode -- before that boundary
         nothing has moved yet, so the cached snapshot / F_LKG are trustworthy; ANY later tick could include
         motion from a reactive maneuver (BLIND_BACKOFF, etc.), which is why this is never re-tried
@@ -2333,6 +2342,11 @@ class ExploreController:
             self._enter("SETTLE", now)
             return {}, "SETTLE", (f"loss detected with a visual match against F_LKG ({kind}, "
                                   f"{visual_match.inliers} inliers) -> immediate standoff settle")
+        # Session 42: the active turn-search hand-off is PLAN-STALE-only (see the docstring's Step 2c) --
+        # a PLAN-LOST/NO-PLAN loss with both checks inconclusive falls through to the caller's plain
+        # hard-hover-hold instead, never spinning open-loop while perception itself is silent.
+        if status != "PLAN-STALE":
+            return None
         return self._enter_visual_recovery(now, "loss detected, clearance + visual loss-instant checks "
                                                  "both inconclusive -> 15° visual recovery probe")
 
@@ -2587,7 +2601,7 @@ class ExploreController:
                 # blind. Wait for perception to speak; the branch below (OK/STALE) then decides.
                 if st != "HOLD_LOST":
                     if not self._loss_snapshot_checked:
-                        snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match)
+                        snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match, status=status)
                         if snap is not None:
                             return snap
                     self._player = None
@@ -2673,21 +2687,39 @@ class ExploreController:
                 return reaction
             waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
             if not self.use_slam_stepback_on_slow:
-                # Session 35 default: SLAM has been slow (and the plan stayed OK -- LOST/STALE are handled
-                # at the step() top) for a sustained run. Stop waiting and force one hop toward the CURRENT
-                # goal instead, rather than holding indefinitely (or until the classic step-back's cap).
-                # Scoped to a plain mid-leg/post-turn slow hold ("ADVANCE" resume, not "SETTLE" -- a recovery
-                # settle hasn't earned trust yet) and `not self._recovering` (belt-and-suspenders: trust now
-                # clears at the settle-gate boundary above, so this should already always hold true here).
-                if (self._slam_resume == "ADVANCE" and not self._recovering and self._slam_slow
-                        and waited >= self.slam_slow_hop_after_s):
+                # Session 35 default, simplified session 43 (operator ask, off flight 20260723_000631: a
+                # recovery-settle SLAM_HOLD sat 31.5s with plan OK the whole time and never forced a hop,
+                # because the old condition below required `_slam_resume == "ADVANCE" and not self._recovering`
+                # -- scoping this rescue to a plain mid-leg slow hold only, never a post-loss recovery-settle
+                # hold). Operator's call: plan OK + still sitting in SLAM_HOLD past slam_slow_hop_after_s is
+                # the ONLY condition that matters -- PLAN-LOST/a slow settle-gate is a perception THROUGHPUT
+                # signal (session 28/42), not evidence the pose itself is wrong, so there's no principled
+                # reason to let a recovery-settle hold wait indefinitely while a plain slow hold gets rescued.
+                # Firing this now doubles as the trust-restoration boundary (mirrors exactly what the
+                # settle-gate-clear branch above does) so a forced hop never leaves `_recovering`/history state
+                # stuck as if still untrusted.
+                # ONE guard kept (caught by the HEIGHT RE-CALIB self-test, off a STUCK->SLAM_HOLD convergence
+                # with cap_ts NEVER fed): the timer alone can't tell "SLAM is slow but alive" from "SLAM has
+                # never produced a single genuinely-captured frame" -- a total capture blackout is a different,
+                # worse failure (perception saying NOTHING, not just something slow) and must never be papered
+                # over by a wall clock -- that's flying on zero live data. Require at least one entry in the
+                # current window to carry a real cap_ts (SLAM has told us SOMETHING, even if slow).
+                has_any_capture = any(cap_ts is not None for _, cap_ts in self._slam_hist)
+                if waited >= self.slam_slow_hop_after_s and has_any_capture:
+                    if self._recovering:
+                        self._recovering = False
+                        self._history_broken = False
+                        self._reset_fallback_sweep()
+                        self._reset_visual_recovery()
+                        self.command_history.clear()
+                    self._slam_resume = None
                     # NOTE: set the deadline AFTER _enter() -- "REPLAN" is not in _enter()'s ("ADVANCE",
                     # "ORIENT") exemption (it's a one-tick pass-through, not a state that itself spends the
                     # grace window), so setting it BEFORE would have it wiped by that same call.
                     self._enter("REPLAN", now)
                     self._slam_slow_hop_deadline = now + self.slam_slow_hop_grace_s
-                    return {}, "REPLAN", (f"SLAM still slow after {waited:.1f}s but plan OK -> forcing one "
-                                          f"hop toward the current goal (grace {self.slam_slow_hop_grace_s:.0f}s)")
+                    return {}, "REPLAN", (f"SLAM_HOLD still waiting after {waited:.1f}s but plan OK -> forcing "
+                                          f"one hop toward the current goal (grace {self.slam_slow_hop_grace_s:.0f}s)")
                 return {}, "SLAM_HOLD", None
             # Legacy (use_slam_stepback_on_slow=true): step one entry back through the rewind queue to
             # re-expose known-good geometry so the solve can re-lock. Re-arm needs another full run of slow
@@ -3625,77 +3657,34 @@ class ExploreController:
                              f"{self.slam_slow_ms:.0f}ms) + {self.settle_gate_s:.1f}s dwell -> {nxt}")
 
         elif st == "TRIM":
-            # GRADUAL HEIGHT TRIM (session 14, RESTORED session 21). Pitch the aim UP + push forward -> the drone
-            # flies toward the raised aim = a GRADUAL climb (joy_vertical is a discrete full-thrust axis; this is
-            # the fine, dose-able vertical primitive). The forward part is translation = SLAM parallax. Sub-phases:
-            #   (init/ring-gate) pick a safe direction to climb-FORWARD into: fwd open -> climb; else reposition
-            #     (reverse to open fwd room; else strafe to an open side) -> climb; else ring blocked -> abort.
-            #   REPOS -> short reverse/strafe to open forward room.  AIM -> hold pitch up (aim to highest).
-            #   FWD   -> forward push WITH pitch up (the climb); a wall/ram contact aborts it (Trap A: guards stay
-            #            active).  RESET -> pulse 'c' to reset the aim.  WAIT -> hold until a HEALTHY frame
-            #            CAPTURED >= _trim_cmd_t0 + trim_settle_s (review-C async-SLAM guard: cap_ts is compared
-            #            to the CLIMB-COMMAND instant on the same monotonic clock, so a stale pre-TRIM frame that
-            #            arrives out of order can never satisfy the gate), LOG the post-trim height, then re-aim
-            #            (ORIENT) at the PRESERVED goal.
-            ring = plan.get("clearance_ring")
-            clr = plan.get("forward_clearance_dist")
-            if self._trim_phase is None:                        # ring-gate on entry
-                def _open(c):    # None (unmapped near-field) == open room (the _pushable convention)
-                    return c is None or c > self.stop_clearance_dist
+            # GRADUAL HEIGHT TRIM (session 14, RESTORED session 21, VERTICAL PULSE session 40). A single short,
+            # full-magnitude joy_vertical pulse -- mirrors DOCK_FLOOR's already-proven pulse+settle-gate
+            # primitive (session 14's "vertical thrust chokes SLAM" finding was about a CONTINUOUS/un-gated
+            # push; a brief pulse followed by a real settle-gate, exactly what DOCK_FLOOR already does, is
+            # SLAM-safe). No forward/lateral room needed at all -- the old ring-gate/reposition machinery (and
+            # its "ring blocked -> skip trim (pray)" indefinite-retry abort, diagnosed off flight
+            # 20260722_124351) is gone entirely, not patched. Sub-phases: PULSE -> full joy_vertical for
+            # trim_pulse_s. WAIT -> hold until a HEALTHY frame CAPTURED >= _trim_cmd_t0 + trim_settle_s
+            # (review-C async-SLAM guard: cap_ts is compared to the PULSE-COMMAND instant on the same monotonic
+            # clock, so a stale pre-TRIM frame that arrives out of order can never satisfy the gate), LOG the
+            # post-trim height, then re-aim (ORIENT) at the PRESERVED goal.
+            if self._trim_phase is None:                        # lazy init on entry
                 self._trimming = True
-                left_c, right_c = self._ring_get(ring, -90.0), self._ring_get(ring, 90.0)
                 sag_ratio = ((self._trim_sag_y - self._ceiling_y) / self._trim_delta
                              if self._trim_delta else float("nan"))
-                if _open(clr):
-                    self._trim_repos_move, ring_txt = None, "fwd-open"
-                elif _open(self._ring_get(ring, 180.0)):
-                    self._trim_repos_move, ring_txt = {"reverse": self.reverse_throttle}, "reverse-to-open-fwd"
-                elif _open(left_c) or _open(right_c):
-                    # strafe toward the OPEN (roomier) side; joy_horizontal -1 = left, +1 = right.
-                    go_left = _open(left_c) and (not _open(right_c) or left_c is None
-                                                 or (right_c is not None and left_c >= right_c))
-                    sign = -1.0 if go_left else 1.0
-                    self._trim_repos_move = {"joy_horizontal": sign * self._strafe_mag}
-                    ring_txt = "strafe-left-to-open" if go_left else "strafe-right-to-open"
-                else:
-                    # Ring blocked all sides -> can't safely climb-forward. Abort (VISIBLE), resume the leg.
-                    event = (f"TRIM abort: sag pos_y={self._trim_sag_y:+.3f} (ratio {sag_ratio:.2f}) but ring "
-                             "blocked fwd+back+sides -> skip trim (pray); resume")
-                    event = self._trim_exit(now, plan, event)
-                    return active, self.state, event
-                self._trim_phase, self._trim_phase_t0 = ("REPOS" if self._trim_repos_move else "AIM"), now
+                self._trim_phase, self._trim_phase_t0 = "PULSE", now
                 if self._trim_dir == "UP":
                     event = (f"TRIM enter (UP): sag pos_y={self._trim_sag_y:+.3f} > desired "
                              f"{self._desired_y:+.3f} + {self.trim_sag_ratio - 1.0:.1f}*delta "
-                             f"(delta={self._trim_delta:.3f}, ratio {sag_ratio:.2f}) -> climb via {ring_txt}")
+                             f"(delta={self._trim_delta:.3f}, ratio {sag_ratio:.2f}) -> pulse up")
                 else:
                     event = (f"TRIM enter (DOWN): high pos_y={self._trim_sag_y:+.3f} < desired "
                              f"{self._desired_y:+.3f} - {self.trim_high_ratio:.1f}*delta "
-                             f"(delta={self._trim_delta:.3f}, ratio {sag_ratio:.2f}) -> descend via {ring_txt}")
-            elif self._trim_phase == "REPOS":
-                active = dict(self._trim_repos_move)
-                if (now - self._trim_phase_t0) >= self.trim_reposition_s:
-                    self._trim_phase, self._trim_phase_t0 = "AIM", now
-            elif self._trim_phase == "AIM":
-                # raise the aim to its highest (UP) or drop it to its lowest (DOWN — session 22 mirror)
-                active = {"pitch": (self.trim_pitch_up if self._trim_dir == "UP" else -self.trim_pitch_up)}
-                if (now - self._trim_phase_t0) >= self.trim_aim_s:
-                    self._trim_cmd_t0 = now                     # climb command issued (settle-gate origin, monotonic)
-                    self._trim_phase, self._trim_phase_t0 = "FWD", now
-            elif self._trim_phase == "FWD":
-                # forward push WITH pitch still aimed = fly toward the raised/lowered aim = gradual climb or
-                # descent. Trap A: a wall/ram contact aborts the push straight to RESET (guards stay ACTIVE).
-                active = dict(self.forward_preset)
-                active["trigger"] = self.trim_throttle
-                active["pitch"] = (self.trim_pitch_up if self._trim_dir == "UP" else -self.trim_pitch_up)
-                contact = wall_contact or (clr is not None and clr <= self.stop_clearance_dist)
-                if contact or (now - self._trim_phase_t0) >= self.trim_fwd_s:
-                    self._trim_phase, self._trim_phase_t0 = "RESET", now
-                    if contact:
-                        event = f"TRIM: contact during {self._trim_dir} push -> abort push -> reset aim"
-            elif self._trim_phase == "RESET":
-                active = {"btnCdown": True}                     # pulse 'c' to reset the aim/attitude
-                if (now - self._trim_phase_t0) >= self.trim_reset_s:
+                             f"(delta={self._trim_delta:.3f}, ratio {sag_ratio:.2f}) -> pulse down")
+            if self._trim_phase == "PULSE":
+                active = {"joy_vertical": -1 if self._trim_dir == "UP" else 1}   # -1 = up (camera Y down)
+                if (now - self._trim_phase_t0) >= self.trim_pulse_s:
+                    self._trim_cmd_t0 = now                     # pulse command issued (settle-gate origin, monotonic)
                     self._trim_phase, self._trim_phase_t0 = "WAIT", now
             else:   # WAIT: hold neutral until a fresh HEALTHY post-trim frame, then log + exit
                 cap_ts = plan.get("cap_ts")
@@ -5307,14 +5296,14 @@ def run_self_test(cfg):
 
     # (SESSION-17: the GRADUAL HEIGHT TRIM self-test was DELETED along with the TRIM feature.)
 
-    # ---- Map mode: GRADUAL HEIGHT TRIM (session 14, restored 21) — sag trigger, ring-gate, climb, WAIT, goal keep ----
+    # ---- Map mode: GRADUAL HEIGHT TRIM (session 14, restored 21, VERTICAL PULSE session 40) — sag trigger,
+    #      pulse, WAIT, goal keep ----
     def _mk_trim():
         c = ExploreController(cfg, no_takeoff=True)
         c._ceiling_y, c._desired_y, c._trim_delta = -2.3, -1.9, 0.4   # threshold = -2.3 + 1.2*0.4 = -1.82
-        c.trim_aim_s = c.trim_fwd_s = 0.1
-        c.trim_reset_s, c.trim_reposition_s, c.trim_settle_s = 0.05, 0.1, 0.2
+        c.trim_pulse_s, c.trim_settle_s = 0.05, 0.2
         c.settle_gate_s = 0.05          # session 28: TRIM_RESUME_WAIT's gate -- independent of rest_between_s
-        c.settle_fresh_frames = 3       # shorten the post-abort/post-climb wait loops below
+        c.settle_fresh_frames = 3       # shorten the post-pulse wait loops below
         return c
 
     def _tplan(posy, pos=(0.0, 0.0), fcd=5.0, ring=None, cap=0.0, fid=1, goal=(3.0, 0.0),
@@ -5356,59 +5345,50 @@ def run_self_test(cfg):
     td = _mk_trim(); td._enter("ORIENT", 0.0); td.leg_goal = [3.0, 0.0]; td._player = td._build_turn(0.0)
     _, sD, _ = td.step(0.0, _tplan(-1.7), False)
     suppress_ok = (sC != "TRIM" and sD != "TRIM")
-    # (c) ring-gate: fwd blocked + back open -> REPOS reverse (active emitted the tick after the gate).
-    tr = _mk_trim(); tr._enter("ADVANCE", 0.0); tr.leg_goal = [3.0, 0.0]
-    rp = _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 5.0], [90.0, 0.3], [-90.0, 0.3]])
-    tr.step(0.0, rp, False); ar, _, _ = tr.step(0.02, rp, False)
-    repos_rev = (tr._trim_phase in ("REPOS", "AIM") and float(ar.get("reverse", 0.0)) > 0.0)
-    # (d) fwd+back blocked but a SIDE open -> strafe reposition.
-    ts = _mk_trim(); ts._enter("ADVANCE", 0.0); ts.leg_goal = [3.0, 0.0]
-    ts.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 5.0], [-90.0, 0.3]]), False)
-    strafe_repos = (ts._trim_repos_move is not None and "joy_horizontal" in ts._trim_repos_move)
-    # (e) ring blocked all sides -> abort (VISIBLE) -> TRIM_RESUME_WAIT (session 28: gated on a fresh
-    #     post-abort frame, not instant) -> once the settle-gate clears, re-aims ORIENT at the PRESERVED goal.
-    tz = _mk_trim(); tz._enter("ADVANCE", 0.0); tz.leg_goal = [3.0, 0.0]
-    _, sZ0, evZ0 = tz.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]],
-                                       cap=0.0, fid=1), False)
-    abort_gated = (sZ0 == "TRIM_RESUME_WAIT" and "abort" in (evZ0 or ""))
-    _, sZ, evZ = _run_trim_resume_wait(tz, 0.02, 0.02, 2)
-    abort_ok = (abort_gated and sZ == "ORIENT" and tz.leg_goal == [3.0, 0.0])
-    # (f) full climb: emits pitch-up -> forward push (WITH trigger_down derived at the choke point — Unity gates
-    #     real thrust on the boolean) -> 'c' reset; WAIT holds until cap_ts >= t0+settle (review-C: the gate is
+    # (c) full pulse: emits a full-magnitude joy_vertical pulse (UP -> -1) for trim_pulse_s -- no ring/clearance
+    #     check at all, so a ring blocked on EVERY side (the exact 20260722_124351 scenario) must still pulse
+    #     normally instead of aborting. WAIT holds until cap_ts >= t0+settle (review-C: the gate is
     #     phase-relative, so a stale pre-TRIM frame can't exit early); TRIM's own exit then hands off to
     #     TRIM_RESUME_WAIT (session 28), which re-aims ORIENT at the preserved goal once ITS OWN settle-gate
     #     (a fresh frame captured after the exit) clears.
     te = _mk_trim(); te._enter("ADVANCE", 0.0); te.leg_goal = [3.0, 0.0]
-    saw_pitch = saw_fwd = saw_c = fwd_gated = False
+    blocked_ring = [[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]]   # blocked on all 4 sides
+    saw_up_pulse, no_abort = False, True
     tt, cap, fid, mid = 0.0, 0.0, 1, None
     for _ in range(300):
-        aE, sE, _ = te.step(tt, _tplan(-1.7, cap=cap, fid=fid), False)
-        if float(aE.get("pitch", 0.0)) != 0.0:
-            saw_pitch = True
-        if float(aE.get("trigger", 0.0) or 0.0) > 0.0:
-            saw_fwd = True
-            # operator ask: the TRIM climb push must engage triggerDown (derived centrally in _full_vector).
-            fwd_gated = _full_vector(aE, 0, tt, sE)["trigger_down"] is True
-        if aE.get("btnCdown"):
-            saw_c = True
+        aE, sE, evE = te.step(tt, _tplan(-1.7, fcd=0.3, ring=blocked_ring, cap=cap, fid=fid), False)
+        if int(aE.get("joy_vertical", 0)) == -1:            # -1 = up (camera Y down)
+            saw_up_pulse = True
+        if evE and "abort" in evE:
+            no_abort = False
         if sE != "TRIM":
             mid = sE; break
         tt += 0.02; cap += 0.02; fid += 1
     climb_wait_gated = (mid == "TRIM_RESUME_WAIT")
     _, final, _ = _run_trim_resume_wait(te, tt + 0.02, cap + 0.02, fid + 1)
-    climb_ok = (saw_pitch and saw_fwd and fwd_gated and saw_c and climb_wait_gated
+    climb_ok = (saw_up_pulse and no_abort and climb_wait_gated
                 and final == "ORIENT" and te.leg_goal == [3.0, 0.0])
     tw = _mk_trim(); tw._enter("TRIM", 0.0); tw._trim_phase = "WAIT"; tw._trim_cmd_t0 = 0.0
     tw._trim_resume_goal = [3.0, 0.0]; tw._trimming = True
     _, sW, _ = tw.step(1.0, _tplan(-1.7, cap=None), False)           # cap_ts None -> not ready -> hold
     wait_hold = (sW == "TRIM")
+    def _run_trim_to_exit(c, t0, cap0, fid0, max_ticks=30):
+        """Step `c` (freshly entered TRIM) forward until its PULSE+WAIT cycle completes and it hands off to
+        TRIM_RESUME_WAIT. Returns (t, cap, fid, state) at that point (or after max_ticks)."""
+        tt, cap, fid, s = t0, cap0, fid0, c.state
+        for _ in range(max_ticks):
+            _, s, _ = c.step(tt, _tplan(-1.7, cap=cap, fid=fid), False)
+            if s == "TRIM_RESUME_WAIT":
+                break
+            tt += 0.02; cap += 0.02; fid += 1
+        return tt, cap, fid, s
     # (g) session 28: the preserved goal died (permanently blacklisted) WHILE TRIM was interrupting the leg
     #     -> TRIM_RESUME_WAIT must NOT blindly restore it -> falls through to SETTLE->REPLAN instead.
     tg = _mk_trim(); tg._enter("ADVANCE", 0.0); tg.leg_goal = [3.0, 0.0]
-    _, sG0, evG0 = tg.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]],
-                                       cap=0.0, fid=1), False)
+    tg.step(0.0, _tplan(-1.7, cap=0.0, fid=1), False)   # fire TRIM
+    ttg, capg, fidg, sG0 = _run_trim_to_exit(tg, 0.02, 0.02, 2)
     gated_g = (sG0 == "TRIM_RESUME_WAIT")
-    _, sG, evG = _run_trim_resume_wait(tg, 0.02, 0.02, 2,
+    _, sG, evG = _run_trim_resume_wait(tg, ttg + 0.02, capg + 0.02, fidg + 1,
                                        blacklist=[[3.0, 0.0]], blacklist_permanent=[True])
     blacklist_reroute_ok = (gated_g and sG == "SETTLE" and tg._settle_to == "REPLAN"
                             and tg.leg_goal == [3.0, 0.0]     # leg_goal untouched (never re-restored)
@@ -5416,18 +5396,17 @@ def run_self_test(cfg):
     # (h) same setup, but the goal is only SOFT-blacklisted (not permanent) -> still restored normally
     #     (only a PERMANENT kill should stop the restore -- a soft/round exclusion may clear next round).
     th = _mk_trim(); th._enter("ADVANCE", 0.0); th.leg_goal = [3.0, 0.0]
-    th.step(0.0, _tplan(-1.7, fcd=0.3, ring=[[0.0, 0.3], [180.0, 0.3], [90.0, 0.3], [-90.0, 0.3]],
-                        cap=0.0, fid=1), False)
-    _, sH, _ = _run_trim_resume_wait(th, 0.02, 0.02, 2,
+    th.step(0.0, _tplan(-1.7, cap=0.0, fid=1), False)   # fire TRIM
+    tth, caph, fidh, _ = _run_trim_to_exit(th, 0.02, 0.02, 2)
+    _, sH, _ = _run_trim_resume_wait(th, tth + 0.02, caph + 0.02, fidh + 1,
                                      blacklist=[[3.0, 0.0]], blacklist_permanent=[False])
     soft_blacklist_still_restores = (sH == "ORIENT" and th.leg_goal == [3.0, 0.0])
-    trim_ok = (trig_adv and no_trig and none_guard and suppress_ok and repos_rev and strafe_repos and abort_ok
+    trim_ok = (trig_adv and no_trig and none_guard and suppress_ok
                and climb_ok and wait_hold and blacklist_reroute_ok and soft_blacklist_still_restores)
     ok = ok and trim_ok
     print(f"[self-test] {'PASS' if trim_ok else 'FAIL'}  explore HEIGHT-TRIM (sag->TRIM+goal-snapshot+hop-eval-clear="
           f"{trig_adv}, no-sag={no_trig}, None-refs-no-op={none_guard}, calib/state-suppress={suppress_ok}, "
-          f"reverse-repos={repos_rev}, strafe-repos={strafe_repos}, ring-blocked-abort(gated)={abort_ok}, "
-          f"climb pitch/fwd+triggerDown/c+re-aim(gated)={climb_ok}, cap-None-holds={wait_hold}, "
+          f"vertical pulse even with ring blocked all sides+re-aim(gated)={climb_ok}, cap-None-holds={wait_hold}, "
           f"perm-blacklist->settle-replan={blacklist_reroute_ok}, "
           f"soft-blacklist-still-restores={soft_blacklist_still_restores})")
 
@@ -5477,23 +5456,22 @@ def run_self_test(cfg):
           f"never-calibrated allowed={recal_none_ok}, post-calib resume theta~0 'c'-only={resume_smooth})")
 
     # ---- (session 22) BIDIRECTIONAL TRIM + SLAM-COMFORT GATE + fixed height reference ----
-    # (a) TRIM DOWN: glued near the ceiling (pos_y < desired - 0.2*delta) -> TRIM with a POSITIVE pitch (aim
-    #     DOWN, since trim_pitch_up=-1) through AIM/FWD; the preserved goal is re-aimed on exit. An IN-BAND
-    #     pos_y fires NEITHER direction.
+    # (a) TRIM DOWN: glued near the ceiling (pos_y < desired - 0.2*delta) -> TRIM pulses joy_vertical=+1 (DOWN,
+    #     session 40); the preserved goal is re-aimed on exit. An IN-BAND pos_y fires NEITHER direction.
     tdn = _mk_trim(); tdn._enter("ADVANCE", 0.0); tdn.leg_goal = [3.0, 0.0]
     _, sDn, evDn = tdn.step(0.0, _tplan(-2.05), False)     # high thr = -1.9 - 0.2*0.4 = -1.98; -2.05 < -1.98 -> DOWN
     down_fired = (sDn == "TRIM" and tdn._trim_dir == "DOWN" and "(DOWN)" in (evDn or ""))
-    saw_down_pitch, tt, cap, fid, mid_dn = False, 0.02, 0.02, 1, None
+    saw_down_pulse, tt, cap, fid, mid_dn = False, 0.02, 0.02, 1, None
     for _ in range(300):
         aD, sD2, _ = tdn.step(tt, _tplan(-2.05, cap=cap, fid=fid), False)
-        if float(aD.get("pitch", 0.0)) > 0.0:              # +1.0 = aim DOWN
-            saw_down_pitch = True
+        if int(aD.get("joy_vertical", 0)) == 1:            # +1 = down (camera Y down)
+            saw_down_pulse = True
         if sD2 != "TRIM":
             mid_dn = sD2; break
         tt += 0.02; cap += 0.02; fid += 1
     # session 28: TRIM's exit hands off to TRIM_RESUME_WAIT (gated re-aim); resolve it here too.
     _, final_dn, _ = _run_trim_resume_wait(tdn, tt + 0.02, cap + 0.02, fid + 1)
-    down_ok = (down_fired and saw_down_pitch and mid_dn == "TRIM_RESUME_WAIT"
+    down_ok = (down_fired and saw_down_pulse and mid_dn == "TRIM_RESUME_WAIT"
                and final_dn == "ORIENT" and tdn.leg_goal == [3.0, 0.0])
     tin = _mk_trim(); tin._enter("ADVANCE", 0.0); tin.leg_goal = [3.0, 0.0]
     _, sIn, _ = tin.step(0.0, _tplan(-1.9), False)          # exactly desired -> inside the band
@@ -5566,7 +5544,7 @@ def run_self_test(cfg):
     warn_ok = (n1 is not None and "DISAGREEMENT" in n1 and cw.take_notice() is None)
     s22_ok = down_ok and band_ok and gate_ok and default_off and latch_ok and ydrift_ok and warn_ok and override_ok
     ok = ok and s22_ok
-    print(f"[self-test] {'PASS' if s22_ok else 'FAIL'}  SESSION-22 (TRIM DOWN fires+pitch+re-aim={down_ok}, "
+    print(f"[self-test] {'PASS' if s22_ok else 'FAIL'}  SESSION-22 (TRIM DOWN fires+pulse+re-aim={down_ok}, "
           f"in-band no-fire={band_ok}, comfort gate hold/timeout/release={gate_ok}, re-tap default OFF="
           f"{default_off}, PASS latches target+drift baseline={latch_ok}, Y-DRIFT audit line={ydrift_ok}, "
           f"median-disagreement notice={warn_ok}, desired-height override (session 38)={override_ok})")
@@ -6761,7 +6739,8 @@ def run_self_test(cfg):
     reached_a, tb, fb = _drive_to_advance(c35a)
     saw_stepback_a, saw_hop_a = False, False
     for _ in range(15):
-        _a, s, _ = c35a.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        _a, s, _ = c35a.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0, cap_ts=tb), False, status="OK")
+        tb += 0.05; fb += 1
         if s == "SLAM_STEPBACK":
             saw_stepback_a = True
         if s == "REPLAN":
@@ -6777,7 +6756,8 @@ def run_self_test(cfg):
     reached_b, tb, fb = _drive_to_advance(c35b)
     saw_replan_b, saw_stepback_b = False, False
     for _ in range(15):
-        _a, s, _ = c35b.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        _a, s, _ = c35b.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0, cap_ts=tb), False, status="OK")
+        tb += 0.05; fb += 1
         if s == "REPLAN":
             saw_replan_b = True
             break
@@ -6786,20 +6766,28 @@ def run_self_test(cfg):
             break
     legacy_never_hops_ok = reached_b and saw_stepback_b and not saw_replan_b
 
-    # (c) the forced hop fires only for a plain mid-leg/post-turn hold (`_slam_resume == "ADVANCE"`) -- NOT
-    #     for a recovery-settle hold (`_slam_resume == "SETTLE"`), even well past slam_slow_hop_after_s.
+    # (c) session 43 (operator ask, off flight 20260723_000631): the forced hop now ALSO fires for a
+    #     recovery-settle hold (`_slam_resume == "SETTLE"`, `_recovering=True`) -- not just a plain
+    #     ADVANCE-resume hold -- since a slow settle-gate under plan OK is a throughput signal (session
+    #     28/42), not evidence the pose itself is wrong. Firing it must ALSO clear `_recovering`/history
+    #     state, mirroring the normal settle-gate-clear trust-restoration (so a forced hop never leaves
+    #     the flight permanently "untrusted").
     c35c = ExploreController(cfg, no_takeoff=True)
     c35c.slam_slow_hop_after_s = 0.05
+    c35c._recovering = True
+    c35c._history_broken = True
+    c35c.command_history.append(("fwd", 1.0))
     c35c._enter("HOLD_LOST", 0.0)
-    _a, s_c, _ = c35c.step(0.0, dict(padv35, frame_id=1, slam_ms=1500.0), False, status="OK")
+    _a, s_c, _ = c35c.step(0.0, dict(padv35, frame_id=1, slam_ms=1500.0, cap_ts=0.0), False, status="OK")
     resume_settle_ok = (s_c == "SLAM_HOLD" and c35c._slam_resume == "SETTLE")
     saw_hop_c, t = False, 0.05
     for i in range(2, 12):
-        _a, s, _ = c35c.step(t, dict(padv35, frame_id=i, slam_ms=1500.0), False, status="OK"); t += 0.05
+        _a, s, _ = c35c.step(t, dict(padv35, frame_id=i, slam_ms=1500.0, cap_ts=t), False, status="OK"); t += 0.05
         if s == "REPLAN":
             saw_hop_c = True
             break
-    recovery_never_hops_ok = resume_settle_ok and not saw_hop_c
+    recovery_now_hops_ok = (resume_settle_ok and saw_hop_c and not c35c._recovering
+                            and not c35c._history_broken and len(c35c.command_history) == 0)
 
     # (d) grace-window leak fix: a physical guard (clearance stand-off) cutting the forced hop short into
     #     BACKOFF must clear `_slam_slow_hop_deadline` immediately -- a LATER, unrelated ADVANCE (still slow)
@@ -6809,11 +6797,13 @@ def run_self_test(cfg):
     c35d.slam_slow_hop_grace_s = 5.0
     reached_d, tb, fb = _drive_to_advance(c35d)
     for _ in range(15):     # go slow -> SLAM_HOLD(resume=ADVANCE) -> waited>=0.05s -> forces the hop (REPLAN)
-        _a, s, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        _a, s, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0, cap_ts=tb), False, status="OK")
+        tb += 0.05; fb += 1
         if s == "REPLAN":
             break
     for _ in range(15):     # drive REPLAN -> ORIENT -> ADVANCE (still slow, riding the grace bypass)
-        _a, s, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0), False, status="OK"); tb += 0.05; fb += 1
+        _a, s, _ = c35d.step(tb, dict(padv35, frame_id=fb, slam_ms=1500.0, cap_ts=tb), False, status="OK")
+        tb += 0.05; fb += 1
         if s == "ADVANCE":
             break
     deadline_active_ok = (c35d._slam_slow_hop_deadline is not None and tb < c35d._slam_slow_hop_deadline
@@ -6831,11 +6821,13 @@ def run_self_test(cfg):
     no_leak_ok = (s_new == "SLAM_HOLD")
 
     grace_leak_ok = (deadline_active_ok and backoff_ok and deadline_cleared_ok and no_leak_ok)
-    switch_ok = default_hops_ok and legacy_never_hops_ok and recovery_never_hops_ok and grace_leak_ok
+    switch_ok = default_hops_ok and legacy_never_hops_ok and recovery_now_hops_ok and grace_leak_ok
     ok = ok and switch_ok
-    print(f"[self-test] {'PASS' if switch_ok else 'FAIL'}  SLAM-slow strategy switch (session 35) "
-          f"(default->hop-not-stepback={default_hops_ok}, stepback-mode->never-hops={legacy_never_hops_ok}, "
-          f"recovery-settle-never-hops={recovery_never_hops_ok}, grace-window-leak-fix={grace_leak_ok})")
+    print(f"[self-test] {'PASS' if switch_ok else 'FAIL'}  SLAM-slow strategy switch (session 35, "
+          f"simplified session 43) (default->hop-not-stepback={default_hops_ok}, "
+          f"stepback-mode->never-hops={legacy_never_hops_ok}, "
+          f"recovery-settle-now-hops-and-restores-trust={recovery_now_hops_ok}, "
+          f"grace-window-leak-fix={grace_leak_ok})")
 
     # ---- Session 34: proactive clearance checks that don't wait for ADVANCE to re-check ----
     # (a) Idea B: a fresh PLAN-LOST with a cached close last-good clearance -> immediate BACKOFF, using the
@@ -6988,13 +6980,27 @@ def run_self_test(cfg):
     clearance_wins_first_ok = (s_vc == "BACKOFF" and ev_vc is not None and "stale pose" in ev_vc)
 
     # (d) both loss-instant checks inconclusive (clear cache + no visual match) -> hands off into the 15°
-    #     VISUAL_RECOVERY probe (not straight to FALLBACK) since the flag is on.
+    #     VISUAL_RECOVERY probe (not straight to FALLBACK) since the flag is on -- PLAN-STALE only.
     cvd = ExploreController(cfg_vr, no_takeoff=True); cvd._ever_tracked = True
     cvd.leg_goal = [5.0, 5.0]
     cvd.step(0.0, p_clear, False, status="OK")
     _a, s_vd, ev_vd = cvd.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_none)
     probe_entered_ok = (s_vd == "VISUAL_RECOVERY" and cvd._visrec_phase == "TURN"
                         and ev_vd is not None and "probe" in ev_vd.lower())
+
+    # (d2) session 42: the SAME both-inconclusive setup, but under PLAN-LOST (perception itself silent,
+    #      e.g. a slow-solve backlog) instead of PLAN-STALE -- must NOT hand off into VISUAL_RECOVERY;
+    #      falls straight through to the plain HOLD_LOST hard-hover-hold instead. Diagnosed off two real
+    #      flights where every VISUAL_RECOVERY entry (62 total) came from PLAN-LOST and reverted to
+    #      HOLD_LOST one tick later anyway (`_step_visual_recovery` was never reachable from PLAN-LOST) --
+    #      this test locks in the fix as the honest, intentional behavior instead of an accidental one-tick
+    #      log artifact.
+    cvd2 = ExploreController(cfg_vr, no_takeoff=True); cvd2._ever_tracked = True
+    cvd2.leg_goal = [5.0, 5.0]
+    cvd2.step(0.0, p_clear, False, status="OK")
+    _a, s_vd2, ev_vd2 = cvd2.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_none)
+    plan_lost_no_probe_ok = (s_vd2 == "HOLD_LOST" and ev_vd2 is not None
+                             and "HARD HOVER-HOLD" in ev_vd2)
 
     def _drive_visrec_turn(ctrl, t0, fid0):
         """Step an in-progress VISUAL_RECOVERY controller through its current TURN sub-phase (turn player +
@@ -7094,12 +7100,13 @@ def run_self_test(cfg):
     regression_off_ok = (s_vj == "HOLD_LOST")
 
     visrec_ok = (visual_contained_ok and visual_planar_ok and clearance_wins_first_ok and probe_entered_ok
-                and turn_reached_match_ok and match_closer_backoff_ok and wait_recover_ok
-                and wait_timeout_stuck_ok and exhausted_fallback_ok and regression_off_ok)
+                and plan_lost_no_probe_ok and turn_reached_match_ok and match_closer_backoff_ok
+                and wait_recover_ok and wait_timeout_stuck_ok and exhausted_fallback_ok and regression_off_ok)
     ok = ok and visrec_ok
     print(f"[self-test] {'PASS' if visrec_ok else 'FAIL'}  VISUAL RECOVERY 15° probe (session 35 ALT) "
           f"(loss-instant contained={visual_contained_ok}, loss-instant planar={visual_planar_ok}, "
           f"clearance-wins-first={clearance_wins_first_ok}, probe-entered={probe_entered_ok}, "
+          f"plan-lost-no-probe={plan_lost_no_probe_ok}, "
           f"turn->match={turn_reached_match_ok}, match-closer->backoff={match_closer_backoff_ok}, "
           f"wait-recover-breaks-on-ok={wait_recover_ok}, wait-timeout->stuck={wait_timeout_stuck_ok}, "
           f"exhausted->fallback={exhausted_fallback_ok}, flag-off-regression={regression_off_ok})")

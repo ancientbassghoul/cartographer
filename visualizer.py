@@ -87,12 +87,13 @@ def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
 
 def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
-    FSM state, current vs. desired (autopilot-locked) height, and plan status, so the operator
-    always has these visible instead of only on the map's transient overlay text. `control` is
-    the latest TOPIC_CONTROL payload (autopilot -> io_bridge, state + target_altitude_y); `plan`
-    is the latest TOPIC_PLAN payload (perception_worker, pos_y + plan-status fields). NO SILENT
-    FALLBACK: an unavailable reading prints as `--`, never a stale or guessed number, and the
-    whole panel says so explicitly if autopilot.py isn't running at all."""
+    FSM state, current vs. desired (autopilot-locked) height, plan status, and (while the plan is
+    valid) live straight-line distance to the current goal, so the operator always has these
+    visible instead of only on the map's transient overlay text. `control` is the latest
+    TOPIC_CONTROL payload (autopilot -> io_bridge, state + target_altitude_y); `plan` is the
+    latest TOPIC_PLAN payload (perception_worker, pos_y + pos/goal + plan-status fields). NO
+    SILENT FALLBACK: an unavailable reading prints as `--`, never a stale or guessed number, and
+    the whole panel says so explicitly if autopilot.py isn't running at all."""
     if control is None:
         return _placeholder(w, h, "waiting for autopilot on the control bus ...")
     panel = np.full((h, w, 3), 30, np.uint8)
@@ -124,6 +125,10 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
                     f"bearing_err={be if be is not None else '--'}  "
                     f"clear={f'{clr:.2f}u' if clr is not None else '--'}",
                     (8, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        pos, goal = plan.get("pos"), plan.get("goal")
+        dg = f"{np.hypot(pos[0] - goal[0], pos[1] - goal[1]):.2f}u" if pos is not None and goal is not None else "--"
+        cv2.putText(panel, f"GOAL     dist={dg}", (8, 146),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
     return panel
 
 
