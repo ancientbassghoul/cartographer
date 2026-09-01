@@ -437,6 +437,17 @@ class Pipeline:
         payload["corner_span_half"] = span_half
         # Goal selection (blacklisting is event-driven via note_wall_hit in run(), NOT a per-select timer).
         goal, n_frontiers, done = self.planner.select(fr, pos, heading_deg, sweep_corners=corners)
+        # Session 45: surface any selection-time rejections (the "already standing on it" too-close drop) as a
+        # planner_event, so they land in the console + the timeline/flight_replay debugger instead of being a
+        # silent candidate drop. Drained here (not in run()'s autopilot-event loop, which only ticks when an
+        # autopilot event arrives) because select() runs on every plan publish. NOTE the ordering: this queues
+        # into last_planner_event, which _consume_planner_event() already read earlier in THIS payload -- so
+        # like the bump receipts, the line rides the FIRST plan AFTER the select that produced it.
+        if self.planner.last_select_events:
+            for _sev in self.planner.last_select_events:
+                self.last_planner_event.append(_sev)
+                print(f"[perception] planner: {_sev}", flush=True)
+            self.planner.last_select_events = []
         payload["n_blacklisted"] = len(self.planner._blacklist)
         payload["blacklist"] = self.planner.blacklist_points()
         payload["blacklist_permanent"] = self.planner.blacklist_permanent()

@@ -1,7 +1,267 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-09-01** (sessions 40-43 **LIVE-FLY CONFIRMED — tolerable overall; HEIGHT still
-open, see "Next"**). Resume from THIS file. Session 43 simplified the `SLAM_HOLD` forced-hop rule
+_Last updated **2026-09-01** (branch **`all-bets-are-off`**, sessions 49-51 **BUILT — self-tests ALL
+GREEN (0 failures), LIVE-FLY PENDING**; `main` unaffected)._
+
+_**Sessions 50-51 — the 91.6-second SETTLE, and two dead ends on the SLAM choke (BUILT, live-fly
+PENDING).** Flight `20260901_172217`. The operator flew sessions 47-49, confirmed the back-off works,
+then flagged two things. First: **the drone sat in `SETTLE` for 91.6 seconds** (3531 ticks) with plan
+status `OK` the entire time. SLAM was alive and tracking, just slow — 42 frames, min 1834ms, max
+2093ms, **mean 1995ms, ZERO under `slam_slow_ms` (1000)**. The settle-gate needs 6 CONSECUTIVE frames
+under that bar, so at 2x over it was **arithmetically unreachable**; meanwhile frames arriving every
+~2.2s stayed comfortably inside `plan_timeout_s` (3.0s), so the status never went LOST either. A
+**dead band between two thresholds**: too slow to proceed, too alive to be rescued. `SETTLE`'s own
+comment named the assumption that failed — "if SLAM stops delivering, the plan status goes STALE/LOST
+and the step() top diverts to recovery" — but SLAM never stopped delivering. Unlike `ORIENT`/`ADVANCE`
+(which divert to `_enter_slam_hold` on `_slam_slow`) and `SLAM_HOLD`/`TRIM_RESUME_WAIT` (which both
+have a forced-resolve rescue), `SETTLE` had no upper bound at all; it escaped only by accident when one
+3.006s inter-frame gap finally tripped `PLAN-LOST`. Same bug class session 44 fixed for
+`TRIM_RESUME_WAIT` and never applied here. Built session 43's rule verbatim into `SETTLE` — plan OK +
+stuck past `slam_slow_hop_after_s` (reusing the knob, not adding one) -> proceed anyway, loudly —
+keeping `SLAM_HOLD`'s capture-blackout guard (a wall clock must not paper over perception producing
+NOTHING) and its `_enter`-then-stamp ordering trap for the hop grace. Deliberately NOT a divert to
+`SLAM_HOLD`: `SETTLE` is often entered FROM it, so that would ping-pong at tick rate. **Second**, the
+operator asked what in the autopilot chokes SLAM — and the answer, measured, is **nothing**: the loop
+ran at **38.5Hz through the entire wedge**, 38.6Hz in `SLAM_HOLD`, 32Hz in a SIFT-heavy `HOLD_LOST`.
+The Unity-focus theory (SLAM ran ~350ms unfocused vs ~2000ms focused, and Unity throttles rendering
+when it loses focus) looked decisive and was **tested and ruled out — SLAM re-chokes ~2 frames after
+refocus**; the log had already undercut it (SLAM recovered BEFORE the pause, degraded to 1767ms DURING
+it with the autopilot idle, mean 734ms not 350ms across the paused window; and the by-state
+correlation is reverse causality — slow SLAM is what PUTS the drone in `SETTLE`/`SLAM_HOLD`). **The
+choke is still undiagnosed and open.** What the measurement DID turn up is self-inflicted waste: the
+visual match ran on EVERY tick of a loss — **~380 full SIFT+BFMatcher+RANSAC passes across session
+48's 12s grace to make ONE decision** (the `[VISREC]` log is throttled to 0.5s, which hid it; the
+computation never was), and `match()` recomputed SIFT on the REFERENCE frame every call even though
+F_LKG is frozen for the whole loss. The consumers turned out to be exactly two, both already guarded
+(`_maybe_loss_snapshot_backoff` under `not _loss_snapshot_checked` at both call sites, and the probe's
+`MATCH` phase), so: **GATE A** (`wants_visual_match()`, exact, zero staleness) skips ticks nothing can
+read — with the trap that `_loss_snapshot_checked` is False throughout healthy flight, so it must
+AND-narrow the status condition, never replace it, or it would run SIFT on every tracking frame;
+**GATE B** memoises across the held-still grace (`visrec_match_min_interval_s`=0.5) with forced
+recomputes on the loss edge, the probe's MATCH phase, any commanded motion, and a replaced F_LKG;
+plus a **lazy `_lkg_feats` memo** so the reference's SIFT is computed once per reference (flagged on
+the TUPLE slot, since a featureless frame legitimately yields `(kp, None)` and would otherwise
+recompute forever). Measured: a 12s held-still loss now costs **24 real matches over 384 ticks**,
+was 384. **Expected to change nothing about SLAM** — it is hygiene, judged as such. Every new
+behaviour proven against its own defect by reverting on a scratch copy, and **that exercise caught a
+weak test of mine**: the first GATE A assertion used a fresh memo, so GATE B's rate-limit returned
+False anyway and masked the missing gate — the revert PASSED when it should have failed; re-asserted
+with no/stale memo so it isolates GATE A. `python autopilot.py --self-test`, `visual_recovery.py`,
+`flight_replay.py`, `frontier_planner.py`: **ALL PASS, 0 failures**; `perception_worker.py` (venv):
+PASS. See `plans/session50-settle-dead-band-escape.md` and
+`plans/session51-visual-match-on-demand.md`. **NEXT = LIVE-FLY.**_
+
+_**Session 49 — the same wall, five legs, one wasted 8 minutes: goal stagnation memory finally wired
+up, plus an LKG debug window (BUILT, live-fly PENDING).** Sessions 47/48 flew — back-off is confirmed
+working, operator's own call. He then flagged the SAME flight's tail: a goal near a wall got bumped
+and backed off cleanly around `15:49:11`, then at `15:50:14.315` the drone picked a new goal SO close
+to the last one he asked "haven't we fixed that like a thousand times?" and "don't we blacklist after
+a few picks — how many?" Traced flight `20260901_154648`: the drone launched **five separate legs at
+the same physical wall** between `15:48:47`-`15:50:52`, retired only at `15:57:27` (~8 minutes, ~40
+losses later). No single "N picks" answer exists — three guards, each with a second condition, were
+ALL structurally starved: **(1)** the STALL guard needs a *judged* hop, but `_enter("HOLD_LOST"/
+"SLAM_HOLD")` clears the pending judgement on every plan-loss (`autopilot.py:2280`) — whole flight,
+**7 `HOP_BASELINE`, 2 `HOP_JUDGE`**, zero strikes ever accrued; **(2)** the LOOP guard's history was
+split in two — the commitment follows a live frontier centroid at `goal_assoc_dist` (1.0u) but the
+goals-DB disc was frozen at `goal_area_radius` (0.5u) around its CREATION point, so one wall drifting
+0.60u ended the flight as TWO discs, `[-2.05,2.303] picks=3 bumps=1` and `[-2.5,2.7] picks=2`, neither
+reaching its own threshold; **(3)** per-hop "progress" was a lie — every leg read as closing distance
+(3.85→2.99→1.68→3.55→2.21) because the SLAM pose jumped BACKWARDS between legs; only a best-EVER test
+sees the truth (never closer than 1.68u after leg 3), and `_best_dist` — the field whose own
+docstring already said "closest distance achieved toward the current committed goal" — was read and
+reset in three places and **written in none**. A third, distinct starvation class, not a regression
+of session 33 or 45. Built two fixes in `frontier_planner.py`: a goals-DB disc's `center` now FOLLOWS
+its goal (bounded by a new `goal_disc_max_drift`=0.75u measured from an immutable `origin`, kept
+strictly below `goal_blacklist_radius` by a fail-fast `ValueError` so a fully-drifted disc's origin
+stays inside its own exclusion ball) — unifying that one wall into ONE disc; and `_best_dist` finally
+gets WRITTEN at the commit site, feeding a new `goal_stagnant_limit`=2 (consecutive legs with no new
+closest approach → permanent blacklist, reason `"stagnant"`) that survives both the pose-jump lie and
+the STALL guard's dead hops. Replayed against the real flight's numbers: blacklist would land at
+`15:50:38` instead of `15:57:27` — seven minutes and an 18-cycle FALLBACK sweep saved. Deliberately
+NOT built: an unconditional pick-count cap (would kill a legitimate far march). Separately built the
+operator's other ask — an LKG debug window. `visual_recovery.py`'s `match()` gains `debug=`/`banner=`
+(zero cost when off) composing F_LKG|live with drawn RANSAC inliers on EVERY return path including
+failures (seeing why a match failed is the point); `autopilot.py` opens it live (`visrec_debug_window`,
+default off) and saves canvases to `OUTPUT/diag/<ts>_visrec/` at decision instants (capped by
+`visrec_save_max`=200), with the window half and the save half failing INDEPENDENTLY (a dead display
+must not stop the PNG evidence, a disk failure must not close the window) — each sets its own visible
+flag + one CRITICAL log line, both ride the replay timeline; `flight_replay.py`'s existing Visual
+Recovery panel now shows the saved canvas as a thumbnail. An external review vetted the design before
+build; one of its two suggestions (register both a drifted disc's center AND origin in the blacklist
+store) doesn't actually work — `_blacklist_goal` MERGES nearby entries, so a second one would move the
+first, covering LESS — the design instead makes the hazard impossible by construction (the drift-budget
+inequality above); its other suggestion (independent window/save failure isolation) was adopted as
+specified. Every new behaviour proven against its own defect by reverting on a scratch copy: dropping
+the disc-drift condition splits the disc back into two; removing the `_best_dist` write fails only the
+`select()`-integration test (bookkeeping tests deliberately isolated from the data source stay green —
+a tighter signal than one coupled assertion); disabling the stagnant-blacklist call fails the real-flight
+case while the never-blacklisted march stays green; injecting a `cv2.resize` into the debug canvas
+fails the exact-width no-scale assertion; collapsing the sink's two independent guards into one shared
+`try/except` fails BOTH isolation tests at once (a dead display now also poisons the save flag). `python
+frontier_planner.py --self-test`, `python visual_recovery.py --self-test`, `python autopilot.py
+--self-test`, `python flight_replay.py --self-test`: **ALL PASS, 0 failures**. See
+`plans/session49-goal-stagnation-and-lkg-window.md`. **NEXT = LIVE-FLY** — watch for a
+`PLANNER: ... reason=stagnant` line retiring a wall after 2 fruitless legs instead of ~8 minutes; NO
+legitimate far goal retired mid-march (the one accepted risk); the goals-DB panel showing ONE disc
+with nonzero `drift` where this flight showed two; the LKG window's drawn inliers piling onto one flat
+surface nose-to-a-wall. Still open, deliberately not touched: `autopilot.py:2280` still discards a
+plan-loss-interrupted hop judgement, so the STALL guard itself remains starved — stagnation covers
+that ground from a different angle now, but judging interrupted hops late is its own session (needs a
+trusted-pose story first; this flight's SLAM pose jumped 1.3u between ticks)._
+
+_**Session 48 — the back-off was reacting to a 3-second blip, not to being stuck (BUILT, live-fly
+PENDING).** Session 47 stopped the back-off *loop*; the operator then asked the better question —
+is reacting ~70ms after the plan goes `PLAN-LOST` too harsh? — proposed holding ~12s first to let
+SLAM re-lock, and asked for statistics before committing to the number. Measured them across **all
+128 flight logs, 2066 loss episodes**: with the drone HOLDING STILL a loss resolves by itself in a
+median of **2.4s**, p95 **9.5s**, and **96.9% within 12s**; the 25 episodes where something DID
+maneuver mid-loss have a median of 29.1s and a max of 183.6s (25 samples and partly reverse-causal,
+so suggestive rather than proof — but the mechanism, moving while blind destroying SLAM's visual
+continuity, is already documented in this codebase). Then the number that settled it, per-episode
+across the two most recent flights: **seven of the eight back-offs fired into losses that
+self-healed in under 1.1 seconds** (0.11 / 0.20 / 0.55 / 0.67 / 0.77 / 0.87 / 1.09s) — the plan was
+green again before the 2s reverse push had even finished, including the one session 47 had called
+legitimate. The cause is structural: `PLAN-LOST` is not an event but a 3.0s `plan_timeout_s`, and
+the back-off fired one tick after it (66-78ms, 8 for 8). Built `loss_backoff_grace_s = 12.0`: a loss
+must OUTLIVE the window before it earns a physical reaction, the one-shot stays ARMED (not spent)
+while deferring and the `HOLD_LOST` tick re-runs it each tick — without that re-call the back-off
+would be dead code rather than delayed — and the window is stamped per-episode AND cleared by a
+genuine `OK`, so the 19-flip `OK`/`PLAN-LOST` oscillation of flight `20260901_142738` can never
+accumulate into a spurious reaction (a slow-but-alive SLAM is not lost; `SLAM_HOLD`'s forced hop is
+that remedy). Every assertion proven against its own defect by reverting on a scratch copy —
+including the discovery that the two window guards are **redundant by design**, so no single-guard
+revert can fail the oscillation assertion; breaking both together does, which is what proves it has
+teeth. `python autopilot.py --self-test`: **ALL PASS, 0 failures**. See
+`plans/session48-loss-recovery-grace.md`. **NEXT = LIVE-FLY** — and watch the hold itself: this
+lengthens exactly the window in which the 20260718 flight drifted into a wall while parked, and the
+intended guard for it is the one session 47 showed is structurally inert._
+
+_**Session 47 — the back-off loop: SLAM never got to look at where the back-off put us (BUILT,
+live-fly PENDING).** Session 46's first live test, flight `20260901_142738`, failed loudly: the
+operator saw two or three back-offs in a row, then the drone put its back to a wall and answered
+with another back-off. Session 46's chunk 1 had worked (real `reverse: 1.0` commanded at last,
+against `fields={}` the flight before) — but chunks 2 and 3 were dead code, 0 `FALLBACK` and 0
+`WEDGED` all flight. Why: session 46 hung its whole "stop repeating a reflex that isn't working"
+escalation off `_blind_contact_backoff`, and **all 7 back-offs came through the other door** (the
+loss-instant `F_LKG` visual check), which counted nothing. Worse, that escalation could never have
+fired anyway — it is polled from `HOLD_LOST`/`SLAM_HOLD`, states that hold no directional command,
+so the flow detector produces no verdict there at all: 12 `HOLD_LOST` + 14 `SLAM_HOLD` entries,
+**zero** detector verdicts from either, one latched contact in the whole flight (a `CEILING` during
+`ASCEND`). The operator then named the real fix himself: **SLAM never got an opportunity to recover
+after a back-off, which is the whole point of backing off.** Confirmed exactly: `BACKOFF` → `SETTLE`,
+whose exit needs 6 frames under 1000 ms while SLAM was solving at 3407/3547/3725 ms — impossible, and
+`SETTLE` has no timeout by design, so the only thing that ever broke the deadlock was the next
+`OK`→`PLAN-LOST` flip, and the recovery path's first act is another back-off. Each flip re-arms the
+one-shot, and the trigger asks only "am I newly lost / does F_LKG read too-close" — neither of which
+changes when a back-off fails, so the evidence was literally identical every time (538 → 577 → 479 →
+704 → 444 → 452 → 412 inliers, `contained=True` on all seven; 19 status flips, one re-fire just
+1.05 s after the previous back-off ended). Built three things: **(1)** a **post-backoff SLAM
+re-solve gate** — no further loss-instant back-off until SLAM has solved a frame *captured after*
+the last one ended (bounded by a budget, and the timeout is LOUD); **(2)** both loss-instant
+triggers now feed the SAME wedge counter, so session 46's `FALLBACK` escalation is finally
+reachable from the door the drone actually uses; **(3)** `BACKOFF` now receives `backwall_contact`
+and stops pushing — it had streamed **31 `BACKWALL-WATCH` verdicts** from inside `BACKOFF`, `ratio=0.00`
+while commanding full reverse, and ground the full 2.0 s into the wall anyway, seven times. Every
+assertion proven against its own defect by reverting on a scratch copy; **one trap the suite missed
+on the first pass** (a gate that opens on any fresh frame regardless of `cap_ts` — at 3.5 s latency,
+pre-backoff captures are exactly what arrive first) was caught by rebuilding that revert, and a
+dedicated assertion added. `python autopilot.py --self-test`: **ALL PASS, 0 failures**. See
+`plans/session47-post-backoff-slam-resolve-gate.md`. **NEXT = LIVE-FLY.**_
+
+_**Session 46 — wedged in a corner: the drone recognised it, reacted the only way it knew, and was
+physically incapable of it (BUILT, live-fly PENDING).** The operator flagged the end of flight
+`20260901_124211` — brief flashes of `BACKOFF` near the end, but the drone stayed stuck — and named
+the missing piece precisely: "tried to backoff, can't, on hold too long, try something different."
+Validated the wedge from the flight's own data before touching code: displacement per ~2s commanded
+reverse push collapsed monotonically, `0.335u → 0.444u → … → 0.046u → 0.016u → **0.000u**` (final
+strafe also `0.000u`), and the SLAM-independent flow detector independently latched `BACKWALL`
+(flow ratio going *negative*, `contact_held=0.891`) — two signals agreeing the drone was physically
+pinned, not just perceiving badly. Then found why nothing escalated: status oscillated `OK 3.0s /
+PLAN-LOST 0.6s` for the last minute, so every escape keyed on continuous time-in-one-state reset
+before firing. `FALLBACK` — the one mechanism that already does "try something different" (turn +
+push a fresh random direction each cycle) — is dispatched only from the PLAN-STALE handler, and
+this flight had **zero** PLAN-STALE events, only PLAN-LOST. `BACKOFF` fired 6 times and commanded
+**zero** reverse every time — the top-level PLAN-LOST router wiped it to `HOLD_LOST` one tick after
+entry, before its own phase-timer body (on a *later* tick) ever got to run, the identical structural
+bug the `BLIND_BACKOFF` state already had a documented fix for. Built exactly what the operator
+asked, plus what it structurally required: **(1)** extracted `BACKOFF`'s body into `_step_backoff`
+and gave it status-ownership like `BLIND_BACKOFF`/`CALIB_ESCAPE` already have, so a backoff in
+flight survives a `PLAN-LOST` flicker and actually commands reverse; **(2)** made the `FALLBACK`
+sweep dispatchable under `PLAN-LOST` too (previously PLAN-STALE only), without touching its
+existing PLAN-STALE path; **(3)** a new counter, `_blind_contact_reacts`, that escalates
+`BLIND_BACKOFF` into the `FALLBACK` sweep after `blind_contact_escalate_after` (2) failed reflexes
+against the same obstacle with no confirmed recovery between — reset ONLY at genuine
+recovery/reset boundaries (never a bare status flip, never a same-disc goal re-commit), so the 3s
+`OK`/`LOST` flicker that flight showed cannot silently clear it. Built as a 4-chunk Sonnet-ready
+implementation spec (contract-first: exact signatures, a load-bearing reset-site table, explicit
+"do NOT do X" guardrails for two traps a fresh implementer would hit — resetting `_fallback_cum_deg`
+redundantly, and an unqualified REPLAN reset re-creating the exact pick-dedup starvation session 45
+just fixed). One implementation bug caught by a *test's own* loop logic (not the revert exercise):
+a test drove past its intended window straight into `BACKOFF`'s natural completion tick and
+misread that as a regression — fixed by tightening the loop bound, not the code. Every fix proven
+against its defect by reverting on a scratch copy and confirming FAIL, restored after. `python
+autopilot.py --self-test`: **ALL PASS, 0 failures** (82 blocks). See
+`plans/session46-wedged-corner-escalation.md`. **LIVE-FLY ATTEMPTED
+(`20260901_142738`) — chunk 1 confirmed working, chunks 2+3 proven unreachable; see session 47
+above, which makes them reachable.**_
+
+_**Session 45 — the "stuck next to its own goal" stall: four defects, all fixed (BUILT, live-fly
+PENDING).** The operator flagged the end of flight `20260901_112227` — the drone sat still for
+minutes near its goal — and asked why neither guard he expected had caught it: a too-close goal
+getting blacklisted, or the goal being marked reached. Answer, from the flight's own log: **one did
+not exist, the other could not run.** Hard numbers: `pos=[-0.7592,-0.0389]` vs
+`goal=[-0.5464,-0.2674]` = **0.312u apart with `goal_reach_dist`=1.0, for 221 seconds**, status `OK`
+for ~2300 of those ticks. It cycled `SLAM_HOLD` →(15s forced hop)→ `REPLAN` → `ORIENT` (turn +30°) →
+`PARALLAX_PUSH` → `SLAM_HOLD` ~30ms later, forever — **turning every ~25s and never translating**
+(whole-flight `ADVANCE` count: 5). Four defects: **(1)** the planner had NO minimum-distance check
+at all, while its utility divides by distance (so a frontier on top of the drone scores highest) and
+the clearance inset walks goals *toward* the drone; **(2)** the "goal reached" test lived ONLY inside
+the `ADVANCE` handler, which the stall never entered; **(3) the root cause** — `PARALLAX_PUSH` was
+missing from the forced-hop grace window (`_enter()`'s exemption AND the `_slam_slow_hop_active`
+guard `ADVANCE` has), so under chronically slow SLAM every forced hop died on entry, making the
+session-35/43 rescue a no-op for any off-axis goal; **(4)** the pick-dedup starved the loop
+blacklist — it suppresses a pick unless a hop was *judged*, no hop ever completed, so the hammered
+disc ended at **`picks=1`** when the guard needs 3 (the same starvation class the code documents
+fixing once already, 20260720). All four fixed; the too-close rejection is soft/round-scoped per the
+operator's choice. **An external review caught a real trap in the draft**: the state-independent
+reached check would have fired inside `SETTLE` too, and `_enter("SETTLE")` resets `_settle_ok`/the
+gate while the drone doesn't move — an infinite SETTLE hover, worse than the original stall.
+Verified in code, `SETTLE`/`REPLAN` (+ TRIM/recovery/postlude) excluded, with a dedicated regression
+test. Every new test proven to catch its defect by reverting the fix and confirming FAIL. `python
+autopilot.py --self-test`, `frontier_planner.py`, `flight_replay.py`, `map_store.py`,
+`ground_grid.py`: **ALL PASS**. See `plans/session45-stuck-at-own-goal.md`. **NEXT = LIVE-FLY.**_
+
+_Session 44 (previous): replaced TRIM's live-calibrated sag/high band with two
+HARDCODED absolute SLAM pos_y thresholds (`trim_sag_trigger_y=-1.75`, `trim_high_trigger_y=-2.10`),
+per the operator's explicit, knowing override of CLAUDE.md's "NO MANUAL-FLIGHT DATA LEAKAGE"
+standing rule — flagged the conflict first, operator chose to proceed anyway. Found + fixed a real
+regression while building it (removing the "must have calibrated once" precondition let TRIM
+hijack the PRELUDE sequence, cascading into 4 unrelated self-test failures). Also traced (and
+fixed) the two long-standing "pre-existing, unrelated" self-test failures this session, prompted
+by the operator asking what they actually were: `explore ALTITUDE-LOCK` was genuine config drift
+(`desired_height_override_y` left at `-1.9` live instead of its disabled default `0` — reset it).
+`explore PRELUDE arm+takeoff+...` was initially (wrongly) called "pre-existing/unrelated" too —
+corrected once actually tested against the clean base: it's a real session-44 regression (the
+test's synthetic flat `pos_y=0.0` reads as permanently "sagged" against the new fixed threshold) —
+fixed by disabling TRIM for that one test (it's about the takeoff sequence, not TRIM). **Then the
+first actual live-fly attempt got stuck in `TRIM_RESUME_WAIT` forever right after takeoff** —
+traced from the flight's own log (`20260901_103028`), not guessed: calibration and the TRIM pulse
+both worked correctly (`pos_y` corrected from `-2.101` to `-1.878`, safely inside the band); the
+REAL bug was that SLAM's solve times ran 900-1500ms for ~35s straight (plan status stayed `OK` the
+whole time — a pure throughput patch, not a bad pose) and `TRIM_RESUME_WAIT` — unlike `SLAM_HOLD`
+(sessions 35/43) — never had a timeout for sustained slowness, so it just hung. Fixed by giving
+`TRIM_RESUME_WAIT` the identical `slam_slow_hop_after_s` forced-resolve rescue, with a new
+self-test that reproduces the exact hang and is confirmed to fail without the fix. `python
+autopilot.py --self-test`: **ALL PASS, 0 failures**. See
+`plans/session44-hardcoded-height-trim-thresholds.md` for the full trace of both bugs. **This
+hardcoded-threshold work is scoped to `all-bets-are-off` only — do not merge back to `main`
+without re-deciding the exception there** (the `TRIM_RESUME_WAIT` timeout fix, however, is a
+general robustness fix with no room-specific data in it — worth porting to `main` on its own
+merits once proven live). Resume pointer for `main`/session 43 work is preserved below.
+
+_Last updated (session 43, `main`) **2026-09-01** (sessions 40-43 **LIVE-FLY CONFIRMED —
+tolerable overall; HEIGHT still open, see "Next"**). Resume from THIS file. Session 43 simplified
+the `SLAM_HOLD` forced-hop rule
 (`slam_slow_hop_after_s`) to fire on ANY sustained hold with plan OK — not just a plain mid-leg slow
 hold — per the operator's explicit instruction, diagnosed off flight `20260723_000631`'s 31.5s
 stall; kept one guard the self-test suite caught (a total capture blackout, `cap_ts` never fed,
@@ -865,7 +1125,67 @@ plan-of-record pointers), and **Documentation** (what we tried, in date order, b
 
 ## Next (resume after a context clear)
 
-### >>> IMMEDIATE NEXT TASK <<<
+### >>> IMMEDIATE NEXT TASK (branch `all-bets-are-off`) <<<
+
+**LIVE-FLY sessions 49 + 50 + 51 together** (`python fly.py` — full stack). Live flights on
+2026-09-01 confirmed sessions 47+48 — the back-off cadence, the post-backoff SLAM re-solve gate, and
+the 12s loss-recovery grace — fly correctly (**operator's own call**; the detailed session 45-48
+per-flight watch checklists that used to fill this section are superseded and folded into their dated
+entries above, same pattern as the 2026-09-01 session-43 confirmation further down this file).
+
+**Session 50** (`plans/session50-settle-dead-band-escape.md`) — watch for
+`SETTLE gate blocked N.Ns by slow-but-ALIVE SLAM ... -> forcing REPLAN` in place of the 91.6s park
+that flight `20260901_172217` showed. If it fires OFTEN that is not a bug in the fix: it is the honest
+signal that SLAM is chronically over `slam_slow_ms`, and the thing to chase is the choke itself.
+
+**Session 51** (`plans/session51-visual-match-on-demand.md`) — pure waste removal, **no behaviour
+change expected**. `[VISREC]` lines should appear at roughly the memo cadence rather than being
+throttle-limited, the `HOLD_LOST` loop rate should sit nearer 38Hz than 32Hz, and every decision in
+the log (grace notice, back-off, probe verdicts) must be **identical** to previous flights. A changed
+decision means the memo is serving something it shouldn't — suspect the motion guard first.
+
+**>> STILL OPEN, TOP OF THE LIST: why does SLAM choke? <<** It runs ~350ms when happy and plateaus at
+a flat ~2000ms for minutes at a time, and nothing we own explains it. **Two candidates are already
+ruled out — do not re-chase them:** (1) the AUTOPILOT is not the cause (loop rate measured at 32-38.5Hz
+throughout, including through the entire 91.6s wedge); (2) UNITY FOCUS is not the cause either
+(operator tested directly: SLAM re-chokes ~2 frames after refocus, and the log shows SLAM recovering
+BEFORE the autonomy pause and degrading to 1767ms DURING it while the autopilot was idle). Note the
+plateau is suspiciously FLAT (1978/1992/1995/2003ms) — a stable equilibrium, not noisy contention —
+and slow solves skip ~129 NDI frames vs ~46 for fast ones, a possible positive-feedback loop worth
+probing. Untested leads: MASt3R-SLAM's own workload growth (keyframe graph / retrieval DB size as the
+map grows), its backend/optimization thread, and GPU contention from the visualizer's `--record` MP4
+encode (which runs regardless of autonomy state). Everything downstream — `slam_slow_ms`, the settle
+gate, `slam_slow_hop_after_s` — has been tuned against a machine in this state.
+
+Session 49 built off an earlier flight's tail: a goal-stagnation memory (`goal_disc_max_drift`,
+`goal_stagnant_limit`, both new in `frontier_planner.py`/`config.yaml`) that retires a goal the
+drone keeps re-attacking without ever getting closer — see `plans/session49-goal-stagnation-and-lkg-window.md`
+for the full trace + design — plus an operator-requested LKG debug window
+(`visrec_debug_window`, off by default, `autopilot.py`/`visual_recovery.py`/`flight_replay.py`).
+Watch for:
+- A `PLANNER: ... reason=stagnant` line retiring a wall goal after 2 fruitless legs (`goal_stagnant_limit`)
+  instead of the ~8 minutes / ~40 losses / 18-cycle FALLBACK sweep the diagnosing flight showed.
+- **No legitimate far goal retired mid-march** — the one accepted risk of the stagnation guard. If a
+  genuinely progressing leg ever gets soft-killed, loosen `goal_stagnant_limit` first, not the design.
+- The goals-DB debugger panel (`flight_replay.py`'s Goals DB floating table) showing **one** disc
+  with a non-zero `drift` where a drifting wall used to show up as two dead-end records.
+- If `visrec_debug_window: true` is flipped on for this flight (default false — flip it deliberately
+  to test the window): the LKG window's drawn SIFT inlier correspondences visibly piling onto one
+  flat surface when the drone is nose-to-a-wall; the window surviving a display hiccup without losing
+  the saved PNG evidence under `OUTPUT/diag/<ts>_visrec/` (or vice versa) — both failure modes are
+  independent and each logs its own `CRITICAL` line if it happens.
+- Still open, deliberately not touched this session: `autopilot.py:2280` still discards a
+  plan-loss-interrupted hop judgement, so the STALL guard itself remains starved (stagnation covers
+  that failure mode from a different angle now, but the dead-hop gap is still there) — judging
+  interrupted hops late needs a trusted-pose story first (this flight's SLAM pose jumped 1.3u between
+  ticks), its own session.
+
+Self-tests are fully green (`python frontier_planner.py --self-test`, `python visual_recovery.py
+--self-test`, `python autopilot.py --self-test`, `python flight_replay.py --self-test`: 0 failures)
+including every new case, each proven against its own defect by reverting on a scratch copy — see
+the plan file for the full revert table.
+
+### >>> NEXT TASK AFTER THAT (branch `main`) <<<
 
 **Diagnose the HEIGHT issue.** A live flight on 2026-09-01 confirmed sessions 20-43 (the full
 TRIM / BACKOFF / FALLBACK / homing / visual-recovery / SLAM_HOLD backlog previously tracked as a
@@ -1501,7 +1821,10 @@ telemetry back is `time` — everything else is vision. Calibration: ~90° at ya
 - **NO SILENT FALLBACKS:** fail-fast OR set a visible/logged/HUD flag; any fallback approved first.
 - **NO manual-flight data leakage:** every autonomous limit is a LIVE self-calibrating signal;
   platform/signal characteristics (flow signatures, control magnitudes, turn calibration, the ~1 s
-  healthy-SLAM compute time) are legitimate — this room's geometry is not.
+  healthy-SLAM compute time) are legitimate — this room's geometry is not. **One documented,
+  operator-approved exception:** branch `all-bets-are-off`, session 44 — TRIM's trigger is two
+  hardcoded absolute pos_y numbers, flagged and knowingly overridden by the operator. Scoped to
+  that branch; re-decide before merging to `main`.
 - Image integrity (no undisclosed downscaling); start multi-step work with a TaskCreate list;
   **never commit unless asked**; self-test offline before live.
 

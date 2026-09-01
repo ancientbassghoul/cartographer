@@ -448,7 +448,12 @@ function updateVisualRecovery(idx) {
     `<span class="k">F_LKG cached</span> ${yn(vr.has_lkg)}<br>` +
     `<span class="k">matched</span> ${yn(vr.matched)} <span class="k">inliers</span> <span class="v">${vr.inliers != null ? vr.inliers : '—'}</span><br>` +
     `<span class="k">contained</span> ${yn(vr.contained)}  <span class="k">planar-like</span> ${yn(vr.planar_like)}<br>` +
-    `<span class="k">scale</span> <span class="v">${fmt(vr.scale, 2)}</span>`;
+    `<span class="k">scale</span> <span class="v">${fmt(vr.scale, 2)}</span>` +
+    (vr.debug_image ? `<br><a href="${vr.debug_image}" target="_blank">` +
+                      `<img src="${vr.debug_image}" style="width:100%;margin-top:6px;border:1px solid #444">` +
+                      `</a>` : '') +
+    (vr.window_failed ? `<br><span class="no">LKG window FAILED this flight</span>` : '') +
+    (vr.save_failed ? `<br><span class="no">LKG save FAILED this flight</span>` : '');
 }
 
 // Floating clearance-detail table (session 29): the raw ray-hit picture (hits / total rays / fraction /
@@ -506,6 +511,8 @@ function updateGoalDb(idx) {
     if (ev.pos) parts.push(`pos [${fmt(ev.pos[0])}, ${fmt(ev.pos[1])}]`);
     if (ev.slam_ms != null) parts.push(`slam ${fmt(ev.slam_ms, 0)}ms`);
     if (ev.spread != null) parts.push(`spread ${fmt(ev.spread)}u`);
+    if (ev.stagnant_legs != null) parts.push(`stagnant ${ev.stagnant_legs} legs`);
+    if (ev.best_ever != null) parts.push(`best ${fmt(ev.best_ever)}u`);
     return parts.length ? ` (${parts.join(', ')})` : '';
   };
   let rows = '';
@@ -599,13 +606,12 @@ function updateTelemetry(idx) {
         .map(([k, v]) => `<span class="k">${k}</span> <span class="cmd">${(typeof v === 'number') ? (+v).toFixed(2) : v}</span>`)
         .join('  ');
   const stCol = (s.status === 'OK' || s.status == null) ? 'v' : (s.status === 'PLAN-LOST' ? 'bad' : 'warn');
-  // TRIM band (session 22, bidirectional): LOW threshold = ceiling + 1.2*delta (sagged -> TRIM UP), HIGH
-  // threshold = desired - 0.2*delta (glued near the ceiling -> TRIM DOWN). Ratios mirror the config defaults
-  // (trim_sag_ratio 1.2 / trim_high_ratio 0.2). pos_y reddens when OUTSIDE the band on either side.
-  const sagThr = (s.alt_ceiling != null && s.alt_delta != null) ? (s.alt_ceiling + 1.2 * s.alt_delta) : null;
-  const sagHThr = (s.alt_desired != null && s.alt_delta != null) ? (s.alt_desired - 0.2 * s.alt_delta) : null;
-  const sagBad = (s.pos_y != null && ((sagThr != null && s.pos_y > sagThr)
-                                      || (sagHThr != null && s.pos_y < sagHThr)));
+  // TRIM band (session 44): HARDCODED absolute pos_y thresholds (autopilot.py trim_sag_trigger_y/
+  // trim_high_trigger_y), no longer derived from the live ceiling/desired/delta calibration -- see
+  // plans/session44-hardcoded-height-trim-thresholds.md. pos_y reddens when OUTSIDE the band on either side.
+  const sagThr = -1.75;   // trim_sag_trigger_y: pos_y >= this -> too LOW (sagged) -> TRIM UP
+  const sagHThr = -2.10;  // trim_high_trigger_y: pos_y <= this -> too HIGH (near ceiling) -> TRIM DOWN
+  const sagBad = (s.pos_y != null && (s.pos_y >= sagThr || s.pos_y <= sagHThr));
   const t = document.getElementById('telemetry');
   t.innerHTML =
     `<div class="grp">RAW TRANSLATION (world, +Y DOWN)</div>` +
@@ -858,7 +864,9 @@ def _self_test():
              "right": {"dist": 1.1, "n_hits": 5, "n_rays": 10, "fraction": 0.5, "min_dist": 1.1,
                        "max_dist": 1.4, "blocked": True}},
          "visual_recovery_detail": {"phase": "MATCH", "cum_deg": 15.0, "has_lkg": True, "matched": True,
-                                    "inliers": 34, "contained": False, "planar_like": True, "scale": 1.02}},
+                                    "inliers": 34, "contained": False, "planar_like": True, "scale": 1.02,
+                                    "debug_image": "20260101_000000_visrec/00-00-01_500.png",
+                                    "window_failed": False, "save_failed": True}},
         {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
         {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
@@ -959,15 +967,20 @@ def _self_test():
         ok = ok and c_clr
 
         # Visual-recovery floating panel (session 35 ALT): phase + SIFT match verdict survive load + the
-        # render/toggle code is wired in.
+        # render/toggle code is wired in. Session 49: the LKG debug canvas path + window/save failure flags
+        # also survive the round-trip and the render code that shows them is wired in.
         vr_rec = next((r for r in embedded if r.get("visual_recovery_detail")), None)
         c_visrec = (vr_rec is not None and vr_rec["visual_recovery_detail"]["phase"] == "MATCH"
                     and vr_rec["visual_recovery_detail"]["planar_like"] is True
                     and vr_rec["visual_recovery_detail"]["scale"] == 1.02
+                    and vr_rec["visual_recovery_detail"]["debug_image"] == "20260101_000000_visrec/00-00-01_500.png"
+                    and vr_rec["visual_recovery_detail"]["window_failed"] is False
+                    and vr_rec["visual_recovery_detail"]["save_failed"] is True
                     and "updateVisualRecovery" in html and 'id="visrec"' in html and 'id="visrecBtn"' in html
-                    and "vr.matched" in html and "vr.scale" in html and "F_LKG cached" in html)
+                    and "vr.matched" in html and "vr.scale" in html and "F_LKG cached" in html
+                    and "vr.debug_image" in html and "vr.window_failed" in html and "vr.save_failed" in html)
         print(f"[self-test] {'PASS' if c_visrec else 'FAIL'}  visual-recovery panel "
-              f"(phase/match verdict survive + render code wired)")
+              f"(phase/match verdict + session-49 debug canvas path/failure flags survive + render code wired)")
         ok = ok and c_visrec
 
         # Paired SLAM logs (ev_kind:"slam_start"/"slam_finish") carried + the orange/green interleave render path

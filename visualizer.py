@@ -129,6 +129,15 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
         dg = f"{np.hypot(pos[0] - goal[0], pos[1] - goal[1]):.2f}u" if pos is not None and goal is not None else "--"
         cv2.putText(panel, f"GOAL     dist={dg}", (8, 146),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+    # SLAM solve time (session 44 ask): rides on EVERY plan, valid or not, so it's shown unconditionally --
+    # this is the number that explains a stuck settle-gate (TRIM_RESUME_WAIT/SLAM_HOLD need several
+    # CONSECUTIVE frames under slam_slow_ms, 1000ms by default) long before the FSM state itself looks wrong.
+    ms = plan.get("slam_ms")
+    ms_txt = f"{ms:.0f}ms" if ms is not None else "--"
+    ms_color = (0, 0, 255) if (ms is not None and ms >= 1000.0) else (255, 255, 255)  # red once >= slow threshold
+    cv2.putText(panel, f"SLAM     ms={ms_txt}", (8, 168),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, ms_color, 1)
     return panel
 
 

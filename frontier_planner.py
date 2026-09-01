@@ -121,12 +121,28 @@ class FrontierPlanner:
         # The DB PERSISTS the WHOLE flight — NEVER reset on a goal switch, hop, or recovery. General SLAM-unit
         # params (HARD RULE), never a room answer.
         self.goal_area_radius = float(g("goal_area_radius", 0.5))      # pick-association disc radius (SLAM units)
+        self.goal_disc_max_drift = float(g("goal_disc_max_drift", 0.75))
+        # FAIL-FAST (CLAUDE.md rule 4): a drift budget >= the exclusion radius would let a retired disc's
+        # ORIGIN sit outside its own blacklist ball, so a frontier re-clustering back toward the origin of a
+        # proven-dead wall would be re-committable. Refuse to start rather than fly a silently-defeated blacklist.
+        if self.goal_disc_max_drift >= self.blacklist_radius:
+            raise ValueError(
+                f"goal_disc_max_drift ({self.goal_disc_max_drift}) must be < goal_blacklist_radius "
+                f"({self.blacklist_radius}): a disc that can drift past the exclusion radius leaves its own "
+                f"origin re-committable after being blacklisted")
         self.goal_loop_min_picks = int(g("goal_loop_min_picks", 2))   # a disc must be picked MORE than this (>2 => >=3)
         self.goal_loop_pos_dist = float(g("goal_loop_pos_dist", 1.0))  # "same drone spot" across picks -> circling
         self.goal_strike_limit = int(g("goal_strike_limit", 2))       # consecutive no-progress hops -> blacklist
+        self.goal_stagnant_limit = int(g("goal_stagnant_limit", 2))   # session 49: LEGS with no new closest approach -> blacklist
         self.goal_db_maxlocs = int(g("goal_db_maxlocs", 12))          # cap the per-disc drone-location history
         self._goal_db = []            # [{center:[x,z], picks, drone_locs:[[x,z]...], strikes}] — PERSISTS the flight
         self.last_loop_event = None    # transient {goal,picks,reason} of a DB-blacklist for the caller to log once
+        # Session 45: transient one-line summaries of selection-time REJECTIONS (currently the "already standing
+        # on it" too-close drop below). Drained by perception_worker right after select() into the plan's
+        # `planner_event` field, so a rejection is VISIBLE in the console + replay timeline instead of being a
+        # silent candidate drop. A list (not a scalar slot) for the same reason _consume_planner_event is:
+        # several candidates can be rejected within ONE select() pass.
+        self.last_select_events = []
 
     @staticmethod
     def _d(a, b):
@@ -161,7 +177,7 @@ class FrontierPlanner:
         -> promote to PERMANENT (two dead goals can't cycle the drone forever); if we DID get closer (a new
         route opened) -> keep it soft/retryable. A first-ever soft blacklist stays soft.
 
-        `reason` (`"2bump"|"stall"|"loop"`, corner give-ups never call this — see force_retire_corner) and
+        `reason` (`"2bump"|"stall"|"loop"|"stagnant"`, corner give-ups never call this — see force_retire_corner) and
         `evidence` (a small dict of whatever was at hand at the call site — position, strikes/picks/spread,
         SLAM state) are recorded on the entry so the debugger's Goals DB panel can show WHY a goal died, not
         just THAT it died. All numeric evidence values must already be float-cast by the caller (goals-DB
@@ -191,6 +207,16 @@ class FrontierPlanner:
         """The goals-DB disc whose center is within goal_area_radius of `goal` (first match), creating a fresh
         one when none exists (unless create=False). Discs persist for the whole flight.
 
+        Session 49: the disc's `center` FOLLOWS its goal (re-centered on every match), the same way the
+        commitment itself already re-snaps to a frontier's live centroid within `goal_assoc_dist` — so one
+        physical, drifting frontier stays ONE accounting record instead of splitting into several as it
+        drifts across successive `goal_area_radius` circles (diagnosed off flight 20260901_154648, where one
+        wall ended as two discs, picks=3+2, neither reaching its own retirement threshold). The follow is
+        bounded: a candidate must stay within `goal_disc_max_drift` of the disc's immutable `origin` (its
+        FIRST center) or a fresh disc is started instead — `goal_disc_max_drift < goal_blacklist_radius` is
+        enforced in `__init__`, so a fully-drifted disc's `origin` is still inside its own exclusion ball once
+        blacklisted.
+
         Schema split (operator ask): ALL FOUR blacklist mechanisms' bookkeeping lives on this ONE per-disc
         record now — `picks`/`drone_locs` (loop guard), `strikes` (stall guard), `bumps` (2-bump, previously
         only the separate active `_wall_hit_count` streak), and `corner_giveups` (far-corner give-up,
@@ -201,12 +227,17 @@ class FrontierPlanner:
         note_wall_hit's docstring)."""
         g = [float(goal[0]), float(goal[1])]
         for e in self._goal_db:
-            if self._d(e["center"], g) <= self.goal_area_radius:
+            # TWO conditions: within the disc AND still inside the drift budget measured from the disc's
+            # ORIGIN (not from its current, already-moved center — measuring from `center` would let the
+            # budget renew itself every pick and the disc would walk without limit).
+            if (self._d(e["center"], g) <= self.goal_area_radius
+                    and self._d(e["origin"], g) <= self.goal_disc_max_drift):
+                e["center"] = g          # the disc FOLLOWS its goal (session 49)
                 return e
         if not create:
             return None
-        e = {"center": g, "picks": 0, "drone_locs": [], "strikes": 0, "bumps": 0,
-             "corner_giveups": 0, "is_corner": False}
+        e = {"center": g, "origin": list(g), "picks": 0, "drone_locs": [], "strikes": 0, "bumps": 0,
+             "corner_giveups": 0, "is_corner": False, "best_ever": None, "stagnant_legs": 0}
         self._goal_db.append(e)
         return e
 
@@ -231,7 +262,9 @@ class FrontierPlanner:
         pick-time drone `pos` (bounded), then run the CIRCLING/ping-pong test: picked MORE than goal_loop_min_picks
         times with any two pick-time drone locations within goal_loop_pos_dist -> permanent blacklist.
         `slam_ms` (optional) is evidence-only — the SLAM solve time at pick time, folded into the loop-
-        blacklist evidence dict below; it never affects the loop decision itself."""
+        blacklist evidence dict below; it never affects the loop decision itself.
+
+        Session 49: also runs the STAGNATION test — see the block below."""
         e = self._db_entry(goal)
         e["picks"] += 1
         if pos is not None:
@@ -254,6 +287,28 @@ class FrontierPlanner:
                 if slam_ms is not None:
                     evidence["slam_ms"] = round(float(slam_ms), 1)
                 self._db_blacklist(e["center"], "loop", evidence)
+        # --- Session 49: STAGNATION. The loop guard above needs all picks from ~one spot, and the STALL
+        # guard needs a JUDGED hop (a plan-loss abandons the pending judgement in the autopilot, so under a
+        # loss storm it gets none). Neither could retire the wall in flight 20260901_154648. This one asks a
+        # question that survives both: across whole LEGS, did we ever get closer than our own best? Uses the
+        # running best (never a per-hop delta), so the SLAM pose jumping backwards between legs — which made
+        # every hop read as "progressed" in that flight — cannot mask it.
+        best = self._best_dist
+        if best is not None:
+            if e["best_ever"] is None or best < e["best_ever"] - self.progress_eps:
+                e["best_ever"] = float(best)
+                e["stagnant_legs"] = 0
+            else:
+                e["stagnant_legs"] += 1
+                if e["stagnant_legs"] >= self.goal_stagnant_limit:
+                    evidence = {"stagnant_legs": int(e["stagnant_legs"]),
+                                "best_ever": round(float(e["best_ever"]), 3),
+                                "picks": int(e["picks"])}
+                    if pos is not None:
+                        evidence["pos"] = [round(float(pos[0]), 3), round(float(pos[1]), 3)]
+                    if slam_ms is not None:
+                        evidence["slam_ms"] = round(float(slam_ms), 1)
+                    self._db_blacklist(e["center"], "stagnant", evidence)
 
     def register_hop_outcome(self, goal, progressed, strike_eligible=True, pos=None, slam_ms=None, is_corner=False):
         """Fed by the AUTOPILOT once per hop (at the REPLAN that ends it). STALL guard via STRIKES: a hop that got
@@ -286,11 +341,16 @@ class FrontierPlanner:
         is_corner, the DRONE LOCATIONS at each pick (what the <goal_loop_pos_dist clustering test runs on —
         so the operator can see whether a loop blacklist was legit), whether the disc is currently
         blacklisted (dead in the _blacklist store), and — when it is — the mechanism that killed it
-        (`blacklist_reason`: "2bump"|"stall"|"loop"|None) plus its recorded `blacklist_evidence` (goals-DB
+        (`blacklist_reason`: "2bump"|"stall"|"loop"|"stagnant"|None) plus its recorded `blacklist_evidence` (goals-DB
         schema split — one place that answers "why is this goal dead", instead of three disconnected
         counters). A corner force-retired via the far-corner give-up cap is NOT in `_blacklist` (see
-        force_retire_corner) so `blacklisted`/`blacklist_reason` reflect only 2bump/stall/loop; its
-        `corner_giveups` count is the record of that separate retirement."""
+        force_retire_corner) so `blacklisted`/`blacklist_reason` reflect only 2bump/stall/loop/stagnant;
+        its `corner_giveups` count is the record of that separate retirement.
+
+        Session 49: also carries `origin` (the disc's first, immutable center) and `drift` (how far
+        `center` has walked from it), so the debugger can show a disc following its goal; and
+        `best_ever`/`stagnant_legs`, the STAGNATION memory (the closest approach ever achieved toward
+        this disc, and how many consecutive picks failed to beat it — see register_goal_pick)."""
         out = []
         for e in self._goal_db:
             dead = self._excluded(e["center"])
@@ -303,8 +363,12 @@ class FrontierPlanner:
                         break
             out.append({
                 "center": [round(e["center"][0], 3), round(e["center"][1], 3)],
+                "origin": [round(e["origin"][0], 3), round(e["origin"][1], 3)],
+                "drift": round(float(self._d(e["origin"], e["center"])), 3),
                 "picks": e["picks"], "strikes": e["strikes"], "bumps": e["bumps"],
                 "corner_giveups": e["corner_giveups"], "is_corner": bool(e["is_corner"]),
+                "best_ever": (None if e["best_ever"] is None else round(float(e["best_ever"]), 3)),
+                "stagnant_legs": int(e["stagnant_legs"]),
                 "drone_locs": [[round(p[0], 3), round(p[1], 3)] for p in e["drone_locs"]],
                 "blacklisted": bool(dead), "blacklist_reason": reason, "blacklist_evidence": evidence,
             })
@@ -509,6 +573,8 @@ class FrontierPlanner:
             self.sweeping = False                          # something to chase -> not done, not sweeping
             self.sweep_target = None
             goal = self._choose(remaining, pos, heading_deg)
+            raw_goal = goal        # the RAW centroid: `goal` may be replaced by the inset point below, but
+                                   # `remaining` is keyed on raw centroids, so every drop must filter on THIS
             # Map-validated clearance inset: pull a goal that hugs an obstacle/corner back along the
             # drone->goal axis to a FREE buffered cell before we commit (so committed == published; bump
             # association holds).
@@ -523,11 +589,48 @@ class FrontierPlanner:
                     adj = (float(adjusted[0]), float(adjusted[1]))
                     if self._excluded(adj):
                         # This candidate's inset collapsed onto a dead zone -- drop it, try the next-best.
+                        # (raw_goal == goal here; naming it explicitly keeps the "filter on the RAW centroid"
+                        # invariant true even if this block is ever reordered past the `goal = adj` rebind.)
                         remaining = [f for f in remaining
-                                     if self._d((float(f["center"][0]), float(f["center"][1])), goal) > 1e-6]
+                                     if self._d((float(f["center"][0]), float(f["center"][1])), raw_goal) > 1e-6]
                         continue
                     goal, self.clearance_ok = adj, True
+            # Session 45: NEVER commit a goal the drone is ALREADY standing on. Diagnosed off flight
+            # 20260901_112227: the drone hovered 0.31u from its committed goal for 221s (goal_reach_dist is
+            # 1.0 -- three times deeper inside "reached" than the threshold) while the planner kept handing
+            # back that same spot. Two existing behaviours make this the DEFAULT outcome once the drone is
+            # near a frontier, not a rare edge: the utility divides by distance (goal_dist_weight), so a
+            # frontier right on top of the drone scores HIGHEST, and the clearance inset above walks the goal
+            # further TOWARD the drone. A goal inside goal_reach_dist teaches us nothing new from here, so
+            # drop it and try the next-best candidate -- the same bounded pattern as the inset-collapse case
+            # above (each pass removes at least the one rejected candidate).
+            # NOTE the coordinate: `goal` is the POST-inset point by now (the raw centroid only when the
+            # inset returned None), i.e. exactly what _commit() would store -- so the soft blacklist below
+            # matches what a later _excluded() actually tests. Blacklisting the raw centroid instead would
+            # leave the adjusted point still committable: precisely the defeat mechanism session 33 fixed.
+            # SOFT (permanent=False): the drone sitting on a frontier does NOT prove the frontier is worthless
+            # -- SLAM may simply have been too slow/blind to consume it. _whitelist_round() restores it on the
+            # next corner arrival; if it genuinely keeps recurring, the loop guard escalates it to permanent.
+            d_goal = self._d(pos, goal)
+            if d_goal <= self.goal_reach_dist:
+                g_r = [round(float(goal[0]), 3), round(float(goal[1]), 3)]
+                self._blacklist_goal(list(goal), permanent=False, reason="reached",
+                                     evidence={"dist": round(float(d_goal), 3),
+                                               "pos": [round(float(pos[0]), 3), round(float(pos[1]), 3)]})
+                self.last_select_events.append(
+                    f"TOO-CLOSE goal={g_r} d={d_goal:.2f} <= goal_reach_dist={self.goal_reach_dist:.2f} "
+                    f"(already standing on it) -> soft-blacklist this round, try next-best")
+                remaining = [f for f in remaining
+                             if self._d((float(f["center"][0]), float(f["center"][1])), raw_goal) > 1e-6]
+                continue
             self._commit(goal)
+            # Session 49: the running CLOSEST approach toward the current commitment. `_commit` already
+            # calls _reset_progress() when the goal jumps beyond assoc_dist, so this min is scoped to one
+            # commitment; small centroid drift under association deliberately KEEPS the memory (that is
+            # exactly the "same goal walking" case chunk 1 unified). Monotonically non-increasing: only a
+            # genuinely NEW closest approach moves it.
+            d_now = self._d(pos, self.committed_goal)
+            self._best_dist = d_now if self._best_dist is None else min(self._best_dist, d_now)
             return self.committed_goal
         return None
 
@@ -624,14 +727,18 @@ def run_self_test():
 
     # (b) commitment: once committed to A, a slightly-better near frontier does NOT steal the goal,
     #     but a dramatically-better one does.
+    #     Session 45: the challenger now sits at dist 1.0, not the original 0.4 -- 0.4 is exactly the planner's
+    #     DEFAULT goal_reach_dist, so the new "already standing on it" rejection legitimately drops it before
+    #     the commitment logic is ever reached, which is not what this test is about. Sizes re-picked to
+    #     preserve the ORIGINAL intent against switch_factor=1.5 (hold vs. switch), utilities recomputed below.
     p = FrontierPlanner(None)
     p.select([A], [0.0, 0.0], heading_deg=0.0)                     # commit to A (util 10/2.5 = 4.0)
-    c_slight = {"center": [0.0, 0.4], "size": 6}                   # util 6/1.2 = 5.0  (< 4.0*1.5=6.0)
+    c_slight = {"center": [0.0, 1.0], "size": 8}                   # util 8/1.5 = 5.33 (< 4.0*1.5=6.0) -> hold
     g2, _, _ = p.select([A, c_slight], [0.0, 0.0], heading_deg=0.0)
     check("(b) commitment holds vs a slightly-better frontier", close(g2, [0.0, 3.0]))
-    c_big = {"center": [0.0, 0.4], "size": 12}                     # util 12/1.2 = 10.0 (> 6.0) -> switch
+    c_big = {"center": [0.0, 1.0], "size": 18}                     # util 18/1.5 = 12.0 (> 6.0) -> switch
     g3, _, _ = p.select([A, c_big], [0.0, 0.0], heading_deg=0.0)
-    check("(b) commitment yields to a much-better frontier", close(g3, [0.0, 0.4]))
+    check("(b) commitment yields to a much-better frontier", close(g3, [0.0, 1.0]))
 
     # (c) done verification via the ALL-CORNERS TOUR: empty frontiers + a corner LIST -> tour them
     #     farthest-first (opposite corner first), each cached EXACTLY as given (already inset by
@@ -839,6 +946,34 @@ def run_self_test():
     check("(opt2) every reachable candidate collapsing onto the dead zone -> no commit (falls through, done)",
           g_none is None and done_none2 and p2.committed_goal is None)
 
+    # ---- (opt3, session 45) NEVER commit a goal the drone is ALREADY standing on (flight 20260901_112227:
+    #      hovered 0.31u from its committed goal for 221s while the planner kept handing that spot back). A
+    #      candidate whose COMMITTED (post-inset) point is within goal_reach_dist of pos is soft-blacklisted
+    #      and the next-best candidate is tried instead. ----
+    near = {"center": [0.0, 0.3], "size": 10}   # 0.3 < default goal_reach_dist 0.4 -> already standing on it
+    far = {"center": [3.0, 0.0], "size": 1}     # small/off-axis -> only chosen once `near` is rejected
+    p3 = FrontierPlanner(None)
+    g_near, _, done_near = p3.select([near, far], [0.0, 0.0], heading_deg=0.0)
+    check("(opt3) a goal inside goal_reach_dist is dropped -> next-best is committed",
+          close(g_near, [3.0, 0.0]) and not done_near and p3._excluded([0.0, 0.3]))
+    check("(opt3) the too-close drop is surfaced as a select event (not a silent candidate drop)",
+          any("TOO-CLOSE" in e for e in p3.last_select_events))
+    # The soft blacklist must record the POST-INSET committed point, not the raw centroid -- otherwise
+    # _excluded() cannot match what actually gets committed on the next pass (the session-33 defeat).
+    p4 = FrontierPlanner(None)
+    p4.set_clearance_fn(lambda goal, pos: [0.0, 0.2] if close(list(goal), [0.0, 2.0]) else list(goal))
+    p4.select([{"center": [0.0, 2.0], "size": 10}, far], [0.0, 0.0], heading_deg=0.0)
+    check("(opt3) the soft blacklist records the POST-INSET point (raw centroid stays clean)",
+          p4._excluded([0.0, 0.2]) and not p4._excluded([0.0, 2.0]))
+    # EVERY candidate too close -> nothing reachable -> the CORNER TOUR takes over (verify_done defaults True,
+    # so this must be a real sweep-corner target, NOT a premature done/None resting state).
+    p5 = FrontierPlanner(None)
+    tour5 = [[5.0, 5.0], [-5.0, 5.0], [-5.0, -5.0], [5.0, -5.0]]
+    g_tour, _, done_tour = p5.select([near], [0.0, 0.0], heading_deg=0.0, sweep_corners=tour5)
+    check("(opt3) all candidates too close -> falls through to the CORNER TOUR, not a premature done",
+          g_tour is not None and not done_tour and p5.sweeping
+          and any(close(g_tour, c) for c in tour5))
+
     # ---- (session 20) GOALS DATABASE + circling-LOOP blacklist ----
     # Each PICKED goal is a DISC (radius goal_area_radius=0.5). A pick registers only on a genuine goal-SWITCH
     # (a different disc than the last pick), so holding one goal across the ~2 Hz selects counts once, while
@@ -900,8 +1035,9 @@ def run_self_test():
     check("(db5) DB persists across switches + snapshot has picks/strikes/drone_locs",
           len(snap) == 2 and a_row and a_row["picks"] == 2 and a_row["strikes"] == 1
           and a_row["drone_locs"] == [[0.0, 0.0], [0.0, 0.0]]
-          and set(a_row) == {"center", "picks", "strikes", "bumps", "corner_giveups", "is_corner",
-                             "drone_locs", "blacklisted", "blacklist_reason", "blacklist_evidence"})
+          and set(a_row) == {"center", "origin", "drift", "picks", "strikes", "bumps", "corner_giveups",
+                             "is_corner", "best_ever", "stagnant_legs", "drone_locs", "blacklisted",
+                             "blacklist_reason", "blacklist_evidence"})
 
     # (db6) goals-DB schema split (operator ask): each blacklist mechanism records its OWN reason +
     # evidence on the disc, and a corner disc can carry BOTH a bump tally and a give-up tally.
@@ -931,6 +1067,137 @@ def run_self_test():
     check("(db6) a corner disc carries BOTH give-up + bump history, is_corner flagged, giveup not blacklisted",
           row3["corner_giveups"] == 1 and row3["bumps"] == 1 and row3["is_corner"] is True
           and not row3["blacklisted"])   # one bump doesn't blacklist; force_retire_corner never does either
+
+    # ---- SESSION 49 — drifting goals-DB discs ----------------------------------------------------------
+    # Diagnosed off flight 20260901_154648: the commitment follows a live frontier centroid within
+    # goal_assoc_dist (1.0), but the goals-DB disc used to be FROZEN at goal_area_radius (0.5) around its
+    # creation point -- so one physical, drifting wall ended the flight as TWO discs (picks=3+bumps=1 and
+    # picks=2), neither reaching its own retirement threshold. The disc must now FOLLOW its goal, bounded by
+    # goal_disc_max_drift measured from its immutable `origin`.
+
+    # (s49a) FOLLOW: the real drift from that flight (total 0.60u across 3 picks) -> ONE disc, center moves
+    # to the LATEST pick, origin stays at the first.
+    real_goal_1, real_goal_2, real_goal_3 = [-2.05, 2.303], [-2.4, 2.62], [-2.5, 2.7]
+    p = FrontierPlanner(None)
+    p.register_goal_pick(real_goal_1, [1.256, 0.928])
+    p.register_goal_pick(real_goal_2, [0.411, 1.611])
+    p.register_goal_pick(real_goal_3, [-0.811, 2.075])
+    check("(s49a) 3 picks drifting 0.60u total -> ONE disc, center follows, origin fixed",
+          len(p._goal_db) == 1 and p._goal_db[0]["picks"] == 3
+          and close(p._goal_db[0]["center"], real_goal_3)
+          and close(p._goal_db[0]["origin"], real_goal_1))
+
+    # (s49b) BUDGET: a 4th pick far enough along the same line that total drift from ORIGIN exceeds
+    # goal_disc_max_drift (0.75) starts a FRESH disc instead of following further.
+    p2 = FrontierPlanner(None)
+    p2.register_goal_pick(real_goal_1, [1.256, 0.928])
+    p2.register_goal_pick(real_goal_2, [0.411, 1.611])
+    p2.register_goal_pick(real_goal_3, [-0.811, 2.075])
+    far_goal = [-2.9, 2.9]   # d(origin, far_goal) > 0.75
+    p2.register_goal_pick(far_goal, [-1.0, 2.2])
+    check("(s49b) a pick beyond goal_disc_max_drift from origin starts a FRESH disc",
+          len(p2._goal_db) == 2 and close(p2._goal_db[1]["origin"], far_goal)
+          and p2._goal_db[1]["picks"] == 1)
+
+    # (s49c) ENVELOPE: once a fully-drifted disc is blacklisted, BOTH its current center AND its origin
+    # read excluded (proves goal_disc_max_drift < goal_blacklist_radius actually protects the origin).
+    p3 = FrontierPlanner(None)
+    p3.register_goal_pick(real_goal_1, [1.256, 0.928])
+    p3.register_goal_pick(real_goal_2, [0.411, 1.611])
+    p3.register_goal_pick(real_goal_3, [-0.811, 2.075])
+    center3, origin3 = list(p3._goal_db[0]["center"]), list(p3._goal_db[0]["origin"])
+    p3._db_blacklist(center3, "loop", {})
+    check("(s49c) a fully-drifted blacklisted disc excludes BOTH its center and its origin",
+          p3._excluded(center3) and p3._excluded(origin3))
+
+    # (s49d) FAIL-FAST: a config that lets the drift budget reach/exceed the exclusion radius must refuse
+    # to start (CLAUDE.md NO-SILENT-FALLBACK rule) rather than fly a silently-defeated blacklist.
+    failfast_ok = False
+    try:
+        FrontierPlanner(None, goal_disc_max_drift=1.5)   # >= default goal_blacklist_radius (1.0)
+    except ValueError:
+        failfast_ok = True
+    check("(s49d) goal_disc_max_drift >= goal_blacklist_radius raises ValueError (fail-fast)", failfast_ok)
+
+    # (s49e) SNAPSHOT: origin/drift ride goal_db_snapshot, drift matches the real 0.60u walk.
+    snap49 = p.goal_db_snapshot()
+    expected_drift = p._d(real_goal_1, real_goal_3)
+    check("(s49e) snapshot carries origin/drift, drift matches the actual walk",
+          "origin" in snap49[0] and "drift" in snap49[0]
+          and abs(snap49[0]["drift"] - round(expected_drift, 3)) < 1e-6)
+
+    # ---- SESSION 49 — stagnation memory (_best_dist wired up + goal_stagnant_limit) ---------------------
+    # Diagnosed off the SAME flight: every leg "closed distance" per-hop because the SLAM pose jumped
+    # backwards between legs, so the STALL guard's per-hop delta read "progress" every time. Only a
+    # best-EVER test sees the truth. Drives register_goal_pick through a RUNNING MIN of _best_dist exactly
+    # as the real commit-site write (2.4) would produce it -- this is the contract under test.
+
+    def _drive_stagnation(planner, goal, raw_leg_dists, positions):
+        """Feed `planner._best_dist` the RUNNING MIN of `raw_leg_dists` (mirrors the real _select_reachable
+        commit-site write) and call register_goal_pick once per leg on `goal`, widely-spread `positions` so
+        the LOOP guard (spread <= goal_loop_pos_dist) never also fires and confounds the stagnation-only
+        assertion."""
+        running = None
+        for d, pos in zip(raw_leg_dists, positions):
+            running = d if running is None else min(running, d)
+            planner._best_dist = running
+            planner.register_goal_pick(goal, pos)
+
+    WIDE_POS = [[0.0, 0.0], [3.0, 0.0], [6.0, 0.0], [9.0, 0.0], [12.0, 0.0]]   # pairwise spread >> goal_loop_pos_dist
+
+    # (s49f) THE REAL FLIGHT: the actual per-leg closest approaches from 20260901_154648.
+    p6 = FrontierPlanner(None)
+    real_leg_dists = [3.85, 2.99, 1.68, 3.55, 2.21]
+    goal6 = [-2.05, 2.303]
+    _drive_stagnation(p6, goal6, real_leg_dists[:3], WIDE_POS[:3])
+    row6 = p6._goal_db[0]
+    after3_ok = (row6["stagnant_legs"] == 0 and abs(row6["best_ever"] - 1.68) < 1e-6
+                 and not p6._excluded(goal6))
+    _drive_stagnation(p6, goal6, real_leg_dists[3:4], WIDE_POS[3:4])
+    after4_ok = (p6._goal_db[0]["stagnant_legs"] == 1 and not p6._excluded(goal6))
+    _drive_stagnation(p6, goal6, real_leg_dists[4:5], WIDE_POS[4:5])
+    snap6 = p6.goal_db_snapshot()[0]
+    after5_ok = (p6._goal_db[0]["stagnant_legs"] == 2 and p6._excluded(goal6)
+                 and snap6["blacklist_reason"] == "stagnant"
+                 and abs(snap6["blacklist_evidence"]["best_ever"] - 1.68) < 1e-6)
+    check("(s49f) real flight: legs 1-3 improve (best_ever=1.68, stagnant=0), leg 4 stagnates (1, not dead), "
+          "leg 5 -> permanent STAGNANT blacklist",
+          after3_ok and after4_ok and after5_ok)
+
+    # (s49g) MARCH NOT PUNISHED: every leg improves by > goal_progress_eps -> never stagnates, never dies.
+    p7 = FrontierPlanner(None)
+    goal7 = [10.0, 0.0]
+    _drive_stagnation(p7, goal7, [6.0, 4.0, 2.0, 1.0], WIDE_POS[:4])
+    check("(s49g) a genuine march (every leg improves) never accrues stagnant_legs, never blacklisted",
+          p7._goal_db[0]["stagnant_legs"] == 0 and not p7._excluded(goal7))
+
+    # (s49h) EPS BOUNDARY: an improvement of EXACTLY goal_progress_eps (strict `<`) does NOT count.
+    p8 = FrontierPlanner(None)
+    goal8 = [20.0, 0.0]
+    _drive_stagnation(p8, goal8, [2.0, 1.8], WIDE_POS[:2])    # 1.8 == 2.0 - progress_eps exactly
+    check("(s49h) an improvement of exactly goal_progress_eps does NOT count -> stagnant_legs increments",
+          p8._goal_db[0]["stagnant_legs"] == 1)
+
+    # (s49i) NO MEMORY, NO VERDICT: _best_dist never set (no select() ran) -> register_goal_pick must NOT
+    # fabricate a verdict from absent evidence.
+    p9 = FrontierPlanner(None)
+    p9.register_goal_pick([30.0, 0.0], [0.0, 0.0])
+    check("(s49i) no live _best_dist -> best_ever stays None, stagnant_legs stays 0, no blacklist",
+          p9._goal_db[0]["best_ever"] is None and p9._goal_db[0]["stagnant_legs"] == 0
+          and not p9._excluded([30.0, 0.0]))
+
+    # (s49j) _best_dist IS ACTUALLY WRITTEN: run select() twice through the REAL commit path (2.4), drone
+    # moving closer between calls -> the running-min memory must reflect the smaller distance. This is the
+    # regression test for the bug that the field existed (read + reset) and nothing ever wrote it.
+    p10 = FrontierPlanner(None)
+    frontier10 = [{"center": [5.0, 0.0], "size": 10}]
+    check("(s49j) _best_dist starts unset", p10._best_dist is None)
+    p10.select(frontier10, [0.0, 0.0])
+    first_best = p10._best_dist
+    p10.select(frontier10, [2.0, 0.0])   # closer (3.0u vs 5.0u)
+    check("(s49j) select() WRITES _best_dist as the running closest approach (bug regression)",
+          first_best is not None and abs(first_best - 5.0) < 1e-6
+          and p10._best_dist is not None and abs(p10._best_dist - 3.0) < 1e-6)
 
     print(f"\n[frontier_planner][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
