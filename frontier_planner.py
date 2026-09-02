@@ -169,6 +169,17 @@ class FrontierPlanner:
                 return True
         return False
 
+    def _excluded_permanent(self, center):
+        """True if `center` falls inside the exclusion ball of a PERMANENTLY blacklisted goal — mirrors
+        `_excluded` but ignores soft/round (active-only, non-permanent) entries entirely (session 52): a
+        corner sitting in a region that is merely dead THIS round must still be toured (that soft-exclusion
+        exemption is `_pick_sweep_corner`'s original operator requirement and survives unchanged), while a
+        region PROVEN unreachable for the whole flight must retire a corner unseen (see `_pick_sweep_corner`)."""
+        for e in self._blacklist:
+            if self._d(center, e["goal"]) <= self.blacklist_radius and e["permanent"]:
+                return True
+        return False
+
     def _blacklist_goal(self, goal, permanent=False, reason=None, evidence=None):
         """Record `goal` as unreachable, using the best (closest) distance reached this commit
         (`self._best_dist`). `permanent=True` (the stagnation watchdog) marks it dead FOR GOOD immediately —
@@ -545,11 +556,29 @@ class FrontierPlanner:
             self._reset_progress()
 
     def _pick_sweep_corner(self, corners, pos):
-        """The FARTHEST-from-`pos` corner that is not yet visited — and NOTHING ELSE. It MUST NOT consult
-        `_excluded`: corner targets are NEVER suppressed by old frontier blacklists (operator's explicit
-        requirement — a walled-off corner is retired by a fresh 2-bump in note_wall_hit, not a stale
-        filter). Farthest-first ⇒ opposite corner first, then the far one of the rest, then the last."""
-        cand = [c for c in (corners or []) if not self._corner_visited(c)]
+        """The FARTHEST-from-`pos` corner that is not yet visited — with ONE exception. Corners still IGNORE
+        a SOFT/this-round blacklist (`_excluded`): the original operator requirement survives — a walled-off
+        corner that is merely dead THIS round is retired by a fresh 2-bump in note_wall_hit, not a stale
+        filter, so a soft exclusion alone never skips a corner. But a corner sitting inside a region already
+        PROVEN unreachable for the whole flight (`_excluded_permanent`) is force-retired unseen instead of
+        being committed to and hammered for minutes (session 52, diagnosed off flight 20260901_222552: corner
+        [4.1,-4.1] sat 0.885u inside a permanently-blacklisted disc and was flown into anyway, taking 3¾ min
+        to kill via a fresh 2-bump that could never have succeeded). Farthest-first among the survivors ⇒
+        opposite corner first, then the far one of the rest, then the last."""
+        cand = []
+        for c in (corners or []):
+            if self._corner_visited(c):
+                continue
+            if self._excluded_permanent(c):
+                e = self._db_entry([float(c[0]), float(c[1])])
+                e["corner_giveups"] += 1
+                e["is_corner"] = True
+                self._mark_corner_visited(c)
+                self.last_select_events.append(
+                    f"CORNER-SKIP goal=[{float(c[0]):.3f}, {float(c[1]):.3f}] inside a PERMANENT dead "
+                    f"zone -> force-retired, tour advances")
+                continue
+            cand.append(c)
         if not cand:
             return None
         return max(cand, key=lambda c: self._d(c, pos))
@@ -861,12 +890,14 @@ def run_self_test():
     g_pull, _, _ = p.select([], [1.0, 1.0], sweep_corners=[[9.0, 5.0], [0.0, 0.0]])
     check("(A3) corner target is the passed corner exactly (no extra pull)", close(g_pull, [9.0, 5.0]))
 
-    # (A1) corners IGNORE the frontier blacklist: a corner sitting in a blacklisted region is STILL toured
-    #      (operator requirement) — corner retirement is via a fresh 2-bump, not `_excluded` filtering.
+    # (A1) corners ignore a SOFT / this-round blacklist: a corner sitting in a round-excluded region is
+    #      STILL toured (the surviving half of the original operator requirement — retirement is via a
+    #      fresh 2-bump, not a stale round filter). Session 52 narrowed this: a PERMANENT dead zone now
+    #      DOES retire a corner unseen — covered by `(52-corner-1)`.
     p = FrontierPlanner(None); p._ever_had_frontiers = True
-    p._blacklist_goal([5.0, 0.0], permanent=True)                  # dead region at a corner
+    p._blacklist_goal([5.0, 0.0], permanent=False)                 # dead region at a corner, THIS ROUND ONLY
     g_x, _, done_x = p.select([], [0.0, 0.0], sweep_corners=[[0.0, 0.0], [5.0, 0.0]])
-    check("(A1) corner in a blacklisted region is STILL toured (corners ignore _excluded)",
+    check("(A1) corner in a SOFT-blacklisted region is STILL toured (corners ignore round exclusions)",
           close(g_x, [5.0, 0.0]) and not done_x and p.sweeping)
 
     # (A2) ESCAPE via corner retirement: while touring toward a corner, two bumps on that target retire it
@@ -909,6 +940,51 @@ def run_self_test():
     check("(A4) force_retire_corner: give-up retires without proximity, advances tour, "
           "exhaustion still -> done, _gave_up_corner flags it",
           force_retire_ok and force_retire_exhausts_ok)
+
+    # (52-corner-1..5, session 52) a sweep corner must not be flown into a permanent dead region. Diagnosed
+    # off flight 20260901_222552: [3.5,-4.75] was loop-blacklisted at 22:37:47, then the tour committed to
+    # corner [4.1,-4.1] — 0.885u away, inside goal_blacklist_radius=1.0 — and hammered it for 3¾ min before a
+    # 2-bump finally killed it. `_pick_sweep_corner` now force-retires a corner unseen when it sits inside a
+    # PERMANENT dead zone (soft/round exclusions still don't touch corners — see the updated (A1) above).
+    corners_rf = [[4.1, -4.1], [-1.0, -4.1], [-1.2, 8.4], [4.1, 8.4]]
+    pos_rf = [1.455, 3.2514]
+
+    p = FrontierPlanner(None)
+    p._blacklist_goal([3.5, -4.75], permanent=True)
+    picked_rf = p._pick_sweep_corner(corners_rf, pos_rf)
+    check("(52-corner-1) real-flight case: corner inside a permanent dead zone is skipped",
+          (picked_rf is None or not close(picked_rf, [4.1, -4.1]))
+          and p._corner_visited([4.1, -4.1])
+          and any("CORNER-SKIP" in s for s in p.last_select_events))
+
+    p = FrontierPlanner(None)
+    p._blacklist_goal([3.5, -4.75], permanent=False)               # SOFT this time
+    picked_soft = p._pick_sweep_corner(corners_rf, pos_rf)
+    check("(52-corner-2) a SOFT blacklist does NOT retire a corner (farthest-first, unchanged)",
+          close(picked_soft, [4.1, -4.1])
+          and not any("CORNER-SKIP" in s for s in p.last_select_events))
+
+    p = FrontierPlanner(None); p._ever_had_frontiers = True
+    for c in corners_rf:
+        p._blacklist_goal(c, permanent=True)
+    picked_all_dead = p._pick_sweep_corner(corners_rf, pos_rf)
+    _, _, done_all_dead = p.select([], pos_rf, sweep_corners=corners_rf)
+    check("(52-corner-3) all corners permanently dead -> None picked, select() reports done",
+          picked_all_dead is None and done_all_dead
+          and sum("CORNER-SKIP" in s for s in p.last_select_events) >= len(corners_rf))
+
+    p = FrontierPlanner(None)
+    p._blacklist_goal([3.5, -4.75], permanent=True)
+    p._pick_sweep_corner(corners_rf, pos_rf)
+    check("(52-corner-4) _gave_up_corner is NOT set by a permanent-dead skip", p._gave_up_corner is False)
+
+    p = FrontierPlanner(None)
+    A_pe, B_pe = [10.0, 10.0], [-10.0, -10.0]
+    p._blacklist_goal(A_pe, permanent=False)
+    p._blacklist_goal(B_pe, permanent=True)
+    check("(52-corner-5) _excluded_permanent ignores soft entries",
+          p._excluded(A_pe) is True and p._excluded_permanent(A_pe) is False
+          and p._excluded(B_pe) is True and p._excluded_permanent(B_pe) is True)
 
     # (opt) clearance inset: a chosen frontier goal is run through the injected clearance_fn before commit,
     #       so committed==published; a None return commits the RAW goal and flags clearance_ok=False.

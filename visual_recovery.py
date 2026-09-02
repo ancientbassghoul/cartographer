@@ -64,6 +64,11 @@ class VisualRecoveryProbe:
         self.sift = cv2.SIFT_create()
         self.matcher = cv2.BFMatcher(cv2.NORM_L2)
         self._lkg = None    # cached BGR frame (last known good — SLAM was TRACKING when it was captured)
+        # Session 52: which frame `_lkg` actually IS -- "live" (the tick's own frame, legacy behaviour),
+        # "slam:<frame_id>" (the exact frame the plan was computed from, pulled from run_explore's ring),
+        # or "live(aged-out)" (the plan's frame_id fell off the ring -- degraded to live, logged LOUD by
+        # the caller). A LABEL ONLY: never read by match(), just surfaced on the debug banner.
+        self._lkg_src = "none"
         # Session 51: LAZY, memoised SIFT for the REFERENCE half of a match. `None` = not computed yet;
         # once computed it holds the (keypoints, descriptors) tuple for the CURRENT `_lkg` and is reused
         # until a new reference replaces it. The flag is the TUPLE SLOT, never the descriptors: a
@@ -71,11 +76,17 @@ class VisualRecoveryProbe:
         # recompute it forever.
         self._lkg_feats = None
 
-    def update_reference(self, frame, tracked):
+    def update_reference(self, frame, tracked, src: str = "live"):
         """Cache `frame` as F_LKG whenever `tracked` is True. Called every tick from run_explore, gated on
-        the same `plan.get("plan_valid")` boundary session-34's own cached-pose snapshot uses — so "F_LKG"
-        is really "frame at the last valid plan", the same close-enough proxy that cache already accepts
-        (the plan can lag frames by up to ~1s). Cheap (a copy); SIFT only runs at match() time.
+        the same `plan.get("plan_valid")` boundary session-34's own cached-pose snapshot uses.
+
+        Session 52: `frame` is now WHICHEVER frame the caller resolved as the true reference -- run_explore
+        keeps a short ring of recent (frame_id, frame) pairs and, when possible, passes the EXACT frame the
+        SLAM plan was computed from (this flight measured solve latency up to 14.9s, so "the live frame at
+        this tick" and "the frame the plan describes" can be seconds apart). `src` is a caller-supplied
+        LABEL for which frame this is ("slam:<frame_id>" | "live" | "live(aged-out)") -- stored verbatim for
+        the debug banner (`_compose_debug`) and never consulted by matching logic. Cheap (a copy); SIFT only
+        runs at match() time.
 
         Session 51: returns True when it actually STORED a new reference (so run_explore can invalidate
         its own per-tick match memo on that exact edge rather than duplicating this condition), else
@@ -83,6 +94,7 @@ class VisualRecoveryProbe:
         if tracked and frame is not None:
             self._lkg = frame.copy()
             self._lkg_feats = None      # new reference -> the memoised SIFT no longer describes it
+            self._lkg_src = str(src)
             return True
         return False
 
@@ -136,7 +148,8 @@ class VisualRecoveryProbe:
         scale_txt = f"{out.scale:.2f}" if out.scale is not None else "n/a"
         line1 = banner or ""
         line2 = (f"has_lkg={out.has_lkg} matched={out.matched} inliers={out.inliers} "
-                 f"contained={out.contained} planar_like={out.planar_like} scale={scale_txt}")
+                 f"contained={out.contained} planar_like={out.planar_like} scale={scale_txt} "
+                 f"lkg_src={self._lkg_src}")
         cv2.putText(banner_strip, line1, (6, 13), BANNER_FONT, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(banner_strip, line2, (6, 29), BANNER_FONT, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
         canvas = np.vstack([banner_strip, body])
@@ -418,6 +431,60 @@ def run_self_test():
     stored_yes = p14.update_reference(base, True)
     case("update_reference returns True only when it really cached a new reference",
          stored_no is False and stored_none is False and stored_yes is True)
+
+    # ---- SESSION 52 — F_LKG selected by frame IDENTITY, not by tick freshness ---------------------------
+    # `src` is a caller-supplied LABEL (run_explore resolves it from a short frame-id ring against the
+    # plan's own frame_id) that must be visible for debugging but must NEVER influence matching.
+
+    # (52-lkg-1) src is recorded and defaults safely; a tracked=False call touches neither _lkg nor _lkg_src.
+    frameA, frameB, frameC = _textured_image(seed=21), _textured_image(seed=22), _textured_image(seed=23)
+    p_lkg1 = VisualRecoveryProbe()
+    p_lkg1.update_reference(frameA, True)
+    case(f"(52-lkg-1a) default src is 'live' (src={p_lkg1._lkg_src!r})", p_lkg1._lkg_src == "live")
+    p_lkg1.update_reference(frameB, True, src="slam:42")
+    case(f"(52-lkg-1b) explicit src is stored verbatim (src={p_lkg1._lkg_src!r})",
+         p_lkg1._lkg_src == "slam:42")
+    p_lkg1.update_reference(frameC, False, src="slam:43")
+    lkg_still_frameB = bool(np.array_equal(p_lkg1._lkg, frameB))
+    case(f"(52-lkg-1c) tracked=False stores NEITHER frame nor src "
+         f"(lkg_still_frameB={lkg_still_frameB}, src={p_lkg1._lkg_src!r})",
+         lkg_still_frameB and p_lkg1._lkg_src == "slam:42")
+
+    # (52-lkg-2) src never affects matching: two probes fed the IDENTICAL reference/live pair, differing
+    # only in the src label, must agree on every match verdict field.
+    p_lkg2_live = VisualRecoveryProbe()
+    p_lkg2_live.update_reference(base, True, src="live")
+    p_lkg2_slam = VisualRecoveryProbe()
+    p_lkg2_slam.update_reference(base, True, src="slam:9")
+    vm_lkg2_live = p_lkg2_live.match(zoomed)
+    vm_lkg2_slam = p_lkg2_slam.match(zoomed)
+    case("(52-lkg-2) src label never affects the match verdict (live vs slam:9 agree in full)",
+         vm_lkg2_live.matched == vm_lkg2_slam.matched
+         and vm_lkg2_live.inliers == vm_lkg2_slam.inliers
+         and vm_lkg2_live.contained == vm_lkg2_slam.contained
+         and vm_lkg2_live.planar_like == vm_lkg2_slam.planar_like
+         and vm_lkg2_live.scale == vm_lkg2_slam.scale)
+
+    # (52-lkg-3) the debug banner names the reference frame's src. cv2.putText draws to pixels (not
+    # OCR-able), so intercept the text ARGUMENTS the same way the module composes them, capturing exactly
+    # what _compose_debug hands to cv2.putText.
+    p_lkg3 = VisualRecoveryProbe()
+    p_lkg3.update_reference(base, True, src="slam:777")
+    _put_text_calls = []
+    _real_put_text = cv2.putText
+
+    def _spy_put_text(img, text, *rest, **kw):
+        _put_text_calls.append(text)
+        return _real_put_text(img, text, *rest, **kw)
+
+    cv2.putText = _spy_put_text
+    try:
+        vm_lkg3 = p_lkg3.match(zoomed, debug=True)
+    finally:
+        cv2.putText = _real_put_text
+    banner_has_src = (vm_lkg3.debug_image is not None
+                       and any("slam:777" in t for t in _put_text_calls))
+    case(f"(52-lkg-3) debug banner names the reference src (lkg_src={p_lkg3._lkg_src!r})", banner_has_src)
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

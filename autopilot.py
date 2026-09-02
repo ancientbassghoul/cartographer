@@ -87,7 +87,11 @@ _NEUTRAL = {
 }
 
 
-def _full_vector(active: dict, seq: int, now: float, state: str, target_altitude_y=None) -> dict:
+def _full_vector(active: dict, seq: int, now: float, state: str,
+                 target_altitude_y=None,
+                 state_since_s: float | None = None,
+                 slam_hold: dict | None = None,
+                 notice: dict | None = None) -> dict:
     v = {"seq": seq, "mono_ts": now, "state": state}
     v.update(_NEUTRAL)
     v.update(active or {})
@@ -102,6 +106,12 @@ def _full_vector(active: dict, seq: int, now: float, state: str, target_altitude
     # calibration latches it) -- rides TOPIC_CONTROL so the visualizer can show it next to the
     # live pos_y (which already rides TOPIC_PLAN) without a third bus/port.
     v["target_altitude_y"] = (round(float(target_altitude_y), 4) if target_altitude_y is not None else None)
+    # Session 52 (chunk 6): panel telemetry -- how long the controller has been in its CURRENT state,
+    # SLAM_HOLD counters/deadline, and the latched last-timeout notice. Always present (never omitted)
+    # so the visualizer can render a fixed-shape panel without a KeyError guard per field.
+    v["state_since_s"] = round(float(state_since_s), 2) if state_since_s is not None else None
+    v["slam_hold"] = slam_hold
+    v["notice"] = notice
     return v
 
 
@@ -801,6 +811,9 @@ class ExploreController:
         self.visrec_match_min_interval_s = float(e.get("visrec_match_min_interval_s", 0.5))
         self.visrec_debug_window = bool(e.get("visrec_debug_window", False))
         self.visrec_save_max = int(e.get("visrec_save_max", 200))
+        # Session 52: F_LKG-by-frame-identity ring length (frame COUNT, not a duration) -- see the
+        # config.yaml comment for the latency/memory rationale. 0 = legacy live-frame behaviour.
+        self.visrec_lkg_ring_len = int(e.get("visrec_lkg_ring_len", 160))
         # NO SILENT FALLBACK (CLAUDE.md rules 2+3): two INDEPENDENT degradation states, each logged CRITICAL
         # once and each carried into the timeline, so the replay shows WHICH half died. A debug window must
         # never kill a flight, but it must never fail quietly either.
@@ -951,6 +964,10 @@ class ExploreController:
         # window -- so this can never accumulate across the OK/PLAN-LOST oscillation into a spurious reaction.
         self._loss_episode_t0 = None
         self._loss_grace_noticed = False
+        # Session 52 (chunk 3): mirrors `_loss_grace_noticed` but for the POST-BACKOFF RE-SOLVE GATE
+        # (`_backoff_resolve_since`) instead of the loss-recovery grace -- stops the "SUPPRESSED" notice
+        # repeating every tick while the gate holds the one-shot deferred (armed, not spent).
+        self._backoff_gate_noticed = False
         # Yaw is "fly toward your aim": a SUSTAINED hold (then 'c' reset) rotates the body; the turn ANGLE
         # is set by the hold DURATION, not a steerable rate (pulses do nothing; SLAM under-tracks rotation
         # so no in-turn closed loop). Turn OPEN-LOOP in quantized steps using the user's calibrated turn
@@ -1040,6 +1057,12 @@ class ExploreController:
         self._slam_ms_win = collections.deque(maxlen=self.calib_slam_avg_window)  # healthy-frame latency window
         self._calib_gate_since = None        # 'now' the comfort gate started blocking a CALIB_LOST_HOLD redo
         self._pending_notice = None          # one-shot operator notice (run_explore prints; e.g. height-drift warn)
+        # Session 52 (chunk 6): FLIGHT-level SLAM_HOLD observability counters + the latched last-timeout notice
+        # for the visualizer panel. Deliberately NOT reset in reset_leg (a manual takeover must not zero the
+        # flight-so-far picture) -- see Contract 1.2 in PROGRESS.md / the session-52 spec.
+        self._slam_hold_entries = 0          # SLAM_HOLD entries this flight (re-entries within one hold don't recount)
+        self._slam_hold_total_s = 0.0        # cumulative seconds spent in SLAM_HOLD this flight
+        self.last_timeout = None             # {"kind","text","t"} of the most recent timeout/forced-escape, or None
         # Diagnostic session: position-state monitoring at the two hop-judgment-relevant instants. One-shot
         # stashes, mirroring `_pending_notice` -- run_explore pops + prints + diag-logs each tick.
         self._hop_baseline_msg = None        # set when the hop-start pose/cap_ts is bound (ADVANCE)
@@ -1265,6 +1288,7 @@ class ExploreController:
         self._backoff_resolve_t0 = None
         self._loss_episode_t0 = None         # session 48: and any in-flight loss-recovery grace window
         self._loss_grace_noticed = False
+        self._backoff_gate_noticed = False   # session 52: and any in-flight post-backoff gate suppression
         self._reset_visual_recovery()
         # Session-12 recovery flags. A manual takeover (the only caller of reset_leg) invalidates any in-flight
         # recovery, so clear them here; DURING a flight they persist across the PLAN-LOST/PLAN-STALE flicker.
@@ -1279,6 +1303,11 @@ class ExploreController:
         self._last_good_t = None
         self._was_lost = False
         self._loss_snapshot_checked = False
+        # Session 52 (chunk 4): arms the 15° probe's LATE/in-flight entry (`_maybe_enter_visual_probe`,
+        # polled from `_step_stale`). Set True at the fresh-loss edge below; spent by `_enter_visual_recovery`
+        # (either entry path) and by `_arm_loss_backoff` (a physical back-off, not a turn-probe, already
+        # answered this episode); cleared by `_reset_visual_recovery` so the next fresh loss re-arms.
+        self._visrec_probe_armed = False
         self._rec_settling = False     # not mid an inter-action recovery settle
         self._slam_resume = None    # SLAM streak/latest persist (health is flight-level); only the pending resume clears
         self._slam_stepback_count = 0   # per-hold step-back counter + timer clear on interruption
@@ -1575,6 +1604,12 @@ class ExploreController:
             self._enter("WARMUP", now)
             return {}, "WARMUP", "PLAN-STALE at startup (SLAM still initializing) -> HOLD (no blind sweep)"
         if not self.use_rewind_on_stale:
+            # Session 52 (chunk 4): the loss-instant one-shot is very often already spent by the time
+            # PLAN-STALE arrives (see `_maybe_enter_visual_probe`'s docstring) -- give the probe a second,
+            # LATE shot before falling through to the blind sweep.
+            probe = self._maybe_enter_visual_probe(now)
+            if probe is not None:
+                return probe
             return self._enter_fallback_sweep(now, "PLAN-STALE -> FALLBACK sweep (REWIND disabled)")
         # Ghost-path guard: a re-lock that already MOVED (unconfirmed) decoupled the leftover history from the
         # true pose -> clear it and BYPASS REWIND straight to the safe FALLBACK sweep.
@@ -1650,6 +1685,7 @@ class ExploreController:
                 ev = self._calib_fail_escalate(now, f"comfort gate timeout ({self.calib_gate_max_s:.0f}s with "
                                                     f"avg {self._slam_ms_avg:.0f}ms >= "
                                                     f"{self.calib_slam_avg_ms:.0f})", allow_redo=False)
+                self.note_timeout("CALIB_GATE", ev, now, loud=False)
                 return {}, self.state, ev
             return {}, "CALIB_LOST_HOLD", None     # gated; holding for the average to clear
         # STUCK -> ONE bump total per hold (either cause), first frame emitted NOW, then hold for plan OK.
@@ -1861,6 +1897,7 @@ class ExploreController:
         self._visrec_phase_t0 = None
         self._visrec_cum_deg = 0.0
         self._visrec_wait_t0 = None
+        self._visrec_probe_armed = False   # session 52 (chunk 4): a confirmed recovery ends the episode
 
     def wants_visual_match(self):
         """Session 51: True only when THIS tick can actually CONSUME a visual match. There are exactly two
@@ -1890,6 +1927,10 @@ class ExploreController:
         whatever sub-phase was in progress, then flickers back to PLAN-STALE) just re-enters
         VISUAL_RECOVERY and continues from wherever `_visrec_phase` already was — the exact
         flicker-persistence rule `_fallback_phase`/`_recovering` already use."""
+        # Session 52 (chunk 4): spend the latch HERE, in the one place both entry paths (the existing tail
+        # hand-off in `_maybe_loss_snapshot_backoff` and the new late entry in `_maybe_enter_visual_probe`)
+        # funnel through -- so neither path can double-spend it.
+        self._visrec_probe_armed = False
         if self._visrec_phase is None:
             self._visrec_phase = "TURN"
             self._visrec_phase_t0 = now
@@ -1970,9 +2011,38 @@ class ExploreController:
         # the bounded give-up.
         if (now - self._visrec_wait_t0) >= self.visrec_wait_recover_s:
             self._enter("STUCK", now)
-            return {}, "STUCK", (f"visual probe re-acquired F_LKG farther at +{self._visrec_cum_deg:.0f}°, "
-                                 f"waited {self.visrec_wait_recover_s:.0f}s, no SLAM re-anchor -> STUCK")
+            _msg = (f"visual probe re-acquired F_LKG farther at +{self._visrec_cum_deg:.0f}°, "
+                    f"waited {self.visrec_wait_recover_s:.0f}s, no SLAM re-anchor -> STUCK")
+            self.note_timeout("VISREC_WAIT_TIMEOUT", _msg, now, loud=False)
+            return {}, "STUCK", _msg
         return {}, "VISUAL_RECOVERY", None
+
+    def _maybe_enter_visual_probe(self, now):
+        """Session 52. Second, LATE entry into the 15° probe, polled from `_step_stale` just before the
+        blind FALLBACK sweep. Returns the usual (fields, state, event) triple, or None to let the
+        caller fall through to the sweep.
+
+        Exists because the probe's original entry (the tail of `_maybe_loss_snapshot_backoff`) is
+        guarded by the back-off one-shot, which 57 of 58 loss episodes on flight 20260901_222552 spent
+        on their opening PLAN-LOST tick -- closing the door before the PLAN-STALE that the probe is
+        scoped to ever arrived.
+
+        The probe TURNS, so it waits out `loss_backoff_grace_s` exactly like a back-off does (session
+        48: 96.9% of held-still losses resolve inside that window); while waiting it HOLDS and returns
+        a HOLD_LOST triple, and it is re-polled on every subsequent stale tick.
+        """
+        if not self.use_visual_recovery_on_stale:
+            return None
+        if not self._visrec_probe_armed:
+            return None
+        if self._loss_episode_t0 is not None and now - self._loss_episode_t0 < self.loss_backoff_grace_s:
+            waited = now - self._loss_episode_t0
+            self._enter("HOLD_LOST", now)
+            return {}, "HOLD_LOST", (f"loss-recovery grace {waited:.1f}s/{self.loss_backoff_grace_s:.0f}s -> "
+                                     f"holding still before the {self.visrec_turn_step_deg:.0f}deg visual "
+                                     "probe (a probe TURNS)")
+        return self._enter_visual_recovery(now, "PLAN-STALE with the loss-instant one-shot already spent -> "
+                                                 "late entry into the 15deg visual recovery probe")
 
     def _enter_fallback_sweep(self, now, event):
         """Route into the FALLBACK sweep (session 31: wait -> turn -> push a FRESH random direction -> wait
@@ -2047,8 +2117,10 @@ class ExploreController:
             return {}, "FALLBACK", None
         if self._fallback_cum_deg >= self.fallback_max_rotation_deg:
             self._enter("STUCK", now)
-            return {}, "STUCK", (f"FALLBACK sweep exhausted ({self._fallback_cum_deg:.0f}° over "
-                                 f"{self._fallback_cycle} cycles) -> STUCK (HOLD; awaiting perception)")
+            _msg = (f"FALLBACK sweep exhausted ({self._fallback_cum_deg:.0f}° over "
+                    f"{self._fallback_cycle} cycles) -> STUCK (HOLD; awaiting perception)")
+            self.note_timeout("FALLBACK_EXHAUSTED", _msg, now, loud=False)
+            return {}, "STUCK", _msg
         self._fallback_phase, self._fallback_phase_t0 = "TURN", now
         return {}, "FALLBACK", None
 
@@ -2285,6 +2357,13 @@ class ExploreController:
                                      f"then resume {resume_state}")
 
     def _enter(self, state, now):
+        # Session 52 (chunk 6): FLIGHT-level SLAM_HOLD counters, latched here (before self.state/t_state are
+        # overwritten below) so a re-entry into SLAM_HOLD from SLAM_HOLD itself never double-counts, and the
+        # dwell time is always measured from the true entry instant (t_state).
+        if state == "SLAM_HOLD" and self.state != "SLAM_HOLD":
+            self._slam_hold_entries += 1
+        elif self.state == "SLAM_HOLD" and state != "SLAM_HOLD":
+            self._slam_hold_total_s += max(0.0, now - self.t_state)
         # Ghost-path guard (D5): the moment a re-locked-but-unconfirmed drone enters a SPATIAL state it physically
         # moves (turn/translate) with logging frozen, so the leftover pre-loss command_history no longer maps to
         # the drone's true pose. Mark it broken -> a secondary SLAM drop clears it and jumps to the
@@ -2466,6 +2545,9 @@ class ExploreController:
         (2) It keeps the escalation decision in ONE place, so the two call sites cannot drift apart.
 
         Returns the (active, state, event) tuple for the caller to hand straight back."""
+        # Session 52 (chunk 4): an episode that earned a physical back-off must not ALSO turn-probe on top
+        # of it -- clear the probe's late-entry latch here, the shared tail both triggers funnel through.
+        self._visrec_probe_armed = False
         self._blind_contact_reacts += 1
         if self._blind_contact_reacts > self.blind_contact_escalate_after:
             # Same shape as `_blind_contact_backoff`'s escalation: a FRESH sweep skips the initial
@@ -2535,36 +2617,47 @@ class ExploreController:
             if waited_loss < self.loss_backoff_grace_s:
                 if not self._loss_grace_noticed:
                     self._loss_grace_noticed = True
-                    self._pending_notice = (
+                    self.note_timeout("LOSS_GRACE", (
                         f"LOSS-RECOVERY GRACE: too-close evidence at the loss instant, but holding still for "
                         f"{self.loss_backoff_grace_s:.0f}s to let SLAM re-lock before reacting "
-                        f"(96.9% of held-still losses resolve inside that window). No back-off yet.")
+                        f"(96.9% of held-still losses resolve inside that window). No back-off yet."), now)
                 return None
-        self._loss_snapshot_checked = True
         # Session 47 -- POST-BACKOFF SLAM RE-SOLVE GATE (see `_backoff_resolve_since`). A back-off that SLAM
         # never got to look at cannot have been judged, so re-firing off the SAME pre-backoff evidence is not
         # a decision, it is a loop: flight 20260901_142738 did exactly that 7 times (once only 1.05s after the
         # previous back-off ENDED), because SETTLE's freshness gate needs 6 frames under slam_slow_ms=1000 and
         # SLAM was solving at 3400-3700ms, so SETTLE could never complete and the next OK->PLAN-LOST flip was
-        # always the thing that broke the deadlock. Spend the one-shot (above) and HOLD instead -- the caller
-        # falls through to its hard hover-hold, which is precisely "give SLAM the opportunity to recover".
-        if self._backoff_resolve_since is not None:
+        # always the thing that broke the deadlock. HOLD instead -- the caller falls through to its hard
+        # hover-hold, which is precisely "give SLAM the opportunity to recover".
+        # Session 52 (chunk 3, flight 20260901_222552): this gate used to sit ABOVE the evidence clauses and
+        # unconditionally spent the one-shot + printed the suppression notice, even when `_would_react` is
+        # False -- i.e. even when there was never any too-close evidence to re-fire off in the first place
+        # (both occurrences this flight, 22:46:34 and 22:49:51, were exactly that: the drone had already
+        # backed off to a clear reading, so the gate fired on nothing). Gate it behind `_would_react` so an
+        # evidence-free loss falls straight through to the visual-recovery hand-off below instead of being
+        # silently swallowed for the whole `backoff_resolve_budget_s` window, and leave the one-shot ARMED
+        # (do NOT set `_loss_snapshot_checked` yet) while genuinely suppressing so the check gets a real shot
+        # once the gate clears.
+        if _would_react and self._backoff_resolve_since is not None:
             waited = now - (self._backoff_resolve_t0 if self._backoff_resolve_t0 is not None else now)
             if waited < self.backoff_resolve_budget_s:
-                self._pending_notice = (
-                    f"LOSS-INSTANT BACK-OFF SUPPRESSED: waiting for SLAM to solve a frame captured after the "
-                    f"last back-off ({waited:.1f}s / {self.backoff_resolve_budget_s:.0f}s budget) — holding "
-                    f"still rather than re-firing off pre-backoff evidence "
-                    f"[{self._blind_contact_reacts} back-off(s) this episode]")
+                if not self._backoff_gate_noticed:
+                    self._backoff_gate_noticed = True
+                    self.note_timeout("BACKOFF_SUPPRESSED", (
+                        f"LOSS-INSTANT BACK-OFF SUPPRESSED: waiting for SLAM to solve a frame captured after the "
+                        f"last back-off ({waited:.1f}s / {self.backoff_resolve_budget_s:.0f}s budget) — holding "
+                        f"still rather than re-firing off pre-backoff evidence "
+                        f"[{self._blind_contact_reacts} back-off(s) this episode]"), now)
                 return None
             # Budget exhausted -- the capture stream never produced a timestamped frame we could compare
             # against. Open the gate, but say so LOUDLY (CLAUDE.md: a degraded path is never silent).
-            self._pending_notice = (
+            self.note_timeout("BACKOFF_GATE_TIMEOUT", (
                 f"POST-BACKOFF RE-SOLVE GATE TIMED OUT after {waited:.1f}s (budget "
                 f"{self.backoff_resolve_budget_s:.0f}s) — no SLAM frame captured after the last back-off ever "
-                f"solved. Proceeding UNCONFIRMED; the loss-instant back-off is re-enabled.")
+                f"solved. Proceeding UNCONFIRMED; the loss-instant back-off is re-enabled."), now)
             self._backoff_resolve_since = None
             self._backoff_resolve_t0 = None
+        self._loss_snapshot_checked = True
         if self._last_good_clearance is not None and self._last_good_clearance <= self.stop_clearance_dist:
             self._register_bump(dict(plan, pos=self._last_good_pos),
                                 "clearance stand-off (stale pose @ loss)")
@@ -2616,6 +2709,18 @@ class ExploreController:
         warning), or None. run_explore prints + diag-logs it (VISIBLE telemetry, no silent state)."""
         n, self._pending_notice = self._pending_notice, None
         return n
+
+    def note_timeout(self, kind: str, text: str, now: float, loud: bool = True) -> None:
+        """Latch a timeout/forced-escape for the visualizer's notice line (session 52).
+
+        ALWAYS overwrites `self.last_timeout` (newest wins; it is never consumed, unlike
+        `_pending_notice`). When `loud`, ALSO sets `_pending_notice` so run_explore prints the
+        existing `*** ... ***` console/diag line. Pass loud=False at sites that already log the same
+        sentence as their `event` return value, so nothing double-logs.
+        """
+        self.last_timeout = {"kind": kind, "text": text, "t": float(now)}
+        if loud:
+            self._pending_notice = text
 
     def take_hop_baseline_msg(self):
         """Pop the pending [HOP_BASELINE] diagnostic (the pose/cap_ts a hop's start was bound against),
@@ -2802,11 +2907,11 @@ class ExploreController:
                     _med = self._alt_median
                     if _med is not None and abs(_med - self._desired_y) > abs(self._trim_delta):
                         self._height_drift_warned = True
-                        self._pending_notice = (
+                        self.note_timeout("HEIGHT_DISAGREEMENT", (
                             f"HEIGHT-REFERENCE DISAGREEMENT: flying-height median {_med:+.3f} is "
                             f"{abs(_med - self._desired_y):.3f}u (> delta {abs(self._trim_delta):.3f}) from "
                             f"desired_y {self._desired_y:+.3f} — long off-height flight, or SLAM Y drift "
-                            f"(check the Y-DRIFT audit / HEIGHT panel)")
+                            f"(check the Y-DRIFT audit / HEIGHT panel)"), now)
 
         # --- status-gated SLAM-loss recovery (CONTROL-SPACE); active only in the explore phase ---
         if self._explore_started:
@@ -2819,6 +2924,8 @@ class ExploreController:
                 self._loss_snapshot_checked = False
                 self._loss_episode_t0 = now          # session 48: the loss-recovery grace window starts HERE
                 self._loss_grace_noticed = False
+                self._backoff_gate_noticed = False   # session 52: fresh episode, gate suppression may re-notice
+                self._visrec_probe_armed = True       # session 52 (chunk 4): re-arm the probe's late entry
             if not lost:
                 self._loss_episode_t0 = None         # a genuine OK ended the episode -- next loss re-stamps
                 self._loss_grace_noticed = False
@@ -2877,6 +2984,14 @@ class ExploreController:
                     # randomized push short on an obstacle.
                     if st == "FALLBACK":
                         return self._step_fallback_sweep(now, wall_contact, backwall_contact)
+                    # Session 52 (chunk 4): the same session-46 fix, applied to the one remaining state that
+                    # needed it. An in-flight VISUAL_RECOVERY probe (now reachable via the late entry in
+                    # `_step_stale`) was structurally killed by a PLAN-LOST flicker one tick after entry --
+                    # this flight's only VISUAL_RECOVERY (22:59:04) was entered and then wiped by a PLAN-LOST
+                    # flip 1.5s later (22:59:06.265), before it ever reached its MATCH phase. Without this
+                    # branch a probe can never survive long enough to complete a single match on a real flight.
+                    if st == "VISUAL_RECOVERY":
+                        return self._step_visual_recovery(now, plan, visual_match)
                     if not self._loss_snapshot_checked:
                         snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match, status=status)
                         if snap is not None:
@@ -3039,8 +3154,10 @@ class ExploreController:
                     # grace window), so setting it BEFORE would have it wiped by that same call.
                     self._enter("REPLAN", now)
                     self._slam_slow_hop_deadline = now + self.slam_slow_hop_grace_s
-                    return {}, "REPLAN", (f"SLAM_HOLD still waiting after {waited:.1f}s but plan OK -> forcing "
-                                          f"one hop toward the current goal (grace {self.slam_slow_hop_grace_s:.0f}s)")
+                    _msg = (f"SLAM_HOLD still waiting after {waited:.1f}s but plan OK -> forcing "
+                            f"one hop toward the current goal (grace {self.slam_slow_hop_grace_s:.0f}s)")
+                    self.note_timeout("SLAM_HOLD_FORCED_HOP", _msg, now, loud=False)
+                    return {}, "REPLAN", _msg
                 return {}, "SLAM_HOLD", None
             # Legacy (use_slam_stepback_on_slow=true): step one entry back through the rewind queue to
             # re-expose known-good geometry so the solve can re-lock. Re-arm needs another full run of slow
@@ -3089,9 +3206,18 @@ class ExploreController:
         # DID) misfire against whatever incidental pos_y the prelude happens to be sitting at and hijack the
         # whole takeoff sequence. This is a basic "don't act before airborne+calibrated" precondition, not a
         # reintroduction of the deleted ratio math.
+        # Session 52: dropped the "and not self._slam_slow" gate that used to guard this trigger.
+        # Flight 20260901_222552 logged 2749 consecutive SETTLE/ADVANCE ticks with slam_ms >= 1000
+        # (zero ticks under 1000ms) while pos_y drifted -2.03 -> -2.22, past trim_high_trigger_y
+        # (-2.10) for the entirety of the last minute -- yet TRIM never fired again after 22:37:59.
+        # Per the doctrine already established at sessions 28/42/43, a slow SLAM solve is a
+        # perception THROUGHPUT signal, not evidence the last published pose is wrong -- and pos_y
+        # is the slowest-varying quantity SLAM publishes, so a stale-but-slow reading is still a
+        # trustworthy height reading. The other six _slam_slow gates in this file guard MOTION/
+        # HEADING decisions and are untouched; only this height READING gate is removed.
         if (self.trim_enable and st in _TRIM_TRIGGER_STATES and not self._calib_active
                 and self._ceiling_y is not None
-                and plan.get("plan_valid") and plan.get("pos_y") is not None and not self._slam_slow):
+                and plan.get("plan_valid") and plan.get("pos_y") is not None):
             _y = float(plan["pos_y"])
             trim_dir = None
             if _y >= self.trim_sag_trigger_y:
@@ -3172,6 +3298,7 @@ class ExploreController:
                 self._settle_to = "DESCEND"
                 self._enter("SETTLE", now)
                 event = f"ascend cap ({self.ascend_max_s}s, no ceiling latch) -> settle -> descend a bit"
+                self.note_timeout("ASCEND_CAP", event, now, loud=False)
             elif self._ascend_phase == "LATCH":
                 active = dict(self.ascend_preset)          # continuous UP; flow CEILING detector is authoritative
                 y = plan.get("pos_y") if plan.get("plan_valid") else None
@@ -3701,6 +3828,7 @@ class ExploreController:
                     event = (f"REPLAN IDLE: planner returned no goal (and not done) for "
                              f">{self.no_goal_idle_s:.0f}s — holding, VISIBLE-FLAGGED (no silent idle; "
                              f"map may be too small to sweep / SLAM still forming)")
+                    self.note_timeout("NO_GOAL_IDLE", event, now, loud=False)
 
         elif st == "STUCK":
             # HOLD (neutral) after the fallback gave up. A valid goal (SLAM re-acquired + planning) resumes.
@@ -3807,6 +3935,7 @@ class ExploreController:
                 self._backoff_t0 = now
                 self._enter("BACKOFF", now)
                 event = f"LEG-TIMEOUT (>{self.leg_max_s}s) -> back off"
+                self.note_timeout("LEG_TIMEOUT", event, now, loud=False)
             elif self.hop_duration_s > 0 and fwd_dur >= self.hop_duration_s:
                 # Session-20 HOP (NO commitment): advanced hop_duration_s SECONDS -> SETTLE (a fresh-frame SLAM
                 # breather) -> REPLAN — re-read SLAM's CURRENT goal. If SLAM re-picked a different goal while the
@@ -4035,6 +4164,7 @@ class ExploreController:
                     event = (f"SETTLE gate blocked {waited:.1f}s by slow-but-ALIVE SLAM (last {ms_txt}, gate "
                              f"needs {self.settle_fresh_frames} frames <{self.slam_slow_ms:.0f}ms) with plan "
                              f"OK -> forcing {nxt} (grace {self.slam_slow_hop_grace_s:.0f}s)")
+                    self.note_timeout("SETTLE_DEADBAND", event, now, loud=False)
 
         elif st == "TRIM":
             # GRADUAL HEIGHT TRIM (session 14, RESTORED session 21, VERTICAL PULSE session 40). A single short,
@@ -4101,6 +4231,7 @@ class ExploreController:
                     event = self._trim_resolve_resume(now, plan)
                     if event:
                         event = f"{event} (forced after {waited:.1f}s of slow settle-gate)"
+                        self.note_timeout("TRIM_RESUME_FORCED", event, now, loud=False)
 
         elif st == "RETURN_TO_ORIGIN":
             # Postlude leg 1: home to the take-off origin [0,0] (SLAM frame) at the current mapping height, via a
@@ -4124,6 +4255,7 @@ class ExploreController:
                 self._enter("ORIENT_HOME", now)
                 event = (f"RETURN_TO_ORIGIN home_max_s ({self.home_max_s:.0f}s) cap — couldn't reach origin, "
                          "proceeding HERE (VISIBLE; no silent fallback) -> ORIENT_HOME")
+                self.note_timeout("HOME_CAP", event, now, loud=False)
             elif self._home_phase == "PLAN":
                 # Aim at the origin from the LIVE pose+heading; hold this tick if the pose isn't trustworthy.
                 if plan.get("plan_valid") and pos is not None and plan.get("heading_deg") is not None:
@@ -4194,6 +4326,7 @@ class ExploreController:
                 self._enter("HOME_REFINE", now)
                 event = (f"ORIENT_HOME orient_home_max_s ({self.orient_home_max_s:.0f}s) cap — couldn't converge "
                          "on take-off heading, proceeding HERE (VISIBLE; no silent fallback) -> HOME_REFINE")
+                self.note_timeout("ORIENT_HOME_CAP", event, now, loud=False)
             elif self._orient_home_phase == "PLAN":
                 if plan.get("plan_valid") and plan.get("heading_deg") is not None:
                     be = ((self._takeoff_heading - float(plan["heading_deg"]) + 180.0) % 360.0) - 180.0
@@ -4251,6 +4384,7 @@ class ExploreController:
                 event = (f"HOME_REFINE home_refine_max_s ({self.home_refine_max_s:.0f}s) cap — couldn't tighten "
                          f"within {self.home_fine_reach_dist:.2f}u (d={self._fmt(reached)}), proceeding HERE "
                          "(VISIBLE; no silent fallback) -> DOCK_FLOOR")
+                self.note_timeout("HOME_REFINE_CAP", event, now, loud=False)
             elif self._home_refine_phase == "PLAN":
                 if plan.get("plan_valid") and pos is not None and plan.get("heading_deg") is not None:
                     bearing = math.degrees(math.atan2(0.0 - pos[0], 0.0 - pos[1]))   # 0=+Z, +90=+X (matches homing)
@@ -4299,6 +4433,7 @@ class ExploreController:
                 self._enter("LOW_STANDOFF", now)
                 event = (f"dock cap ({self.dock_max_s:.0f}s, no FLOOR latch) -> LOW_STANDOFF "
                          "(VISIBLE WARN; FLOOR detection is new/unvalidated)")
+                self.note_timeout("DOCK_CAP", event, now, loud=False)
             elif self._dock_phase == "LATCH":
                 active = {"joy_vertical": 1}               # continuous DOWN; the flow FLOOR detector is authoritative
                 y = plan.get("pos_y") if plan.get("plan_valid") else None
@@ -4583,6 +4718,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     enabled = False
     was_enabled = False
     announced_wait = warned_no_auto = False
+    _auto_off_t = None   # session 52 (chunk 9): timestamp of the ON->OFF edge, for the pause-duration log line
     last_status = None
     last_cmd_key = None
     last_label = None
@@ -4599,6 +4735,20 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     visrec_memo_t = 0.0
     visrec_moved_since_match = False
     visrec_matches = 0          # total real matches computed this flight (waste-reduction gauge)
+    # Session 52: F_LKG must be the EXACT frame SLAM's plan was computed from, not just whatever frame was
+    # live when plan_valid ticked true -- this flight measured up to 14.9s SLAM solve latency, so those can
+    # differ by many frames. Ring of trailing (frame_id, frame) pairs, newest last, looked up by the plan's
+    # own frame_id at the update_reference call site below. 0-length ring = NO SILENT FALLBACK: stated LOUD
+    # once, not silently degraded.
+    _lkg_ring = (collections.deque(maxlen=ctrl.visrec_lkg_ring_len)
+                 if ctrl.visrec_lkg_ring_len > 0 else None)   # (frame_id, frame) newest last
+    _lkg_ring_warned = False        # one-shot LOUD notice, either failure mode
+    if _lkg_ring is None:
+        _line = ("*** F_LKG running in LEGACY LIVE-FRAME mode (visrec_lkg_ring_len<=0) -- the visual "
+                 "recovery reference is the tick's live frame, not the frame SLAM's plan actually describes; "
+                 "this degrades under slow SLAM solves ***")
+        print(_line, flush=True)
+        diag.line(_line)
     # [TRIGGER] tracking (diagnostic session): the exact wall-time the forward-push command engages/
     # releases, tracked purely from the published command vector -- decoupled from FSM state or SLAM.
     # `_trig_release_t` derives a "hop-end" marker at release + 1.0s ease-down (a fixed diagnostic bound
@@ -4673,8 +4823,22 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
         now = time.monotonic()
         if (now - last_pub) >= pub_dt:
             log_cmd(active, state)
+            # Session 52 (chunk 6): panel telemetry, built fresh each publish from the controller's live
+            # flight-level counters (Contracts 1.6/1.7) -- last_timeout is LATCHED, never consumed, so
+            # age_s is recomputed every tick from its stamped 't' rather than popped once.
+            _lt = ctrl.last_timeout
+            notice = (None if _lt is None else
+                     {"kind": _lt["kind"], "text": _lt["text"], "age_s": now - _lt["t"]})
+            slam_hold = {
+                "now_s": (now - ctrl.t_state) if ctrl.state == "SLAM_HOLD" else None,
+                "deadline_s": ctrl.slam_slow_hop_after_s,
+                "entries": ctrl._slam_hold_entries,
+                "total_s": ctrl._slam_hold_total_s,
+            }
             pub.publish(frame_bus.TOPIC_CONTROL,
-                        _full_vector(active, seq, now, state, ctrl.target_altitude_y))
+                        _full_vector(active, seq, now, state, ctrl.target_altitude_y,
+                                    state_since_s=now - ctrl.t_state,
+                                    slam_hold=slam_hold, notice=notice))
             seq += 1
             last_pub = now
 
@@ -4699,6 +4863,12 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 frame, meta = msg
                 if meta.get("rec_frame") is not None:
                     last_rec_frame = meta.get("rec_frame")
+                # Session 52: feed the F_LKG-by-identity ring. Dedup on frame_id -- the frame bus can repeat
+                # an id across ticks (same source the SLAM_TRACKER drain elsewhere dedups on).
+                if _lkg_ring is not None and frame is not None and meta.get("frame_id") is not None:
+                    _fid_new = meta.get("frame_id")
+                    if not _lkg_ring or _lkg_ring[-1][0] != _fid_new:
+                        _lkg_ring.append((_fid_new, frame))
             # drain the plan bus to the freshest message. `planner_event` is TRANSIENT (perception clears it
             # after one plan), so capture it DURING the drain — otherwise draining to the freshest could skip
             # the event-carrying plan and lose the blacklist/reset marker.
@@ -4792,6 +4962,14 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             if not enabled:
                 if was_enabled:
                     print("[autopilot][explore] autonomy OFF -> PAUSED (press 'm' to resume).", flush=True)
+                    _auto_off_t = now
+                    # Session 52 (chunk 9): reset_leg() below silently clears a pile of in-flight recovery
+                    # state; without this line the log shows the FALLBACK sweep restarting at cycle 1 (or
+                    # similar) with no explanation of why.
+                    diag.line(f"{_rec_prefix(last_rec_frame)} [autopilot][explore] autonomy OFF -> PAUSED: "
+                              f"reset_leg() clears the FALLBACK sweep budget/cycle, _recovering, "
+                              f"_blind_contact_reacts, the post-back-off re-solve gate, _loss_episode_t0 "
+                              f"and _visrec_probe_armed.")
                 elif not announced_wait:
                     print("[autopilot][explore] waiting for autonomy enable ('m' on io_bridge) ...", flush=True)
                     announced_wait = True
@@ -4804,6 +4982,10 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 continue
             if not was_enabled:
                 print("[autopilot][explore] autonomy LIVE -> executing the frontier plan.", flush=True)
+                _pause_note = f"paused {now - _auto_off_t:.1f}s" if _auto_off_t is not None else "pause duration unknown"
+                diag.line(f"{_rec_prefix(last_rec_frame)} [autopilot][explore] autonomy LIVE -> resuming ({_pause_note}): "
+                          f"recovery state (FALLBACK sweep, _recovering, wedge/back-off gates, loss/probe flags) "
+                          f"was reset by reset_leg() on pause.")
                 was_enabled = True
 
             # ---- plan health (visibility; NO SILENT FALLBACK) ----
@@ -4857,7 +5039,30 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             visual_match = None
             if visrec_probe is not None:
                 if frame is not None:
-                    if visrec_probe.update_reference(frame, bool(plan_for_step.get("plan_valid"))):
+                    # Session 52: resolve the TRUE reference frame by identity, not by tick freshness -- see
+                    # the ring comment near this loop's top. `tracked` still gates WHETHER to store (session
+                    # 34/35 plan_valid boundary, unchanged); only WHICH frame gets stored changes here.
+                    tracked = bool(plan_for_step.get("plan_valid"))
+                    ref_frame, ref_src = frame, "live"
+                    if tracked and _lkg_ring is not None:
+                        _pfid = plan_for_step.get("frame_id")
+                        if _pfid is not None:
+                            _hit = next((f for fid, f in reversed(_lkg_ring) if fid == _pfid), None)
+                            if _hit is not None:
+                                ref_frame, ref_src = _hit, f"slam:{_pfid}"
+                            else:
+                                ref_src = "live(aged-out)"
+                                # LOUD once per flight -- the ring is too short for this flight's SLAM
+                                # latency (NO SILENT FALLBACK): degraded to the live frame instead of crashing.
+                                if not _lkg_ring_warned:
+                                    _lkg_ring_warned = True
+                                    _line = (f"*** F_LKG aged out of the ring: plan frame_id={_pfid} is no "
+                                             f"longer in the last {ctrl.visrec_lkg_ring_len} frames -> "
+                                             f"falling back to the LIVE frame for this reference (degraded "
+                                             f"match). Consider raising visrec_lkg_ring_len. ***")
+                                    print(_line, flush=True)
+                                    diag.line(_line)
+                    if visrec_probe.update_reference(ref_frame, tracked, src=ref_src):
                         visrec_memo, visrec_memo_t = None, 0.0   # new F_LKG -> the memo describes nothing
                 # Session 49's decision-instant edge, hoisted here: session 51's GATE B needs `loss_edge`
                 # as a force condition, so it must be computed BEFORE the match decision, not inside it.
@@ -5129,6 +5334,11 @@ def run_self_test(cfg):
     # VISUAL_RECOVERY instead of REWIND/FALLBACK. The dedicated VISUAL RECOVERY tests re-enable it
     # explicitly on their OWN deepcopy (`cfg_vr`, below) — this harness-wide default stays OFF regardless.
     cfg["autonomy"]["explore"]["use_visual_recovery_on_stale"] = False
+    # Session 52: and the same for `visrec_debug_window` -- armed ON in config.yaml so the operator can
+    # watch the probe live, which made the "(a) DEFAULT OFF" case below fail on the shipped value rather
+    # than on any real regression. Third flag of the same family (session 21/30 calibrate_on_goal_change,
+    # session 38 use_visual_recovery_on_stale): the harness must never read an operator's live retune.
+    cfg["autonomy"]["explore"]["visrec_debug_window"] = False
 
     # F8 replay timeline: the JSONL sink is --log-gated, so a disabled AutopilotLog must swallow
     # .timeline()/.line() as no-ops (no file, no crash) — the path taken when self-test/dry constructs run.
@@ -5259,7 +5469,7 @@ def run_self_test(cfg):
     t, a, s, st = _drive(ctrl, plan_turn, False, 2.4, t)
     rec(st)
     advancing = (s == "ADVANCE" and float(a.get("trigger", 0)) > 0)
-    # WALL contact -> BACKOFF -> SETTLE. BACKOFF is now a phase-timer (session 30): backoff_hold_s (2.0) +
+    # WALL contact -> BACKOFF -> SETTLE. BACKOFF is now a phase-timer (session 30): backoff_hold_s (1.0) +
     # backoff_release_s (0.2) before it hands off, so the drive window must comfortably clear that.
     t, a, s, st = _drive(ctrl, plan_turn, True, 0.05, t)
     rec(st)
@@ -5631,7 +5841,7 @@ def run_self_test(cfg):
     adv_big = (s == "ADVANCE" and float(a.get("trigger", 0)) > 0)
     near = dict(big, forward_clearance_dist=cs.stop_clearance_dist - 0.05)
     # default (backoff_on_standoff=True): standoff -> BACKOFF (reverse>0) -> SETTLE, no REVERSE_PROBE.
-    # BACKOFF is now a phase-timer (session 30): backoff_hold_s (2.0) + backoff_release_s (0.2) before it
+    # BACKOFF is now a phase-timer (session 30): backoff_hold_s (1.0) + backoff_release_s (0.2) before it
     # hands off to SETTLE, so the drive window must comfortably clear that (was a flat 40 ticks / ~2s, sized
     # for the old fixed 0.3s recipe).
     bo_ticks = int((cs.backoff_hold_s + cs.backoff_release_s + 0.3) / 0.05)
@@ -6208,6 +6418,69 @@ def run_self_test(cfg):
           f"in-band no-fire={band_ok}, comfort gate hold/timeout/release={gate_ok}, re-tap default OFF="
           f"{default_off}, PASS latches target+drift baseline={latch_ok}, Y-DRIFT audit line={ydrift_ok}, "
           f"median-disagreement notice={warn_ok}, desired-height override (session 38)={override_ok})")
+
+    # ---- (session 52) TRIM must fire while SLAM is slow: flight 20260901_222552 logged 2749 consecutive
+    #      SETTLE/ADVANCE ticks, ALL with slam_ms >= 1000 (zero fast frames), while pos_y drifted past
+    #      trim_high_trigger_y for the entire last minute and TRIM never fired again -- the "not self._slam_slow"
+    #      conjunct on the trigger made it unreachable. It has since been removed; these prove it fires under
+    #      slow SLAM, still fires under fast SLAM (no regression), and that the OTHER guards (band, ceiling-
+    #      calibrated, not-mid-calibration) still gate it regardless of SLAM speed.
+    def _mk_trim52():
+        c = ExploreController(cfg, no_takeoff=True)
+        c._ceiling_y = -2.3           # "plausible negative float" -- calibrated
+        c._enter("SETTLE", 0.0)
+        return c
+
+    def _fill_slam(c, ms, start_fid=1):
+        # settle_fresh_frames FRESH frames at `ms`, real (monotonically increasing) cap_ts, per spec.
+        fid = start_fid
+        for _ in range(c.settle_fresh_frames):
+            c._update_slam({"slam_ms": ms, "frame_id": fid, "cap_ts": float(fid) * 0.1})
+            fid += 1
+        return fid
+
+    # (52-trim-1) TRIM fires under slow SLAM: the triggering tick's OWN plan is slow (matching the flight,
+    # where every tick -- including the ones that should have fired TRIM -- was slow), not just past history.
+    t52a = _mk_trim52()
+    nfid = _fill_slam(t52a, 2000.0)
+    p52a = _tplan(-2.20, cap=float(nfid) * 0.1, fid=nfid); p52a["slam_ms"] = 2000.0
+    _, s52a, _ = t52a.step(float(nfid) * 0.1, p52a, False)
+    trim_under_slow_ok = (t52a._slam_slow and s52a == "TRIM" and t52a._trim_dir == "DOWN")
+
+    # (52-trim-2) TRIM still fires under FAST SLAM -- no regression from removing the gate.
+    t52b = _mk_trim52()
+    nfid = _fill_slam(t52b, 300.0)
+    p52b = _tplan(-2.20, cap=float(nfid) * 0.1, fid=nfid); p52b["slam_ms"] = 300.0
+    _, s52b, _ = t52b.step(float(nfid) * 0.1, p52b, False)
+    trim_under_fast_ok = (not t52b._slam_slow and s52b == "TRIM" and t52b._trim_dir == "DOWN")
+
+    # (52-trim-3) the OTHER guards still block, even while SLAM is slow: in-band pos_y, no completed
+    # calibration (_ceiling_y is None), and mid-calibration (_calib_active) must all still suppress TRIM.
+    t52c = _mk_trim52()
+    nfid = _fill_slam(t52c, 2000.0)
+    p52c = _tplan(-1.90, cap=float(nfid) * 0.1, fid=nfid); p52c["slam_ms"] = 2000.0    # inside the band
+    _, s52c, _ = t52c.step(float(nfid) * 0.1, p52c, False)
+    band_still_gates = (s52c != "TRIM")
+
+    t52d = _mk_trim52(); t52d._ceiling_y = None
+    nfid = _fill_slam(t52d, 2000.0)
+    p52d = _tplan(-2.20, cap=float(nfid) * 0.1, fid=nfid); p52d["slam_ms"] = 2000.0
+    _, s52d, _ = t52d.step(float(nfid) * 0.1, p52d, False)
+    no_ceiling_still_gates = (s52d != "TRIM")
+
+    t52e = _mk_trim52(); t52e._calib_active = True
+    nfid = _fill_slam(t52e, 2000.0)
+    p52e = _tplan(-2.20, cap=float(nfid) * 0.1, fid=nfid); p52e["slam_ms"] = 2000.0
+    _, s52e, _ = t52e.step(float(nfid) * 0.1, p52e, False)
+    calib_active_still_gates = (s52e != "TRIM")
+
+    trim52_ok = (trim_under_slow_ok and trim_under_fast_ok and band_still_gates
+                 and no_ceiling_still_gates and calib_active_still_gates)
+    ok = ok and trim52_ok
+    print(f"[self-test] {'PASS' if trim52_ok else 'FAIL'}  SESSION-52 TRIM fires under slow SLAM "
+          f"(slow-SLAM fires DOWN={trim_under_slow_ok}, fast-SLAM still fires (no regression)="
+          f"{trim_under_fast_ok}, in-band guard={band_still_gates}, no-ceiling guard="
+          f"{no_ceiling_still_gates}, mid-calibration guard={calib_active_still_gates})")
 
     # Negative bearing error -> open-loop turn yaw NEGATIVE (turn left).
     c2 = ExploreController(cfg, no_takeoff=True)
@@ -8569,8 +8842,13 @@ def run_self_test(cfg):
     # to _visrec_debug_sink's own module-level `cv2` reference).
     import cv2 as _cv2mod
 
-    # (a) DEFAULT OFF: the feature is off by default, and both degradation flags start clean.
-    ctrl_a = ExploreController(cfg, no_takeoff=True)
+    # (a) DEFAULT OFF: with the key ABSENT the CODE default must still be off, and both degradation
+    # flags start clean. Session 52: previously this constructed from the live cfg and so asserted
+    # "config.yaml currently ships false" -- a different (and much weaker) property than the one the
+    # case name claims, which broke the moment the operator armed the window for a real flight.
+    cfg_no_window = copy.deepcopy(cfg)
+    cfg_no_window["autonomy"]["explore"].pop("visrec_debug_window", None)
+    ctrl_a = ExploreController(cfg_no_window, no_takeoff=True)
     default_off_ok = (ctrl_a.visrec_debug_window is False and ctrl_a.visrec_window_failed is False
                       and ctrl_a.visrec_save_failed is False)
     ok = ok and default_off_ok
@@ -8705,6 +8983,271 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if s51_ok else 'FAIL'}  SESSION-51 visual-match gating "
           f"(GATE A predicate + healthy-flight trap={gate_a_ok}, GATE B memo reuse + all 3 force "
           f"conditions={gate_b_ok}, grace-window match count collapses={grace_ok})")
+
+    # ---- SESSION 52 (chunk 3): the loss-instant gate must not speak (or spend the one-shot) before reading
+    # the evidence. Diagnosed off flight 20260901_222552 -- at 22:49:51.742 the drone had ALREADY backed off
+    # to a clear reading (fwd_clear 0.975 -> 1.625, past stop_clearance_dist 1.25), so `_would_react` was
+    # False and no back-off was ever contemplated, yet the old ordering (gate ABOVE the evidence clauses)
+    # unconditionally spent the one-shot and printed the SUPPRESSED notice anyway -- a false alarm that also
+    # swallowed the whole episode's evaluation (cached-clearance check, F_LKG visual check, AND the
+    # VISUAL_RECOVERY hand-off, all of which live below the gate) for the rest of `backoff_resolve_budget_s`.
+    cfg_gate52 = copy.deepcopy(cfg)
+    cfg_gate52["autonomy"]["explore"]["use_visual_recovery_on_stale"] = True
+
+    def _mk_c52(clearance):
+        c = ExploreController(cfg_gate52, no_takeoff=True)
+        c._ever_tracked = True
+        c.loss_backoff_grace_s = 0.0   # session 48 timing is tested in its own block
+        c._last_good_clearance = clearance
+        c._last_good_pos = [1.0, 1.0]
+        c._last_good_t = 0.0
+        return c
+
+    # (52-gate-1) no evidence (clearance clear, no visual match) -> the gate is never even consulted -- falls
+    #             straight through to the VISUAL_RECOVERY hand-off, with no false-alarm notice and no bump.
+    c52a = _mk_c52(1.625)                    # > stop_clearance_dist (1.25) -- clearance clause reads CLEAR
+    now52a = 100.0
+    c52a._backoff_resolve_since = now52a - 1.5   # a gate WOULD be open here if it were consulted
+    c52a._backoff_resolve_t0 = now52a - 1.5
+    _a52a, s52a, ev52a = c52a._maybe_loss_snapshot_backoff({}, now52a, None, status="PLAN-STALE")
+    gate1_notice_ok = c52a._pending_notice is None
+    gate1_pulse_ok = c52a.take_bump_pulse() == (None, None, None, None)
+    gate1_state_ok = s52a == "VISUAL_RECOVERY"
+    gate1_ok = gate1_notice_ok and gate1_pulse_ok and gate1_state_ok
+
+    # (52-gate-2) real too-close evidence, inside the budget -> still suppressed, but the one-shot is LEFT
+    #             ARMED (not spent) so the check gets a real shot once the gate clears.
+    c52b = _mk_c52(0.97)                     # <= stop_clearance_dist -- real too-close evidence
+    now52b = 100.0
+    c52b._backoff_resolve_since = now52b - 1.5
+    c52b._backoff_resolve_t0 = now52b - 1.5
+    r52b = c52b._maybe_loss_snapshot_backoff({}, now52b, None, status="PLAN-STALE")
+    notice52b = c52b.take_notice()
+    gate2_notice_ok = notice52b is not None and "SUPPRESSED" in notice52b
+    gate2_armed_ok = c52b._loss_snapshot_checked is False
+    gate2_no_backoff_ok = r52b is None        # no state returned at all -- certainly not "BACKOFF"
+    gate2_ok = gate2_notice_ok and gate2_armed_ok and gate2_no_backoff_ok
+
+    # (52-gate-3) the suppression notice must not repeat every tick while the gate holds the one-shot
+    #             deferred -- `_backoff_gate_noticed` mirrors `_loss_grace_noticed` for exactly this.
+    count52c, t52c = 0, now52b
+    for _ in range(5):
+        t52c += 0.05
+        c52b._maybe_loss_snapshot_backoff({}, t52c, None, status="PLAN-STALE")
+        if c52b.take_notice() is not None:
+            count52c += 1
+    gate3_ok = count52c == 0                  # the ONE notice was already popped by gate-2, above
+
+    # (52-gate-4) budget exhausted -> the timeout sentence fires LOUDLY, the gate clears, and the deferred
+    #             back-off finally proceeds on the (still valid) too-close evidence.
+    c52d = _mk_c52(0.97)
+    now52d = 100.0
+    c52d._backoff_resolve_since = now52d - (c52d.backoff_resolve_budget_s + 1.0)
+    c52d._backoff_resolve_t0 = now52d - (c52d.backoff_resolve_budget_s + 1.0)
+    _a52d, s52d, ev52d = c52d._maybe_loss_snapshot_backoff({}, now52d, None, status="PLAN-STALE")
+    notice52d = c52d.take_notice()
+    gate4_notice_ok = notice52d is not None and "TIMED OUT" in notice52d
+    gate4_cleared_ok = c52d._backoff_resolve_since is None
+    gate4_state_ok = s52d == "BACKOFF"
+    gate4_ok = gate4_notice_ok and gate4_cleared_ok and gate4_state_ok
+
+    s52_ok = gate1_ok and gate2_ok and gate3_ok and gate4_ok
+    ok = ok and s52_ok
+    print(f"[self-test] {'PASS' if s52_ok else 'FAIL'}  SESSION-52 chunk 3 loss-instant gate ordering "
+          f"(no-evidence hand-off reached, no false alarm={gate1_ok}, "
+          f"real evidence still suppressed + one-shot left armed={gate2_ok}, "
+          f"suppression notice does not repeat={gate3_ok}, "
+          f"budget timeout is LOUD + gate clears + back-off proceeds={gate4_ok})")
+
+    # ---- SESSION 52 (chunk 4): make the 15° visual probe reachable, and let it survive a status flicker.
+    # Diagnosed off flight 20260901_222552: 57 of the flight's 58 loss episodes BEGAN as PLAN-LOST, which
+    # spends the loss-instant one-shot on `_maybe_loss_snapshot_backoff`'s opening tick -- so the
+    # PLAN-STALE-only tail hand-off into the probe (session 42) never gets a real shot. `_visrec_probe_armed`
+    # gives the probe its OWN latch, polled LATE from `_step_stale` (`_maybe_enter_visual_probe`); the flight's
+    # single VISUAL_RECOVERY entry (22:59:04) was then killed 1.5s later (22:59:06.265) by a PLAN-LOST flip
+    # before it ever reached MATCH -- the new `st == "VISUAL_RECOVERY"` dispatch under PLAN-LOST fixes that.
+    cfg_probe_on = copy.deepcopy(cfg)
+    cfg_probe_on["autonomy"]["explore"]["use_visual_recovery_on_stale"] = True
+
+    def _mk_c52p(clearance=3.0, grace_s=1.0):
+        c = ExploreController(cfg_probe_on, no_takeoff=True)
+        c._ever_tracked = True
+        c.loss_backoff_grace_s = grace_s   # scaled down; the RULE (grace elapses -> probe proceeds) is tested
+        c._last_good_clearance = clearance
+        c._last_good_pos = [1.0, 1.0]
+        c._last_good_t = 0.0
+        c.leg_goal = [5.0, 5.0]
+        return c
+
+    # (52-probe-1) THE 57/58 CASE: loss opens as PLAN-LOST (spends the loss-instant one-shot into HOLD_LOST,
+    #              deferred by the grace since there is no too-close evidence), and the probe is still
+    #              reached on the LATER PLAN-STALE, via the new late-entry latch.
+    c52p1 = _mk_c52p()
+    t52p1 = 0.0
+    _a, s52p1a, _ = c52p1.step(t52p1, {"plan_valid": False}, False, status="PLAN-LOST")
+    probe1_tick1_ok = (s52p1a == "HOLD_LOST" and c52p1._loss_snapshot_checked is True
+                       and c52p1._visrec_probe_armed is True)
+    t52p1 += c52p1.loss_backoff_grace_s + 0.1     # past the grace
+    _a, s52p1b, _ = c52p1.step(t52p1, {"plan_valid": False}, False, status="PLAN-STALE")
+    probe1_tick2_ok = (s52p1b == "VISUAL_RECOVERY")
+    probe1_ok = probe1_tick1_ok and probe1_tick2_ok
+
+    # (52-probe-2) the probe waits out the grace instead of turning immediately -- a probe TURNS, and
+    #              session 48's grace applies to it exactly like a back-off.
+    c52p2 = _mk_c52p()
+    t52p2 = 0.0
+    c52p2.step(t52p2, {"plan_valid": False}, False, status="PLAN-LOST")
+    t52p2 += 0.1                                   # still INSIDE the grace
+    _a, s52p2a, _ = c52p2.step(t52p2, {"plan_valid": False}, False, status="PLAN-STALE")
+    probe2_wait_ok = (s52p2a == "HOLD_LOST" and c52p2._visrec_probe_armed is True)
+    t52p2 += c52p2.loss_backoff_grace_s + 0.1      # now past it
+    _a, s52p2b, _ = c52p2.step(t52p2, {"plan_valid": False}, False, status="PLAN-STALE")
+    probe2_turn_ok = (s52p2b == "VISUAL_RECOVERY")
+    probe2_ok = probe2_wait_ok and probe2_turn_ok
+
+    # (52-probe-3) an in-flight probe SURVIVES a PLAN-LOST flicker (was forced back to HOLD_LOST, abandoning
+    #              the phase, before this chunk -- the exact 22:59:04 -> 22:59:06 kill).
+    c52p3 = _mk_c52p()
+    t52p3 = 0.0
+    c52p3.step(t52p3, {"plan_valid": False}, False, status="PLAN-LOST")
+    t52p3 += c52p3.loss_backoff_grace_s + 0.1
+    _a, s52p3_enter, _ = c52p3.step(t52p3, {"plan_valid": False}, False, status="PLAN-STALE")
+    entered_probe_ok = (s52p3_enter == "VISUAL_RECOVERY")
+    t52p3 += 0.05
+    _a, s52p3_flicker, _ = c52p3.step(t52p3, {"plan_valid": False}, False, status="PLAN-LOST")
+    probe3_ok = (entered_probe_ok and s52p3_flicker == "VISUAL_RECOVERY"
+                and c52p3._visrec_phase is not None)
+
+    # (52-probe-4) a genuine loss-instant back-off (real too-close evidence, grace elapsed, resolve gate
+    #              clear) consumes the probe latch -- an episode that already earned a physical reaction
+    #              must not also turn-probe on top of it.
+    c52p4 = _mk_c52p(clearance=0.3)   # <= stop_clearance_dist -- real too-close evidence
+    t52p4 = 0.0
+    _a, s52p4a, _ = c52p4.step(t52p4, {"plan_valid": False}, False, status="PLAN-LOST")
+    armed_before_ok = (s52p4a == "HOLD_LOST" and c52p4._visrec_probe_armed is True)   # deferred by the grace
+    t52p4 += c52p4.loss_backoff_grace_s + 0.1
+    _a, s52p4b, _ = c52p4.step(t52p4, {"plan_valid": False}, False, status="PLAN-LOST")
+    probe4_ok = (armed_before_ok and s52p4b == "BACKOFF" and c52p4._visrec_probe_armed is False)
+
+    # (52-probe-5) flag OFF reproduces today's behavior byte-for-byte: (52-probe-1) with
+    #              use_visual_recovery_on_stale=False lands on the FALLBACK sweep, never the probe.
+    cfg_probe_off = copy.deepcopy(cfg)
+    cfg_probe_off["autonomy"]["explore"]["use_visual_recovery_on_stale"] = False
+    c52p5 = ExploreController(cfg_probe_off, no_takeoff=True)
+    c52p5._ever_tracked = True
+    c52p5.loss_backoff_grace_s = 1.0
+    c52p5._last_good_clearance = 3.0
+    c52p5._last_good_pos = [1.0, 1.0]
+    c52p5._last_good_t = 0.0
+    c52p5.leg_goal = [5.0, 5.0]
+    t52p5 = 0.0
+    c52p5.step(t52p5, {"plan_valid": False}, False, status="PLAN-LOST")
+    t52p5 += c52p5.loss_backoff_grace_s + 0.1
+    _a, s52p5, _ = c52p5.step(t52p5, {"plan_valid": False}, False, status="PLAN-STALE")
+    probe5_ok = (s52p5 == "FALLBACK")
+
+    s52_probe_ok = probe1_ok and probe2_ok and probe3_ok and probe4_ok and probe5_ok
+    ok = ok and s52_probe_ok
+    print(f"[self-test] {'PASS' if s52_probe_ok else 'FAIL'}  SESSION-52 chunk 4 visual-probe reachability "
+          f"(57/58 PLAN-LOST-opened case reaches the probe={probe1_ok}, "
+          f"probe waits out the grace before turning={probe2_ok}, "
+          f"an in-flight probe survives a PLAN-LOST flicker={probe3_ok}, "
+          f"a genuine back-off consumes the probe latch={probe4_ok}, "
+          f"flag OFF is byte-identical to today={probe5_ok})")
+
+    # ---- (session 52, chunk 6) controller-side telemetry: SLAM_HOLD counters, note_timeout, control-bus
+    #      fields (`_full_vector`'s state_since_s/slam_hold/notice). No rendering here -- visualizer.py's
+    #      panel is chunk 7's job; this proves the DATA it will consume is produced correctly. ----
+    # (52-tel-1) SLAM_HOLD counters: a re-entry into SLAM_HOLD FROM SLAM_HOLD must not double-count entries;
+    #            dwell time accumulates from the TRUE entry instant (t_state), across separate episodes.
+    c52t1 = ExploreController(cfg, no_takeoff=True)
+    c52t1._enter("SLAM_HOLD", 0.0)
+    c52t1._enter("SLAM_HOLD", 1.0)     # re-entry -- must NOT double-count
+    tel1a_ok = (c52t1._slam_hold_entries == 1)
+    c52t1._enter("SETTLE", 10.0)
+    tel1b_ok = abs(c52t1._slam_hold_total_s - 9.0) < 1e-6   # measured from t=1 (the true SLAM_HOLD entry)
+    c52t1._enter("SLAM_HOLD", 12.0)
+    c52t1._enter("REPLAN", 15.0)
+    tel1c_ok = (c52t1._slam_hold_entries == 2 and abs(c52t1._slam_hold_total_s - 12.0) < 1e-6)
+    tel1_ok = tel1a_ok and tel1b_ok and tel1c_ok
+    ok = ok and tel1_ok
+    print(f"[self-test] {'PASS' if tel1_ok else 'FAIL'}  SESSION-52 chunk 6 SLAM_HOLD counters "
+          f"(re-entry no double-count={tel1a_ok}, dwell from t_state={tel1b_ok}, "
+          f"second episode accumulates={tel1c_ok})")
+
+    # (52-tel-2) note_timeout ALWAYS overwrites last_timeout (newest wins); loud=True ALSO sets the
+    #            one-shot _pending_notice (popped via take_notice), loud=False leaves it alone.
+    c52t2 = ExploreController(cfg, no_takeoff=True)
+    c52t2.note_timeout("X", "hello", 5.0, loud=False)
+    tel2a_ok = (c52t2.last_timeout == {"kind": "X", "text": "hello", "t": 5.0})
+    tel2b_ok = (c52t2.take_notice() is None)
+    c52t2.note_timeout("Y", "world", 6.0, loud=True)
+    tel2c_ok = (c52t2.take_notice() == "world" and c52t2.last_timeout["kind"] == "Y")
+    tel2d_ok = (c52t2.take_notice() is None and c52t2.last_timeout is not None)   # latched, never consumed
+    tel2_ok = tel2a_ok and tel2b_ok and tel2c_ok and tel2d_ok
+    ok = ok and tel2_ok
+    print(f"[self-test] {'PASS' if tel2_ok else 'FAIL'}  SESSION-52 chunk 6 note_timeout "
+          f"(latches={tel2a_ok}, quiet by default={tel2b_ok}, loud shouts={tel2c_ok}, "
+          f"latch survives consumption={tel2d_ok})")
+
+    # (52-tel-3) reset_leg is a manual-takeover interruption -- must NOT zero the flight-so-far picture
+    #            (SLAM_HOLD counters, last_timeout are flight-level), but DOES still clear the two
+    #            per-episode flags it always has (_visrec_probe_armed, _backoff_gate_noticed).
+    c52t3 = ExploreController(cfg, no_takeoff=True)
+    c52t3._slam_hold_entries = 3
+    c52t3._slam_hold_total_s = 42.0
+    c52t3.last_timeout = {"kind": "Z", "text": "z", "t": 1.0}
+    c52t3._visrec_probe_armed = True
+    c52t3._backoff_gate_noticed = True
+    c52t3.reset_leg()
+    tel3_ok = (c52t3._slam_hold_entries == 3 and c52t3._slam_hold_total_s == 42.0
+              and c52t3.last_timeout == {"kind": "Z", "text": "z", "t": 1.0}
+              and c52t3._visrec_probe_armed is False and c52t3._backoff_gate_noticed is False)
+    ok = ok and tel3_ok
+    print(f"[self-test] {'PASS' if tel3_ok else 'FAIL'}  SESSION-52 chunk 6 reset_leg preserves "
+          f"flight-level counters, still clears per-episode flags ({tel3_ok})")
+
+    # (52-tel-4) _full_vector: the three new keys are ALWAYS present (never omitted, even when the caller
+    #            passes none of the new kwargs), and round-trip when the caller does pass them.
+    v_empty = _full_vector({}, 1, 0.0, "WAIT")
+    tel4a_ok = (v_empty["state_since_s"] is None and v_empty["slam_hold"] is None and v_empty["notice"] is None)
+    v_full = _full_vector({}, 1, 0.0, "SLAM_HOLD", None, state_since_s=3.0,
+                          slam_hold={"now_s": 3.0, "deadline_s": 15.0, "entries": 2, "total_s": 12.0},
+                          notice={"kind": "X", "text": "t", "age_s": 1.0})
+    tel4b_ok = (v_full["state_since_s"] == 3.0
+               and v_full["slam_hold"] == {"now_s": 3.0, "deadline_s": 15.0, "entries": 2, "total_s": 12.0}
+               and v_full["notice"] == {"kind": "X", "text": "t", "age_s": 1.0})
+    tel4_ok = tel4a_ok and tel4b_ok
+    ok = ok and tel4_ok
+    print(f"[self-test] {'PASS' if tel4_ok else 'FAIL'}  SESSION-52 chunk 6 _full_vector shape "
+          f"(omitted -> None defaults={tel4a_ok}, round-trips={tel4b_ok})")
+
+    # (52-tel-5) the session-35/43 forced SLAM_HOLD hop latches its kind via note_timeout, and the event
+    #            string it RETURNS is unchanged from today's wording (loud=False -- the return value
+    #            already carries this exact sentence into the log, so note_timeout must not also shout it).
+    c52t5 = ExploreController(cfg, no_takeoff=True)
+    c52t5.slam_slow_hop_after_s = 0.05
+    reached5, tb5, fb5 = _drive_to_advance(c52t5)
+    saw_hop5, hop_event5 = False, None
+    for _ in range(15):
+        _a, s, ev = c52t5.step(tb5, dict(padv35, frame_id=fb5, slam_ms=1500.0, cap_ts=tb5), False, status="OK")
+        tb5 += 0.05; fb5 += 1
+        if s == "REPLAN":
+            saw_hop5 = True
+            hop_event5 = ev
+            break
+    event5_text_ok = (hop_event5 is not None
+                      and hop_event5.startswith("SLAM_HOLD still waiting after")
+                      and "forcing one hop toward the current goal" in hop_event5
+                      and hop_event5.endswith(f"grace {c52t5.slam_slow_hop_grace_s:.0f}s)"))
+    tel5_ok = (reached5 and saw_hop5 and event5_text_ok
+              and c52t5.last_timeout is not None
+              and c52t5.last_timeout["kind"] == "SLAM_HOLD_FORCED_HOP"
+              and c52t5.last_timeout["text"] == hop_event5)
+    ok = ok and tel5_ok
+    print(f"[self-test] {'PASS' if tel5_ok else 'FAIL'}  SESSION-52 chunk 6 forced hop latches its kind "
+          f"(reached ADVANCE={reached5}, hop fired={saw_hop5}, event text unchanged={event5_text_ok}, "
+          f"kind=SLAM_HOLD_FORCED_HOP + text matches the returned event={tel5_ok})")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

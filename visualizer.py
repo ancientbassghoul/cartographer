@@ -77,6 +77,33 @@ def _placeholder(w, h, text):
     return p
 
 
+def _wrap_text(text, max_chars):
+    """Greedy word-wrap `text` into lines of at most `max_chars` (session 52). A single word
+    longer than `max_chars` is hard-split across as many lines as it needs rather than
+    overflowing the panel. Returns [] for None/empty input; never raises."""
+    if not text:
+        return []
+    lines = []
+    cur = ""
+    for word in text.split():
+        while len(word) > max_chars:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:max_chars])
+            word = word[max_chars:]
+        candidate = f"{cur} {word}".strip()
+        if len(candidate) <= max_chars:
+            cur = candidate
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
     if frame is None:
         return _placeholder(w, h, "input: no frame bus")
@@ -87,20 +114,27 @@ def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
 
 def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
-    FSM state, current vs. desired (autopilot-locked) height, plan status, and (while the plan is
-    valid) live straight-line distance to the current goal, so the operator always has these
-    visible instead of only on the map's transient overlay text. `control` is the latest
-    TOPIC_CONTROL payload (autopilot -> io_bridge, state + target_altitude_y); `plan` is the
-    latest TOPIC_PLAN payload (perception_worker, pos_y + pos/goal + plan-status fields). NO
-    SILENT FALLBACK: an unavailable reading prints as `--`, never a stale or guessed number, and
-    the whole panel says so explicitly if autopilot.py isn't running at all."""
+    FSM state (with time-in-state), current vs. desired (autopilot-locked) height, plan status,
+    (while the plan is valid) live straight-line distance to the current goal, the SLAM_HOLD
+    forced-hop countdown (session 52), and a 1-2 line notice block surfacing the latest timeout
+    (`control["notice"]`) and/or the latest planner event (`plan["planner_event"]`) so the
+    operator always has these visible instead of only on the map's transient overlay text or the
+    console log. `control` is the latest TOPIC_CONTROL payload (autopilot -> io_bridge, state +
+    target_altitude_y + state_since_s + slam_hold + notice); `plan` is the latest TOPIC_PLAN
+    payload (perception_worker, pos_y + pos/goal + plan-status fields). NO SILENT FALLBACK: an
+    unavailable reading prints as `--` (never a stale or guessed number), the SLAMHOLD row prints
+    as `SLAMHOLD  --` when no slam_hold payload is present, the notice block renders nothing when
+    neither source has content, and the whole panel says so explicitly if autopilot.py isn't
+    running at all."""
     if control is None:
         return _placeholder(w, h, "waiting for autopilot on the control bus ...")
     panel = np.full((h, w, 3), 30, np.uint8)
     cv2.putText(panel, "telemetry", (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     state = control.get("state")
-    cv2.putText(panel, f"STATE: {state}", (8, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    state_since = control.get("state_since_s")
+    t_txt = f"{state_since:.1f}s" if state_since is not None else "--"
+    cv2.putText(panel, f"STATE: {state}   t={t_txt}", (8, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
     plan = plan or {}
     pos_y = plan.get("pos_y")
@@ -138,6 +172,43 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     ms_color = (0, 0, 255) if (ms is not None and ms >= 1000.0) else (255, 255, 255)  # red once >= slow threshold
     cv2.putText(panel, f"SLAM     ms={ms_txt}", (8, 168),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, ms_color, 1)
+
+    # SLAM_HOLD forced-hop countdown (session 52): mirrors the SLAM ms= red-past-threshold
+    # treatment above so an operator sees a stuck hold approaching its forced-hop deadline
+    # before the FSM state itself looks wrong. NO SILENT FALLBACK: absent payload -> "--".
+    slam_hold = control.get("slam_hold")
+    if slam_hold is None:
+        cv2.putText(panel, "SLAMHOLD  --", (8, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    else:
+        now_s = slam_hold.get("now_s")
+        deadline_s = slam_hold.get("deadline_s")
+        now_txt = f"{now_s:.1f}s" if now_s is not None else "--"
+        deadline_txt = f"{deadline_s:.1f}s" if deadline_s is not None else "--"
+        total_txt = f"{slam_hold.get('total_s'):.1f}s" if slam_hold.get("total_s") is not None else "--"
+        hold_color = (0, 0, 255) if (now_s is not None and deadline_s is not None and now_s >= deadline_s) \
+            else (255, 255, 255)
+        cv2.putText(panel,
+                    f"SLAMHOLD now={now_txt}/{deadline_txt}  n={slam_hold.get('entries')}  total={total_txt}",
+                    (8, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.45, hold_color, 1)
+
+    # Notice block (session 52): latest timeout/forced-escape (`control["notice"]`) then the
+    # latest planner event (`plan["planner_event"]`, a list -> last entry), so the operator sees
+    # WHY the FSM did something unusual without having to scroll the console log. Capped at 2
+    # rendered lines total; a truncated tail gets a trailing "..." (NO SILENT FALLBACK would be
+    # dropping the line with no indication more text existed).
+    notice_lines = []
+    notice = control.get("notice")
+    if notice is not None:
+        notice_lines = _wrap_text(
+            f"! {notice.get('kind')} ({notice.get('age_s'):.0f}s ago): {notice.get('text')}", 68)
+    events = plan.get("planner_event")
+    event_lines = _wrap_text(events[-1], 68) if events else []
+    all_lines = (notice_lines + event_lines)[:2]
+    if len(notice_lines) + len(event_lines) > 2 and all_lines:
+        tail = all_lines[-1][:65].rstrip()
+        all_lines[-1] = tail + "..."
+    for i, line in enumerate(all_lines):
+        cv2.putText(panel, line, (8, 210 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
     return panel
 
 

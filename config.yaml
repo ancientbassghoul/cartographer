@@ -218,7 +218,11 @@ autonomy:
     # io_bridge's ramp math alone only explains a fraction of that; the rest is very likely Unity's own physics/
     # momentum once thrust reaches the sim (a black box from this side of the socket). General platform CONTROL-
     # DYNAMICS characteristics (learned response time + magnitude), not a room-specific value.
-    backoff_hold_s: 2.0           # hold full reverse this long (clock starts at BACKOFF entry, includes the ramp-up)
+    # Session 52: 2.0 s measured TOO STRONG live on flight 20260901_222552 -- one push moved the
+    # drone ~1.3 u (SLAM pose [1.686,-0.440] -> [2.388,0.652]) and forward clearance jumped
+    # 0.975 -> 1.625. Cut to 1.0 s. backoff_reverse_mag deliberately LEFT at 1.0 (operator's call:
+    # shorter, not softer) -- this is a platform control DURATION, not a room answer.
+    backoff_hold_s: 1.0           # hold full reverse this long (clock starts at BACKOFF entry, includes the ramp-up)
     backoff_release_s: 0.2        # then wait this long (open-loop) for the reverse ramp-down to finish before SETTLE
     loss_backoff_grace_s: 12.0    # session 48: a loss must OUTLIVE this (on top of the 3.0s plan_timeout_s that
                                   #   declares PLAN-LOST at all) before it earns a physical reaction. Measured over
@@ -439,13 +443,26 @@ autonomy:
                                           # edge, the probe's MATCH phase, any commanded motion since the last
                                           # match, and a replaced F_LKG. General robustness interval, not a
                                           # room answer.
-    visrec_debug_window: false            # session 49: open an OS window showing F_LKG | LIVE with the SIFT
+    visrec_debug_window: true             # session 49: open an OS window showing F_LKG | LIVE with the SIFT
                                           # inlier correspondences drawn, so the operator can SEE what the CV
                                           # probe is matching against. Also saves the canvas at decision
                                           # instants to OUTPUT/diag/<ts>_visrec/. Default OFF (same convention
                                           # as use_rewind_on_stale / use_visual_recovery_on_stale).
     visrec_save_max: 200                  # hard cap on saved canvases per flight (bounded disk, like the
                                           # STUCK log-suppression cap) — general bound, not a room answer.
+    visrec_lkg_ring_len: 160              # session 52: F_LKG must be the EXACT frame SLAM's plan was
+                                          # computed from, not just "whatever frame was live when plan_valid
+                                          # ticked true" — this flight measured a 2s median / 14.9s WORST
+                                          # SLAM solve latency, so those can be seconds apart. run_explore
+                                          # keeps this many trailing (frame_id, frame) pairs and looks the
+                                          # plan's own frame_id up in it. A frame count, not a duration: at
+                                          # perception.target_processing_fps=10, 160 ≈ 16s of history, chosen
+                                          # to exceed the worst observed solve latency above. MEMORY COST IS
+                                          # REAL: each ring slot holds a full processing_width x
+                                          # processing_height x 3 BGR frame (512x288x3 = 442 KB), so 160 ≈
+                                          # 71 MB resident — a general platform-latency bound, not a room
+                                          # answer. 0 = disabled (legacy live-frame behaviour; logged LOUD
+                                          # once at startup, NO SILENT FALLBACK).
     blind_contact_escalate_after: 2   # after this many blind back-off reflexes against the same obstacle
                                       #   with no confirmed recovery in between, stop repeating a reflex that
                                       #   is demonstrably not working and escalate into the FALLBACK sweep

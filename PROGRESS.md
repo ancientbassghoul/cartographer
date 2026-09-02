@@ -1,7 +1,34 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-09-01** (branch **`all-bets-are-off`**, sessions 49-51 **BUILT — self-tests ALL
+_Last updated **2026-09-02** (branch **`all-bets-are-off`**, session 52 **BUILT — self-tests ALL
 GREEN (0 failures), LIVE-FLY PENDING**; `main` unaffected)._
+
+_**Session 52 — the visual-recovery probe had never once run on a real flight, TRIM was starving
+under slow SLAM, and a permanently-blacklisted corner still got flown into (BUILT, live-fly
+PENDING).** Flight `20260901_222552` surfaced five symptoms at once. We wanted the 15° probe
+(sessions 36/42) to actually execute a MATCH someday; we found it structurally couldn't — four
+defects stacked to keep it unreachable (a one-shot flag spent too early by the loss-recovery grace;
+the shared one-shot almost always pre-spent because 57 of 58 losses opened as `PLAN-LOST`; the
+`PLAN-LOST` branch had no dispatch case for an in-progress probe, so any flicker killed it; and
+even once entered, its frozen reference frame (F_LKG) was cached by tick-freshness instead of by
+the SLAM frame_id the plan was actually computed from, silently drifting under this flight's up-to-
+14.9s solve latency). Fixed all four together — a shared latch was not enough, the probe needed its
+own. Separately, TRIM had an `and not self._slam_slow` guard that made it depend on the exact SLAM
+choke it exists to correct — 2749 consecutive ticks, zero fast frames, TRIM dead the whole time; removed
+the conjunct. A stale post-backoff gate was also raising "BACK-OFF SUPPRESSED" notices on episodes
+where no back-off was ever contemplated (evidence-free), swallowing the whole episode's downstream
+checks for `backoff_resolve_budget_s`; reordered it behind the evidence check. And a sweep corner
+0.885u inside an already-permanently-blacklisted region got hammered for 3¾ minutes because corners
+had a blanket carve-out from ALL blacklist checks, soft and permanent alike; scoped the carve-out to
+soft/round-only. Also cut `backoff_hold_s` 2.0→1.0s (one push measured moving the drone ~1.3u, well
+past a comfortable stand-off). Drafted a fix for the post-backoff re-solve budget's own timeout
+(§4b) — operator rejected both drafts; an external reviewer's alternative turned out to already be
+the implemented mechanism, its only real delta being to delete the timeout entirely, which was not
+itself put to the operator this session — left as backlog. Every new assertion proven against its
+own defect by reverting on a scratch copy. `python autopilot.py --self-test`, `frontier_planner.py`,
+`visual_recovery.py`, `flight_replay.py`: **ALL PASS, 0 failures**. See
+`plans/session52-lkg-recovery-unreachable.md` for the full four-defect trace + the corner/blacklist
+geometry + the §4b decision record. **NEXT = LIVE-FLY.**_
 
 _**Sessions 50-51 — the 91.6-second SETTLE, and two dead ends on the SLAM choke (BUILT, live-fly
 PENDING).** Flight `20260901_172217`. The operator flew sessions 47-49, confirmed the back-off works,
@@ -1127,11 +1154,35 @@ plan-of-record pointers), and **Documentation** (what we tried, in date order, b
 
 ### >>> IMMEDIATE NEXT TASK (branch `all-bets-are-off`) <<<
 
-**LIVE-FLY sessions 49 + 50 + 51 together** (`python fly.py` — full stack). Live flights on
-2026-09-01 confirmed sessions 47+48 — the back-off cadence, the post-backoff SLAM re-solve gate, and
-the 12s loss-recovery grace — fly correctly (**operator's own call**; the detailed session 45-48
-per-flight watch checklists that used to fill this section are superseded and folded into their dated
-entries above, same pattern as the 2026-09-01 session-43 confirmation further down this file).
+**LIVE-FLY session 52** (`python fly.py` — full stack), on top of sessions 49-51 (already built,
+live-fly still pending from before). Watch list, in priority order:
+
+1. **`VISUAL_RECOVERY` actually runs** — a loss opening as `PLAN-LOST` reaches the probe on the
+   following `PLAN-STALE`, survives the flicker, and logs a **MATCH-phase verdict** — never once
+   achieved on a real flight before this session.
+2. The LKG debug window (on by default now, `visrec_debug_window: true`) open, inliers drawn,
+   `OUTPUT/diag/<ts>_visrec/` filling; the banner naming `slam:<frame_id>`, with **no**
+   `live(aged-out)` warning at normal latency.
+3. `TRIM enter (DOWN)` firing while `slam_ms` is 1500-2500 ms — TRIM must no longer sit dead through
+   a slow-SLAM stretch the way it did for 2749 ticks on `20260901_222552`.
+4. The `SLAMHOLD` telemetry row counting up and turning red at 15.0s; the amber notice line naming
+   each forced hop / forced REPLAN / suppressed back-off.
+5. **No `LOSS-INSTANT BACK-OFF SUPPRESSED` notice unless a back-off was genuinely about to fire** —
+   the chunk-3 false-alarm fix.
+6. A back-off travelling roughly half as far (`backoff_hold_s` 2.0→1.0s).
+7. **No goal committed inside a permanently blacklisted region** — a `CORNER-SKIP ... force-retired`
+   line where flight `20260901_222552` showed `blacklist bypassed` eight times instead.
+8. An `autonomy OFF -> PAUSED` / `autonomy LIVE (paused N.Ns; recovery state reset)` pair on `m`.
+
+See `plans/session52-lkg-recovery-unreachable.md` for the full trace: the five symptoms, the four
+stacked LKG defects (D1-D4), the chunk-3 false-alarm finding, the TRIM starvation numbers, the
+back-off/clearance figures, the corner/blacklist geometry, and the §4b (post-backoff re-solve
+budget) **NOT BUILT** decision record — backlog only, do not assume it landed.
+
+Sessions 49-51 (below) are still themselves LIVE-FLY PENDING — this session did not touch or
+re-verify them; the detailed session 45-48 per-flight watch checklists that used to fill this
+section are superseded and folded into their dated entries above, same pattern as the 2026-09-01
+session-43 confirmation further down this file.
 
 **Session 50** (`plans/session50-settle-dead-band-escape.md`) — watch for
 `SETTLE gate blocked N.Ns by slow-but-ALIVE SLAM ... -> forcing REPLAN` in place of the 91.6s park
@@ -1145,7 +1196,9 @@ the log (grace notice, back-off, probe verdicts) must be **identical** to previo
 decision means the memo is serving something it shouldn't — suspect the motion guard first.
 
 **>> STILL OPEN, TOP OF THE LIST: why does SLAM choke? <<** It runs ~350ms when happy and plateaus at
-a flat ~2000ms for minutes at a time, and nothing we own explains it. **Two candidates are already
+a flat ~2000ms for minutes at a time, and nothing we own explains it. Session 52 measured it across a
+whole flight (`20260901_222552`): **median 1943 ms, worst inter-frame gap 13.6 s** — worse than
+session 50's ~2000ms plateau, same open problem. **Two candidates are already
 ruled out — do not re-chase them:** (1) the AUTOPILOT is not the cause (loop rate measured at 32-38.5Hz
 throughout, including through the entire 91.6s wedge); (2) UNITY FOCUS is not the cause either
 (operator tested directly: SLAM re-chokes ~2 frames after refocus, and the log shows SLAM recovering

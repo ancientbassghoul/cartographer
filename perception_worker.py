@@ -709,7 +709,8 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
                         # planner_event (console + the timeline/flight_replay debugger), not a silent no-op.
                         if pipe.planner.is_excluded(pg):
                             wg = [round(float(pg[0]), 3), round(float(pg[1]), 3)]
-                            wmsg = f"WARNING: pick landed on an ALREADY-excluded goal={wg} -> blacklist bypassed"
+                            wmsg = (f"WARNING: pick landed on an ALREADY-excluded goal={wg} -> blacklist bypassed"
+                                    f"{' (sweep-tour CORNER target)' if pipe.planner.sweeping else ''}")
                             pipe.last_planner_event.append(wmsg)
                             print(f"[perception] planner: {wmsg}", flush=True)
                         pipe.planner.register_goal_pick(pg, ev.get("pick_pos"),
