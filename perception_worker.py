@@ -590,6 +590,32 @@ class Pipeline:
 # ==============================================================================
 # Live loop (frame bus) and offline loop (recorded mp4)
 # ==============================================================================
+def _checkpoint_livemap(pipe, out_dir, ts, min_count=2):
+    """Session 55 (H2, crash survivability): write a durable snapshot of the fused SLAM map RIGHT NOW,
+    via a temp file + `os.replace` per artifact, so a crash mid-write can never corrupt the PREVIOUS
+    good checkpoint (`render_topdown`/`save_npz`/`save_ply` are full non-atomic rewrites). Before this,
+    these three exports ran ONLY in `run_live`'s `finally` block -- the entire voxel map + point cloud
+    was memory-only for the whole flight (a hard machine bugcheck, which skips `finally` entirely,
+    previously lost all of it; see PROGRESS.md session 55). Called periodically from the main loop AND
+    once more at clean shutdown, so a normal exit still captures the truly-latest state.
+
+    `os.replace` is atomic on the same volume on both POSIX and Windows -- readers either see the old
+    file or the new one, never a half-written one."""
+    ests = pipe.estimator.estimate_all()
+    targets = [e["position"] for e in ests] if ests else None
+    png_final, npz_final, ply_final = (out_dir / f"{ts}_livemap_topdown.png",
+                                       out_dir / f"{ts}_livemap.npz", out_dir / f"{ts}_livemap.ply")
+    png_tmp, npz_tmp, ply_tmp = (out_dir / f"{ts}_livemap_topdown_tmp.png",
+                                 out_dir / f"{ts}_livemap_tmp.npz", out_dir / f"{ts}_livemap_tmp.ply")
+    pipe.mapstore.render_topdown(png_tmp, min_count=min_count, targets=targets)
+    pipe.mapstore.save_npz(npz_tmp, min_count=min_count)
+    pipe.mapstore.save_ply(ply_tmp, min_count=min_count, trajectory=True, targets=targets)
+    os.replace(png_tmp, png_final)
+    os.replace(npz_tmp, npz_final)
+    os.replace(ply_tmp, ply_final)
+    return png_final, npz_final, ply_final
+
+
 def _show_and_quit(panel, pipe, map_updated, show):
     """Render the top-down map window and return True if the user pressed 'q'. (`panel` is always
     None since the DA-V2 depth panel was removed; kept in the signature for call-site symmetry.)"""
@@ -610,6 +636,9 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")   # shared by the diag CSVs + the shutdown map export
     out_dir = Path(REPO) / "OUTPUT" / "diag"
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Session 55 (H2): periodic durable map checkpoint -- see _checkpoint_livemap's docstring.
+    livemap_checkpoint_period_s = float((cfg.get("diag") or {}).get("livemap_checkpoint_period_s", 60.0))
+    last_checkpoint_t = time.monotonic()
     pipe = Pipeline(cfg, conf_thresh=conf_thresh, debug_lift=debug_lift)
     if log:
         pipe.enable_diag(ts=ts)
@@ -744,6 +773,25 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
             if tp is not None and (now - pipe.last_target_pub) >= 0.5:
                 state_pub.publish(frame_bus.TOPIC_TARGET, tp)
                 pipe.last_target_pub = now
+            # Session 55 (H2): periodic durable checkpoint of the whole map, so a hard crash costs at
+            # most livemap_checkpoint_period_s instead of the entire flight (previously memory-only
+            # until a clean shutdown reached `finally` below). Caught (not left to crash the whole
+            # flight) because a periodic checkpoint failing must never take the mission down with it --
+            # e.g. Windows raises PermissionError from os.replace() if some OTHER process (an operator
+            # inspecting the last checkpoint) has the target file open. Surfaced LOUDLY, not swallowed
+            # (CLAUDE.md: visible degraded-state alert, not a silent fallback); the FINAL checkpoint in
+            # `finally` below is intentionally left UNPROTECTED -- that is the last chance to save the
+            # map and a failure there should be as visible as possible.
+            if livemap_checkpoint_period_s > 0 and (now - last_checkpoint_t) >= livemap_checkpoint_period_s:
+                try:
+                    _checkpoint_livemap(pipe, out_dir, ts, min_count=2)
+                    print(f"[perception] periodic livemap checkpoint -> {out_dir / f'{ts}_livemap.npz'}",
+                          flush=True)
+                except OSError as exc:
+                    print(f"*** CRITICAL: periodic livemap checkpoint FAILED ({exc}) -- continuing the "
+                          f"flight; will retry in {livemap_checkpoint_period_s:g}s. If this repeats, "
+                          f"the map is at risk on a crash until it succeeds once ***", flush=True)
+                last_checkpoint_t = now
 
             if _show_and_quit(panel, pipe, map_updated, show):
                 break
@@ -751,20 +799,13 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
         pass
     finally:
         print("[perception] shutting down ...")
-        # Export the fused SLAM map -- same three calls run_offline_video() already makes (proven
-        # there), just <ts>-prefixed into OUTPUT/diag/ instead of <stem>-prefixed into OUTPUT/. Only
-        # reachable if this loop exits NORMALLY (the 'q' key, Ctrl+C in this console, or the
-        # stop-file above) -- a hard TerminateProcess skips this, same caveat as autopilot's own
-        # shutdown-emitted report.
-        ests = pipe.estimator.estimate_all()
-        targets = [e["position"] for e in ests] if ests else None
-        png = out_dir / f"{ts}_livemap_topdown.png"
-        pipe.mapstore.render_topdown(png, min_count=2, targets=targets)
-        pipe.mapstore.save_npz(out_dir / f"{ts}_livemap.npz", min_count=2)
-        ply = out_dir / f"{ts}_livemap.ply"
-        pipe.mapstore.save_ply(ply, min_count=2, trajectory=True, targets=targets)
+        # Export the fused SLAM map via the SAME checkpoint helper the periodic tick above uses (session
+        # 55) -- a clean exit still captures the truly-latest state, not just the last periodic snapshot.
+        # This `finally` is only reachable on a NORMAL exit (the 'q' key, Ctrl+C, or the stop-file) -- a
+        # hard TerminateProcess/bugcheck skips it, which is exactly why the periodic checkpoint exists.
+        png, npz, ply = _checkpoint_livemap(pipe, out_dir, ts, min_count=2)
         print(f"[perception] top-down (flight path + target marks) -> {png}")
-        print(f"[perception] voxel map -> {out_dir / f'{ts}_livemap.npz'}")
+        print(f"[perception] voxel map -> {npz}")
         print(f"[perception] point cloud + flight path + targets (.ply, Blender-loadable) -> {ply}")
         pipe.close_diag()
         frame_sub.close()
@@ -945,7 +986,60 @@ def run_self_test(cfg):
     assert len(g) == 0 and p.committed_goal is None
     print("[perception][self-test] depth removed; GroundGrid + FrontierPlanner construct OK (no GPU/no depth).")
     print("[perception][self-test] full SLAM+map path -> use: perception_worker.py --video <mp4> --no-display")
+
+    ok = _self_test_checkpoint_livemap()
+    print(f"[perception][self-test] {'PASS' if ok else 'FAIL'}  session 55 (H2) livemap checkpoint")
+    assert ok
     print("[perception][self-test] PASS")
+
+
+def _self_test_checkpoint_livemap():
+    """Session 55 (H2): _checkpoint_livemap must (a) produce loadable, non-empty artifacts from live
+    map state, (b) leave NO stray *_tmp.* files behind (the .tmp+os.replace atomicity contract), and
+    (c) a SECOND checkpoint call must cleanly REPLACE the first, never leaving a half-written or stale
+    file -- the whole point of writing to a temp path first (np.savez/save_ply/render_topdown are full
+    non-atomic rewrites; a crash mid-write must not corrupt the PREVIOUS good checkpoint). No GPU/SLAM
+    needed: only MapStore + TargetEstimator, duck-typed as a Pipeline substitute (_checkpoint_livemap
+    only touches pipe.mapstore / pipe.estimator)."""
+    import tempfile
+    import types
+    from pathlib import Path
+    import numpy as np
+    from map_store import MapStore
+    from target_estimator import TargetEstimator
+
+    ok = True
+    tmp_dir = Path(tempfile.mkdtemp(prefix="checkpoint_selftest_"))
+    try:
+        pipe = types.SimpleNamespace(mapstore=MapStore(0.1), estimator=TargetEstimator())
+        pipe.mapstore.integrate(np.array([[1.0, 0.0, 1.0], [2.0, 0.0, 2.0]], np.float64))
+        pipe.mapstore.add_pose(np.array([0.0, 0.0, 0.0]))
+        ts = "20260101_000000"
+
+        png1, npz1, ply1 = _checkpoint_livemap(pipe, tmp_dir, ts, min_count=1)
+        first_ok = png1.exists() and npz1.exists() and ply1.exists()
+        no_stray_tmp_1 = not any(tmp_dir.glob("*_tmp.*"))
+        # `with`: release the handle before the 2nd checkpoint's os.replace() runs -- on Windows,
+        # os.replace() over a file another handle still has open raises PermissionError (confirmed:
+        # this test failed with exactly that until the file was closed first).
+        with np.load(npz1) as loaded1:
+            centers_ok = len(loaded1["centers"]) == 2
+
+        # A second checkpoint with DIFFERENT content must fully replace the first, not merge/append.
+        pipe.mapstore.integrate(np.array([[9.0, 0.0, 9.0]], np.float64))
+        png2, npz2, ply2 = _checkpoint_livemap(pipe, tmp_dir, ts, min_count=1)
+        with np.load(npz2) as loaded2:
+            replaced_ok = len(loaded2["centers"]) == 3 and (png1, npz1, ply1) == (png2, npz2, ply2)
+        no_stray_tmp_2 = not any(tmp_dir.glob("*_tmp.*"))
+
+        ok = first_ok and no_stray_tmp_1 and centers_ok and replaced_ok and no_stray_tmp_2
+        print(f"[perception][self-test]   checkpoint files written={first_ok}, no stray .tmp after "
+              f"1st={no_stray_tmp_1}, centers round-trip={centers_ok}, 2nd checkpoint REPLACES (not "
+              f"merges)={replaced_ok}, no stray .tmp after 2nd={no_stray_tmp_2}")
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+    return ok
 
 
 def main():

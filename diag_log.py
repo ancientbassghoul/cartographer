@@ -7,6 +7,7 @@ placement). Pure stdlib; no GPU/torch. Disabled = a no-op object (writes nothing
 """
 
 import csv
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,22 @@ class DiagLog:
         self._w.writerow({k: kw.get(k, "") for k in self.fields})
         self._f.flush()
 
+    def fsync(self):
+        """Session 55: force the just-flush()'d bytes past the OS page cache onto disk, so a hard
+        reboot (not just a process kill) can't still lose the tail. `flush()` alone is NOT enough for
+        that case -- see diag.yaml's `log_fsync_period_s`. Call on a timer from the owning loop, never
+        per-row (this file can run at tens of Hz). A failure is surfaced LOUDLY once and further fsync
+        attempts on this log are then skipped (CLAUDE.md: no silent downgrade) -- `flush()` keeps
+        working regardless, so rows are never lost by this failing, only the reboot-safety margin."""
+        if getattr(self, "_fsync_failed", False):
+            return
+        try:
+            os.fsync(self._f.fileno())
+        except OSError as exc:
+            self._fsync_failed = True
+            print(f"*** CRITICAL: fsync failed for {self.path} ({exc}) -> periodic fsync DISABLED for "
+                  f"this log; flush()-only durability continues ***", flush=True)
+
     def close(self):
         try:
             self._f.close()
@@ -44,6 +61,9 @@ class NullLog:
     path = None
 
     def row(self, **kw):
+        pass
+
+    def fsync(self):
         pass
 
     def close(self):

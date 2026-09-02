@@ -264,6 +264,7 @@ class AutopilotLog:
         self.cmd_csv = NullLog()
         self.ts = None          # flight stamp (YYYYmmdd_HHMMSS) when enabled, else None
         self.diag_dir = None    # OUTPUT/diag when enabled, else None
+        self._fsync_failed = False   # session 55: latched after the first fsync() OSError (see fsync())
         if enabled:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             d = os.path.join(REPO, "OUTPUT", "diag")
@@ -294,6 +295,27 @@ class AutopilotLog:
         if self._jsonl is not None:
             self._jsonl.write(json.dumps(record) + "\n")
             self._jsonl.flush()
+
+    def fsync(self):
+        """Session 55: periodic (NOT per-write) os.fsync of the raw text/timeline handles + the CSV
+        sinks, so a hard machine reboot (a GPU-driver TDR bugcheck gave zero shutdown path on flight
+        20260902_165340) loses at most one fsync period instead of whatever the OS page cache hadn't
+        written back yet. `line()`/`timeline()`/`row()` already flush() every call -- that's sufficient
+        against a process kill, not against a reboot. Call from the owning loop on a timer; a failure
+        is surfaced once per handle (see DiagLog.fsync) rather than silently dropped."""
+        if not self._fsync_failed:
+            for f in (self._txt, self._jsonl):
+                if f is not None:
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError as exc:
+                        self._fsync_failed = True
+                        print(f"*** CRITICAL: fsync failed for {f.name} ({exc}) -> periodic fsync "
+                              f"DISABLED for the rest of this flight; flush()-only durability "
+                              f"continues ***", flush=True)
+                        break
+        self.csv.fsync()
+        self.cmd_csv.fsync()
 
     def cmd(self, rec_frame, seq, step, source, fields):
         self.cmd_csv.row(rec_frame=("" if rec_frame is None else int(rec_frame)),
@@ -4753,6 +4775,11 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     ascend_cmd = int(cfg["autonomy"]["ascend_cmd"])
     e = (cfg["autonomy"].get("explore") or {})
     plan_timeout_s = float(e.get("plan_timeout_s", 2.0))
+    # Session 55 (crash survivability): a hard machine bugcheck gives no shutdown path, so both of
+    # these must happen PERIODICALLY during the flight, not only in `finally` (see diag.yaml).
+    _d = (cfg.get("diag") or {})
+    timeline_map_period_s = float(_d.get("timeline_map_period_s", 10.0))
+    log_fsync_period_s = float(_d.get("log_fsync_period_s", 2.0))
     detector = detector_from_cfg(cfg)
     ctrl = ExploreController(cfg, no_takeoff=no_takeoff)
     # Session 35 ALT: only build the visual-recovery probe (SIFT model load + per-tick reference cache) when
@@ -4783,6 +4810,8 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     pick_seq = 0          # dedup id for TOPIC_AUTOPILOT_EVENT pick+hop-outcome pulses (goals-DB)
     giveup_seq = 0        # dedup id for TOPIC_AUTOPILOT_EVENT corner-giveup pulses (force_retire_corner)
     last_pub = last_log = 0.0
+    last_map_emit_t = 0.0    # session 55: t_mono of the last periodic map-backdrop timeline record
+    last_fsync_t = 0.0       # session 55: t_mono of the last periodic diag fsync
     last_plan = None
     last_plan_t = time.monotonic()
     last_rec_frame = None
@@ -4921,6 +4950,11 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             # compounding tracking offset — replay still sorts by t_mono; this just unifies the capture instant.
             now = time.monotonic()
             now_wall = datetime.now()
+            # Session 55: periodic fsync (NOT per-record — see AutopilotLog.fsync) so a hard reboot loses
+            # at most log_fsync_period_s of the already-flush()'d logs, not the whole flight.
+            if log and log_fsync_period_s > 0 and (now - last_fsync_t) >= log_fsync_period_s:
+                diag.fsync()
+                last_fsync_t = now
             visrec_last_saved_rel = None   # session 49: only the tick that ACTUALLY writes a PNG carries the path
             # [TRIGGER] derived "hop-end" marker (diagnostic session): fires exactly once, 1.0s after the
             # forward-push command was released -- a fixed diagnostic ease-down bound to compare the pose
@@ -5338,6 +5372,17 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 g = plan_for_step.get("ground")
                 if g and g.get("bounds"):
                     last_ground = g
+                # Session 55: periodic map-backdrop record, IN ADDITION to the final one emitted in
+                # `finally` below — a hard crash before that block runs previously left the replay with
+                # ZERO map records (flight 20260902_165340). Same _downsample_map call, same "map" key
+                # flight_replay.py already reads (MAPS = RECORDS.filter(r => r.map !== undefined), newest
+                # at/before the cursor) — periodic records only make the replay show the map EVOLVE.
+                if log and timeline_map_period_s > 0 and last_ground is not None \
+                        and (now - last_map_emit_t) >= timeline_map_period_s:
+                    m = _downsample_map(last_ground)
+                    if m is not None:
+                        diag.timeline({"t_mono": round(now, 3), "map": m})
+                    last_map_emit_t = now
     except KeyboardInterrupt:
         print("\n[autopilot][explore] interrupted — sending a final HOLD (neutral).")
     finally:
@@ -9454,6 +9499,82 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if tel5_ok else 'FAIL'}  SESSION-52 chunk 6 forced hop latches its kind "
           f"(reached ADVANCE={reached5}, hop fired={saw_hop5}, event text unchanged={event5_text_ok}, "
           f"kind=SLAM_HOLD_FORCED_HOP + text matches the returned event={tel5_ok})")
+
+    # ---- Session 55 (H3): periodic diag fsync must actually reach disk, and a failure must LATCH
+    #      (surfaced once, then degrade to flush()-only rather than raising/crashing on every
+    #      subsequent tick) -- see AutopilotLog.fsync()/DiagLog.fsync(). The periodic TIMER GATING
+    #      itself lives inline in run_explore()'s ZMQ loop (not a separately-callable function), so it
+    #      is verified live-fly, not here (see PROGRESS.md session 55); this proves the primitive the
+    #      timer calls is correct. ----
+    import io as _io_mod
+    import tempfile as _tempfile_mod
+    import contextlib as _ctxlib
+    log55 = AutopilotLog(True)   # needs REAL open file handles to prove os.fsync() actually reaches disk
+    fsync_no_raise = True
+    try:
+        log55.fsync()          # healthy handles -- must not raise
+    except Exception:
+        fsync_no_raise = False
+    # Force the REAL failure shape: os.fsync() itself raising OSError on a still-open, valid handle
+    # (a disk error, not a Python-level "file already closed" mistake -- that raises ValueError from
+    # Python's own io layer before the syscall, a different bug this isn't testing for). Monkeypatch
+    # os.fsync for the duration of this check only; restored in `finally` even if an assertion below
+    # fails, so no other self-test module state is left disturbed.
+    _real_os_fsync = os.fsync
+    def _boom_fsync(_fd):
+        raise OSError("simulated disk failure (session-55 self-test)")
+    _buf = _io_mod.StringIO()
+    try:
+        os.fsync = _boom_fsync
+        with _ctxlib.redirect_stdout(_buf):
+            log55.fsync()
+        # AutopilotLog.fsync() drives 3 independently-latching sinks (its own _txt/_jsonl pair, then
+        # self.csv and self.cmd_csv -- each a SEPARATE DiagLog with its own _fsync_failed flag) -- so
+        # the first failing call prints once per sink (3), latching all three.
+        latched_after_failure = (log55._fsync_failed and log55.csv._fsync_failed
+                                 and log55.cmd_csv._fsync_failed)
+        printed_on_first_failure = _buf.getvalue().count("CRITICAL: fsync failed") == 3
+        with _ctxlib.redirect_stdout(_buf):
+            log55.fsync()       # 2nd call: every sink already latched -> must be fully silent
+        silent_after_latch = _buf.getvalue().count("CRITICAL: fsync failed") == 3   # unchanged
+    finally:
+        os.fsync = _real_os_fsync
+    log55.close()
+    # AutopilotLog has no output-dir override -- clean up the 4 real files it wrote under OUTPUT/diag/
+    # so --self-test stays side-effect-free there (every OTHER self-test in this file uses
+    # AutopilotLog(False), precisely to avoid this; this one needs real handles, so it cleans up).
+    for _suffix in ("_autopilot.csv", "_autopilot_cmd.csv", "_autopilot.log", "_timeline.jsonl"):
+        _p = os.path.join(log55.diag_dir, f"{log55.ts}{_suffix}")
+        if os.path.exists(_p):
+            os.remove(_p)
+
+    _dl_dir = _tempfile_mod.mkdtemp(prefix="diaglog_fsync_selftest_")
+    diaglog55 = DiagLog("selftest55", ["x"], out_dir=_dl_dir)
+    diaglog55.row(x=1)
+    diaglog55_no_raise = True
+    try:
+        diaglog55.fsync()
+    except Exception:
+        diaglog55_no_raise = False
+    try:
+        os.fsync = _boom_fsync
+        with _ctxlib.redirect_stdout(_buf):
+            diaglog55.fsync()
+    finally:
+        os.fsync = _real_os_fsync
+    diaglog55_latched = diaglog55._fsync_failed is True
+    diaglog55.close()
+    import shutil as _shutil_mod
+    _shutil_mod.rmtree(_dl_dir, ignore_errors=True)
+
+    fsync55_ok = (fsync_no_raise and latched_after_failure and printed_on_first_failure
+                 and silent_after_latch and diaglog55_no_raise and diaglog55_latched)
+    ok = ok and fsync55_ok
+    print(f"[self-test] {'PASS' if fsync55_ok else 'FAIL'}  SESSION-55 (H3) periodic fsync "
+          f"(healthy fsync doesn't raise={fsync_no_raise}, a failure latches all 3 sinks="
+          f"{latched_after_failure}, CRITICAL printed once per sink on first failure="
+          f"{printed_on_first_failure}, post-latch calls are silent no-ops={silent_after_latch}, "
+          f"DiagLog.fsync same contract={diaglog55_no_raise and diaglog55_latched})")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

@@ -562,6 +562,23 @@ autonomy:
     strafe_reposition_min_fwd: 2.0    # only reposition if the forward raycast is clearly open beyond this (SLAM units)
     strafe_reposition_fwd_s: 2.0      # forward reposition duration (s) before handing off to the queued strafe
 
+# Session 55: crash/reboot survivability. A hard machine bugcheck (e.g. a GPU driver TDR) gives NO
+# process a clean-shutdown path, so anything that is written only in a `finally` block (perception's
+# map export, autopilot's map-backdrop timeline record) is lost, and anything only flush()'d (not
+# fsync()'d) can still be lost on a REBOOT (not just a process kill) because flush() only reaches the
+# OS page cache. These are general periodic-durability knobs, not room/flight answers.
+diag:
+  log_fsync_period_s: 2.0             # periodic os.fsync() on the append-only autopilot text/timeline
+                                       #   logs so a reboot loses at most this much (flush() alone only
+                                       #   reaches the page cache). NOT per-record -- the timeline runs at
+                                       #   ~30-50 Hz on a 300 MB/flight file. 0 disables.
+  livemap_checkpoint_period_s: 60.0   # perception: periodic durable checkpoint (.tmp + os.replace) of the
+                                       #   voxel map + point cloud + topdown, previously written ONLY in
+                                       #   `finally` (memory-only the whole flight otherwise). 0 disables.
+  timeline_map_period_s: 10.0         # autopilot: periodic map-backdrop record appended to the replay
+                                       #   timeline (previously emitted ONCE, only at clean shutdown) so a
+                                       #   crash still leaves a non-blank map in the report. 0 disables.
+
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.
   tracking_mode: "MASt3R"               # {"MASt3R"} only unless an alternate is approved

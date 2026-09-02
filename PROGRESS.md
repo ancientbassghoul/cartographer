@@ -1,9 +1,45 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-09-02** (branch **`all-bets-are-off`**, session 54 **BUILT — self-tests ALL
-GREEN (0 failures), LIVE-FLY PENDING**; `main` unaffected)._
+_Last updated **2026-09-02** (branch **`all-bets-are-off`**, session 55 **BUILT — self-tests ALL
+GREEN (0 failures), LIVE-FLY PENDING** for sessions 52-55; `main` unaffected)._
 
-_**Session 54 — the session-53 live-fly cleared the `SLAM_HOLD` limit cycle, then immediately hit
+_**Session 55 — a live unattended flight was lost to a GPU-driver TDR bugcheck mid-run; investigation
+found almost all of it actually survived, and a new tool + three in-flight hardening changes now
+close the remaining gaps (BUILT, live-fly PENDING).** Flight `20260902_165340` (~34 min) ended when
+Windows bugchecked (`0x116 VIDEO_TDR_ERROR`) — the Intel iGPU choking on Unity's render load, NOT the
+SLAM/AI stack (`slam_engine.py` is hard-pinned to `cuda:0`; no per-app GPU preference was set for
+`Xlab.exe`, so Optimus defaulted it to the iGPU — operator mitigation: force it to the RTX 3080 in
+Windows Graphics settings). A bugcheck skips every process's `finally`, so all three of `fly.py`'s
+graceful-stop sentinels were bypassed. Investigation found the text log/CSVs/timeline had ALREADY
+survived (flush()'d per write) — what was actually broken was the dashboard MP4's missing frame index
+(`moov`, written only by `writer.release()`) and the replay's map backdrop (emitted only once, in
+`finally`). Built `salvage_flight.py`: MP4 repair works by realizing the un-finalized recording is
+missing its MPEG-4 VOL header (stored once in `moov`, never in `mdat`) — not by treating the payload
+as a self-delimiting raw stream, which was tried first and failed (`ffmpeg` error: "Picture size 0x0
+is invalid"). Fix: borrow the byte-identical VOL header from any OTHER finalized recording at the
+same resolution (`visualizer.py`'s dashboard is a fixed pixel layout, not room data) and prepend it —
+lossless, no re-encode. Verified end-to-end on the real crashed flight: 17,437 frames recovered,
+visually confirmed intact. A second repair path reconstructs a map backdrop from perception's
+`livemap.npz` (OCC from voxels, FREE from the trajectory only — deliberately NOT replaying raycast
+carving, since the npz has no per-frame point↔pose association and inventing one would fabricate
+free-space evidence never actually observed). Added three periodic hardening changes so this repair
+tool is needed less often: H1 periodic map-backdrop timeline records (autopilot.py, was shutdown-only),
+H2 periodic perception map checkpoints via `.tmp`+`os.replace` (was shutdown-only, and the WHOLE map
+was memory-only until then), H3 periodic (not per-record) `fsync()` on the append-only logs so a
+REBOOT, not just a process kill, can't still eat the un-fsync'd tail — there was not one `os.fsync()`
+anywhere in the codebase before this session. `fly.py` now writes a run manifest at launch and offers
+(never silently runs) `salvage_flight.py` on the next launch if the previous run never reached a clean
+teardown; this incidentally surfaced **three OLDER, previously-unnoticed crashed flights**
+(`20260720_133111/135245/135307`) nobody had salvaged. Per operator direction: no video segmentation
+(a repair tool instead), no downsampling/trimming of ANY timeline field, ever — the raw log stays
+fully intact for direct debugging. `autopilot.py --self-test`, `perception_worker.py --self-test`,
+`ground_grid.py`, `map_store.py`, `flight_replay.py`, `salvage_flight.py --self-test`: **ALL PASS, 0
+failures.** See `plans/session55-crash-survivability.md` for the full trace, the MP4/VOL-header
+investigation, and the config knobs. **NOT yet verified live**: H1/H2/H3 firing during a real flight,
+and the fly.py recovery prompt on an actually-killed run (next step: fly a short flight, then
+`Stop-Process -Force` perception/visualizer mid-flight — mirrors `plans/session27-*.md`'s own
+reproduction — confirm the periodic artifacts exist, then relaunch and confirm the prompt). **NEXT =
+LIVE-FLY** (this, then still-pending sessions 52-54 below).
 the SAME bug class one state over: `TRIM` parked for 73.9 seconds with no exit (FIXED, live-fly
 PENDING).** Flight `20260902_155916` ran 5m28s. Session 53's fix worked exactly as designed — the
 log shows `SLAM_HOLD still waiting (this hold 15.0s / episode 15.0s) -> forcing one hop`, both clocks
@@ -1228,18 +1264,32 @@ plan-of-record pointers), and **Documentation** (what we tried, in date order, b
 
 ### >>> IMMEDIATE NEXT TASK (branch `all-bets-are-off`) <<<
 
-**LIVE-FLY session 54** (`python fly.py` — full stack), on top of sessions 49-53 (all already built,
+**LIVE-FLY session 55** (`python fly.py` — full stack), on top of sessions 49-54 (all already built,
 all still live-fly PENDING). Watch list, in priority order:
 
-1. **`TRIM` must exit within ~3s of its pulse, even while `slam_ms` reads 1500-2700ms.** Expect
+1. **Session 55's own crash-survivability additions** (`plans/session55-crash-survivability.md`) —
+   none of this has been exercised on a real flight yet:
+   - Periodic `[perception] periodic livemap checkpoint -> ...` lines every ~60s (`livemap_checkpoint_period_s`).
+   - The replay timeline should carry MULTIPLE `"map"` records now, not just the one at shutdown —
+     spot check by grepping the `_timeline.jsonl` for `"map"` after a flight.
+   - Simulate the actual crash this session was built for: mid-flight, `Stop-Process -Force` on
+     `perception_worker.py` AND `visualizer.py` (mirrors `plans/session27-*.md`'s own repro). Confirm
+     afterward: a recent `*_livemap.npz` checkpoint exists (not just memory that evaporated), the
+     un-finalized `*_visualizer.mp4` is real (no `moov`), and `python salvage_flight.py <ts>` recovers
+     both losslessly.
+   - Relaunch `python fly.py` right after that kill — confirm the CRASH RECOVERY prompt fires, names
+     the correct ts, and (if answered `y`) actually salvages it.
+   - No CRITICAL fsync-failure spam under normal operation (H3's `log_fsync_period_s` tick should be
+     silent when healthy).
+2. **`TRIM` must exit within ~3s of its pulse, even while `slam_ms` reads 1500-2700ms.** Expect
    `TRIM done (...) -> wait for a fresh post-trim frame before resuming` promptly after `TRIM enter`.
    If instead you see `TRIM done (...): FORCED after N.Ns waiting for a post-trim frame`, that's the
    backstop doing its job (not a bug) — but it means the primary fix isn't landing; check `cap_ts` is
    actually advancing. Either way, `TRIM` must never again sit silent like flight `20260902_155916`
    did for 73.9s.
-2. **The `SLAM_HOLD`↔`HOLD_LOST` limit cycle still cannot persist past ~18s** (session 53, confirmed
+3. **The `SLAM_HOLD`↔`HOLD_LOST` limit cycle still cannot persist past ~18s** (session 53, confirmed
    working on this same flight — watch for it to keep holding, this is now just a regression check).
-3. Because sessions 53 and 54's flights were both cut short by these bugs, session 52's own watch
+4. Because sessions 53 and 54's flights were both cut short by these bugs, session 52's own watch
    list (below) is STILL **completely unconfirmed** — re-watch all of it this flight:
    - **`VISUAL_RECOVERY` actually runs**: a loss opening as `PLAN-LOST` reaches the probe on the
      following `PLAN-STALE`, survives the flicker, logs a **MATCH-phase verdict**.
@@ -1251,9 +1301,10 @@ all still live-fly PENDING). Watch list, in priority order:
    - An `autonomy OFF -> PAUSED` / `autonomy LIVE (paused N.Ns; recovery state reset)` pair on `m`.
    - The LKG debug window open, inliers drawn, `OUTPUT/diag/<ts>_visrec/` filling.
 
-See `plans/session54-trim-wait-no-exit.md` for the session-54 trace (root cause, both fixes, the
-four-state audit table below) and `plans/session52-lkg-recovery-unreachable.md` for the still-
-unconfirmed session-52 watch list above.
+See `plans/session55-crash-survivability.md` for the crash-survivability trace (MP4/VOL-header repair,
+map reconstruction, H1/H2/H3, the run manifest), `plans/session54-trim-wait-no-exit.md` for the
+session-54 trace (root cause, both fixes, the four-state audit table below), and
+`plans/session52-lkg-recovery-unreachable.md` for the still-unconfirmed session-52 watch list above.
 
 Sessions 49-51 (below) are also still themselves LIVE-FLY PENDING — the detailed session 45-48
 per-flight watch checklists that used to fill this section are superseded and folded into their dated

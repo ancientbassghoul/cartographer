@@ -1,7 +1,59 @@
+import json
 import os
 import glob
 import time
 import subprocess
+
+
+def _check_for_crash_recovery(cartographer_dir, python_exe, diag_dir):
+    """Session 55 (crash survivability): a hard machine bugcheck (a GPU-driver TDR, confirmed the cause
+    of flight 20260902_165340's loss) bypasses every graceful-stop sentinel below AND the report-compile
+    step at the bottom of this file -- so a run manifest written "in_progress" at launch and only ever
+    marked "completed" down there is a reliable crash signal: if the NEXT launch finds one still
+    "in_progress", that run never got a clean teardown. Also independently flags any un-finalized
+    *_visualizer.mp4 (the video's own crash signature, in case an OLDER run predates this manifest).
+    Prints a loud, explicit notice and OFFERS to run salvage_flight.py now -- never runs it silently
+    (operator's call, matching CLAUDE.md's transparency requirement for anything touching prior-flight
+    data)."""
+    import sys
+    sys.path.insert(0, cartographer_dir)
+    from salvage_flight import is_mp4_finalized
+
+    crashed_ts = set()
+    for mp in glob.glob(os.path.join(diag_dir, "*_run.json")):
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if manifest.get("status") == "in_progress":
+            crashed_ts.add(manifest.get("launch_ts") or os.path.basename(mp)[: -len("_run.json")])
+    for mp in glob.glob(os.path.join(diag_dir, "*_visualizer.mp4")):
+        if mp.endswith(".recovered.mp4") or os.path.exists(mp[: -len(".mp4")] + ".recovered.mp4"):
+            continue    # already repaired earlier -- don't re-flag it forever
+        try:
+            if not is_mp4_finalized(mp):
+                crashed_ts.add(os.path.basename(mp)[: -len("_visualizer.mp4")])
+        except (OSError, ValueError):
+            continue
+    if not crashed_ts:
+        return
+
+    print("\n" + "=" * 78)
+    print("[!] CRASH RECOVERY: the previous run did not shut down cleanly. Flight(s) needing salvage:")
+    for ts in sorted(crashed_ts):
+        print(f"      python salvage_flight.py {ts}")
+    print("    (recovers the video + reconstructs a map backdrop if needed -- never touches an")
+    print("     original artifact. Run any of the above yourself at any time, or answer below.)")
+    print("=" * 78)
+    try:
+        answer = input("Salvage them now before launching this flight? [y/N] ").strip().lower()
+    except EOFError:
+        answer = "n"
+    if answer == "y":
+        for ts in sorted(crashed_ts):
+            subprocess.run([python_exe, "salvage_flight.py", ts], cwd=cartographer_dir)
+
 
 def main():
     cartographer_dir = r"d:\EXTEND\C2_SIM\XLAB\cartographer"
@@ -9,6 +61,19 @@ def main():
 
     python_exe = os.path.join(cartographer_dir, "venv", "Scripts", "python.exe")
     xlab_exe = os.path.join(xlab_dir, "Xlab.exe")
+
+    diag_dir = os.path.join(cartographer_dir, "OUTPUT", "diag")
+    os.makedirs(diag_dir, exist_ok=True)
+    _check_for_crash_recovery(cartographer_dir, python_exe, diag_dir)
+
+    # Session 55: a run manifest, written "in_progress" now and marked "completed" only once the
+    # teardown below actually finishes -- a hard crash leaves this stuck at "in_progress", which is
+    # exactly the signal _check_for_crash_recovery looks for on the NEXT launch.
+    from datetime import datetime as _dt
+    launch_ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    run_manifest_path = os.path.join(diag_dir, f"{launch_ts}_run.json")
+    with open(run_manifest_path, "w", encoding="utf-8") as f:
+        json.dump({"launch_ts": launch_ts, "pid": os.getpid(), "status": "in_progress"}, f)
 
     # Graceful-stop sentinel: the autopilot polls this path (--stop-file) and exits its loop CLEANLY when the
     # file appears, so its shutdown runs — emitting the replay MAP backdrop + closing the timeline — instead of
@@ -117,7 +182,6 @@ def main():
 
         # 3) Compile the replay ONLY from a timeline this run produced (guards against reporting a stale flight
         #    if the autopilot never logged, e.g. it failed to start).
-        diag_dir = os.path.join(cartographer_dir, "OUTPUT", "diag")
         timelines = [f for f in glob.glob(os.path.join(diag_dir, "*_timeline.jsonl"))
                      if os.path.getmtime(f) >= launch_t]
         if timelines:
@@ -126,6 +190,15 @@ def main():
             subprocess.run([python_exe, "flight_replay.py", latest_log, "--open"], cwd=cartographer_dir)
         else:
             print("[!] No timeline was produced this run (autopilot never logged?) -> no report compiled.")
+
+        # 4) Session 55: this teardown ran (a HARD crash would have skipped everything above), so the
+        #    manifest is genuinely clean -- mark it, closing the crash-recovery window this run opened.
+        try:
+            with open(run_manifest_path, "w", encoding="utf-8") as f:
+                json.dump({"launch_ts": launch_ts, "pid": os.getpid(), "status": "completed",
+                          "timeline": (os.path.basename(latest_log) if timelines else None)}, f)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     main()
