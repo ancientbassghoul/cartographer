@@ -1,7 +1,81 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-09-02** (branch **`all-bets-are-off`**, session 52 **BUILT — self-tests ALL
+_Last updated **2026-09-02** (branch **`all-bets-are-off`**, session 54 **BUILT — self-tests ALL
 GREEN (0 failures), LIVE-FLY PENDING**; `main` unaffected)._
+
+_**Session 54 — the session-53 live-fly cleared the `SLAM_HOLD` limit cycle, then immediately hit
+the SAME bug class one state over: `TRIM` parked for 73.9 seconds with no exit (FIXED, live-fly
+PENDING).** Flight `20260902_155916` ran 5m28s. Session 53's fix worked exactly as designed — the
+log shows `SLAM_HOLD still waiting (this hold 15.0s / episode 15.0s) -> forcing one hop`, both clocks
+named, then the forced hop landed and TRIM fired correctly (`sag pos_y=-1.738 >= trim_sag_trigger_y
+=-1.750 -> pulse up`, pulse released 61ms later). It just never left `TRIM`: the WAIT sub-phase's
+`healthy` check required `not self._slam_slow`, SLAM was solving at a flat ~2700ms for the rest of
+the flight, and TRIM has no wall-clock cap — so `ready` was arithmetically unreachable and the drone
+hovered, holding neutral, until the operator killed the run. Same dead band as sessions 44/50/53:
+too slow to satisfy the gate, frames arriving every ~2.86s stayed just inside `plan_timeout_s` (3.0s)
+so plan status never left `OK` either, so the status-dispatch rescues (`HOLD_LOST`/`_step_stale`)
+never got a chance. Root cause: session 52 removed the identical `not self._slam_slow` conjunct from
+TRIM's *trigger*, arguing pos_y is the slowest-varying quantity SLAM publishes and its own comment
+claimed only that one height-reading gate existed — but the WAIT phase's `healthy` reads the SAME
+pos_y for the SAME reason (the "TRIM done ... post pos_y=" log line) and was left untouched. Session
+52 made TRIM enterable under slow SLAM without making it exitable. Fixed both halves: dropped the
+`_slam_slow` conjunct from WAIT's `healthy` (the real freshness proof is `cap_ts >= _trim_cmd_t0 +
+trim_settle_s`, already present) — this alone would have exited this flight's TRIM in ~3s instead of
+74s — plus a bounded forced exit reusing `slam_slow_hop_after_s`, mirroring `TRIM_RESUME_WAIT`'s
+session-44 rescue verbatim (same knob, same `has_any_capture` blackout guard so a wall clock can't
+paper over perception producing nothing), as a backstop against any OTHER unsatisfiable condition.
+A follow-up audit of every state in `step()`/the `_step_*` helpers for this exact signature
+(`_slam_fast_streak >= N` or `not self._slam_slow` as the ONLY exit predicate, no wall clock) found
+**three more live instances, all worse than TRIM** — dispatched above the status router, so not even
+a real `PLAN-LOST` rescues them: `CALIB_LOST_HOLD`, `CALIB_ESCAPE`, and `POSTLUDE_LOST_HOLD`
+(residual — its 30s budget relaxes the required streak but not the speed bar, so it's still
+unreachable at 2700ms). Plus one latent instance, the `SLAM_HOLD` legacy `use_slam_stepback_on_slow=
+True` arm (off by default; the sessions-43/53 rescue lives only in the other arm). None of the four
+fixed this session — operator's call on scope; recorded as backlog below with the grep signature.
+Separately worth recording: SLAM latency on this flight degrades **monotonically with map size** —
+mean ms/20-frame-block `489→462→452→485→702→866→3844→2468→3282→2716`, flight median 1184ms, i.e.
+`_slam_slow` was true for **more than half the flight**. Direct support for the "MASt3R-SLAM's own
+workload grows with the keyframe graph" lead already the top open question below — and the disease
+behind all four of these dead-band bugs. Every new assertion proven against its own defect on a
+scratch copy: reverting fix 1 (the dropped conjunct) fails only the fast-exit sub-check and flips the
+suite to FAILURES PRESENT; reverting fix 2 (the backstop condition) fails only the forced-resolve
+sub-check; both restored byte-identical. `python autopilot.py --self-test`, `frontier_planner.py`,
+`visual_recovery.py`, `flight_replay.py`: **ALL PASS, 0 failures**. See
+`plans/session54-trim-wait-no-exit.md` for the full trace + the four-state audit table. **NEXT =
+LIVE-FLY.**_
+
+_**Session 53 — the session-52 live-fly hit a NEW blocker before most of session 52 could even be
+exercised: a `SLAM_HOLD` ↔ `HOLD_LOST` limit cycle that hovered the drone for 2m21s until the
+operator killed the run (FIXED, live-fly PENDING).** Flight `20260902_143207` ran ~5 minutes total —
+prelude, one short leg, then 43 straight `SLAM_HOLD`→`HOLD_LOST`→`SLAM_HOLD` bounces at a dead-steady
+~3.3s period, nothing else. SLAM never lost tracking (`PLAN-STALE` count: **zero**, all flight) — it
+was just slow, median 3155ms, so `plan_timeout_s` (3.0s) kept aging the plan out between frames.
+The session-43 forced-hop rescue (`slam_slow_hop_after_s`=15.0s) exists for exactly this — and fired
+correctly ONCE, early in the flight — then never again. Root cause: `_enter_slam_hold` re-stamps
+`_slam_hold_start = now` on EVERY entry, so the rescue's `waited` clock got zeroed by the very
+PLAN-LOST/HOLD_LOST bounce it was supposed to survive, capping out at ~3.0s against the 15.0s bar —
+arithmetically unreachable, same shape as session 50's SETTLE dead band. The exact lesson was already
+written in this file, just applied to the wrong field: the `_slam_stepback_count` comment right above
+`_slam_hold_start`'s declaration already explains "resetting this on every fresh hold entry meant the
+escalation could never reach its cap in exactly the scenario it exists to bound" — and was never
+extended to the timer next to it. Fix: a new `_slam_hold_episode_t0` clock, stamped only on the FIRST
+`_enter_slam_hold` of a bad patch (mirrors `_slam_stepback_count`'s own reset rule exactly — cleared
+only in the REPLAN handler, `reset_leg()`, and the settle-gate-clear branch); `_slam_hold_start`
+itself is untouched so the existing per-hold log wording doesn't silently change meaning. Scope
+deliberately narrowed to `SLAM_HOLD` only (operator's call) — the identical hazard exists in `SETTLE`'s
+session-50 escape and `TRIM_RESUME_WAIT`'s session-44 escape (both re-stamp on re-entry too) but
+neither has manifested on a flight; left as backlog. No escalation past the forced hop was built
+either (operator's call) — the hop is the only lever that might unstick a slow solve, and this flight
+supplied zero evidence for picking a cap. New self-test modeled directly on the existing
+`SLAM-STEPBACK counter PERSISTENCE` test drives the same OK/PLAN-LOST bounce and asserts the forced
+hop fires; proven against its own defect by reverting the one-line fix in place and confirming ONLY
+this new test fails (`bounce-preserves=False, forced-hop-fires=False`), then restored byte-identical
+from backup. `python autopilot.py --self-test`, `frontier_planner.py`, `visual_recovery.py`,
+`flight_replay.py`: **ALL PASS, 0 failures**. Because the flight was cut short by this bug, almost
+none of session 52's own watch-list items got exercised (TRIM fired once, but for the sag/UP case,
+not the slow-SLAM/DOWN case it was built for; `VISUAL_RECOVERY`, back-off, and the corner blacklist
+saw no real evidence either way) — they are still themselves LIVE-FLY PENDING, not confirmed and not
+refuted. See `plans/session53-slamhold-limit-cycle.md` for the full trace. **NEXT = LIVE-FLY.**_
 
 _**Session 52 — the visual-recovery probe had never once run on a real flight, TRIM was starving
 under slow SLAM, and a permanently-blacklisted corner still got flown into (BUILT, live-fly
@@ -1154,35 +1228,36 @@ plan-of-record pointers), and **Documentation** (what we tried, in date order, b
 
 ### >>> IMMEDIATE NEXT TASK (branch `all-bets-are-off`) <<<
 
-**LIVE-FLY session 52** (`python fly.py` — full stack), on top of sessions 49-51 (already built,
-live-fly still pending from before). Watch list, in priority order:
+**LIVE-FLY session 54** (`python fly.py` — full stack), on top of sessions 49-53 (all already built,
+all still live-fly PENDING). Watch list, in priority order:
 
-1. **`VISUAL_RECOVERY` actually runs** — a loss opening as `PLAN-LOST` reaches the probe on the
-   following `PLAN-STALE`, survives the flicker, and logs a **MATCH-phase verdict** — never once
-   achieved on a real flight before this session.
-2. The LKG debug window (on by default now, `visrec_debug_window: true`) open, inliers drawn,
-   `OUTPUT/diag/<ts>_visrec/` filling; the banner naming `slam:<frame_id>`, with **no**
-   `live(aged-out)` warning at normal latency.
-3. `TRIM enter (DOWN)` firing while `slam_ms` is 1500-2500 ms — TRIM must no longer sit dead through
-   a slow-SLAM stretch the way it did for 2749 ticks on `20260901_222552`.
-4. The `SLAMHOLD` telemetry row counting up and turning red at 15.0s; the amber notice line naming
-   each forced hop / forced REPLAN / suppressed back-off.
-5. **No `LOSS-INSTANT BACK-OFF SUPPRESSED` notice unless a back-off was genuinely about to fire** —
-   the chunk-3 false-alarm fix.
-6. A back-off travelling roughly half as far (`backoff_hold_s` 2.0→1.0s).
-7. **No goal committed inside a permanently blacklisted region** — a `CORNER-SKIP ... force-retired`
-   line where flight `20260901_222552` showed `blacklist bypassed` eight times instead.
-8. An `autonomy OFF -> PAUSED` / `autonomy LIVE (paused N.Ns; recovery state reset)` pair on `m`.
+1. **`TRIM` must exit within ~3s of its pulse, even while `slam_ms` reads 1500-2700ms.** Expect
+   `TRIM done (...) -> wait for a fresh post-trim frame before resuming` promptly after `TRIM enter`.
+   If instead you see `TRIM done (...): FORCED after N.Ns waiting for a post-trim frame`, that's the
+   backstop doing its job (not a bug) — but it means the primary fix isn't landing; check `cap_ts` is
+   actually advancing. Either way, `TRIM` must never again sit silent like flight `20260902_155916`
+   did for 73.9s.
+2. **The `SLAM_HOLD`↔`HOLD_LOST` limit cycle still cannot persist past ~18s** (session 53, confirmed
+   working on this same flight — watch for it to keep holding, this is now just a regression check).
+3. Because sessions 53 and 54's flights were both cut short by these bugs, session 52's own watch
+   list (below) is STILL **completely unconfirmed** — re-watch all of it this flight:
+   - **`VISUAL_RECOVERY` actually runs**: a loss opening as `PLAN-LOST` reaches the probe on the
+     following `PLAN-STALE`, survives the flicker, logs a **MATCH-phase verdict**.
+   - `TRIM enter (DOWN)` firing while `slam_ms` is 1500-2500 ms (every flight so far has only shown
+     the sag/UP case).
+   - **No `LOSS-INSTANT BACK-OFF SUPPRESSED` notice unless a back-off was genuinely about to fire.**
+   - **No goal committed inside a permanently blacklisted region** — a `CORNER-SKIP ... force-retired`
+     line, not `blacklist bypassed`.
+   - An `autonomy OFF -> PAUSED` / `autonomy LIVE (paused N.Ns; recovery state reset)` pair on `m`.
+   - The LKG debug window open, inliers drawn, `OUTPUT/diag/<ts>_visrec/` filling.
 
-See `plans/session52-lkg-recovery-unreachable.md` for the full trace: the five symptoms, the four
-stacked LKG defects (D1-D4), the chunk-3 false-alarm finding, the TRIM starvation numbers, the
-back-off/clearance figures, the corner/blacklist geometry, and the §4b (post-backoff re-solve
-budget) **NOT BUILT** decision record — backlog only, do not assume it landed.
+See `plans/session54-trim-wait-no-exit.md` for the session-54 trace (root cause, both fixes, the
+four-state audit table below) and `plans/session52-lkg-recovery-unreachable.md` for the still-
+unconfirmed session-52 watch list above.
 
-Sessions 49-51 (below) are still themselves LIVE-FLY PENDING — this session did not touch or
-re-verify them; the detailed session 45-48 per-flight watch checklists that used to fill this
-section are superseded and folded into their dated entries above, same pattern as the 2026-09-01
-session-43 confirmation further down this file.
+Sessions 49-51 (below) are also still themselves LIVE-FLY PENDING — the detailed session 45-48
+per-flight watch checklists that used to fill this section are superseded and folded into their dated
+entries above, same pattern as the 2026-09-01 session-43 confirmation further down this file.
 
 **Session 50** (`plans/session50-settle-dead-band-escape.md`) — watch for
 `SETTLE gate blocked N.Ns by slow-but-ALIVE SLAM ... -> forcing REPLAN` in place of the 91.6s park
@@ -1260,6 +1335,30 @@ used to fill this section, now superseded by the 2026-09-01 confirmation above.
 ---
 
 ## Future (backlog)
+- **The `_slam_fast_streak` dead-band class — three remaining sites (found session 54, not fixed).**
+  Same signature each time: the ONLY exit predicate is `_slam_fast_streak >= N` or `not
+  self._slam_slow`, with no wall-clock cap and no `has_any_capture` blackout guard — grep for that
+  pattern to find more. All three are dispatched ABOVE `step()`'s status router and own every status
+  themselves, so unlike `TRIM` (fixed this session) not even a genuine `PLAN-LOST` can rescue them:
+
+  | State | Exit predicate | Why it can't fire at ~2700ms/frame |
+  |---|---|---|
+  | `CALIB_LOST_HOLD` (`_step_calib_lost`, `autopilot.py:1680`) | `_slam_fast_streak >= calib_lost_recover_frames` (6) + `status == "OK"` | `_slam_fast_streak` resets to 0 on every slow frame, pinned at 0. `calib_gate_max_s` bounds only the downstream comfort sub-gate, never reached. Docstring: "No time cap — the SLAM frame stream is the liveness signal (operator ask)" — that premise assumes slow eventually turns fast; this flight class disproves it. |
+  | `CALIB_ESCAPE` (`_step_calib_escape`, `autopilot.py:1791`) | `_slam_fast_streak >= calib_escape_ok_frames` (12) + `status == "OK"` + `_calib_slam_comfortable()` | Same, stricter (12 fast frames + a latency-average bar). Comment: "no extra bound needed here". |
+  | `POSTLUDE_LOST_HOLD` (`_step_postlude_lost`, `autopilot.py:1879-1881`) | `_slam_fast_streak >= required_streak` + `status == "OK"` | `postlude_recover_budget_s` (30s) relaxes the required streak 6→1 but NOT the speed bar — a fast frame is still required and there are none. Residual, not absent. Hangs at mission end, near the ground. |
+
+  Plus one **latent** instance (off by default, so not yet bitten anyone): the `SLAM_HOLD` legacy
+  `use_slam_stepback_on_slow=True` arm — the sessions-43/53 rescue lives only in the `if not
+  self.use_slam_stepback_on_slow:` branch; the legacy arm returns "keep holding" with no clock at
+  all. The un-fixed twin of a known-fixed bug, waiting for whoever flips that flag.
+
+  Each fix should mirror `TRIM`'s session-54 idiom (or `TRIM_RESUME_WAIT`'s session-44 original): a
+  bounded forced exit on `slam_slow_hop_after_s`, guarded by `has_any_capture` so a total capture
+  blackout still isn't papered over by a wall clock. `CALIB_LOST_HOLD`/`CALIB_ESCAPE` both have an
+  explicit "operator ask: no cap" comment on record — re-confirm the premise with the operator before
+  changing either, since the no-cap choice was deliberate at the time, not an oversight (unlike
+  `TRIM`'s, which was). See `plans/session54-trim-wait-no-exit.md` for the full audit table this was
+  drawn from.
 - **Session-22 — fixed height reference + BIDIRECTIONAL TRIM; mid-flight re-tap RETIRED — BUILT
   (`leg-hops-and-goal-commit-fix`), all 6 module self-tests green, UNCOMMITTED, LIVE-FLY PENDING**
   (`plans/session22-fixed-height-ref-and-bidirectional-trim.md`): the 20260717_004418 calibration death-loop +

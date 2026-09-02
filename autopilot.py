@@ -933,6 +933,22 @@ class ExploreController:
         # goal (both in the REPLAN handler) -- NOT on every `_enter_slam_hold`.
         self._slam_stepback_count = 0
         self._slam_hold_start = None      # 'now' when the current SLAM_HOLD began (total-wait logging)
+        # Session 53 (flight 20260902_143207): the session-43 forced-hop rescue below reads `_slam_hold_start`,
+        # which is re-stamped on EVERY `_enter_slam_hold` -- exactly the hazard the `_slam_stepback_count`
+        # comment above already documents ("resetting this on every fresh hold entry meant the escalation
+        # could never reach its cap in exactly the scenario it exists to bound"), just never applied to this
+        # field. That flight's SLAM ran ~3.1s/frame: too slow to hold a plan valid past `plan_timeout_s`
+        # (3.0s), so status flip-flopped OK<->PLAN-LOST every ~3.3s and `_slam_hold_start` was wiped every
+        # cycle -- `waited` never got past ~3.0s against the 15.0s bar. 43 bounces, 0 forced hops. This field
+        # is the EPISODE clock: stamped ONLY on the first `_enter_slam_hold` of a bad patch (see there), left
+        # untouched by every re-entry the bounce causes, so the rescue's `waited` finally accumulates across
+        # the oscillation instead of being repeatedly zeroed by it. `_slam_hold_start` itself is UNCHANGED and
+        # keeps feeding the "this hold" wait already printed in the settle/rescue log lines -- widening ITS
+        # meaning would silently change numbers the operator reads on every flight. Reset at the same
+        # boundaries `_slam_stepback_count` uses: the REPLAN handler (trusted recovery / new goal),
+        # reset_leg() (autonomy pause/interruption), and SLAM_HOLD's own settle-gate-clear branch (the hold
+        # genuinely settled, the episode is over).
+        self._slam_hold_episode_t0 = None
         # Reactive wall/backwall response while BLIND (HOLD_LOST / waiting in SLAM_HOLD): the flow contact
         # detector doesn't need SLAM, but nothing read it in those states before this fix (the drone could
         # drift into a wall for 30-40s of a bad SLAM patch with no reaction). Edge-triggered (armed=True
@@ -1312,6 +1328,7 @@ class ExploreController:
         self._slam_resume = None    # SLAM streak/latest persist (health is flight-level); only the pending resume clears
         self._slam_stepback_count = 0   # per-hold step-back counter + timer clear on interruption
         self._slam_hold_start = None
+        self._slam_hold_episode_t0 = None   # session 53: autonomy pause/leg interruption ends the episode too
         # Two-Phase Hybrid Ascent runtime (lazy-init in the ASCEND handler when _ascend_phase is None).
         self._ascend_phase = None       # "PULSE" | "REST" | "LATCH" within ASCEND (None => (re)initialize)
         self._ascend_phase_t0 = None    # entry time of the current ascend sub-phase
@@ -2295,10 +2312,19 @@ class ExploreController:
         typically bounces through PLAN-LOST/HOLD_LOST before the next `_enter_slam_hold`, and resetting
         the counter on every fresh entry (the old behavior) meant the #1/3->#2/3->#3/3 escalation could
         never advance past #1 in exactly that scenario. It resets only in the REPLAN handler, on a
-        genuinely trusted recovery or a materially new leg goal — see `_hop_start_goal` nearby there."""
+        genuinely trusted recovery or a materially new leg goal — see `_hop_start_goal` nearby there.
+
+        Session 53: `_slam_hold_episode_t0` gets the SAME treatment, for the SAME reason -- stamped only
+        if it is currently None, so a PLAN-LOST/HOLD_LOST bounce within one bad SLAM patch does not zero
+        it on every re-entry (see the field's own comment). `_slam_hold_start` is stamped unconditionally
+        as before -- it still means "this particular hold began", feeding the per-hold wait already in the
+        settle/rescue log text; `_slam_hold_episode_t0` means "this bad-SLAM-patch episode began" and feeds
+        only the forced-hop rescue's bounded wait."""
         self._slam_resume = resume
         self._player = None
         self._slam_hold_start = now
+        if self._slam_hold_episode_t0 is None:
+            self._slam_hold_episode_t0 = now
         self._settle_gate_begin(now)      # session 24: open the shared gate HERE (the true stationary-start
                                            # instant), so a later resume's motion-gate elapsed time already
                                            # covers the whole hold -- no separate credit bookkeeping needed
@@ -3075,6 +3101,10 @@ class ExploreController:
                 nxt = self._slam_resume or "REPLAN"
                 self._slam_resume = None
                 waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
+                # Session 53: the hold genuinely settled -- the bad-SLAM-patch episode this clock was
+                # bounding is over. Reset here (mirrors _slam_stepback_count's REPLAN-handler reset) so the
+                # NEXT bad patch starts its own fresh episode rather than inheriting this one's elapsed time.
+                self._slam_hold_episode_t0 = None
                 trust_note = ""
                 # Session 35: settle-gate-based trust restoration. Gated STRICTLY on nxt == "SETTLE" (the
                 # recovery-resume path) -- every other resume target ("ADVANCE"/"PARALLAX_PUSH", a plain
@@ -3121,6 +3151,12 @@ class ExploreController:
             if reaction is not None:
                 return reaction
             waited = now - (self._slam_hold_start if self._slam_hold_start is not None else self.t_state)
+            # Session 53: the EPISODE clock -- persists across the PLAN-LOST/HOLD_LOST bounce that
+            # `_slam_hold_start` does not (see `_slam_hold_episode_t0`'s own comment). Only the forced-hop
+            # rescue below reads it; the legacy step-back branch further down keeps using the per-hold
+            # `waited` above, unchanged.
+            episode_waited = now - (self._slam_hold_episode_t0 if self._slam_hold_episode_t0 is not None
+                                     else self.t_state)
             if not self.use_slam_stepback_on_slow:
                 # Session 35 default, simplified session 43 (operator ask, off flight 20260723_000631: a
                 # recovery-settle SLAM_HOLD sat 31.5s with plan OK the whole time and never forced a hop,
@@ -3140,7 +3176,7 @@ class ExploreController:
                 # over by a wall clock -- that's flying on zero live data. Require at least one entry in the
                 # current window to carry a real cap_ts (SLAM has told us SOMETHING, even if slow).
                 has_any_capture = any(cap_ts is not None for _, cap_ts in self._slam_hist)
-                if waited >= self.slam_slow_hop_after_s and has_any_capture:
+                if episode_waited >= self.slam_slow_hop_after_s and has_any_capture:
                     if self._recovering:
                         self._recovering = False
                         self._history_broken = False
@@ -3154,8 +3190,9 @@ class ExploreController:
                     # grace window), so setting it BEFORE would have it wiped by that same call.
                     self._enter("REPLAN", now)
                     self._slam_slow_hop_deadline = now + self.slam_slow_hop_grace_s
-                    _msg = (f"SLAM_HOLD still waiting after {waited:.1f}s but plan OK -> forcing "
-                            f"one hop toward the current goal (grace {self.slam_slow_hop_grace_s:.0f}s)")
+                    _msg = (f"SLAM_HOLD still waiting (this hold {waited:.1f}s / episode {episode_waited:.1f}s) "
+                            f"but plan OK -> forcing one hop toward the current goal "
+                            f"(grace {self.slam_slow_hop_grace_s:.0f}s)")
                     self.note_timeout("SLAM_HOLD_FORCED_HOP", _msg, now, loud=False)
                     return {}, "REPLAN", _msg
                 return {}, "SLAM_HOLD", None
@@ -3214,7 +3251,12 @@ class ExploreController:
         # perception THROUGHPUT signal, not evidence the last published pose is wrong -- and pos_y
         # is the slowest-varying quantity SLAM publishes, so a stale-but-slow reading is still a
         # trustworthy height reading. The other six _slam_slow gates in this file guard MOTION/
-        # HEADING decisions and are untouched; only this height READING gate is removed.
+        # HEADING decisions and are untouched -- CORRECTION (session 54): that count was wrong. The
+        # TRIM WAIT sub-phase's `healthy` check (below, in the "elif st == TRIM" handler) is ALSO a
+        # height-reading gate on the identical pos_y, and session 52 left it in place -- so TRIM became
+        # enterable under slow SLAM without becoming exitable. Flight 20260902_155916 hovered in TRIM
+        # for 73.9s as a direct result. Session 54 removed that gate too and added a bounded forced
+        # exit (slam_slow_hop_after_s) as a backstop; see that handler for the full trace.
         if (self.trim_enable and st in _TRIM_TRIGGER_STATES and not self._calib_active
                 and self._ceiling_y is not None
                 and plan.get("plan_valid") and plan.get("pos_y") is not None):
@@ -3629,6 +3671,7 @@ class ExploreController:
             # let a bad patch's PLAN-LOST/HOLD_LOST bounce wipe it before it could ever escalate).
             self._slam_stepback_count = 0
             self._slam_slow_streak = 0
+            self._slam_hold_episode_t0 = None   # session 53: same trusted-recovery boundary, same reason
             if plan.get("done") or plan.get("goal") is not None:
                 self._no_goal_since = None         # a live goal / done clears the idle backstop tracker
                 self._no_goal_warned = False
@@ -4192,9 +4235,21 @@ class ExploreController:
                 if (now - self._trim_phase_t0) >= self.trim_pulse_s:
                     self._trim_cmd_t0 = now                     # pulse command issued (settle-gate origin, monotonic)
                     self._trim_phase, self._trim_phase_t0 = "WAIT", now
-            else:   # WAIT: hold neutral until a fresh HEALTHY post-trim frame, then log + exit
+            else:   # WAIT: hold neutral until a fresh post-trim frame, then log + exit
+                # Session 54 (live-flight bug, flight 20260902_155916): dropped the `not self._slam_slow`
+                # conjunct that used to gate `healthy` here. Session 52 removed the same conjunct from
+                # TRIM's *trigger* above, arguing pos_y is the slowest-varying quantity SLAM publishes so a
+                # stale-but-slow reading is still trustworthy -- and its comment claimed only the trigger
+                # was a height-reading gate, the rest guarded MOTION/HEADING. That claim missed this one:
+                # this IS a height-reading gate too (its only consumer is the "post pos_y=" log line below).
+                # With SLAM solving at a flat ~2700ms this flight, `_slam_slow` was true on EVERY frame, so
+                # `ready` could never fire -- and TRIM has no other exit, so it hovered 73.9s until the
+                # operator killed the run. The real freshness guarantee is `cap_ts >= _trim_cmd_t0 +
+                # trim_settle_s` below: it proves the frame was CAPTURED after the pulse settled, on the
+                # same monotonic clock -- `_slam_slow` says only how long the solve took, not whether pos_y
+                # is right.
                 cap_ts = plan.get("cap_ts")
-                healthy = plan.get("plan_valid") and plan.get("pos_y") is not None and not self._slam_slow
+                healthy = plan.get("plan_valid") and plan.get("pos_y") is not None
                 ready = (self._trim_cmd_t0 is not None and cap_ts is not None
                          and cap_ts >= self._trim_cmd_t0 + self.trim_settle_s and healthy)
                 if ready:
@@ -4206,6 +4261,22 @@ class ExploreController:
                     msg = (f"TRIM done ({self._trim_dir}): post pos_y={y_after:+.3f} (desired {desired_str})")
                     event = self._trim_exit(now, plan, msg)
                     return active, self.state, event
+                # Session 54: bounded forced exit, belt-and-suspenders alongside the fix above (a DIFFERENT
+                # unsatisfiable condition -- e.g. plan_valid staying False, or cap_ts never advancing --
+                # could still park WAIT forever otherwise). Mirrors TRIM_RESUME_WAIT's session-44 rescue
+                # verbatim: same knob (no new one for a fourth name of the same idea), same
+                # has_any_capture blackout guard (a wall clock must never paper over perception producing
+                # NOTHING, only genuine slowness).
+                elif self._trim_cmd_t0 is not None:
+                    waited = now - self._trim_cmd_t0
+                    has_any_capture = any(c is not None for _, c in self._slam_hist)
+                    if waited >= self.slam_slow_hop_after_s and has_any_capture:
+                        y_txt = (f"{plan['pos_y']:+.3f}" if plan.get("pos_y") is not None else "unavailable")
+                        msg = (f"TRIM done ({self._trim_dir}): FORCED after {waited:.1f}s waiting for a "
+                               f"post-trim frame (last pos_y={y_txt})")
+                        event = self._trim_exit(now, plan, msg)
+                        self.note_timeout("TRIM_WAIT_FORCED", event, now, loud=False)
+                        return active, self.state, event
 
         elif st == "TRIM_RESUME_WAIT":
             # Session 28: hold neutral until the settle-gate proves a fresh post-TRIM frame exists, then hand
@@ -6482,6 +6553,76 @@ def run_self_test(cfg):
           f"{trim_under_fast_ok}, in-band guard={band_still_gates}, no-ceiling guard="
           f"{no_ceiling_still_gates}, mid-calibration guard={calib_active_still_gates})")
 
+    # ---- (session 54) TRIM's WAIT sub-phase must not hang under sustained slow SLAM ----
+    # Flight 20260902_155916: TRIM fired correctly (session 52 confirmed above), then hovered in TRIM's
+    # WAIT sub-phase for 73.9s -- `healthy` (the exit gate) still required `not self._slam_slow`, and
+    # SLAM was solving at a flat ~2700ms the entire time, so it was arithmetically unreachable. Fixed by
+    # (1) dropping that conjunct -- the real freshness proof is `cap_ts >= _trim_cmd_t0 + trim_settle_s`,
+    # which session 52's own argument already covers -- and (2) a bounded forced exit
+    # (slam_slow_hop_after_s, has_any_capture-guarded) as a backstop against any OTHER unsatisfiable
+    # condition. These four cases mirror the session-44 TRIM_RESUME_WAIT block above one-for-one.
+    def _mk_trim_wait(hop_after=None):
+        c = _mk_trim()
+        c._enter("TRIM", 0.0)
+        c._trim_phase, c._trim_cmd_t0, c._trim_dir = "WAIT", 0.0, "UP"
+        c._trim_resume_goal, c._trimming = [3.0, 0.0], True
+        if hop_after is not None:
+            c.slam_slow_hop_after_s = hop_after
+        return c
+
+    def _drive_trim_wait(c, slam_ms, cap_ts_none=False, plan_valid=True, max_ticks=60, dt=0.05):
+        tt, fid, s, ev = 0.0, 1, "TRIM", None
+        for _ in range(max_ticks):
+            tt += dt; fid += 1
+            p = _tplan(-1.7, cap=(None if cap_ts_none else tt), fid=fid)
+            p["slam_ms"], p["plan_valid"] = slam_ms, plan_valid
+            _, s, ev = c.step(tt, p, False)
+            if s != "TRIM":
+                break
+        return tt, fid, s, ev
+
+    # (54-trim-1) THE REGRESSION CASE: sustained slow SLAM (2700ms/frame, matching the flight) with an
+    # otherwise-healthy plan must resolve in a couple of ticks, NOT the 15s backstop -- the fix, not the
+    # safety net, is what should be firing here.
+    t54a = _mk_trim_wait()
+    tt54a, _, s54a, ev54a = _drive_trim_wait(t54a, slam_ms=2700.0)
+    fixed_fast_exit_ok = (s54a == "TRIM_RESUME_WAIT" and tt54a < t54a.slam_slow_hop_after_s
+                          and "FORCED" not in (ev54a or ""))
+
+    # (54-trim-2) no regression under fast SLAM -- unaffected by the fix, and not misreported as forced.
+    t54b = _mk_trim_wait()
+    _, _, s54b, _ = _drive_trim_wait(t54b, slam_ms=200.0)
+    fast_no_regression_ok = (s54b == "TRIM_RESUME_WAIT"
+                             and (t54b.last_timeout is None
+                                  or t54b.last_timeout.get("kind") != "TRIM_WAIT_FORCED"))
+
+    # (54-trim-3) belt-and-suspenders: a DIFFERENT unsatisfiable condition (plan_valid pinned False, real
+    # cap_ts still advancing) must still force-resolve after slam_slow_hop_after_s, and the preserved goal
+    # (Trap B) must survive the forced hand-off through to ORIENT, exactly like TRIM_RESUME_WAIT's own
+    # force-resolve test above.
+    t54c = _mk_trim_wait(hop_after=0.5)
+    tt54c, fid54c, s54c, ev54c = _drive_trim_wait(t54c, slam_ms=200.0, plan_valid=False, dt=0.02)
+    forced_exit_ok = (s54c == "TRIM_RESUME_WAIT" and "FORCED after" in (ev54c or "")
+                      and t54c.last_timeout is not None
+                      and t54c.last_timeout.get("kind") == "TRIM_WAIT_FORCED")
+    _, s54c2, _ = _run_trim_resume_wait(t54c, tt54c + 0.02, tt54c + 0.02, fid54c + 1)
+    forced_goal_preserved_ok = (s54c2 == "ORIENT" and t54c.leg_goal == [3.0, 0.0])
+
+    # (54-trim-4) blackout guard: cap_ts NEVER arrives (perception producing nothing) -- the forced exit
+    # must NOT fire even past slam_slow_hop_after_s; a wall clock must never paper over a total blackout.
+    t54d = _mk_trim_wait(hop_after=0.5)
+    _, _, s54d, _ = _drive_trim_wait(t54d, slam_ms=200.0, cap_ts_none=True, dt=0.02)
+    blackout_no_force_ok = (s54d == "TRIM")
+
+    trim54_ok = (fixed_fast_exit_ok and fast_no_regression_ok and forced_exit_ok
+                and forced_goal_preserved_ok and blackout_no_force_ok)
+    ok = ok and trim54_ok
+    print(f"[self-test] {'PASS' if trim54_ok else 'FAIL'}  SESSION-54 TRIM WAIT no-hang "
+          f"(sustained-slow-SLAM exits fast, not forced={fixed_fast_exit_ok}, fast-SLAM no regression="
+          f"{fast_no_regression_ok}, other-unsatisfiable-condition force-resolves={forced_exit_ok}, "
+          f"forced hand-off preserves goal (Trap B)={forced_goal_preserved_ok}, "
+          f"total blackout never forces={blackout_no_force_ok})")
+
     # Negative bearing error -> open-loop turn yaw NEGATIVE (turn left).
     c2 = ExploreController(cfg, no_takeoff=True)
     _, a2, s2, _ = _drive(c2, {"done": False, "goal": [-1.0, 0.0], "pos": [0.0, 0.0], "bearing_err": -90.0}, False, 0.3, 0.0)
@@ -7837,6 +7978,68 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if stepback_persist_ok else 'FAIL'}  SLAM-STEPBACK counter PERSISTENCE "
           f"(first={sb1_ok}, bounce-preserves={bounce_ok}, fresh-hold-preserves={fresh_hold_ok}, "
           f"escalates-to-2={escalate_ok}, goal-change-resets={goal_reset_ok})")
+
+    # ---- Session 53: SLAM_HOLD forced-hop rescue must accumulate ACROSS a PLAN-LOST/HOLD_LOST bounce
+    #      (bug diagnosed off flight 20260902_143207: SLAM ran ~3.1s/frame -- too slow to hold a plan
+    #      valid past plan_timeout_s (3.0s) but fast enough to keep re-locking, so status flip-flopped
+    #      OK<->PLAN-LOST every ~3.3s for 2m21s. `_slam_hold_start` is re-stamped on EVERY `_enter_slam_
+    #      hold`, so the session-43 rescue's `waited` never got past ~3.0s against the 15.0s bar: 43
+    #      bounces, 0 forced hops. `_slam_hold_episode_t0` must survive the bounce the same way
+    #      `_slam_stepback_count` already does, proven above.) ----
+    padv53 = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
+              "forward_clearance_dist": 9.0}
+
+    def _tick53(ctrl, t, fid, status, ms=3155.0):
+        p = dict(padv53, frame_id=fid, slam_ms=ms, cap_ts=t)
+        _a, s, ev = ctrl.step(t, p, False, status=status)
+        return s, ev, t + 0.05, fid + 1
+
+    cs53 = ExploreController(cfg, no_takeoff=True)
+    cs53.slam_slow_hop_after_s = 0.5     # shrink the real 15.0s bar so the bounce test runs fast
+    cs53._enter("HOLD_LOST", 0.0)        # mirrors the flight: recovering from a fresh loss
+    t53, fid53 = 0.0, 0
+
+    # First OK tick: HOLD_LOST (a _RECOVERY_STATE) + status OK -> _enter_slam_hold, OPENS the episode.
+    s53, _, t53, fid53 = _tick53(cs53, t53, fid53, "OK")
+    ep0_53 = cs53._slam_hold_episode_t0
+    first_entry_ok = (s53 == "SLAM_HOLD" and ep0_53 is not None)
+
+    # Bounce: a run of slow-but-OK ticks (never fast enough to clear the settle gate) <-> ONE PLAN-LOST
+    # tick <-> ONE OK tick that re-enters a FRESH SLAM_HOLD, repeated until the forced hop fires. Every
+    # tick in between must PRESERVE the episode clock (never reset it to a later value).
+    bounce_preserved, saw_hop_53, hop_event_53 = True, False, None
+    for _cycle in range(20):
+        for _ in range(4):
+            s53, ev53, t53, fid53 = _tick53(cs53, t53, fid53, "OK")
+            if s53 == "REPLAN":
+                saw_hop_53, hop_event_53 = True, ev53
+                break
+            if not (s53 == "SLAM_HOLD" and cs53._slam_hold_episode_t0 == ep0_53):
+                bounce_preserved = False
+        if saw_hop_53:
+            break
+        s_lost_53, _, t53, fid53 = _tick53(cs53, t53, fid53, "PLAN-LOST")
+        if not (s_lost_53 == "HOLD_LOST" and cs53._slam_hold_episode_t0 == ep0_53):
+            bounce_preserved = False
+        s53, ev53, t53, fid53 = _tick53(cs53, t53, fid53, "OK")
+        if s53 == "REPLAN":
+            saw_hop_53, hop_event_53 = True, ev53
+            break
+        if not (s53 == "SLAM_HOLD" and cs53._slam_hold_episode_t0 == ep0_53):
+            bounce_preserved = False
+
+    hop_fires_ok = (saw_hop_53 and hop_event_53 is not None
+                     and "forcing" in hop_event_53 and "hop" in hop_event_53)
+    # The forced hop only calls _enter("REPLAN", now) and returns; the episode-clock reset lives in the
+    # REPLAN handler itself, which runs on the NEXT step() call once state == "REPLAN" -- one more tick.
+    _s_replan_53, _, t53, fid53 = _tick53(cs53, t53, fid53, "OK")
+    episode_reset_ok = (cs53._slam_hold_episode_t0 is None)
+
+    slamhold_episode_ok = first_entry_ok and bounce_preserved and hop_fires_ok and episode_reset_ok
+    ok = ok and slamhold_episode_ok
+    print(f"[self-test] {'PASS' if slamhold_episode_ok else 'FAIL'}  SLAM_HOLD EPISODE clock PERSISTENCE "
+          f"(first-entry={first_entry_ok}, bounce-preserves={bounce_preserved}, forced-hop-fires={hop_fires_ok}, "
+          f"REPLAN-resets={episode_reset_ok})")
 
     # ---- Session 35: forced-hop escape (default) vs legacy step-back, selected by use_slam_stepback_on_slow ----
     padv35 = {"plan_valid": True, "done": False, "goal": [9.0, 0.0], "pos": [0.0, 0.0], "bearing_err": 0.0,
@@ -9236,8 +9439,11 @@ def run_self_test(cfg):
             saw_hop5 = True
             hop_event5 = ev
             break
+    # Session 53: wording gained a second clock ("this hold X.Xs / episode Y.Ys") so the log makes the
+    # PLAN-LOST/HOLD_LOST bounce visible instead of inferred -- see _slam_hold_episode_t0.
     event5_text_ok = (hop_event5 is not None
-                      and hop_event5.startswith("SLAM_HOLD still waiting after")
+                      and hop_event5.startswith("SLAM_HOLD still waiting (this hold")
+                      and "episode" in hop_event5
                       and "forcing one hop toward the current goal" in hop_event5
                       and hop_event5.endswith(f"grace {c52t5.slam_slow_hop_grace_s:.0f}s)"))
     tel5_ok = (reached5 and saw_hop5 and event5_text_ok
