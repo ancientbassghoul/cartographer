@@ -12,6 +12,12 @@ Why each piece is here (all of it earned by a real failure mode):
   * verification gate -- `claude -p` exits 0 when the model refuses, stalls, or writes code whose
                          tests fail. "the process exited" is NOT "the chunk landed", so after each
                          chunk this runner executes the module self-tests ITSELF and halts on failure.
+  * empty-chunk gate  -- and that self-test gate passes TRIVIALLY on an untouched tree, so it is
+                         BLIND to the one failure it most needs to see: a chunk that wrote nothing
+                         at all. The usual cause is a session killed mid-flight by a usage limit,
+                         which can still exit 0. Left unchecked the runner marches into the NEXT
+                         chunk, whose declared dependency was never built. An empty diff between
+                         chunk trees is therefore a FAILURE, not a note.
   * git tree snapshots-- a per-chunk .patch so one bad chunk can be isolated and reverted without
                          losing the others. Uses `git write-tree` (writes an object; no commit, no
                          ref move) -- the runner never commits.
@@ -177,6 +183,9 @@ def main():
                     help="comma-separated self-test modules run after EVERY chunk (empty to disable)")
     ap.add_argument("--no-verify", action="store_true", help="skip the self-test gate (not recommended)")
     ap.add_argument("--no-git", action="store_true", help="skip the per-chunk .patch snapshots")
+    ap.add_argument("--allow-empty-chunk", default="", metavar="N[,N...]",
+                    help="comma-separated 1-based chunk indices permitted to produce an EMPTY diff "
+                         "(default: none -- a chunk that changes no files halts the run)")
     ap.add_argument("--list", action="store_true", help="list the chunks and exit")
     ap.add_argument("--dry-run", action="store_true",
                     help="write every prompt to disk without invoking claude")
@@ -202,12 +211,27 @@ def main():
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
     verify = not args.no_verify and bool(suites)
 
+    # Fail-fast on a malformed index list rather than silently ignoring it -- an --allow-empty-chunk
+    # the user THINKS is armed but isn't would disarm the guard exactly when it is being relied on.
+    try:
+        allow_empty = {int(n) for n in args.allow_empty_chunk.split(",") if n.strip()}
+    except ValueError:
+        sys.exit(f"ERROR: --allow-empty-chunk expects comma-separated integers, got "
+                 f"{args.allow_empty_chunk!r}")
+
     use_git = not args.no_git and not args.dry_run
     if use_git and not index_is_clean():
         print("WARNING: the git index has staged changes, so per-chunk patches are DISABLED "
               "(snapshotting would discard that staged state). Commit or unstage first, "
               "or pass --no-git to silence this.")
         use_git = False
+    if not use_git and not args.dry_run:
+        # A disabled safety check must be LOUD, never silent: the empty-chunk gate below lives
+        # inside the snapshot block, so no snapshots means no gate.
+        print("WARNING: per-chunk git snapshots are OFF, so the EMPTY-CHUNK GUARD CANNOT RUN. "
+              "A chunk that exits 0 having written nothing will pass unnoticed and the next chunk "
+              "will build on a dependency that was never built. Watch each chunk's change summary "
+              "yourself, or re-enable snapshots (clean index, drop --no-git).")
 
     run_dir = REPO / "OUTPUT" / "sonnet_runs" / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +285,27 @@ def main():
             print(f"\n[chunk {idx}] changes:\n{stat if stat else '  (no file changes)'}")
             print(f"[chunk {idx}] patch: {patch}")
             print(f"[chunk {idx}] revert just this chunk:  git apply -R {patch}")
+
+            # EMPTY-CHUNK GATE. `claude` exited 0 but touched nothing, so the chunk did not land.
+            # The self-test gate below cannot see this -- an untouched tree passes trivially -- and
+            # continuing would run the NEXT chunk against a dependency that was never built.
+            if not stat and idx not in allow_empty:
+                print(f"\nChunk {idx} FAILED: claude exited 0 but changed NO FILES, so this chunk "
+                      f"did NOT land.")
+                print("  Most likely cause: the session ran out of tokens (usage limit) and was cut "
+                      "off before it wrote anything. A refusal or a silent stall looks identical.")
+                print(f"  Nothing to revert -- the diff is empty, so the tree is exactly as it was "
+                      f"before chunk {idx} started.")
+                print(f"  Fix: top up / wait for the limit to reset, then RE-RUN THIS CHUNK. Do not "
+                      f"re-run from chunk 1 -- chunk edits are insertions and are not idempotent.")
+                print(f"  transcript: {log_path}")
+                print("  If the transcript shows the chunk DID do work, check `git status` before "
+                      "resuming -- something reverted it.")
+                print(f"  If this chunk legitimately changes no files, re-run with "
+                      f"--allow-empty-chunk {idx}")
+                print(resume_hint)
+                sys.exit(1)
+
             prev_tree = cur_tree
 
         if verify:
