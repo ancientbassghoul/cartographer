@@ -18,14 +18,32 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**, **session 56**: BUILT, self-tests ALL GREEN (0 failures, all 8
-suites), **LIVE-FLY PENDING** — sessions 49-56 have never been flown together. `main` is
-unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one open
-problem: height.
+Branch **`all-bets-are-off`**. **Session 56 is BUILT and was FLOWN** on 2026-09-03
+(`OUTPUT/diag/20260903_083329_*`) — fast and efficient, the SLAM_HOLD work landed. **Session 57 is
+SPECIFIED but NOT BUILT**: `plans/session57-spec.md` is a 9-chunk Sonnet-ready spec, and the runner
+is armed. All 8 self-test suites are green at HEAD. `main` is unaffected and sits at session 43
+(confirmed tolerable live-fly on 2026-09-01), with one open problem: height.
 
-## >>> IMMEDIATE NEXT: LIVE-FLY session 56 (`python fly.py`) <<<
-Watch list, priority order — full design/replay-arithmetic in
-`plans/session56-settle-gate-currency-and-lkg-freeze.md`:
+## >>> IMMEDIATE NEXT: run session 57 <<<
+```
+python sonnet_runner.py --plan plans/session57-spec.md
+```
+The gate now runs **all 9 suites under the project venv** after every chunk (`sonnet_runner.py`
+`DEFAULT_SUITES` + `suite_python()`); `visualizer.py` joins that list in chunk 6, which creates its
+`--self-test` entry point. Resume a failed run with `--start-at N` — chunk edits are insertions and
+are NOT idempotent, so never re-run from 1.
+
+**What session 57 fixes and why** — the operator saw the LKG window show a reference frame plainly
+closer than the live frame while the drone backed off anyway. Of that flight's 86 loss episodes only
+**30 ever ran a visual match**; 56 ran none. See `plans/session57-spec.md`'s MISSION CONTEXT for the
+full evidence, and the session-57 entry in `PROGRESS.md`.
+
+After the run completes, chunk 9 rewrites this section with session 57's own watch list. Then
+live-fly, watching **both** lists — session 56's below has still never been re-flown against its
+own fixes in isolation.
+
+### Session 56's watch list (still current — its fixes were flown once, on 2026-09-03)
+Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-freeze.md`:
 
 1. **`SLAM_HOLD_FORCED_HOP`/`SETTLE_DEADBAND` should become rare, not the normal exit.** Before
    this session every gate release came from the 15s dead-band escape; now most holds should
@@ -55,10 +73,17 @@ Watch list, priority order — full design/replay-arithmetic in
    - Session 51: pure waste removal — expect **zero** decision changes vs. earlier flights.
 
 **STILL OPEN, TOP OF THE LIST: why does SLAM choke** (plateaus at ~2000ms for minutes, worst gap
-90.8s on the session-52 flight)? Two theories ruled out — autopilot loop rate (measured 32-38.5Hz
-throughout) and Unity focus loss (tested directly, re-chokes ~2 frames after refocus). Untested
-leads: MASt3R-SLAM's own workload growing with the keyframe graph/retrieval DB, its backend
-optimization thread, GPU contention from the visualizer's `--record` MP4 encode.
+90.8s on the session-52 flight)? **Three** theories now ruled out — autopilot loop rate (measured
+32-38.5Hz throughout), Unity focus loss (tested directly, re-chokes ~2 frames after refocus), and
+**the clearance raycast** (session 57: `slam_ms` times *only* `slam.process(rgb)`
+(`perception_worker.py:218-220`) while the clearance fan runs afterwards in `_plan_payload`, outside
+that window; and `clearance_fan_deg`/`fan_n` last changed at session 12, after which flights ran at
+300-500ms medians for six weeks — do not re-derive this). Untested leads: MASt3R-SLAM's own workload
+growing with the keyframe graph/retrieval DB, its backend optimization thread, GPU contention from
+the visualizer's `--record` MP4 encode, and the session-49 LKG debug window (`cv2.imshow` + PNG
+writes; medians stepped from ~400ms to ~1300-1700ms on 2026-09-01 between the 17:22 and 21:48
+flights, which brackets when that window was built — correlation only, one flight with
+`visrec_debug_window: false` would settle it).
 
 ### `main` branch — next after that: diagnose the HEIGHT issue
 A 2026-09-01 live flight confirmed sessions 20-43 fly *tolerably* (operator's own call). Height is

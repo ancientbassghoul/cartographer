@@ -13,6 +13,22 @@ in a `plans/*.md` pointer for full detail. No code changed this session._
 
 ## Session Log (newest first)
 
+- **57 (SPEC ONLY — NOT YET BUILT)** — Flew session 56 and it worked: fast, efficient, the SLAM_HOLD
+  fix landed. But the operator watched the LKG window show a reference frame plainly *closer* than
+  the live frame while the drone backed off anyway. Two causes. First, `planar_like` means "flat
+  surface", not "closer" — it is direction-blind, and fired `True` at `scale=0.32`. Second, and
+  worse: of 86 loss episodes only 30 ever ran a match at all, because the match block runs *before*
+  `ctrl.step()`, so on a loss's first tick `visual_match` is `None` and the one-shot ticket gets
+  spent on the cached clearance alone — clear front meant the camera was never consulted. The one
+  case where the picture is the only evidence is the case that never looked. Designed a replacement
+  with the operator: for PLAN-LOST, always wait 12s unconditionally, then *always* look; the
+  remembered clearance only marks a back-off *pending*; a three-way inlier-spread verdict
+  (live bigger → back off / same → let it through / LKG bigger and confident → hold) adjudicates it;
+  and firing a back-off restarts the 12s wait, which replaces the one-shot ticket's re-fire guard.
+  Also dropped a general CV-veto-over-clearance idea as unsound (matching isn't continuously active,
+  so it can't continuously veto). Written as a 9-chunk Sonnet-ready spec:
+  `plans/session57-spec.md`. **This entry is a placeholder — chunk 9 replaces it with the built
+  narrative.**
 - **56** — SLAM was slow the whole flight; the settle gate needed 6 *consecutive* fast frames
   (arithmetically unreachable), so every hold escaped via the 15s dead-band instead of the gate.
   Separately, F_LKG's cache trusted `plan_valid` regardless of age, and on a ring age-out silently

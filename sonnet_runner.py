@@ -37,7 +37,20 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 
 DEFAULT_PLAN = "test_plan.md"
-DEFAULT_SUITES = ["autopilot.py", "frontier_planner.py", "visual_recovery.py", "flight_replay.py"]
+# Every module in the repo that has a self-test. A chunk can only be gated by a suite that actually
+# RUNS after it, so this list is the gate's reach: anything missing here is a module a chunk may
+# silently break. `visualizer.py` is deliberately absent -- it has no --self-test entry point yet
+# (argparse rejects the flag, which would fail EVERY chunk); session 57's visualizer chunk adds one
+# and adds the module here in the same edit.
+DEFAULT_SUITES = ["autopilot.py", "frontier_planner.py", "visual_recovery.py", "flight_replay.py",
+                  "ground_grid.py", "map_store.py", "salvage_flight.py", "perception_worker.py"]
+
+# The suites run under the PROJECT VENV, not under whatever interpreter launched this runner.
+# `perception_worker.py` imports torch/MASt3R, which exist only in the venv -- running it with a bare
+# system python raises ModuleNotFoundError, and the gate would report a FAILURE that is really a
+# missing dependency (or, worse, get excluded from the list to make the noise go away, silently
+# narrowing the gate). The venv can run every suite; the system python cannot.
+VENV_PY = REPO / "venv" / "Scripts" / "python.exe"
 
 # Grep/Glob are REQUIRED: the spec gives anchors as source strings rather than line numbers, and
 # autopilot.py is ~8.7k lines (a bare Read truncates).
@@ -93,6 +106,18 @@ def chunk_title(chunk_text):
     return chunk_text.splitlines()[0].strip() if chunk_text else "(untitled)"
 
 
+def suite_python():
+    """The interpreter the self-tests run under -- see VENV_PY. Falls back to this process's own
+    interpreter ONLY when the venv is absent, and says so LOUDLY: a gate that has quietly become
+    narrower than it looks is worse than no gate, because it still prints PASS."""
+    if VENV_PY.exists():
+        return str(VENV_PY)
+    print(f"*** WARNING: {VENV_PY} not found -- running the self-test gate with {sys.executable} "
+          f"instead. Suites with GPU/torch dependencies (perception_worker.py) will report an "
+          f"IMPORT failure that is a missing dependency, NOT a code defect. ***")
+    return sys.executable
+
+
 def run_suites(suites, log_fh, timeout):
     """Run each module's --self-test. Returns [] on success, else a list of failure descriptions.
 
@@ -100,12 +125,13 @@ def run_suites(suites, log_fh, timeout):
     word FAIL anywhere in the output. A passing suite emits neither.
     """
     failures = []
+    py = suite_python()
     for suite in suites:
         if not (REPO / suite).exists():
             failures.append(f"{suite}: MISSING")
             continue
         try:
-            r = subprocess.run([sys.executable, suite, "--self-test"], cwd=REPO,
+            r = subprocess.run([py, suite, "--self-test"], cwd=REPO,
                                capture_output=True, text=True, encoding="utf-8",
                                errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
