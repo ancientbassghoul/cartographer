@@ -328,10 +328,18 @@ class MapStore:
                  trajectory=self.trajectory_array(),
                  voxel_size=self.voxel_size, tracking_mode=self.tracking_mode)
 
-    def save_ply(self, path, min_count: int = 1, trajectory=True, targets=None):
-        """Write a viewable ASCII .ply point cloud: the voxel occupancy (true colors), plus the
+    def save_ply(self, path, min_count: int = 1, trajectory=True, targets=None,
+                 markers=None, binary: bool = False):
+        """Write a viewable .ply point cloud: the voxel occupancy (true colors), plus the
         flight path as GREEN points and any target instances as large MAGENTA points. Opens in
-        MeshLab/CloudCompare. `targets` = optional list of world (3,) points."""
+        MeshLab/CloudCompare. `targets` = optional list of world (3,) points.
+
+        `markers` (session 57): optional list of ((x, y, z), (r, g, b)) pairs. Each is written as a
+        7-point cluster -- the centre plus +/- self.voxel_size along each axis -- so it is visible and
+        selectable in Blender. Written LAST, after occupancy/trajectory/targets.
+        `binary` (session 57): write `format binary_little_endian 1.0` instead of ASCII. Identical
+        vertex layout (float x,y,z + uchar red,green,blue), ~3x smaller and ~10x faster to write.
+        """
         centers, colors = self.occupied(min_count)
         xyz = [centers.astype(np.float32)]
         rgb = [colors.astype(np.uint8)]
@@ -344,15 +352,35 @@ class MapStore:
             tp = np.asarray(targets, np.float32).reshape(-1, 3)
             xyz.append(tp)
             rgb.append(np.tile(np.array([255, 0, 255], np.uint8), (len(tp), 1)))        # target = magenta
+        if markers:
+            d = self.voxel_size
+            offsets = np.array([[0, 0, 0], [d, 0, 0], [-d, 0, 0], [0, d, 0],
+                                 [0, -d, 0], [0, 0, d], [0, 0, -d]], np.float32)
+            for (mx, my, mz), (mr, mg, mb) in markers:
+                xyz.append(np.array([mx, my, mz], np.float32)[None, :] + offsets)
+                rgb.append(np.tile(np.array([mr, mg, mb], np.uint8), (7, 1)))
         P = np.concatenate(xyz, axis=0)
         C = np.concatenate(rgb, axis=0)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {len(P)}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
-            for (x, y, z), (r, g, b) in zip(P, C):
-                f.write(f"{x:.4f} {y:.4f} {z:.4f} {int(r)} {int(g)} {int(b)}\n")
+        if binary:
+            with open(path, "wb") as f:
+                f.write(b"ply\nformat binary_little_endian 1.0\n")
+                f.write(f"element vertex {len(P)}\n".encode("ascii"))
+                f.write(b"property float x\nproperty float y\nproperty float z\n")
+                f.write(b"property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+                rec = np.zeros(len(P), dtype=np.dtype([
+                    ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                    ("red", "u1"), ("green", "u1"), ("blue", "u1")]))
+                rec["x"], rec["y"], rec["z"] = P[:, 0], P[:, 1], P[:, 2]
+                rec["red"], rec["green"], rec["blue"] = C[:, 0], C[:, 1], C[:, 2]
+                f.write(rec.tobytes())
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("ply\nformat ascii 1.0\n")
+                f.write(f"element vertex {len(P)}\n")
+                f.write("property float x\nproperty float y\nproperty float z\n")
+                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+                for (x, y, z), (r, g, b) in zip(P, C):
+                    f.write(f"{x:.4f} {y:.4f} {z:.4f} {int(r)} {int(g)} {int(b)}\n")
 
     def render_topdown(self, out_path=None, size=900, pad=0.06, min_count: int = 1,
                        point_px: int = 1, targets=None):
@@ -495,6 +523,98 @@ def run_self_test():
                        and df["n_hits"] == 0 and df["n_rays"] == 5 and df["fraction"] == 0.0
                        and df["min_dist"] is None and df["max_dist"] is None)
     check(f"(f) detail=True on an empty map -> well-formed all-zero row, not None ({df})", detail_empty_ok)
+
+    # --------------------------------------------------------------------
+    # SESSION-57 BINARY PLY: save_ply gains binary output + marker clusters. The ASCII branch
+    # must stay byte-identical (no writer-format regression); the binary branch is verified by
+    # re-parsing its own header/payload rather than trusting a byte count alone.
+    # --------------------------------------------------------------------
+    import tempfile
+
+    sp = MapStore(voxel_size=0.5)
+    sp.integrate(np.array([[0.0, 0.0, 1.0], [2.0, 0.0, 1.0], [0.0, 0.0, 3.0]], np.float64),
+                 colors=np.array([[10, 20, 30], [40, 50, 60], [70, 80, 90]], np.uint8))
+    sp.add_pose([0.1, 0.0, 0.0])
+    sp.add_pose([0.2, 0.0, 0.5])
+    n_base = len(sp.occupied(1)[0]) + len(sp.trajectory_array())
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        # (a) ASCII output unchanged: baseline established by re-deriving the exact header/line
+        # format the pre-session-57 writer produced (same f-strings, same field order) and diffing
+        # against what save_ply(binary=False) now emits for this fixed synthetic map.
+        p_ascii = td / "a.ply"
+        sp.save_ply(p_ascii, binary=False)
+        text = p_ascii.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        header_ok = (lines[0] == "ply" and lines[1] == "format ascii 1.0"
+                     and lines[2] == f"element vertex {n_base}"
+                     and lines[3] == "property float x" and lines[4] == "property float y"
+                     and lines[5] == "property float z" and lines[6] == "property uchar red"
+                     and lines[7] == "property uchar green" and lines[8] == "property uchar blue"
+                     and lines[9] == "end_header")
+        body = lines[10:]
+        ascii_unchanged = header_ok and len(body) == n_base and all(len(ln.split()) == 6 for ln in body)
+        check(f"(g) ascii_unchanged -- header + one 'x y z r g b' line per vertex (n={n_base})",
+              ascii_unchanged)
+
+        # (h) binary header + vertex count matches the ASCII file's count for the same arguments.
+        p_bin = td / "b.ply"
+        sp.save_ply(p_bin, binary=True)
+        raw = p_bin.read_bytes()
+        binary_header_and_count = (
+            raw.startswith(b"ply\nformat binary_little_endian 1.0\n")
+            and f"element vertex {n_base}\n".encode("ascii") in raw[:200]
+        )
+        check("(h) binary_header_and_count -- magic + element vertex N matches ASCII N",
+              binary_header_and_count)
+
+        # (i) binary_payload_size: file size == header length + N * 15 bytes (3 f32 + 3 u1).
+        header_end = raw.index(b"end_header\n") + len(b"end_header\n")
+        expected_size = header_end + n_base * 15
+        binary_payload_size = len(raw) == expected_size
+        check(f"(i) binary_payload_size -- {len(raw)} == header({header_end}) + {n_base}*15",
+              binary_payload_size)
+
+        def _parse_binary(raw_bytes):
+            hdr_end = raw_bytes.index(b"end_header\n") + len(b"end_header\n")
+            header_txt = raw_bytes[:hdr_end].decode("ascii")
+            n = int(header_txt.split("element vertex ")[1].splitlines()[0])
+            payload = raw_bytes[hdr_end:]
+            rec = np.frombuffer(payload, dtype=np.dtype([
+                ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                ("red", "u1"), ("green", "u1"), ("blue", "u1")]), count=n)
+            return rec
+
+        # (j) markers_add_seven_points_each: +14 vertices for 2 markers vs markers=None.
+        markers = [((1.0, 2.0, 3.0), (255, 0, 0)), ((4.0, 5.0, 6.0), (0, 0, 255))]
+        p_mk = td / "m.ply"
+        sp.save_ply(p_mk, binary=True, markers=markers)
+        rec_mk = _parse_binary(p_mk.read_bytes())
+        markers_add_seven_points_each = len(rec_mk) == n_base + 14
+        check(f"(j) markers_add_seven_points_each -- {len(rec_mk)} == {n_base}+14",
+              markers_add_seven_points_each)
+
+        # (k) marker_colour_present: exactly 7 vertices of each marker colour, beyond the base map.
+        base_red = int(np.sum((rec_mk["red"][:n_base] == 255) & (rec_mk["green"][:n_base] == 0)
+                               & (rec_mk["blue"][:n_base] == 0)))
+        base_blue = int(np.sum((rec_mk["red"][:n_base] == 0) & (rec_mk["green"][:n_base] == 0)
+                                & (rec_mk["blue"][:n_base] == 255)))
+        n_red = int(np.sum((rec_mk["red"] == 255) & (rec_mk["green"] == 0) & (rec_mk["blue"] == 0)))
+        n_blue = int(np.sum((rec_mk["red"] == 0) & (rec_mk["green"] == 0) & (rec_mk["blue"] == 255)))
+        marker_colour_present = (n_red - base_red == 7) and (n_blue - base_blue == 7)
+        check(f"(k) marker_colour_present -- 7 red + 7 blue beyond base map "
+              f"(red={n_red - base_red}, blue={n_blue - base_blue})", marker_colour_present)
+
+        # (l) markers_none_is_noop: markers=None and markers=[] produce identical output.
+        p_none = td / "n_none.ply"
+        p_empty = td / "n_empty.ply"
+        sp.save_ply(p_none, binary=True, markers=None)
+        sp.save_ply(p_empty, binary=True, markers=[])
+        markers_none_is_noop = p_none.read_bytes() == p_empty.read_bytes()
+        check("(l) markers_none_is_noop -- markers=None byte-identical to markers=[]",
+              markers_none_is_noop)
 
     print(f"\n[map_store][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

@@ -5,30 +5,37 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-03**, branch `all-bets-are-off`, session 56 continued: restructured this
-file — split the concise current-state/resume-pointer content into `STATE.md` (the new first-read
-file) and compressed the session log below from full multi-paragraph traces (never actually done,
-despite CLAUDE.md's own long-standing rule to keep it this way) into one-liners, each still ending
-in a `plans/*.md` pointer for full detail. No code changed this session._
+_Last updated **2026-09-03**, branch `all-bets-are-off`, session 57: built and gated the PLAN-LOST
+recovery rewrite + direction-aware LKG matching spec end to end (all 10 chunks), all 9 self-test
+suites green. Not yet live-flown — see `STATE.md`'s watch list._
 
 ## Session Log (newest first)
 
-- **57 (SPEC ONLY — NOT YET BUILT)** — Flew session 56 and it worked: fast, efficient, the SLAM_HOLD
-  fix landed. But the operator watched the LKG window show a reference frame plainly *closer* than
-  the live frame while the drone backed off anyway. Two causes. First, `planar_like` means "flat
-  surface", not "closer" — it is direction-blind, and fired `True` at `scale=0.32`. Second, and
-  worse: of 86 loss episodes only 30 ever ran a match at all, because the match block runs *before*
-  `ctrl.step()`, so on a loss's first tick `visual_match` is `None` and the one-shot ticket gets
-  spent on the cached clearance alone — clear front meant the camera was never consulted. The one
-  case where the picture is the only evidence is the case that never looked. Designed a replacement
-  with the operator: for PLAN-LOST, always wait 12s unconditionally, then *always* look; the
-  remembered clearance only marks a back-off *pending*; a three-way inlier-spread verdict
-  (live bigger → back off / same → let it through / LKG bigger and confident → hold) adjudicates it;
-  and firing a back-off restarts the 12s wait, which replaces the one-shot ticket's re-fire guard.
-  Also dropped a general CV-veto-over-clearance idea as unsound (matching isn't continuously active,
-  so it can't continuously veto). Written as a 9-chunk Sonnet-ready spec:
-  `plans/session57-spec.md`. **This entry is a placeholder — chunk 9 replaces it with the built
-  narrative.**
+- **57** — Flew session 56 and it worked: fast, efficient, the SLAM_HOLD fix landed. But the operator
+  watched the LKG window show a reference frame plainly *closer* than the live frame while the drone
+  backed off anyway. Two causes. First, `planar_like` means "flat surface", not "closer" — it is
+  direction-blind, and fired `True` at `scale=0.32`. Second, and worse: of 86 loss episodes only 30
+  ever ran a match at all, because the match block runs *before* `ctrl.step()`, so on a loss's first
+  tick `visual_match` is `None` and the one-shot ticket gets spent on the cached clearance alone —
+  clear front meant the camera was never consulted. The one case where the picture is the only
+  evidence is the case that never looked. Built a replacement with the operator: for PLAN-LOST,
+  always wait 12s unconditionally, then *always* look; the remembered clearance only marks a
+  back-off *pending*; a three-way inlier-spread verdict (live bigger → back off / same → let it
+  through / LKG bigger and confident → hold indefinitely) adjudicates it; firing a back-off restarts
+  the 12s wait, which replaces the one-shot ticket's re-fire guard. Along the way, removing the ticket
+  from the PLAN-LOST path exposed a second bug the ticket had been silently gating: the 15° visual
+  probe could now turn the drone before the loss-recovery grace elapsed, since the ticket had been
+  its de-facto grace check too — fixed by requiring the grace explicitly at the probe hand-off.
+  Also shipped: `scale`'s replacement estimator (RANSAC-inlier spread ratio, far less noisy — `scale`
+  swung 0.65→27.4 within half a second on one real flight, the spread ratio doesn't); the same
+  direction gate applied to the PLAN-STALE trigger; blue corner-tour goals on the map panel (were
+  indistinguishable from frontier goals); and an optional per-SLAM-frame binary PLY sequence with
+  frozen goal-anchor markers, for a Blender build-up animation (off by default, config-gated). Also
+  dropped a general CV-veto-over-clearance idea as unsound (matching isn't continuously active, so it
+  can't continuously veto), and cleared the clearance raycast as a SLAM-choke suspect on two
+  independent grounds (see the deferred findings below). All 9 self-test suites green (`visualizer.py`
+  gained its first `--self-test` entry point this session and joined the gate).
+  `plans/session57-planlost-recovery-and-direction-aware-lkg.md`
 - **56** — SLAM was slow the whole flight; the settle gate needed 6 *consecutive* fast frames
   (arithmetically unreachable), so every hold escaped via the 15s dead-band instead of the gate.
   Separately, F_LKG's cache trusted `plan_valid` regardless of age, and on a ring age-out silently
@@ -298,6 +305,31 @@ pending live-fly and the `main`-branch HEIGHT-issue pointer, kept current instea
 ---
 
 ## Future (backlog)
+- **Session 57 backlog — two diagnosed-but-unbuilt findings from the 20260903_083329 flight, neither
+  built this session.** Both carry this warning:
+
+  > **Re-evaluate after session 57's PLAN-LOST rule has flown.** The cached clearance no longer
+  > decides whether we look and no longer fires a back-off by itself — it only marks one *pending*,
+  > which the camera adjudicates over a 12s wait. Both may be defanged or moot. Do not schedule
+  > either until a post-session-57 flight shows they still bite.
+
+  1. *Capture-age / abandoned heading.* Frame #367 was captured at `cap_ts=48347.718`, reconstructed
+     from frame #368 (`cap_ts=48364.906`, `slam_ms=557.9`, solved 08:51:24.530) as **08:51:06.8**.
+     SLAM ground on it for 16.5s publishing nothing, so status read PLAN-LOST from 08:51:09.4 while
+     the drone hovered blind; at 08:51:23.6 the answer landed and status flipped to `OK` **on the
+     arrival of a 17-second-old answer** (`OK` means "a message arrived within `plan_timeout_s`",
+     never "the information is recent"). The drone then turned **−30°**, advanced, and backed off on
+     that plan's `clearance 0.60` — measured by the raycast fan along the **pre-turn heading**. While
+     hovering, a stale clearance is not very wrong; it turns wrong the moment the drone acts on it,
+     which here meant turning first. The finding is therefore not "17.7s old" but **"measured at a
+     heading we have since abandoned, and nothing re-checks that."**
+  2. *`_last_good_*` cache currency.* The cache is gated on `plan_valid` alone. `plan_valid` is
+     SLAM's "I was tracking" flag and says nothing about age, while PLAN-LOST is a pure age verdict —
+     so during a loss the last plan still reads `plan_valid=True` and the cache is re-written every
+     tick with a fresh `now`. `_last_good_t` is therefore always ~0, which is why the log prints
+     `stale pose, 0.0s old` — not "fresh" but "we touched this variable 0.0s ago". It is a
+     cache-WRITE time, not a capture time; session 52 §7 flagged exactly this trap. Same shape as
+     session 56's F_LKG fix (`status == "OK"` was the missing conjunct), one field over.
 - **Session 56 backlog — recorded, deliberately not implemented (operator's explicit call to defer):**
   - **`visrec_min_inliers`=12 is too low to trust a homography *scale* for a physical BACKOFF
     reaction.** The `17:21:40.711` BACKOFF on the diagnosing flight was decided on ~19 inliers whose

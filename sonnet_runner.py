@@ -39,11 +39,10 @@ REPO = Path(__file__).resolve().parent
 DEFAULT_PLAN = "test_plan.md"
 # Every module in the repo that has a self-test. A chunk can only be gated by a suite that actually
 # RUNS after it, so this list is the gate's reach: anything missing here is a module a chunk may
-# silently break. `visualizer.py` is deliberately absent -- it has no --self-test entry point yet
-# (argparse rejects the flag, which would fail EVERY chunk); session 57's visualizer chunk adds one
-# and adds the module here in the same edit.
+# silently break.
 DEFAULT_SUITES = ["autopilot.py", "frontier_planner.py", "visual_recovery.py", "flight_replay.py",
-                  "ground_grid.py", "map_store.py", "salvage_flight.py", "perception_worker.py"]
+                  "ground_grid.py", "map_store.py", "salvage_flight.py", "perception_worker.py",
+                  "visualizer.py"]
 
 # The suites run under the PROJECT VENV, not under whatever interpreter launched this runner.
 # `perception_worker.py` imports torch/MASt3R, which exist only in the venv -- running it with a bare

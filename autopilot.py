@@ -824,6 +824,11 @@ class ExploreController:
         self.visrec_min_inliers = int(e.get("visrec_min_inliers", 12))          # reuse the project's already-validated SIFT/RANSAC inlier threshold
         self.visrec_planar_inlier_ratio = float(e.get("visrec_planar_inlier_ratio", 0.85))  # inlier fraction to call a match "planar-like" (Step 2b)
         self.visrec_contain_margin_frac = float(e.get("visrec_contain_margin_frac", 0.02))   # slack for the corner-containment test (Step 2a)
+        # Session 57: inlier-SPREAD size ratio (live/LKG) -- the direction estimator for PLAN-LOST/NO-PLAN
+        # (see `_step_lost_recovery`). Configurable, not yet consumed by any decision in this chunk.
+        self.visrec_size_ratio_hi = float(e.get("visrec_size_ratio_hi", 1.25))
+        self.visrec_size_ratio_lo = float(e.get("visrec_size_ratio_lo", 0.80))
+        self.visrec_size_min_inliers = int(e.get("visrec_size_min_inliers", 20))
         self.visrec_close_scale = float(e.get("visrec_close_scale", 1.15))      # homography linear scale >= this => zoomed-in => closer (Step 2c BACKOFF)
         self.visrec_turn_step_deg = float(e.get("visrec_turn_step_deg", 15.0))  # the probe's discrete rotation step (operator's exact value; independent of FALLBACK's own recovery_turn_step_deg)
         self.visrec_max_rotation_deg = float(e.get("visrec_max_rotation_deg", 720.0))  # cumulative probe budget before "exhausted" -> FALLBACK
@@ -1016,6 +1021,7 @@ class ExploreController:
         # window -- so this can never accumulate across the OK/PLAN-LOST oscillation into a spurious reaction.
         self._loss_episode_t0 = None
         self._loss_grace_noticed = False
+        self._lost_hold_noticed = False    # session 57: one-shot for the "LKG is closer -> holding" notice
         # Session 52 (chunk 3): mirrors `_loss_grace_noticed` but for the POST-BACKOFF RE-SOLVE GATE
         # (`_backoff_resolve_since`) instead of the loss-recovery grace -- stops the "SUPPRESSED" notice
         # repeating every tick while the gate holds the one-shot deferred (armed, not spent).
@@ -1340,6 +1346,7 @@ class ExploreController:
         self._backoff_resolve_t0 = None
         self._loss_episode_t0 = None         # session 48: and any in-flight loss-recovery grace window
         self._loss_grace_noticed = False
+        self._lost_hold_noticed = False      # session 57: and any in-flight LKG-closer hold notice
         self._backoff_gate_noticed = False   # session 52: and any in-flight post-backoff gate suppression
         self._reset_visual_recovery()
         # Session-12 recovery flags. A manual takeover (the only caller of reset_leg) invalidates any in-flight
@@ -1970,15 +1977,21 @@ class ExploreController:
         self._visrec_wait_t0 = None
         self._visrec_probe_armed = False   # session 52 (chunk 4): a confirmed recovery ends the episode
 
-    def wants_visual_match(self):
-        """Session 51: True only when THIS tick can actually CONSUME a visual match. There are exactly two
-        consumers, and both are precisely guarded:
+    def wants_visual_match(self, now=None, status=None):
+        """Session 51: True only when THIS tick can actually CONSUME a visual match. There are exactly
+        three consumers, each precisely guarded:
           • `_maybe_loss_snapshot_backoff` -- the loss-instant one-shot, dispatched from BOTH of its call
             sites under `if not self._loss_snapshot_checked:` (the PLAN-LOST branch in `step()` and the
             fresh-entry branch in `_step_stale`). Once the one-shot is SPENT nothing reads a match again
             for the rest of the episode.
           • `_step_visual_recovery`'s MATCH phase -- one match per turn cycle, and it must be the FRESH
             post-turn view.
+          • Session 57: `_step_lost_recovery`, once a PLAN-LOST/NO-PLAN episode has outlived
+            `loss_backoff_grace_s`. The one-shot ticket is spent the instant the FIRST tick of a loss reads
+            a clear cached clearance (see MISSION CONTEXT finding 1 in plans/session57-spec.md) -- 56 of 86
+            loss episodes in flight 20260903_083329 never ran a single match because of exactly this. This
+            clause re-opens the camera for every MATURED episode regardless of the ticket's state, without
+            touching the ticket itself.
         Everything else that touches `visual_match` (the timeline record, the debug canvas) is
         observability and already handles None. `run_explore` previously matched on EVERY tick of a loss:
         a full SIFT + brute-force BFMatcher + RANSAC at ~32Hz, i.e. ~380 complete matches across session
@@ -1988,8 +2001,14 @@ class ExploreController:
         NEVER a replacement for it. `_loss_snapshot_checked` starts False at construction and is only
         re-armed at a fresh loss edge, so it reads False throughout healthy flight before the first loss --
         using this predicate alone would start running SIFT on every healthy tracking frame, the exact
-        opposite of the point."""
-        return (not self._loss_snapshot_checked) or self._visrec_phase == "MATCH"
+        opposite of the point. The session 57 clause is an ADDITIONAL narrow permission on top of that --
+        `now`/`status` default to None so every pre-existing caller (and self-test) is unaffected."""
+        if (not self._loss_snapshot_checked) or self._visrec_phase == "MATCH":
+            return True
+        if (status in ("PLAN-LOST", "NO-PLAN") and now is not None and self._loss_episode_t0 is not None
+                and (now - self._loss_episode_t0) >= self.loss_backoff_grace_s):
+            return True
+        return False
 
     def _enter_visual_recovery(self, now, event):
         """Route into the 15° visual recovery probe (session 35 ALT; mirrors `_enter_fallback_sweep`). A
@@ -2665,12 +2684,88 @@ class ExploreController:
         self._enter("BACKOFF", now)
         return {}, "BACKOFF", f"{why} -> immediate standoff back off (re-arm bump latch) -> settle"
 
+    def _step_lost_recovery(self, plan, now, visual_match, status):
+        """Session 57: the WHOLE PLAN-LOST/NO-PLAN loss-instant decision, replacing the one-shot
+        ticket path for these statuses. PLAN-STALE still uses `_maybe_loss_snapshot_backoff`.
+
+        Returns the usual (fields: dict, state: str, event: str | None) triple to hand straight
+        back to the caller, or None to fall through to the caller's plain hard hover-hold.
+
+        Diagnosed off flight 20260903_083329 (see plans/session57-spec.md MISSION CONTEXT):
+        `_maybe_loss_snapshot_backoff`'s one-shot ticket was spent on the very first tick of a loss
+        whenever the cached clearance already read clear -- before `visual_match` could ever be
+        anything but `None` (the match block runs BEFORE `ctrl.step()` in `run_explore`) -- so the
+        camera was never consulted again for the rest of the episode. 56 of 86 loss episodes in that
+        flight ran zero matches. The rule here: always wait `loss_backoff_grace_s` unconditionally
+        (no more "too-close evidence" framing -- the wait is now unconditional); past the grace,
+        ALWAYS run LKG matching for as long as the episode lasts (see `wants_visual_match`'s session
+        57 clause); the remembered clearance decides only whether a back-off is PENDING, never
+        whether we look; and the inlier-spread `closer` verdict (session 57 chunks 1-3) adjudicates a
+        pending back-off three ways -- LIVE/EQUAL/UNKNOWN backs off, LKG holds indefinitely. Firing a
+        back-off restamps `_loss_episode_t0`, which is what stops it repeating -- see the restamp
+        below, step 6."""
+        # step 1: no episode stamp -> nothing to time.
+        if self._loss_episode_t0 is None:
+            return None
+        # step 2: unconditional wait, regardless of any evidence -- see MISSION CONTEXT finding 1.
+        waited = now - self._loss_episode_t0
+        if waited < self.loss_backoff_grace_s:
+            if not self._loss_grace_noticed:
+                self._loss_grace_noticed = True
+                self.note_timeout("LOSS_GRACE", (
+                    f"LOSS-RECOVERY GRACE: holding still for {self.loss_backoff_grace_s:.0f}s before any "
+                    f"reaction (96.9% of held-still losses resolve inside that window). Looking at the "
+                    f"camera after that."), now)
+            return None
+        # step 3: the cached clearance decides whether a back-off is PENDING -- never whether we look.
+        pending = (self._last_good_clearance is not None
+                  and self._last_good_clearance <= self.stop_clearance_dist)
+        if not pending:
+            return None
+        # step 4/5: the three-way size-ratio verdict adjudicates the pending back-off. "LKG" means the
+        # camera is confident we are already FARTHER than F_LKG was -- hold, do not act on stale geometry.
+        verdict = visual_match.closer if visual_match is not None else "UNKNOWN"
+        if verdict == "LKG":
+            if not self._lost_hold_noticed:
+                self._lost_hold_noticed = True
+                self.note_timeout("LOST_VISUAL_HOLD", (
+                    f"LOST-RECOVERY HOLD: F_LKG reads closer than the live view (size_ratio="
+                    f"{visual_match.size_ratio:.2f}, {visual_match.inliers} inliers) -- we are already "
+                    f"farther from the surface than the cached too-close evidence describes. Holding, "
+                    f"no back-off. This hold is indefinite by design: it exits only on SLAM returning OK, "
+                    f"or on a fresh plan routing to PLAN-STALE and its own probe path."), now)
+            return None
+        # step 6: LIVE / EQUAL / UNKNOWN all proceed -- weak CV (UNKNOWN) must never veto a back-off.
+        clr = self._last_good_clearance
+        ratio_txt = (f"{visual_match.size_ratio:.2f}"
+                    if (visual_match is not None and visual_match.size_ratio is not None) else "n/a")
+        why = (f"loss detected with cached clearance {clr:.2f} <= {self.stop_clearance_dist:.2f}, "
+              f"visual verdict closer={verdict} (size_ratio={ratio_txt})")
+        self._register_bump(dict(plan, pos=self._last_good_pos),
+                            "clearance stand-off (stale pose @ loss)")
+        # Session 57: taking a PHYSICAL action restarts the wait. This is what stops a back-off
+        # repeating -- it replaces the one-shot ticket's re-fire protection. After the push the drone
+        # is farther from the surface, so when the next window matures the match reads closer="LKG"
+        # and step 5 holds. Restamping also re-arms both notices, since this is a NEW wait window.
+        self._loss_episode_t0 = now
+        self._loss_grace_noticed = False
+        self._lost_hold_noticed = False
+        if self.backoff_on_standoff:
+            return self._arm_loss_backoff(now, why)
+        self._enter("SETTLE", now)
+        return {}, "SETTLE", f"{why} -> immediate standoff settle"
+
     def _maybe_loss_snapshot_backoff(self, plan, now, visual_match=None, status=None):
         """Session 34, Idea B (Step 1) + session 35 ALT (Step 2/2c): the ONE-SHOT check at the instant a
         loss episode begins. Marks the one-shot spent immediately (so a LOST<->STALE flicker within the
         same episode can't fire twice), then runs a short decision tree and returns the (active, state,
         event) tuple to return immediately, or `None` if the caller should fall through to its normal
         loss-entry behavior (REWIND/FALLBACK/plain hard-hover):
+        Session 57: reached ONLY for `status == "PLAN-STALE"` now -- the PLAN-LOST/NO-PLAN path this
+        function used to also serve is entirely handled by `_step_lost_recovery` above (see MISSION
+        CONTEXT in plans/session57-spec.md: PLAN-LOST/NO-PLAN needed an unconditional wait-then-always-
+        look rule that this one-shot-ticket shape could not express). The docstring below is otherwise
+        unchanged.
           Step 1 (geometric, UNCHANGED): a last-known-good clearance was cached (see `step()`'s per-tick
             cache) and it reads too close -> back off using that CACHED position (the live `plan['pos']` is
             unavailable during a loss), exactly like ADVANCE's own clearance stand-off. Fires for ANY status.
@@ -2707,11 +2802,16 @@ class ExploreController:
         # leave the one-shot ARMED (deliberately NOT spent) -- the HOLD_LOST tick and _step_stale both re-call
         # us every tick, and the drone is holding still throughout, which preserves the "nothing has moved
         # since the snapshot was taken" invariant this whole check is built on.
+        # Session 57: `planar_like` means "flat surface", not "closer" -- see the identical note at
+        # the action site above (08:51:44.313 evidence). This clause must stay in lockstep with that
+        # site's conjunct, or the grace/gate can arm for a reaction the action then declines to take,
+        # silently stalling the episode.
         _would_react = ((self._last_good_clearance is not None
                          and self._last_good_clearance <= self.stop_clearance_dist)
                         or (self.use_visual_recovery_on_stale and visual_match is not None
                             and visual_match.matched
-                            and (visual_match.contained or visual_match.planar_like)))
+                            and (visual_match.contained or visual_match.planar_like)
+                            and visual_match.closer == "LIVE"))
         if _would_react and self._loss_episode_t0 is not None:
             waited_loss = now - self._loss_episode_t0
             if waited_loss < self.loss_backoff_grace_s:
@@ -2781,7 +2881,14 @@ class ExploreController:
         # explicit invariant of this function rather than an implicit contract with its one caller.
         if not self.use_visual_recovery_on_stale:
             return None
-        if visual_match is not None and visual_match.matched and (visual_match.contained or visual_match.planar_like):
+        # Session 57: `planar_like` means "flat surface", not "closer" -- it is a pure inlier-ratio
+        # test, direction-blind. Real flight evidence (08:51:44.313): matched=True inliers=45
+        # contained=False planar_like=True scale=0.32 -- scale<1 means the live view is a SHRUNK
+        # view of F_LKG, i.e. farther away, yet this branch backed off anyway. Require the
+        # inlier-spread verdict to agree that the live frame is actually the closer one.
+        if (visual_match is not None and visual_match.matched
+                and (visual_match.contained or visual_match.planar_like)
+                and visual_match.closer == "LIVE"):
             self._register_bump(dict(plan, pos=self._last_good_pos), "visual too-close @ loss")
             kind = "contained crop" if visual_match.contained else "planar/flat surface"
             if self.backoff_on_standoff:
@@ -2795,6 +2902,15 @@ class ExploreController:
         # a PLAN-LOST/NO-PLAN loss with both checks inconclusive falls through to the caller's plain
         # hard-hover-hold instead, never spinning open-loop while perception itself is silent.
         if status != "PLAN-STALE":
+            return None
+        # Session 57: a probe TURNS -- it must wait out the same loss-recovery grace a back-off does
+        # (session 48: 2066 loss episodes, 96.9% of held-still losses resolve inside the window) before
+        # ANY physical reaction, including a turn. Before chunk 5 this hand-off had no grace check of its
+        # own and relied on the one-shot ticket being unspent to keep it from firing early -- chunk 4's
+        # late-entry `_maybe_enter_visual_probe` path bypasses that ticket, so this hand-off could turn
+        # the drone inside the grace. Reuses `_maybe_enter_visual_probe`'s condition verbatim rather than
+        # writing a second variant of the same rule.
+        if self._loss_episode_t0 is not None and now - self._loss_episode_t0 < self.loss_backoff_grace_s:
             return None
         return self._enter_visual_recovery(now, "loss detected, clearance + visual loss-instant checks "
                                                  "both inconclusive -> 15° visual recovery probe")
@@ -3025,6 +3141,7 @@ class ExploreController:
                 self._loss_episode_t0 = now          # session 48: the loss-recovery grace window starts HERE
                 self._loss_grace_noticed = False
                 self._backoff_gate_noticed = False   # session 52: fresh episode, gate suppression may re-notice
+                self._lost_hold_noticed = False       # session 57: fresh episode, hold notice may re-notice
                 self._visrec_probe_armed = True       # session 52 (chunk 4): re-arm the probe's late entry
             if not lost:
                 self._loss_episode_t0 = None         # a genuine OK ended the episode -- next loss re-stamps
@@ -3092,10 +3209,12 @@ class ExploreController:
                     # branch a probe can never survive long enough to complete a single match on a real flight.
                     if st == "VISUAL_RECOVERY":
                         return self._step_visual_recovery(now, plan, visual_match)
-                    if not self._loss_snapshot_checked:
-                        snap = self._maybe_loss_snapshot_backoff(plan, now, visual_match, status=status)
-                        if snap is not None:
-                            return snap
+                    # Session 57: unconditional -- the ticket is no longer consulted or spent on this
+                    # path (see `_step_lost_recovery`'s docstring for why the one-shot shape couldn't
+                    # express "always wait, then always look").
+                    snap = self._step_lost_recovery(plan, now, visual_match, status)
+                    if snap is not None:
+                        return snap
                     self._player = None
                     self._enter("HOLD_LOST", now)
                     return {}, "HOLD_LOST", ("PLAN-LOST -> HARD HOVER-HOLD (indefinite; waiting for "
@@ -3105,15 +3224,15 @@ class ExploreController:
                 reaction = self._blind_contact_backoff(now, wall_contact, backwall_contact, "HOLD_LOST")
                 if reaction is not None:
                     return reaction
-                # Session 48: the loss-instant check is no longer decided at the loss INSTANT -- it defers
-                # while the loss-recovery grace runs (see `_maybe_loss_snapshot_backoff`). It stays ARMED
-                # across that window, so re-run it here every tick until it actually reaches a decision;
-                # without this re-call the deferred check would simply never be revisited and the back-off
-                # would be dead code rather than delayed.
-                if not self._loss_snapshot_checked:
-                    deferred = self._maybe_loss_snapshot_backoff(plan, now, visual_match, status=status)
-                    if deferred is not None:
-                        return deferred
+                # Session 48: the loss-instant check is not decided at the loss INSTANT -- it defers
+                # while the loss-recovery grace runs, so re-run it here every tick until it actually
+                # reaches a decision; without this re-call the deferred check would simply never be
+                # revisited and the back-off would be dead code rather than delayed.
+                # Session 57: `_step_lost_recovery` now owns the WHOLE PLAN-LOST/NO-PLAN decision --
+                # unconditional every tick, no ticket to check or spend -- see the fresh-entry site above.
+                deferred = self._step_lost_recovery(plan, now, visual_match, status)
+                if deferred is not None:
+                    return deferred
                 return {}, "HOLD_LOST", None
             if status == "PLAN-STALE":
                 # Perception is publishing but SLAM is not TRACKING -> retrace to re-expose keyframes.
@@ -4807,7 +4926,8 @@ def _visrec_should_cache_reference(status: str, plan: dict) -> bool:
     return status == "OK" and bool(plan.get("plan_valid"))
 
 
-def _visrec_should_match(ctrl, *, needs_match, has_frame, loss_edge, moved_since_match, memo, memo_age_s):
+def _visrec_should_match(ctrl, *, needs_match, has_frame, loss_edge, moved_since_match,
+                         memo, memo_age_s, now=None, status=None):
     """Session 51: does THIS tick have to actually COMPUTE a visual match, or can it reuse `memo`?
 
     Pure decision function (no I/O, no state) so it is unit-testable -- `run_explore` itself is never
@@ -4815,9 +4935,11 @@ def _visrec_should_match(ctrl, *, needs_match, has_frame, loss_edge, moved_since
     may be None, meaning simply no match this tick).
 
     GATE A -- exact, zero staleness. `needs_match` is run_explore's ORIGINAL status condition and is kept
-    as-is; `ctrl.wants_visual_match()` narrows it to ticks where a consumer can actually read the result.
-    The AND is load-bearing in both directions: see `wants_visual_match`'s caller contract for why the
-    predicate must never replace the status condition.
+    as-is; `ctrl.wants_visual_match(now=now, status=status)` narrows it to ticks where a consumer can
+    actually read the result -- session 57 adds a third such consumer (`_step_lost_recovery` on a matured
+    PLAN-LOST/NO-PLAN episode), which is why `now`/`status` thread through here too. The AND is
+    load-bearing in both directions: see `wants_visual_match`'s caller contract for why the predicate must
+    never replace the status condition.
 
     GATE B -- bounded staleness. Even with a live consumer, the answer cannot change while the drone holds
     still against a frozen F_LKG (session 48's own grace invariant), so an unchanged value is reused until
@@ -4827,7 +4949,7 @@ def _visrec_should_match(ctrl, *, needs_match, has_frame, loss_edge, moved_since
       • `moved_since_match` -- any commanded motion (e.g. a mid-loss BLIND_BACKOFF reverse) changes the view.
       • `memo is None`   -- nothing to reuse (a new F_LKG clears it at the call site).
     """
-    if not (needs_match and has_frame and ctrl.wants_visual_match()):
+    if not (needs_match and has_frame and ctrl.wants_visual_match(now=now, status=status)):
         return False
     if loss_edge or ctrl._visrec_phase == "MATCH" or moved_since_match or memo is None:
         return True
@@ -4911,7 +5033,10 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     # the config flag is actually on -- an idle unused probe still shouldn't pay SIFT's init cost.
     visrec_probe = VisualRecoveryProbe(
         min_inliers=ctrl.visrec_min_inliers, planar_inlier_ratio=ctrl.visrec_planar_inlier_ratio,
-        contain_margin_frac=ctrl.visrec_contain_margin_frac) if ctrl.use_visual_recovery_on_stale else None
+        contain_margin_frac=ctrl.visrec_contain_margin_frac,
+        # Session 57: inlier-SPREAD direction verdict thresholds (C4 in _step_lost_recovery, chunk 3+).
+        size_ratio_hi=ctrl.visrec_size_ratio_hi, size_ratio_lo=ctrl.visrec_size_ratio_lo,
+        size_min_inliers=ctrl.visrec_size_min_inliers) if ctrl.use_visual_recovery_on_stale else None
 
     frame_port = cfg["network"]["frame_bus_port"]
     pstate_port = cfg["network"]["perception_state_port"]
@@ -5319,7 +5444,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 do_match = _visrec_should_match(
                     ctrl, needs_match=needs_match, has_frame=(frame is not None), loss_edge=loss_edge,
                     moved_since_match=visrec_moved_since_match, memo=visrec_memo,
-                    memo_age_s=(now - visrec_memo_t))
+                    memo_age_s=(now - visrec_memo_t), now=now, status=status)
                 if not do_match and needs_match and visrec_memo is not None and ctrl.wants_visual_match():
                     visual_match = visrec_memo          # unchanged answer -- reuse, do not recompute
                 if do_match:
@@ -5329,13 +5454,18 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                     visrec_moved_since_match = False
                     visrec_matches += 1
                     vlabel = (visual_match.has_lkg, visual_match.matched, visual_match.contained,
-                             visual_match.planar_like, round(visual_match.scale, 2) if visual_match.scale else None)
+                             visual_match.planar_like, round(visual_match.scale, 2) if visual_match.scale else None,
+                             visual_match.closer)
                     if vlabel != last_visrec_label or (now - last_visrec_log) >= 0.5:
                         scale_txt = f"{visual_match.scale:.2f}" if visual_match.scale is not None else "n/a"
+                        # Session 57: the inlier-SPREAD size ratio, logged beside `scale` so the next flight
+                        # compares both direction estimators on real data (see MISSION CONTEXT finding 3).
+                        size_txt = f"{visual_match.size_ratio:.2f}" if visual_match.size_ratio is not None else "n/a"
                         vline = (f"{_rec_prefix(last_rec_frame)} [autopilot][explore][{ctrl.state}] [VISREC] "
                                  f"has_lkg={visual_match.has_lkg} matched={visual_match.matched} "
                                  f"inliers={visual_match.inliers} contained={visual_match.contained} "
-                                 f"planar_like={visual_match.planar_like} scale={scale_txt}")
+                                 f"planar_like={visual_match.planar_like} scale={scale_txt}"
+                                 f" size={size_txt} closer={visual_match.closer}")
                         print(vline, flush=True)
                         diag.line(vline)
                         last_visrec_label, last_visrec_log = vlabel, now
@@ -8392,8 +8522,10 @@ def run_self_test(cfg):
                       "goal": [5.0, 5.0], "done": False, "bearing_err": 0.0, "slam_ms": 100.0, "frame_id": 1}
     c34a.step(0.0, ok_plan_close, False, status="OK")             # caches last-good pos/clearance
     _a, s34a, ev34a = c34a.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")
+    # Session 57: PLAN-LOST now routes through `_step_lost_recovery`, whose event text names the cached
+    # clearance directly rather than the old "(stale pose, N.Ns old)" age suffix -- see C6.
     lost_immediate_ok = (s34a == "BACKOFF" and c34a._last_bump_anchor == [1.0, 1.0]
-                          and ev34a is not None and "stale pose" in ev34a)
+                          and ev34a is not None and "cached clearance" in ev34a)
 
     # (b) Idea B: same, but the episode STARTS as PLAN-STALE (perception publishing, SLAM not TRACKING).
     c34b = ExploreController(cfg, no_takeoff=True)
@@ -8404,19 +8536,27 @@ def run_self_test(cfg):
     _a, s34b, _ = c34b.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE")
     stale_immediate_ok = (s34b == "BACKOFF" and c34b._last_bump_anchor == [1.0, 1.0])
 
-    # (c) a LOST->STALE flicker within the SAME episode fires the one-shot only ONCE (one bump, not two).
+    # (c) a LOST->STALE flicker within the SAME episode fires only ONCE (one bump, not two). Session 57:
+    #     PLAN-LOST no longer shares `_loss_snapshot_checked` with PLAN-STALE (that ticket is now
+    #     PLAN-STALE-only, see `_step_lost_recovery`'s docstring) -- the shared protection against a
+    #     flicker re-fire is now `_loss_episode_t0` itself, restamped by the LOST back-off and read by
+    #     BOTH `_step_lost_recovery`'s own grace AND `_maybe_loss_snapshot_backoff`'s pre-existing
+    #     session-48 grace clause. That only holds with a REAL (non-zero) grace window, so this case
+    #     alone uses one, unlike its siblings which zero it out to isolate the instant-fire logic.
     c34c = ExploreController(cfg, no_takeoff=True)
-    c34c.loss_backoff_grace_s = 0.0   # session 48 timing is tested in its own block
+    c34c.loss_backoff_grace_s = 0.5
     c34c.leg_goal = [5.0, 5.0]
     c34c.step(0.0, ok_plan_close, False, status="OK")
-    _a, s34c1, _ = c34c.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")   # 1st -> fires BACKOFF
+    _a, s34c0, _ = c34c.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")   # fresh edge -> defers
+    inside_grace_ok = (s34c0 == "HOLD_LOST")
+    _a, s34c1, _ = c34c.step(0.6, {"plan_valid": False}, False, status="PLAN-LOST")   # past grace -> BACKOFF
     g1, _r1, _p1, _ic1 = c34c.take_bump_pulse()
     first_fire_ok = (s34c1 == "BACKOFF" and g1 is not None)
-    c34c._bump_armed = True     # re-arm the SEPARATE bump latch, to isolate the one-shot flag under test
+    c34c._bump_armed = True     # re-arm the SEPARATE bump latch, to isolate the field under test
     c34c.state = "HOLD_LOST"    # simulate falling back to HOLD_LOST, then flickering to STALE (same episode)
-    _a, s34c2, _ = c34c.step(0.05, {"plan_valid": False}, False, status="PLAN-STALE")
+    _a, s34c2, _ = c34c.step(0.65, {"plan_valid": False}, False, status="PLAN-STALE")   # restamped grace holds
     g2, _r2, _p2, _ic2 = c34c.take_bump_pulse()
-    no_double_fire_ok = (first_fire_ok and s34c2 != "BACKOFF" and g2 is None)
+    no_double_fire_ok = (inside_grace_ok and first_fire_ok and s34c2 != "BACKOFF" and g2 is None)
 
     # (d) a cached clearance that ISN'T close -> falls through to the normal HOLD_LOST entry unchanged.
     c34d = ExploreController(cfg, no_takeoff=True)
@@ -8535,10 +8675,17 @@ def run_self_test(cfg):
     # The flight's OK->PLAN-LOST flip. State is SETTLE, not HOLD_LOST, exactly as in flight 20260901_142738
     # (`14:29:49.218 SETTLE` -> `14:29:50.265 BACKOFF`) -- the loss-instant check only runs from a NON-hold
     # state, which is why SETTLE's un-satisfiable freshness gate kept feeding it.
+    # Session 57: this gate (`_backoff_resolve_since`) lives ONLY in `_maybe_loss_snapshot_backoff` now,
+    # which PLAN-LOST no longer calls (see `_step_lost_recovery`'s docstring) -- redrive through
+    # PLAN-STALE, the path the gate still guards. This harness's shared `cfg` runs with
+    # `use_visual_recovery_on_stale=False` (session 38 isolation, above), so a suppressed geometric
+    # back-off correctly falls through to PLAN-STALE's own default recovery, the FALLBACK sweep -- not
+    # re-gated by `_backoff_resolve_since` at all -- rather than a bare hold. The assertion that matters
+    # is still "no second BACKOFF", not the exact resulting state.
     c47a.state, c47a._was_lost, c47a._bump_armed = "SETTLE", False, True
-    _a, s47a3, _ = c47a.step(t47, {"plan_valid": False}, False, status="PLAN-LOST"); t47 += 0.05
+    _a, s47a3, _ = c47a.step(t47, {"plan_valid": False}, False, status="PLAN-STALE"); t47 += 0.05
     notice47 = c47a.take_notice()
-    suppressed_ok = (s47a3 == "HOLD_LOST" and c47a._blind_contact_reacts == 1
+    suppressed_ok = (s47a3 == "FALLBACK" and c47a._blind_contact_reacts == 1
                      and notice47 is not None and "SUPPRESSED" in notice47)
 
     # (b) ONLY a solve of a frame CAPTURED AFTER the back-off ended opens the gate. A fresh solve of an
@@ -8549,8 +8696,10 @@ def run_self_test(cfg):
     stale_capture_holds_ok = (c47a._backoff_resolve_since is not None)
     c47a.step(t47, dict(ok_plan_close, frame_id=50, cap_ts=t47, slam_ms=200.0), False, status="OK"); t47 += 0.05
     gate_opens_ok = (stale_capture_holds_ok and c47a._backoff_resolve_since is None)
+    # Session 57: PLAN-STALE again (see the suppressed_ok comment above) -- once the gate is open, Step 1's
+    # cached-clearance back-off still fires the SAME as before, since it runs regardless of status.
     c47a.state, c47a._was_lost, c47a._bump_armed = "SETTLE", False, True
-    _a, s47a4, _ = c47a.step(t47, {"plan_valid": False}, False, status="PLAN-LOST")
+    _a, s47a4, _ = c47a.step(t47, {"plan_valid": False}, False, status="PLAN-STALE")
     refire_ok = (gate_opens_ok and s47a4 == "BACKOFF" and c47a._blind_contact_reacts == 2)
 
     # (c) the budget bounds the wait: a capture stream that never carries a cap_ts cannot hang the trigger
@@ -8562,11 +8711,14 @@ def run_self_test(cfg):
     c47b.step(0.0, ok_plan_close, False, status="OK")
     c47b.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")
     t47b, _s = _run_backoff(c47b, 0.07)
+    # Session 57: PLAN-STALE again (see the suppressed_ok comment above) -- budget_holds_ok lands on the
+    # PLAN-STALE default fall-through (FALLBACK) exactly like suppressed_ok; budget_timeout_ok's
+    # timeout re-opens the gate and Step 1's cached-clearance back-off fires the SAME as before.
     c47b.state, c47b._was_lost, c47b._bump_armed = "SETTLE", False, True
-    _a, s47b1, _ = c47b.step(t47b, {"plan_valid": False}, False, status="PLAN-LOST")   # inside the budget
-    budget_holds_ok = (s47b1 == "HOLD_LOST" and c47b.take_notice() is not None)
+    _a, s47b1, _ = c47b.step(t47b, {"plan_valid": False}, False, status="PLAN-STALE")   # inside the budget
+    budget_holds_ok = (s47b1 == "FALLBACK" and c47b.take_notice() is not None)
     c47b.state, c47b._was_lost, c47b._bump_armed = "SETTLE", False, True
-    _a, s47b2, _ = c47b.step(t47b + 2.0, {"plan_valid": False}, False, status="PLAN-LOST")   # past it
+    _a, s47b2, _ = c47b.step(t47b + 2.0, {"plan_valid": False}, False, status="PLAN-STALE")   # past it
     n47b = c47b.take_notice()
     budget_timeout_ok = (s47b2 == "BACKOFF" and c47b._backoff_resolve_since is None
                          and n47b is not None and "TIMED OUT" in n47b)
@@ -8612,8 +8764,30 @@ def run_self_test(cfg):
             break
     backwall_cut_ok = (cut_ok and s_after == "HOLD_LOST" and t47d < 1.2)   # released early, not at 2.2s
 
+    # (f) session 57: PLAN-LOST's own replacement protection. This gate (`_backoff_resolve_since`) no
+    #     longer guards PLAN-LOST at all -- `_step_lost_recovery` restamps `_loss_episode_t0` the instant
+    #     a back-off fires (C6), and that restamp is what stops an immediate re-fire on the SAME cached
+    #     evidence now. Chunk 4's SESSION-57 PLAN-LOST RECOVERY block (`restamp_blocks_immediate_refire`)
+    #     already proves this across a longer window; this is the equivalent check in this gate's own
+    #     test, so the file records PLAN-LOST's protection alongside PLAN-STALE's.
+    c47e = ExploreController(cfg, no_takeoff=True)
+    c47e.loss_backoff_grace_s = 2.0
+    c47e.leg_goal = [5.0, 5.0]
+    c47e.step(0.0, ok_plan_close, False, status="OK")
+    c47e.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST")   # fresh entry, arms the grace
+    t47e, s47e = 0.02, "HOLD_LOST"
+    while s47e == "HOLD_LOST":
+        t47e += 0.1
+        _a, s47e, _ = c47e.step(t47e, {"plan_valid": False}, False, status="PLAN-LOST")
+    fired_ok = (s47e == "BACKOFF" and c47e._blind_contact_reacts == 1)
+    t47e, s47e_after = _run_backoff(c47e, t47e + 0.05)
+    _a, s47e_next, _ = c47e.step(t47e, {"plan_valid": False}, False, status="PLAN-LOST")
+    plan_lost_restamp_protection_ok = (fired_ok and s47e_after == "HOLD_LOST"
+                                       and s47e_next == "HOLD_LOST" and c47e._blind_contact_reacts == 1)
+
     s47_ok = (fire1_ok and gate_armed_ok and suppressed_ok and stale_capture_holds_ok and refire_ok
-              and budget_holds_ok and budget_timeout_ok and escalates_ok and backwall_cut_ok)
+              and budget_holds_ok and budget_timeout_ok and escalates_ok and backwall_cut_ok
+              and plan_lost_restamp_protection_ok)
     ok = ok and s47_ok
     print(f"[self-test] {'PASS' if s47_ok else 'FAIL'}  SESSION-47 post-backoff re-solve gate "
           f"(1st fires+counts={fire1_ok}, gate armed on completion={gate_armed_ok}, "
@@ -8622,7 +8796,8 @@ def run_self_test(cfg):
           f"post-backoff solve re-enables={refire_ok}, "
           f"budget holds={budget_holds_ok}, budget timeout is LOUD={budget_timeout_ok}, "
           f"loss-instant path escalates to FALLBACK={escalates_ok}, "
-          f"BACKWALL cuts the reverse push={backwall_cut_ok})")
+          f"BACKWALL cuts the reverse push={backwall_cut_ok}, "
+          f"PLAN-LOST restamp blocks immediate re-fire={plan_lost_restamp_protection_ok})")
 
     # ---- Session 48: the LOSS-RECOVERY GRACE (a loss must OUTLIVE it to earn a physical reaction) ----
     # Measured over all 128 flight logs (2066 episodes): holding still, a loss self-heals in a median 2.4s,
@@ -8808,14 +8983,22 @@ def run_self_test(cfg):
 
     # (a) Step 2 loss-instant: cached clearance CLEAR + a CONTAINED visual match -> BACKOFF (the exact
     #     Idea-B gap this session closes: geometry alone reads "clear" when SLAM never mapped the wall).
+    # Session 57: this Step-2 visual-ALONE trigger is now PLAN-STALE-only -- PLAN-LOST/NO-PLAN went to
+    # `_step_lost_recovery`, whose "pending" gate is clearance-only by design (MISSION CONTEXT's new
+    # rule: "the remembered clearance decides only whether a back-off is pending, never whether we
+    # look"; the visual verdict ADJUDICATES a pending back-off, it no longer triggers one on its own).
     cva = ExploreController(cfg_vr, no_takeoff=True)
     cva.loss_backoff_grace_s = 0.0   # session 48 timing is tested in its own block
     cva.leg_goal = [5.0, 5.0]
     p_clear = {"plan_valid": True, "pos": [1.0, 1.0], "forward_clearance_dist": 5.0,
               "goal": [5.0, 5.0], "done": False, "bearing_err": 0.0, "slam_ms": 100.0, "frame_id": 1}
     cva.step(0.0, p_clear, False, status="OK")
-    vm_contained = VisualMatch(has_lkg=True, matched=True, inliers=40, contained=True, planar_like=False, scale=1.8)
-    _a, s_va, ev_va = cva.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_contained)
+    # Session 57: closer="LIVE" makes this fixture's evidence agree with the new direction gate (chunk 6) --
+    # this test's INTENT (a contained crop that is genuinely too close) is unchanged, it just now has to say
+    # so explicitly instead of the old direction-blind default.
+    vm_contained = VisualMatch(has_lkg=True, matched=True, inliers=40, contained=True, planar_like=False,
+                               scale=1.8, closer="LIVE")
+    _a, s_va, ev_va = cva.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_contained)
     visual_contained_ok = (s_va == "BACKOFF" and ev_va is not None and "visual" in ev_va.lower())
 
     # (b) same, but PLANAR-LIKE (flat-surface) instead of a contained crop -> also BACKOFF.
@@ -8823,12 +9006,16 @@ def run_self_test(cfg):
     cvb.loss_backoff_grace_s = 0.0   # session 48 timing is tested in its own block
     cvb.leg_goal = [5.0, 5.0]
     cvb.step(0.0, p_clear, False, status="OK")
-    vm_planar = VisualMatch(has_lkg=True, matched=True, inliers=55, contained=False, planar_like=True, scale=1.0)
-    _a, s_vb, _ = cvb.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_planar)
+    # Session 57: same closer="LIVE" fix as vm_contained above -- this fixture's intent is the CLOSE case.
+    vm_planar = VisualMatch(has_lkg=True, matched=True, inliers=55, contained=False, planar_like=True,
+                            scale=1.0, closer="LIVE")
+    _a, s_vb, _ = cvb.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE", visual_match=vm_planar)
     visual_planar_ok = (s_vb == "BACKOFF")
 
     # (c) a close CACHED CLEARANCE still wins first — visual is never even consulted, even when it would
-    #     have said something else (an inconclusive no-match here).
+    #     have said something else (an inconclusive no-match here). Session 57: PLAN-LOST's event text now
+    #     names the cached clearance directly (see `_step_lost_recovery`, C6) rather than the old
+    #     "(stale pose, N.Ns old)" age suffix.
     p_close = {"plan_valid": True, "pos": [1.0, 1.0], "forward_clearance_dist": 0.5,
               "goal": [5.0, 5.0], "done": False, "bearing_err": 0.0, "slam_ms": 100.0, "frame_id": 1}
     cvc = ExploreController(cfg_vr, no_takeoff=True)
@@ -8837,7 +9024,7 @@ def run_self_test(cfg):
     cvc.step(0.0, p_close, False, status="OK")
     vm_none = VisualMatch(has_lkg=True, matched=False)
     _a, s_vc, ev_vc = cvc.step(0.02, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_none)
-    clearance_wins_first_ok = (s_vc == "BACKOFF" and ev_vc is not None and "stale pose" in ev_vc)
+    clearance_wins_first_ok = (s_vc == "BACKOFF" and ev_vc is not None and "cached clearance" in ev_vc)
 
     # (d) both loss-instant checks inconclusive (clear cache + no visual match) -> hands off into the 15°
     #     VISUAL_RECOVERY probe (not straight to FALLBACK) since the flag is on -- PLAN-STALE only.
@@ -9533,13 +9720,14 @@ def run_self_test(cfg):
         c.leg_goal = [5.0, 5.0]
         return c
 
-    # (52-probe-1) THE 57/58 CASE: loss opens as PLAN-LOST (spends the loss-instant one-shot into HOLD_LOST,
-    #              deferred by the grace since there is no too-close evidence), and the probe is still
-    #              reached on the LATER PLAN-STALE, via the new late-entry latch.
+    # (52-probe-1) THE 57/58 CASE: loss opens as PLAN-LOST, held by `_step_lost_recovery`'s own grace.
+    #              Session 57: PLAN-LOST no longer touches `_loss_snapshot_checked` at all (that ticket is
+    #              PLAN-STALE-only now, see `_step_lost_recovery`'s docstring) -- it stays UNSPENT here,
+    #              unlike the pre-57 one-shot this comment used to describe.
     c52p1 = _mk_c52p()
     t52p1 = 0.0
     _a, s52p1a, _ = c52p1.step(t52p1, {"plan_valid": False}, False, status="PLAN-LOST")
-    probe1_tick1_ok = (s52p1a == "HOLD_LOST" and c52p1._loss_snapshot_checked is True
+    probe1_tick1_ok = (s52p1a == "HOLD_LOST" and c52p1._loss_snapshot_checked is False
                        and c52p1._visrec_probe_armed is True)
     t52p1 += c52p1.loss_backoff_grace_s + 0.1     # past the grace
     _a, s52p1b, _ = c52p1.step(t52p1, {"plan_valid": False}, False, status="PLAN-STALE")
@@ -9608,6 +9796,206 @@ def run_self_test(cfg):
           f"an in-flight probe survives a PLAN-LOST flicker={probe3_ok}, "
           f"a genuine back-off consumes the probe latch={probe4_ok}, "
           f"flag OFF is byte-identical to today={probe5_ok})")
+
+    # ---- SESSION 57 (chunk 5): probe_inside_grace_holds -- the NEW grace check Fix A added to the Step
+    #      2c hand-off in `_maybe_loss_snapshot_backoff`, exercised by a FRESH PLAN-STALE loss with no
+    #      cached clearance and no visual match, so `_would_react` is False and the PRE-EXISTING
+    #      session-48 grace clause (gated behind `_would_react`) never fires -- only Fix A's own check can
+    #      hold this tick. Asserts the STATE (HOLD_LOST / VISUAL_RECOVERY), not just whether a turn player
+    #      was built, since a probe that silently held without changing state would also look like "no turn".
+    cfg_probe_grace = copy.deepcopy(cfg)
+    cfg_probe_grace["autonomy"]["explore"]["use_visual_recovery_on_stale"] = True
+    c57g = ExploreController(cfg_probe_grace, no_takeoff=True)
+    c57g._ever_tracked = True
+    c57g.loss_backoff_grace_s = 1.0
+    c57g.leg_goal = [5.0, 5.0]
+    t57g = 0.0
+    _a, s57g_in, _ = c57g.step(t57g, {"plan_valid": False}, False, status="PLAN-STALE")
+    inside_grace_ok = (s57g_in == "HOLD_LOST")
+    t57g += c57g.loss_backoff_grace_s + 0.1
+    _a, s57g_out, _ = c57g.step(t57g, {"plan_valid": False}, False, status="PLAN-STALE")
+    past_grace_ok = (s57g_out == "VISUAL_RECOVERY")
+    probe_inside_grace_holds_ok = inside_grace_ok and past_grace_ok
+    ok = ok and probe_inside_grace_holds_ok
+    print(f"[self-test] {'PASS' if probe_inside_grace_holds_ok else 'FAIL'}  SESSION-57 chunk 5 "
+          f"probe_inside_grace_holds (inside_grace_holds_LOST={inside_grace_ok}, "
+          f"past_grace_enters_VISUAL_RECOVERY={past_grace_ok})")
+
+    # ---- SESSION 57 (chunk 5): no_second_grace_variant -- Fix A reuses `_maybe_enter_visual_probe`'s
+    #      grace condition VERBATIM rather than writing a second, subtly different comparison (e.g. a
+    #      `waited = now - t0; if waited < grace` variant like the pre-existing session-48/step_lost_recovery
+    #      clauses use) -- so the exact literal string appears in only the two intended sites.
+    _grace_condition_literal = ("self._loss_episode_t0 is not None and now - self._loss_episode_t0 < "
+                                "self.loss_backoff_grace_s")
+    with open(__file__, "r", encoding="utf-8") as _gf:
+        _grace_src = _gf.read()
+    _grace_variant_count = _grace_src.count(_grace_condition_literal)
+    no_second_grace_variant_ok = (_grace_variant_count <= 2)
+    ok = ok and no_second_grace_variant_ok
+    print(f"[self-test] {'PASS' if no_second_grace_variant_ok else 'FAIL'}  SESSION-57 chunk 5 "
+          f"no_second_grace_variant (grace condition literal appears {_grace_variant_count} time(s), <= 2)")
+
+    # ---- SESSION 57 PLAN-LOST RECOVERY -- `_step_lost_recovery` replaces the one-shot ticket path for
+    #      PLAN-LOST/NO-PLAN: always wait `loss_backoff_grace_s`, then always look, and let the
+    #      inlier-spread `closer` verdict adjudicate a pending back-off. See plans/session57-spec.md
+    #      MISSION CONTEXT -- 56 of 86 loss episodes in flight 20260903_083329 never ran a single match
+    #      because the old ticket was spent before `visual_match` could ever be non-None. ----
+    def _mk_c57(clearance=3.0, grace_s=1.0):
+        c = ExploreController(cfg, no_takeoff=True)
+        c._ever_tracked = True
+        c.loss_backoff_grace_s = grace_s
+        c._last_good_clearance = clearance
+        c._last_good_pos = [1.0, 1.0]
+        c._last_good_t = 0.0
+        c.leg_goal = [5.0, 5.0]
+        return c
+
+    # (57-1) inside_grace_holds: clear-front PLAN-LOST inside the grace -> HOLD_LOST, no BACKOFF, and the
+    #        grace notice fires exactly once across three consecutive ticks.
+    c57_1 = _mk_c57(clearance=3.0, grace_s=5.0)
+    t57_1 = 0.0
+    _a, s57_1a, _ = c57_1.step(t57_1, {"plan_valid": False}, False, status="PLAN-LOST")
+    grace_notices = 1 if c57_1.take_notice() is not None else 0
+    for _ in range(2):
+        t57_1 += 0.1
+        _a, s57_1a, _ = c57_1.step(t57_1, {"plan_valid": False}, False, status="PLAN-LOST")
+        if c57_1.take_notice() is not None:
+            grace_notices += 1
+    s57_1_ok = (s57_1a == "HOLD_LOST" and grace_notices == 1)
+
+    # (57-2) clear_front_past_grace_holds: `_last_good_clearance = 3.0` past the grace -> HOLD_LOST, no
+    #        BACKOFF (nothing pending), and NO hold-notice (that notice is only for the LKG verdict).
+    c57_2 = _mk_c57(clearance=3.0, grace_s=1.0)
+    t57_2 = 0.0
+    c57_2.step(t57_2, {"plan_valid": False}, False, status="PLAN-LOST")
+    c57_2.take_notice()   # drain the grace notice from the fresh-entry tick, irrelevant to this case
+    t57_2 += c57_2.loss_backoff_grace_s + 0.1
+    _a, s57_2, _ = c57_2.step(t57_2, {"plan_valid": False}, False, status="PLAN-LOST")
+    notice57_2 = c57_2.take_notice()
+    s57_2_ok = (s57_2 == "HOLD_LOST" and notice57_2 is None)
+
+    # (57-3/4/5) verdict_{live,equal,unknown}_backs_off: `_last_good_clearance = 0.5` (pending), past the
+    #            grace, with `closer` LIVE / EQUAL / UNKNOWN -> BACKOFF every time (weak CV never vetoes).
+    def _mk_vm(closer, size_ratio=1.5):
+        return VisualMatch(has_lkg=True, matched=True, inliers=30, contained=False, planar_like=False,
+                           scale=1.2, size_ratio=size_ratio, closer=closer)
+
+    def _run_verdict(closer):
+        c = _mk_c57(clearance=0.5, grace_s=1.0)
+        t = 0.0
+        c.step(t, {"plan_valid": False}, False, status="PLAN-LOST")
+        t += c.loss_backoff_grace_s + 0.1
+        _a, s, _ = c.step(t, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=_mk_vm(closer))
+        return c, s
+
+    _c57_live, s57_live = _run_verdict("LIVE")
+    _c57_equal, s57_equal = _run_verdict("EQUAL")
+    _c57_unknown, s57_unknown = _run_verdict("UNKNOWN")
+    s57_3_ok = s57_live == "BACKOFF"
+    s57_4_ok = s57_equal == "BACKOFF"
+    s57_5_ok = s57_unknown == "BACKOFF"
+
+    # (57-6) verdict_lkg_holds: same but `closer="LKG"` -> HOLD_LOST, no BACKOFF, hold notice fired once.
+    c57_6 = _mk_c57(clearance=0.5, grace_s=1.0)
+    t57_6 = 0.0
+    c57_6.step(t57_6, {"plan_valid": False}, False, status="PLAN-LOST")
+    t57_6 += c57_6.loss_backoff_grace_s + 0.1
+    vm_lkg = _mk_vm("LKG", size_ratio=0.5)
+    _a, s57_6a, _ = c57_6.step(t57_6, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_lkg)
+    hold_notices = 1 if c57_6.take_notice() is not None else 0
+    for _ in range(2):
+        t57_6 += 0.1
+        _a, s57_6a, _ = c57_6.step(t57_6, {"plan_valid": False}, False, status="PLAN-LOST",
+                                   visual_match=vm_lkg)
+        if c57_6.take_notice() is not None:
+            hold_notices += 1
+    s57_6_ok = (s57_6a == "HOLD_LOST" and hold_notices == 1)
+
+    # (57-7) lkg_hold_is_indefinite: the `closer="LKG"` controller still holds after 60s of further ticks.
+    t57_6 += 60.0
+    _a, s57_7, _ = c57_6.step(t57_6, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=vm_lkg)
+    s57_7_ok = (s57_7 == "HOLD_LOST")
+
+    # (57-8) backoff_restamps_the_wait: after a `closer="LIVE"` back-off, `_loss_episode_t0` equals the
+    #        back-off's `now`, and both notice flags are back to False.
+    s57_8_ok = (_c57_live._loss_episode_t0 is not None
+               and abs(_c57_live._loss_episode_t0 - (1.0 + 0.1)) < 1e-6
+               and _c57_live._loss_grace_noticed is False
+               and _c57_live._lost_hold_noticed is False)
+
+    # (57-9) restamp_blocks_immediate_refire: continuing to tick that controller with the SAME evidence
+    #        produces no second BACKOFF until a further `loss_backoff_grace_s` has elapsed. BACKOFF owns
+    #        every status while its own phase-timer runs (session 46, ~backoff_hold_s + backoff_release_s
+    #        ~= 1.2s at defaults), so this needs a grace comfortably longer than that to see a real gap
+    #        between "backoff just completed" and "grace re-elapsed" -- a dedicated controller, not
+    #        `_c57_live` (grace_s=1.0, too close to the backoff's own duration to separate the two).
+    def _run_c57_backoff(ctl, t, dt=0.05):
+        st = ctl.state
+        for _ in range(400):
+            _a, st, _e = ctl.step(t, {"plan_valid": False}, False, status="PLAN-LOST",
+                                  visual_match=_mk_vm("LIVE"))
+            t += dt
+            if st != "BACKOFF":
+                break
+        return t, st
+
+    c57_9 = _mk_c57(clearance=0.5, grace_s=5.0)
+    t57_9 = 0.0
+    c57_9.step(t57_9, {"plan_valid": False}, False, status="PLAN-LOST")
+    t57_9 += c57_9.loss_backoff_grace_s + 0.1
+    _a, s57_9_fire, _ = c57_9.step(t57_9, {"plan_valid": False}, False, status="PLAN-LOST",
+                                   visual_match=_mk_vm("LIVE"))
+    fire_ok = (s57_9_fire == "BACKOFF")
+    t57_9, s57_9_done = _run_c57_backoff(c57_9, t57_9 + 0.05)
+    backoff_done_ok = (s57_9_done == "HOLD_LOST")
+    _a, s57_9a, _ = c57_9.step(t57_9, {"plan_valid": False}, False, status="PLAN-LOST",
+                               visual_match=_mk_vm("LIVE"))
+    no_immediate_refire_ok = (s57_9a != "BACKOFF")
+    t57_9 = c57_9._loss_episode_t0 + c57_9.loss_backoff_grace_s + 0.1
+    _a, s57_9b, _ = c57_9.step(t57_9, {"plan_valid": False}, False, status="PLAN-LOST",
+                               visual_match=_mk_vm("LIVE"))
+    s57_9_ok = (fire_ok and backoff_done_ok and no_immediate_refire_ok and s57_9b == "BACKOFF")
+
+    # (57-10) plan_stale_path_untouched: a PLAN-STALE loss still routes through
+    #         `_maybe_loss_snapshot_backoff` and still spends `_loss_snapshot_checked`.
+    cfg57_stale = copy.deepcopy(cfg)
+    cfg57_stale["autonomy"]["explore"]["use_visual_recovery_on_stale"] = False
+    c57_10 = ExploreController(cfg57_stale, no_takeoff=True)
+    c57_10._ever_tracked = True
+    c57_10.loss_backoff_grace_s = 0.0
+    c57_10._last_good_clearance = 0.5
+    c57_10._last_good_pos = [1.0, 1.0]
+    c57_10._last_good_t = 0.0
+    t57_10 = 0.0
+    ticket_before_ok = (c57_10._loss_snapshot_checked is False)
+    _a, s57_10, _ = c57_10.step(t57_10, {"plan_valid": False}, False, status="PLAN-STALE")
+    s57_10_ok = (ticket_before_ok and c57_10._loss_snapshot_checked is True and s57_10 == "BACKOFF")
+
+    # (57-11) episode_edge_resets: a genuine OK followed by a fresh loss clears `_lost_hold_noticed`.
+    c57_11 = _mk_c57(clearance=0.5, grace_s=1.0)
+    t57_11 = 0.0
+    c57_11.step(t57_11, {"plan_valid": False}, False, status="PLAN-LOST")
+    t57_11 += c57_11.loss_backoff_grace_s + 0.1
+    c57_11.step(t57_11, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=_mk_vm("LKG", 0.5))
+    hold_latched_ok = (c57_11._lost_hold_noticed is True)
+    t57_11 += 0.1
+    c57_11.step(t57_11, {"plan_valid": True, "pos": [1.0, 1.0], "forward_clearance_dist": 3.0}, False,
+               status="OK")
+    episode_ended_ok = (c57_11._loss_episode_t0 is None)
+    t57_11 += 0.1
+    c57_11.step(t57_11, {"plan_valid": False}, False, status="PLAN-LOST")   # a FRESH loss -- new episode
+    s57_11_ok = (hold_latched_ok and episode_ended_ok and c57_11._lost_hold_noticed is False)
+
+    s57_ok = (s57_1_ok and s57_2_ok and s57_3_ok and s57_4_ok and s57_5_ok and s57_6_ok and s57_7_ok
+             and s57_8_ok and s57_9_ok and s57_10_ok and s57_11_ok)
+    ok = ok and s57_ok
+    print(f"[self-test] {'PASS' if s57_ok else 'FAIL'}  SESSION-57 PLAN-LOST RECOVERY "
+          f"(inside_grace_holds={s57_1_ok}, clear_front_past_grace_holds={s57_2_ok}, "
+          f"verdict_live_backs_off={s57_3_ok}, verdict_equal_backs_off={s57_4_ok}, "
+          f"verdict_unknown_backs_off={s57_5_ok}, verdict_lkg_holds={s57_6_ok}, "
+          f"lkg_hold_is_indefinite={s57_7_ok}, backoff_restamps_the_wait={s57_8_ok}, "
+          f"restamp_blocks_immediate_refire={s57_9_ok}, plan_stale_path_untouched={s57_10_ok}, "
+          f"episode_edge_resets={s57_11_ok})")
 
     # ---- (session 52, chunk 6) controller-side telemetry: SLAM_HOLD counters, note_timeout, control-bus
     #      fields (`_full_vector`'s state_since_s/slam_hold/notice). No rendering here -- visualizer.py's
@@ -10133,6 +10521,183 @@ def run_self_test(cfg):
     ok = ok and hold_lost_still_excluded
     print(f"[self-test] {'PASS' if hold_lost_still_excluded else 'FAIL'}  SESSION-56 TRIM FROM SLAM_HOLD "
           f"hold_lost_still_excluded (state={s_t5})")
+
+    # ---- SESSION-57 CONFIG WIRING: the three visrec_size_* thresholds load from config.yaml and honour
+    # overrides (C5/C11) -- no decision logic yet, this just confirms the wiring itself. ----
+    # (1) defaults_present: a controller built from the repo's OWN config.yaml gets the C11 defaults.
+    c57cfg_a = ExploreController(cfg, no_takeoff=True)
+    defaults_present = (c57cfg_a.visrec_size_ratio_hi == 1.25 and c57cfg_a.visrec_size_ratio_lo == 0.80
+                        and c57cfg_a.visrec_size_min_inliers == 20)
+
+    # (2) overrides_honoured: a cfg dict with different explore.* values produces those values on the
+    #     controller, proving the read is live (`e.get(...)`), not hardcoded.
+    cfg57 = copy.deepcopy(cfg)
+    cfg57["autonomy"]["explore"]["visrec_size_ratio_hi"] = 2.0
+    cfg57["autonomy"]["explore"]["visrec_size_ratio_lo"] = 0.5
+    cfg57["autonomy"]["explore"]["visrec_size_min_inliers"] = 7
+    c57cfg_b = ExploreController(cfg57, no_takeoff=True)
+    overrides_honoured = (c57cfg_b.visrec_size_ratio_hi == 2.0 and c57cfg_b.visrec_size_ratio_lo == 0.5
+                          and c57cfg_b.visrec_size_min_inliers == 7)
+
+    # (3) lo_below_hi: sanity invariant on the repo's shipped defaults -- a mis-set config would make
+    #     EVERY match verdict either LIVE or LKG with no EQUAL band, silently breaking C4.
+    lo_below_hi = (c57cfg_a.visrec_size_ratio_lo < c57cfg_a.visrec_size_ratio_hi)
+
+    config57_ok = defaults_present and overrides_honoured and lo_below_hi
+    ok = ok and config57_ok
+    print(f"[self-test] {'PASS' if config57_ok else 'FAIL'}  SESSION-57 CONFIG WIRING "
+          f"(defaults_present={defaults_present}, overrides_honoured={overrides_honoured}, "
+          f"lo_below_hi={lo_below_hi})")
+
+    # ---- SESSION-57 PLAN-LOST ALWAYS LOOKS: chunk 3 opens `wants_visual_match` for a matured
+    # PLAN-LOST/NO-PLAN episode regardless of the one-shot ticket's state (MISSION CONTEXT finding 1 --
+    # 56 of 86 loss episodes in flight 20260903_083329 ran zero matches because the ticket was spent on
+    # the episode's very first tick, before any camera evidence existed). ----
+    c57w = _mk_gate_ctrl(one_shot_spent=True)          # ticket SPENT -- the old code path never looks again
+    grace57 = c57w.loss_backoff_grace_s
+    t0_57 = 200.0
+    c57w._loss_episode_t0 = t0_57
+
+    # (1) spent_ticket_clear_front_still_looks -- past the grace, a matured PLAN-LOST episode looks anyway.
+    spent_ticket_clear_front_still_looks = c57w.wants_visual_match(
+        now=t0_57 + grace57 + 0.1, status="PLAN-LOST") is True
+
+    # (2) inside_grace_does_not_look -- the unconditional 12s wait is still honoured; no early peek.
+    inside_grace_does_not_look = c57w.wants_visual_match(
+        now=t0_57 + grace57 - 0.1, status="PLAN-LOST") is False
+
+    # (3) no_args_is_unchanged -- every pre-existing caller (no now/status) keeps today's answer.
+    no_args_is_unchanged = c57w.wants_visual_match() is False
+
+    # (4) plan_stale_unaffected -- PLAN-STALE still runs through `_maybe_loss_snapshot_backoff` only; the
+    #     new clause names PLAN-LOST/NO-PLAN exclusively.
+    plan_stale_unaffected = c57w.wants_visual_match(
+        now=t0_57 + grace57 + 0.1, status="PLAN-STALE") is False
+
+    # (5) no_episode_stamp -- with no loss-episode stamp there is nothing to time, regardless of `now`.
+    c57w_noep = _mk_gate_ctrl(one_shot_spent=True)
+    c57w_noep._loss_episode_t0 = None
+    no_episode_stamp = c57w_noep.wants_visual_match(now=t0_57 + 9999.0, status="PLAN-LOST") is False
+
+    # (6) should_match_threads_args -- `_visrec_should_match` forwards now/status into the new clause,
+    #     and the status name itself still gates it (an unrelated "OK" status must not force a match).
+    c57sm = _mk_gate_ctrl(one_shot_spent=True)
+    c57sm._loss_episode_t0 = t0_57
+    should_match_lost = _gate(c57sm, memo=None, now=t0_57 + grace57 + 0.1, status="PLAN-LOST") is True
+    should_match_ok = _gate(c57sm, memo=None, now=t0_57 + grace57 + 0.1, status="OK") is False
+    should_match_threads_args = should_match_lost and should_match_ok
+
+    s57_looks_ok = (spent_ticket_clear_front_still_looks and inside_grace_does_not_look
+                    and no_args_is_unchanged and plan_stale_unaffected and no_episode_stamp
+                    and should_match_threads_args)
+    ok = ok and s57_looks_ok
+    print(f"[self-test] {'PASS' if spent_ticket_clear_front_still_looks else 'FAIL'}  SESSION-57 PLAN-LOST "
+          f"ALWAYS LOOKS spent_ticket_clear_front_still_looks")
+    print(f"[self-test] {'PASS' if inside_grace_does_not_look else 'FAIL'}  SESSION-57 PLAN-LOST "
+          f"ALWAYS LOOKS inside_grace_does_not_look")
+    print(f"[self-test] {'PASS' if no_args_is_unchanged else 'FAIL'}  SESSION-57 PLAN-LOST "
+          f"ALWAYS LOOKS no_args_is_unchanged")
+    print(f"[self-test] {'PASS' if plan_stale_unaffected else 'FAIL'}  SESSION-57 PLAN-LOST "
+          f"ALWAYS LOOKS plan_stale_unaffected")
+    print(f"[self-test] {'PASS' if no_episode_stamp else 'FAIL'}  SESSION-57 PLAN-LOST "
+          f"ALWAYS LOOKS no_episode_stamp")
+    print(f"[self-test] {'PASS' if should_match_threads_args else 'FAIL'}  SESSION-57 PLAN-LOST "
+          f"ALWAYS LOOKS should_match_threads_args")
+    print(f"[self-test] {'PASS' if s57_looks_ok else 'FAIL'}  SESSION-57 PLAN-LOST ALWAYS LOOKS overall")
+
+    # ---- SESSION-57 STALE DIRECTION GATE (chunk 6): Finding 2 on the PLAN-STALE path -- `planar_like`
+    # is a pure inlier-ratio test ("flat surface"), not a distance verdict, and is completely
+    # direction-blind. Real flight evidence (08:51:44.313): matched=True inliers=45 contained=False
+    # planar_like=True scale=0.32 -- scale<1 means the live view is a SHRUNK view of F_LKG (farther
+    # away), yet the pre-chunk-6 code backed off anyway. Both the action site (:2879-2891) and the
+    # `_would_react` predicate that arms the grace/gate ahead of it (:2809-2814) now require
+    # `closer == "LIVE"` in lockstep. ----
+    cfg_dir57 = cfg_vr   # use_visual_recovery_on_stale=True; same fixture as the block above
+
+    # (1) planar_far_no_backoff: PLAN-STALE, matched+planar_like, but closer="LKG" (live frame is the
+    #     FARTHER one) with a clear cached clearance -> both loss-instant checks inconclusive, hands
+    #     off into the 15deg probe instead of backing off.
+    c57dir1 = ExploreController(cfg_dir57, no_takeoff=True); c57dir1._ever_tracked = True
+    c57dir1.loss_backoff_grace_s = 0.0   # session 48 timing is tested in its own block
+    c57dir1.leg_goal = [5.0, 5.0]
+    c57dir1.step(0.0, p_clear, False, status="OK")
+    vm_planar_far = VisualMatch(has_lkg=True, matched=True, inliers=50, contained=False, planar_like=True,
+                                scale=1.0, closer="LKG")
+    _a, s_dir1, _ = c57dir1.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE",
+                                 visual_match=vm_planar_far)
+    planar_far_no_backoff = (s_dir1 == "VISUAL_RECOVERY")
+
+    # (2) planar_near_backs_off: identical evidence, but closer="LIVE" (live frame is genuinely the
+    #     closer one) -> BACKOFF, same as the pre-chunk-6 behavior for this evidence shape.
+    c57dir2 = ExploreController(cfg_dir57, no_takeoff=True)
+    c57dir2.loss_backoff_grace_s = 0.0
+    c57dir2.leg_goal = [5.0, 5.0]
+    c57dir2.step(0.0, p_clear, False, status="OK")
+    vm_planar_near = VisualMatch(has_lkg=True, matched=True, inliers=50, contained=False, planar_like=True,
+                                 scale=1.0, closer="LIVE")
+    _a, s_dir2, ev_dir2 = c57dir2.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE",
+                                       visual_match=vm_planar_near)
+    planar_near_backs_off = (s_dir2 == "BACKOFF" and ev_dir2 is not None and "visual" in ev_dir2.lower())
+
+    # (3) contained_far_no_backoff: same shape as (1) but via the CONTAINED (zoomed-crop) clause instead
+    #     of planar_like -- both disjuncts of the OR must honour the same closer=="LIVE" requirement.
+    c57dir3 = ExploreController(cfg_dir57, no_takeoff=True); c57dir3._ever_tracked = True
+    c57dir3.loss_backoff_grace_s = 0.0
+    c57dir3.leg_goal = [5.0, 5.0]
+    c57dir3.step(0.0, p_clear, False, status="OK")
+    vm_contained_far = VisualMatch(has_lkg=True, matched=True, inliers=40, contained=True, planar_like=False,
+                                   scale=1.8, closer="LKG")
+    _a, s_dir3, _ = c57dir3.step(0.02, {"plan_valid": False}, False, status="PLAN-STALE",
+                                 visual_match=vm_contained_far)
+    contained_far_no_backoff = (s_dir3 == "VISUAL_RECOVERY")
+
+    # (4) would_react_agrees: the grace/gate predicate (:2809-2814) must arm for exactly the same
+    #     evidence the action then honours. Isolated via the grace-notice side effect of
+    #     `_maybe_loss_snapshot_backoff` itself: a clear cached clearance removes the geometric
+    #     disjunct, so with `waited < loss_backoff_grace_s` the LOSS_GRACE notice fires ONLY when the
+    #     visual disjunct (closer=="LIVE") is True -- closer=="LKG" leaves `_would_react` False, so that
+    #     branch is skipped entirely (falls through silently to the probe's own, separate grace gate,
+    #     which also returns None but never touches the notice).
+    def _mk_dir57_probe(clearance=5.0, grace=10.0, t0=100.0):
+        c = ExploreController(cfg_dir57, no_takeoff=True)
+        c._ever_tracked = True
+        c.loss_backoff_grace_s = grace
+        c._last_good_clearance = clearance
+        c._last_good_pos = [1.0, 1.0]
+        c._last_good_t = 0.0
+        c._loss_episode_t0 = t0
+        return c
+
+    now_dir57 = 105.0   # waited = 5.0 < grace = 10.0
+    vm_dir57_live = VisualMatch(has_lkg=True, matched=True, inliers=50, contained=False, planar_like=True,
+                                scale=1.0, closer="LIVE")
+    c_dir57_live = _mk_dir57_probe()
+    r_dir57_live = c_dir57_live._maybe_loss_snapshot_backoff({}, now_dir57, vm_dir57_live, status="PLAN-STALE")
+    notice_dir57_live = c_dir57_live.take_notice()
+    would_react_live_ok = (r_dir57_live is None and notice_dir57_live is not None
+                           and "GRACE" in notice_dir57_live.upper())
+
+    vm_dir57_lkg = VisualMatch(has_lkg=True, matched=True, inliers=50, contained=False, planar_like=True,
+                               scale=1.0, closer="LKG")
+    c_dir57_lkg = _mk_dir57_probe()
+    r_dir57_lkg = c_dir57_lkg._maybe_loss_snapshot_backoff({}, now_dir57, vm_dir57_lkg, status="PLAN-STALE")
+    notice_dir57_lkg = c_dir57_lkg.take_notice()
+    would_react_lkg_ok = (r_dir57_lkg is None and notice_dir57_lkg is None)
+
+    would_react_agrees = would_react_live_ok and would_react_lkg_ok
+
+    dir57_ok = (planar_far_no_backoff and planar_near_backs_off and contained_far_no_backoff
+               and would_react_agrees)
+    ok = ok and dir57_ok
+    print(f"[self-test] {'PASS' if planar_far_no_backoff else 'FAIL'}  SESSION-57 STALE DIRECTION GATE "
+          f"planar_far_no_backoff (state={s_dir1})")
+    print(f"[self-test] {'PASS' if planar_near_backs_off else 'FAIL'}  SESSION-57 STALE DIRECTION GATE "
+          f"planar_near_backs_off (state={s_dir2})")
+    print(f"[self-test] {'PASS' if contained_far_no_backoff else 'FAIL'}  SESSION-57 STALE DIRECTION GATE "
+          f"contained_far_no_backoff (state={s_dir3})")
+    print(f"[self-test] {'PASS' if would_react_agrees else 'FAIL'}  SESSION-57 STALE DIRECTION GATE "
+          f"would_react_agrees (live={would_react_live_ok}, lkg={would_react_lkg_ok})")
+    print(f"[self-test] {'PASS' if dir57_ok else 'FAIL'}  SESSION-57 STALE DIRECTION GATE overall")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

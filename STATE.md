@@ -18,29 +18,41 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**. **Session 56 is BUILT and was FLOWN** on 2026-09-03
-(`OUTPUT/diag/20260903_083329_*`) — fast and efficient, the SLAM_HOLD work landed. **Session 57 is
-SPECIFIED but NOT BUILT**: `plans/session57-spec.md` is a 9-chunk Sonnet-ready spec, and the runner
-is armed. All 8 self-test suites are green at HEAD. `main` is unaffected and sits at session 43
-(confirmed tolerable live-fly on 2026-09-01), with one open problem: height.
+Branch **`all-bets-are-off`**. **Session 57 is BUILT, LIVE-FLY PENDING** — all 10 chunks of
+`plans/session57-spec.md` applied (chunk 4's fix turned out to need a companion chunk 5 to close a
+trap it exposed; the spec file's own chunk numbering was renumbered in place to 1-10, see
+`plans/session57-planlost-recovery-and-direction-aware-lkg.md`). All **9** self-test suites are green
+at HEAD (`visualizer.py` joined the gate this session with its first `--self-test` entry point).
+Session 56 (BUILT and FLOWN on 2026-09-03, `OUTPUT/diag/20260903_083329_*`) is folded into this
+session's watch list below — its own fixes still haven't been re-flown in isolation. `main` is
+unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one open
+problem: height.
 
-## >>> IMMEDIATE NEXT: run session 57 <<<
-```
-python sonnet_runner.py --plan plans/session57-spec.md
-```
-The gate now runs **all 9 suites under the project venv** after every chunk (`sonnet_runner.py`
-`DEFAULT_SUITES` + `suite_python()`); `visualizer.py` joins that list in chunk 6, which creates its
-`--self-test` entry point. Resume a failed run with `--start-at N` — chunk edits are insertions and
-are NOT idempotent, so never re-run from 1.
+## >>> IMMEDIATE NEXT: live-fly session 57 <<<
+Full design/traps/files-touched: `plans/session57-planlost-recovery-and-direction-aware-lkg.md`.
+**What it fixes and why** — the operator saw the LKG window show a reference frame plainly closer
+than the live frame while the drone backed off anyway. Of the diagnosing flight's 86 loss episodes
+only **30 ever ran a visual match**; 56 ran none, because the one-shot ticket that gated matching was
+almost always spent before any picture was taken. PLAN-LOST/NO-PLAN now always waits 12s, then always
+looks; the cached clearance only marks a back-off *pending*; a three-way inlier-spread `closer`
+verdict adjudicates it; and firing a back-off restarts the wait.
 
-**What session 57 fixes and why** — the operator saw the LKG window show a reference frame plainly
-closer than the live frame while the drone backed off anyway. Of that flight's 86 loss episodes only
-**30 ever ran a visual match**; 56 ran none. See `plans/session57-spec.md`'s MISSION CONTEXT for the
-full evidence, and the session-57 entry in `PROGRESS.md`.
+Watch these, in priority order, on the first live flight:
 
-After the run completes, chunk 9 rewrites this section with session 57's own watch list. Then
-live-fly, watching **both** lists — session 56's below has still never been re-flown against its
-own fixes in isolation.
+1. **Every** loss episode should now show `[VISREC]` lines after 12s, including clear-front ones.
+   Diagnosing flight: 56 of 86 episodes ran zero matches. Expect that count to go to **zero**.
+2. A `[VISREC]` line reading `closer=LKG` while a back-off was pending → the hold should fire and
+   **no** BACKOFF should follow. This is the operator-reported 08:51 symptom, directly.
+3. `size=` versus `scale=` on the same lines — does the spread ratio hold steady where `scale` swung
+   `0.27 → 1.85` within one second on the diagnosing flight?
+4. `LOST_VISUAL_HOLD` notices should appear and NOT repeat every tick.
+5. No two back-offs inside one loss episode should land closer together than `loss_backoff_grace_s` —
+   the restamp is what enforces this now that the one-shot ticket is gone from this path.
+6. Corner-tour goals should draw **blue** on the map panel; frontier goals stay yellow.
+7. If `diag.ply_sequence` is turned on, `OUTPUT/diag/<ts>_plyseq/` should fill, `markers.json` should
+   be written, and the first five markers should sit at identical world coordinates in an early and a
+   late frame. (Off by default — leave off for an ordinary flight, ~1.2GB/flight.)
+8. **Session 56's own watch list below still applies in full** — this is still its first live flight.
 
 ### Session 56's watch list (still current — its fixes were flown once, on 2026-09-03)
 Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-freeze.md`:

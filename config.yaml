@@ -432,6 +432,12 @@ autonomy:
     visrec_planar_inlier_ratio: 0.85      # inlier fraction of all good matches to call a match "planar-like" (nose-to-a-flat-surface)
     visrec_contain_margin_frac: 0.02      # slack (fraction of frame size) for the corner-containment test (zoomed-in-crop verdict)
     visrec_close_scale: 1.15              # homography linear scale >= this => the live frame is magnified (closer) => BACKOFF
+    visrec_size_ratio_hi: 1.25    # session 57: inlier-SPREAD ratio (live/LKG) above this => the live frame is
+                                  #   MAGNIFIED => we moved CLOSER => a pending back-off is justified.
+    visrec_size_ratio_lo: 0.80    # session 57: below this (= 1/1.25) the LKG frame is the closer one => we are
+                                  #   already farther than the evidence describes => HOLD, never back off.
+    visrec_size_min_inliers: 20   # session 57: a direction verdict resting on fewer inliers than this is "not
+                                  #   sure" -> UNKNOWN, which never suppresses a back-off (weak CV must not veto).
     visrec_turn_step_deg: 15.0            # the probe's discrete open-loop rotation step (operator's exact value; independent of
                                           #   recovery_turn_step_deg below, so FALLBACK's own sweep structure is never altered)
     visrec_max_rotation_deg: 720.0        # cumulative probe budget (2 full rotations) before "exhausted" -> hand off to FALLBACK
@@ -581,6 +587,10 @@ diag:
   timeline_map_period_s: 10.0         # autopilot: periodic map-backdrop record appended to the replay
                                        #   timeline (previously emitted ONCE, only at clean shutdown) so a
                                        #   crash still leaves a non-blank map in the report. 0 disables.
+  ply_sequence: false         # session 57: write one .ply per fused SLAM frame, for a Blender build-up animation.
+                              #   OFF by default -- roughly 1.2 GB per flight.
+  ply_sequence_markers: 5     # session 57: freeze the first N committed goals into EVERY ply as alignment anchors.
+  ply_sequence_max: 2000      # session 57: hard file cap per flight (mirrors visrec_save_max's bounded-disk rule).
 
 runtime:
   # NO SILENT FALLBACKS: these flags are surfaced in the visualizer overlay + logs.

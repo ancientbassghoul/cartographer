@@ -23,6 +23,7 @@ any failure raises. There is no CPU fallback.
 """
 
 import argparse
+import json
 import math
 import os
 import time
@@ -43,6 +44,11 @@ from diag_log import DiagLog, NullLog
 REPO = os.path.dirname(os.path.abspath(__file__))
 
 MAP_GRID = 200              # resolution of the compact top-down occupancy summary on TOPIC_MAP
+
+# Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
+# frame of the PLY sequence (Pipeline._record_ply_marker / _write_frame_ply) so a Blender viewer can
+# always tell which anchor is which without reading markers.json.
+PLY_MARKER_COLORS = [(255, 0, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255), (255, 128, 0)]
 
 
 def load_config(path=None):
@@ -191,6 +197,15 @@ class Pipeline:
         # to the freshest message" loop dropped a published plan -- something the NDI frame_id can't show,
         # since that only reveals camera-side skips. Rides every plan payload as "slam_seq".
         self._slam_seq = 0
+
+        # Session 57: per-SLAM-frame PLY sequence (Blender build-up animation), config-gated OFF by
+        # default (diag.ply_sequence, ~1.2 GB/flight) -- see run_live for the writer hook and
+        # _record_ply_marker below for the frozen goal-anchor markers baked into every frame so the
+        # sequence stays spatially aligned when opened as a stack in Blender.
+        self.ply_markers = []          # list[dict], record shape in _record_ply_marker; append-only, capped
+        self.ply_seq_failures = 0      # count of frame-PLY writes that raised
+        self.ply_seq_degraded = False  # sticky: True on the first failure, never cleared
+        self.ply_sequence_markers = int((cfg.get("diag") or {}).get("ply_sequence_markers", 5))
 
     def enable_diag(self, ts=None, out_dir=None):
         """Open CSV diagnostic logs (per-frame timing + per-lift hit geometry)."""
@@ -478,10 +493,36 @@ class Pipeline:
         payload["n_frontiers"], payload["done"] = n_frontiers, done
         if goal is not None:
             payload["goal"] = [round(float(goal[0]), 4), round(float(goal[1]), 4)]
+            self._record_ply_marker(payload["goal"], payload.get("pos_y"))
             bearing = math.degrees(math.atan2(goal[0] - pos[0], goal[1] - pos[1]))
             payload["bearing_deg"] = round(bearing, 2)
             payload["bearing_err"] = round(_wrap180(bearing - heading_deg), 2)
         return payload
+
+    def _record_ply_marker(self, goal_xz, pos_y) -> None:
+        """Session 57: freeze the first N distinct committed goals as PLY alignment anchors.
+
+        No-op when: the list is already at `self.ply_sequence_markers`, `goal_xz` is None, `pos_y` is
+        None, or `goal_xz` equals the most recently recorded goal (dedupe on CHANGE, so a goal held
+        across many plans is recorded once). Once appended a record is NEVER modified except for
+        `first_frame`, which the writer stamps on the first PLY that carries it.
+        """
+        if goal_xz is None or pos_y is None:
+            return
+        if len(self.ply_markers) >= self.ply_sequence_markers:
+            return
+        gx, gz = float(goal_xz[0]), float(goal_xz[1])
+        if self.ply_markers and self.ply_markers[-1]["goal_xz"] == [gx, gz]:
+            return
+        idx = len(self.ply_markers)
+        rgb = list(PLY_MARKER_COLORS[idx % len(PLY_MARKER_COLORS)])
+        self.ply_markers.append({
+            "goal_index": idx,
+            "goal_xz": [gx, gz],
+            "xyz": [gx, float(pos_y), gz],
+            "rgb": rgb,
+            "first_frame": None,
+        })
 
     # ------------------------------------------------------------- target lift
     def _remember_pose(self, fid: int, pose: np.ndarray):
@@ -616,6 +657,30 @@ def _checkpoint_livemap(pipe, out_dir, ts, min_count=2):
     return png_final, npz_final, ply_final
 
 
+def _write_frame_ply(pipe, seq_dir, frame_idx: int, min_count: int = 2):
+    """Session 57: write ONE .ply for the current fused map state, for a Blender build-up animation.
+
+    Path: `seq_dir / f"frame_{frame_idx:05d}.ply"`. Binary. Includes trajectory and every marker
+    recorded so far; stamps `first_frame` on any marker whose value is still None. Returns the
+    written Path. Raises OSError on failure -- the CALLER owns the loud-and-counted handling,
+    mirroring the periodic-checkpoint pattern in run_live."""
+    path = seq_dir / f"frame_{frame_idx:05d}.ply"
+    markers = [(tuple(m["xyz"]), tuple(m["rgb"])) for m in pipe.ply_markers]
+    pipe.mapstore.save_ply(path, min_count=min_count, trajectory=True, markers=markers, binary=True)
+    for m in pipe.ply_markers:
+        if m["first_frame"] is None:
+            m["first_frame"] = frame_idx
+    return path
+
+
+def _write_markers_sidecar(pipe, seq_dir):
+    """Session 57: rewrite `markers.json` (every marker recorded so far) -- called whenever
+    Pipeline._record_ply_marker appends a new one, and once more at shutdown, so a crash mid-flight
+    still leaves the alignment anchors on disk for whatever frames DID get written."""
+    with open(seq_dir / "markers.json", "w", encoding="utf-8") as f:
+        json.dump({"markers": pipe.ply_markers}, f, indent=2)
+
+
 def _show_and_quit(panel, pipe, map_updated, show):
     """Render the top-down map window and return True if the user pressed 'q'. (`panel` is always
     None since the DA-V2 depth panel was removed; kept in the signature for call-site symmetry.)"""
@@ -639,6 +704,15 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
     # Session 55 (H2): periodic durable map checkpoint -- see _checkpoint_livemap's docstring.
     livemap_checkpoint_period_s = float((cfg.get("diag") or {}).get("livemap_checkpoint_period_s", 60.0))
     last_checkpoint_t = time.monotonic()
+    # Session 57: per-SLAM-frame PLY sequence (Blender build-up animation) -- OFF by default (diag.
+    # ply_sequence, ~1.2 GB/flight). seq_dir is created only when enabled.
+    ply_sequence = bool((cfg.get("diag") or {}).get("ply_sequence", False))
+    ply_sequence_max = int((cfg.get("diag") or {}).get("ply_sequence_max", 2000))
+    seq_dir = out_dir / f"{ts}_plyseq"
+    if ply_sequence:
+        seq_dir.mkdir(parents=True, exist_ok=True)
+    ply_frame_idx = 0
+    ply_seq_cap_logged = False   # one-shot, mirrors autopilot.py's visrec_cap_logged
     pipe = Pipeline(cfg, conf_thresh=conf_thresh, debug_lift=debug_lift)
     if log:
         pipe.enable_diag(ts=ts)
@@ -756,7 +830,26 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
                         pipe.planner.last_loop_event = None
                 ap = apevent_sub.recv(timeout_ms=0)
 
+            n_ply_markers_before = len(pipe.ply_markers)
             _, _, panel, map_updated = pipe.step(frame, meta, state_pub, show)
+            if ply_sequence and len(pipe.ply_markers) > n_ply_markers_before:
+                _write_markers_sidecar(pipe, seq_dir)
+
+            if ply_sequence and map_updated and ply_frame_idx < ply_sequence_max:
+                try:
+                    _write_frame_ply(pipe, seq_dir, ply_frame_idx)
+                    ply_frame_idx += 1
+                except OSError as exc:
+                    pipe.ply_seq_failures += 1
+                    pipe.ply_seq_degraded = True
+                    print(f"*** CRITICAL: frame PLY #{ply_frame_idx} FAILED ({exc}) -- "
+                          f"{pipe.ply_seq_failures} failure(s) so far; the flight continues but the PLY "
+                          f"sequence is INCOMPLETE ***", flush=True)
+            elif (ply_sequence and map_updated and ply_frame_idx >= ply_sequence_max
+                  and not ply_seq_cap_logged):
+                ply_seq_cap_logged = True
+                print(f"*** PLY sequence cap reached (ply_sequence_max={ply_sequence_max}) -> no "
+                      f"further frame PLYs written ***", flush=True)
 
             # Drain any target detections and lift them into the map.
             d = det_sub.recv(timeout_ms=0)
@@ -807,6 +900,10 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
         print(f"[perception] top-down (flight path + target marks) -> {png}")
         print(f"[perception] voxel map -> {npz}")
         print(f"[perception] point cloud + flight path + targets (.ply, Blender-loadable) -> {ply}")
+        if ply_sequence:
+            _write_markers_sidecar(pipe, seq_dir)
+            print(f"[perception] PLY sequence ({ply_frame_idx} frame(s)"
+                  f"{', DEGRADED -- see CRITICAL lines above' if pipe.ply_seq_degraded else ''}) -> {seq_dir}")
         pipe.close_diag()
         frame_sub.close()
         state_pub.close()
@@ -990,6 +1087,11 @@ def run_self_test(cfg):
     ok = _self_test_checkpoint_livemap()
     print(f"[perception][self-test] {'PASS' if ok else 'FAIL'}  session 55 (H2) livemap checkpoint")
     assert ok
+
+    ok_ply = _self_test_ply_sequence(cfg)
+    print(f"[perception][self-test] {'PASS' if ok_ply else 'FAIL'}  SESSION-57 PLY SEQUENCE")
+    assert ok_ply
+
     print("[perception][self-test] PASS")
 
 
@@ -1039,6 +1141,129 @@ def _self_test_checkpoint_livemap():
     finally:
         import shutil as _shutil
         _shutil.rmtree(tmp_dir, ignore_errors=True)
+    return ok
+
+
+def _self_test_ply_sequence(cfg):
+    """SESSION-57 PLY SEQUENCE: the per-SLAM-frame PLY writer, its frozen goal-anchor markers, and
+    the loud-and-counted failure path diagnosed as missing in the mission's crash-survivability pass
+    (session 55) but never exercised for THIS artifact. No GPU/SLAM needed: MapStore + TargetEstimator
+    duck-typed as a Pipeline substitute (mirrors _self_test_checkpoint_livemap) -- _write_frame_ply only
+    touches pipe.mapstore / pipe.ply_markers, and _record_ply_marker only touches pipe.ply_markers /
+    pipe.ply_sequence_markers."""
+    import tempfile
+    import types
+    from pathlib import Path
+    import numpy as np
+    from map_store import MapStore
+    from target_estimator import TargetEstimator
+
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    def _make_pipe(markers_cap=5):
+        p = types.SimpleNamespace(mapstore=MapStore(0.1), estimator=TargetEstimator())
+        pts = np.array([[1.0, 0.0, 1.0], [2.0, 0.0, 2.0]], np.float64)
+        p.mapstore.integrate(pts)
+        p.mapstore.integrate(pts)   # 2nd observation -> passes _write_frame_ply's default min_count=2
+        p.mapstore.add_pose(np.array([0.0, 0.0, 0.0]))
+        p.ply_markers = []
+        p.ply_seq_failures = 0
+        p.ply_seq_degraded = False
+        p.ply_sequence_markers = markers_cap
+        p._record_ply_marker = types.MethodType(Pipeline._record_ply_marker, p)
+        return p
+
+    p1 = _make_pipe()
+    p1._record_ply_marker([1.0, 2.0], 0.5)
+    p1._record_ply_marker([1.0, 2.0], 0.5)
+    p1._record_ply_marker([1.0, 2.0], 0.5)
+    p1._record_ply_marker([3.0, 4.0], 0.6)
+    check("marker_dedupes_on_change -- same goal x3 -> 1 record, new goal -> 2nd",
+          len(p1.ply_markers) == 2)
+
+    p2 = _make_pipe(markers_cap=2)
+    p2._record_ply_marker([1.0, 1.0], 0.0)
+    p2._record_ply_marker([2.0, 2.0], 0.0)
+    p2._record_ply_marker([3.0, 3.0], 0.0)
+    check("marker_cap_respected -- cap=2, 3rd distinct goal ignored", len(p2.ply_markers) == 2)
+
+    p3 = _make_pipe()
+    p3._record_ply_marker(None, 0.5)
+    p3._record_ply_marker([1.0, 1.0], None)
+    check("marker_skips_none -- goal_xz=None or pos_y=None appends nothing", len(p3.ply_markers) == 0)
+
+    p4 = _make_pipe()
+    p4._record_ply_marker([5.0, 7.0], 1.25)
+    xyz_ok = p4.ply_markers[0]["xyz"] == [5.0, 1.25, 7.0]
+    check(f"marker_xyz_shape -- xyz=[goal_x,pos_y,goal_z] ({p4.ply_markers[0]['xyz']})", xyz_ok)
+
+    rec_dtype = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                          ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+
+    def _tail_marker_xyz(raw, n=7):
+        hdr_end = raw.index(b"end_header\n") + len(b"end_header\n")
+        arr = np.frombuffer(raw[hdr_end:], dtype=rec_dtype)
+        tail = arr[-n:]
+        return np.stack([tail["x"], tail["y"], tail["z"]], axis=1)
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        p5 = _make_pipe()
+        seq5 = td / "seq5"
+        seq5.mkdir()
+        out5 = _write_frame_ply(p5, seq5, 0)
+        raw5 = out5.read_bytes()
+        check("frame_ply_written -- non-empty frame_00000.ply, binary header",
+              out5.exists() and out5.name == "frame_00000.ply" and len(raw5) > 0
+              and raw5.startswith(b"ply\nformat binary_little_endian 1.0\n"))
+
+        p6 = _make_pipe()
+        p6._record_ply_marker([1.0, 2.0], 0.5)
+        seq6 = td / "seq6"
+        seq6.mkdir()
+        out6_0 = _write_frame_ply(p6, seq6, 0)
+        out6_1 = _write_frame_ply(p6, seq6, 1)
+        same_coords = np.array_equal(_tail_marker_xyz(out6_0.read_bytes()),
+                                     _tail_marker_xyz(out6_1.read_bytes()))
+        check("markers_identical_across_frames -- marker vertices byte-identical across frames",
+              same_coords)
+        check("first_frame_stamped_once -- every marker's first_frame == 0 after frames 0,1",
+              all(m["first_frame"] == 0 for m in p6.ply_markers))
+
+        p8 = _make_pipe()
+        p8._record_ply_marker([1.0, 1.0], 0.0)
+        p8._record_ply_marker([2.0, 2.0], 0.0)
+        seq8 = td / "seq8"
+        seq8.mkdir()
+        _write_markers_sidecar(p8, seq8)
+        with open(seq8 / "markers.json", "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        check("sidecar_matches -- markers.json round-trips pipe.ply_markers",
+              loaded == {"markers": p8.ply_markers})
+
+        p9 = _make_pipe()
+        bad_dir = td / "does_not_exist"       # never created -> save_ply's open() raises OSError
+        try:
+            _write_frame_ply(p9, bad_dir, 0)
+        except OSError:
+            p9.ply_seq_failures += 1
+            p9.ply_seq_degraded = True
+        check("failure_is_counted -- OSError on a missing dir increments ply_seq_failures + degrades",
+              p9.ply_seq_failures == 1 and p9.ply_seq_degraded is True)
+
+        ply_sequence_default = bool((cfg.get("diag") or {}).get("ply_sequence", False))
+        seq10 = td / "seq10_never_created"
+        if ply_sequence_default:
+            seq10.mkdir(parents=True, exist_ok=True)   # mirrors run_live's gating
+        check("disabled_writes_nothing -- config default ply_sequence=False -> dir never created",
+              (not ply_sequence_default) and not seq10.exists())
+
     return ok
 
 

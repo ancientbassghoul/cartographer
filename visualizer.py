@@ -274,9 +274,10 @@ _CLS_FREE, _CLS_FRONTIER = 1, 3
 
 def overlay_plan(img, plan, m, size):
     """Overlay the Map-mode plan on the (world-aligned) map panel: explored-FREE cells (dim),
-    FRONTIER cells (cyan), the current goal (yellow star), and a heading arrow at the drone — all
-    projected through the SAME TOPIC_MAP bounds as the occupancy map so they line up. Also surfaces a
-    degraded plan (PLAN-STALE) rather than hiding it (NO SILENT FALLBACKS)."""
+    FRONTIER cells (cyan), the current goal (blue star if a bbox-corner-tour goal, else yellow star),
+    and a heading arrow at the drone — all projected through the SAME TOPIC_MAP bounds as the
+    occupancy map so they line up. Also surfaces a degraded plan (PLAN-STALE) rather than hiding it
+    (NO SILENT FALLBACKS)."""
     if not plan or not m or not m.get("bounds"):
         return
     x0, x1, z0, _z1 = m["bounds"]
@@ -326,7 +327,10 @@ def overlay_plan(img, plan, m, size):
             cv2.drawMarker(img, (px, py), (0, 0, 255), cv2.MARKER_DIAMOND, 20, 1)
     if goal is not None:
         gu, gv = to_px_vec(np.array([goal[0]]), np.array([goal[1]]))
-        cv2.drawMarker(img, (int(gu[0]), int(gv[0])), (0, 255, 255), cv2.MARKER_STAR, 18, 2)
+        # Session 57: a bbox-corner-tour goal (planner.sweeping) is drawn BLUE instead of the usual
+        # frontier YELLOW, so the operator can tell at a glance which behaviour picked this goal.
+        goal_bgr = (255, 0, 0) if plan.get("goal_is_corner") else (0, 255, 255)   # corner = BLUE, frontier = yellow
+        cv2.drawMarker(img, (int(gu[0]), int(gv[0])), goal_bgr, cv2.MARKER_STAR, 18, 2)
     clr = plan.get("forward_clearance_dist")
     if pos is not None and plan.get("heading_deg") is not None:
         h = np.radians(plan["heading_deg"])     # 0 = +Z, +90 = +X
@@ -609,8 +613,51 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
             pass
 
 
+# ==============================================================================
+# Self-test: deterministic synthetic overlay_plan calls (no window, no socket, no hardware).
+# ==============================================================================
+def run_self_test():
+    ok = True
+
+    def case(name, good):
+        nonlocal ok
+        ok = ok and good
+        print(f"[self-test] {'PASS' if good else 'FAIL'}  {name}")
+
+    def has_bgr(img, bgr):
+        return bool(np.any(np.all(img == np.array(bgr, dtype=np.uint8), axis=-1)))
+
+    size = 200
+    m = {"bounds": (0.0, 10.0, 0.0, 10.0), "grid": 50}
+
+    # SESSION-57 CORNER GOAL COLOUR: a bbox-corner-tour goal (goal_is_corner=True) must draw a pure
+    # BLUE star and no yellow; a frontier goal (False, or the key absent) must draw yellow and no blue.
+    img_corner = np.zeros((size, size, 3), dtype=np.uint8)
+    overlay_plan(img_corner, {"goal": (5.0, 5.0), "goal_is_corner": True}, m, size)
+    case(f"(57-1) corner_goal_is_blue (blue={has_bgr(img_corner, (255, 0, 0))} "
+         f"yellow={has_bgr(img_corner, (0, 255, 255))})",
+         has_bgr(img_corner, (255, 0, 0)) and not has_bgr(img_corner, (0, 255, 255)))
+
+    img_frontier = np.zeros((size, size, 3), dtype=np.uint8)
+    overlay_plan(img_frontier, {"goal": (5.0, 5.0), "goal_is_corner": False}, m, size)
+    case(f"(57-2) frontier_goal_is_yellow (yellow={has_bgr(img_frontier, (0, 255, 255))} "
+         f"blue={has_bgr(img_frontier, (255, 0, 0))})",
+         has_bgr(img_frontier, (0, 255, 255)) and not has_bgr(img_frontier, (255, 0, 0)))
+
+    img_missing = np.zeros((size, size, 3), dtype=np.uint8)
+    overlay_plan(img_missing, {"goal": (5.0, 5.0)}, m, size)
+    case(f"(57-3) missing_flag_defaults_yellow (yellow={has_bgr(img_missing, (0, 255, 255))} "
+         f"blue={has_bgr(img_missing, (255, 0, 0))})",
+         has_bgr(img_missing, (0, 255, 255)) and not has_bgr(img_missing, (255, 0, 0)))
+
+    print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description="Cartographer visualizer (P3): live map + telemetry dashboard")
+    ap.add_argument("--self-test", action="store_true",
+                    help="synthetic overlay_plan colour validation, no window/socket/hardware")
     ap.add_argument("--config", default=None)
     ap.add_argument("--no-frame", action="store_true",
                     help="don't subscribe to the frame bus (skip the live input panel)")
@@ -624,6 +671,8 @@ def main():
                          "the --record video properly) instead of being hard-terminated by a "
                          "launcher. Mirrors autopilot.py's --stop-file.")
     args = ap.parse_args()
+    if args.self_test:
+        raise SystemExit(0 if run_self_test() else 1)
     # A stale sentinel from a crashed prior run would stop us instantly -- clear it before we start.
     if args.stop_file and os.path.exists(args.stop_file):
         try:

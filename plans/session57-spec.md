@@ -533,9 +533,77 @@ actually computed for a matured PLAN-LOST episode). Contracts C5, C6.
 **Verify.** `python autopilot.py --self-test`, `python visual_recovery.py --self-test`,
 `python frontier_planner.py --self-test`, `python flight_replay.py --self-test`.
 
+**Known consequence, fixed by chunk 5 — do not try to fix it here.** The one-shot ticket was
+implicitly acting as the 15° probe's grace gate: because it was almost always spent on the opening
+PLAN-LOST tick, `_step_stale`'s `if not self._loss_snapshot_checked:` guard skipped the *ungated*
+Step-2c hand-off, and the grace-checking late entry (`_maybe_enter_visual_probe`) handled the probe
+instead. Removing the ticket from this path exposes that ungated hand-off, so
+`SESSION-52 chunk 4 visual-probe reachability` will fail on
+`probe waits out the grace before turning`. Two `SESSION-47` sub-assertions will also fail, because
+the restamp replaced `_backoff_resolve_since` on this path by design. **Both are expected after chunk
+4 and are chunk 5's job.** Report them; do not paper over them, and do not edit those two blocks here.
+
 ---
 
-## CHUNK 5 — direction gate on the PLAN-STALE visual trigger
+## CHUNK 5 — probe grace on the Step-2c hand-off, and re-scope the session-47 test
+
+**Module Objective.** Close the one real defect chunk 4 exposed (the 15° probe can now turn the drone
+without waiting out the loss-recovery grace), and point the session-47 test block at the path where
+its mechanism still lives. After this chunk the tree must be fully green again.
+
+**Required Context/Dependencies.** Chunk 4 applied. Note the tree is currently RED — exactly two
+`autopilot.py` FAIL lines, `SESSION-47 post-backoff re-solve gate` and
+`SESSION-52 chunk 4 visual-probe reachability`. Those two, and only those two, are what this chunk
+clears. Confirm that baseline before editing.
+
+**Target Files.** `autopilot.py`.
+
+**Strict Interfaces.**
+
+**Fix A — the probe must wait out the grace on EVERY entry path.** Anchor on the source string
+`if status != "PLAN-STALE":` inside `_maybe_loss_snapshot_backoff`. Before the
+`_enter_visual_recovery(...)` hand-off below it, require the grace to have elapsed, and return `None`
+inside the grace so the caller falls through to its hard hover-hold. **Reuse
+`_maybe_enter_visual_probe`'s existing condition verbatim** —
+`self._loss_episode_t0 is not None and now - self._loss_episode_t0 < self.loss_backoff_grace_s` —
+rather than writing a second variant of the same rule. Comment it as session 57: a probe TURNS, and
+session 48's measurement (2066 loss episodes; 96.9% of held-still losses resolve inside the grace) is
+why nothing physical may happen before the window elapses. The ticket used to enforce this
+implicitly; now it is enforced explicitly, at the hand-off itself.
+
+**Fix B — re-scope `SESSION-47 post-backoff re-solve gate`.** Four of its nine sub-assertions
+currently fail: `next loss edge SUPPRESSED`, `post-backoff solve re-enables`, `budget holds`,
+`budget timeout is LOUD`. All four exercise `_backoff_resolve_since`, which session 57 replaced on the
+PLAN-LOST path with the `_loss_episode_t0` restamp, and which is untouched on the PLAN-STALE path.
+Drive those four through a **PLAN-STALE** loss instead of a PLAN-LOST one. **Do not delete them, do
+not relax their thresholds, and do not touch the five that already pass.** Then add exactly one new
+sub-assertion recording PLAN-LOST's replacement protection: a PLAN-LOST back-off restamps
+`_loss_episode_t0`, and no second back-off fires until the grace re-elapses. Chunk 4's
+`restamp_blocks_immediate_refire` already proves the mechanism — cross-reference it in a comment
+rather than duplicating the scenario.
+
+**STOP AND REPORT, do not work around, if:** the resolve gate turns out to be unreachable on the
+PLAN-STALE path as well. That would be a second real defect rather than a test-scoping problem, and it
+needs a design conversation, not a passing test. Say so plainly and leave the block failing.
+
+**Acceptance Tests.**
+
+1. `SESSION-52 chunk 4 visual-probe reachability` — passes with
+   `probe waits out the grace before turning=True`, and its other four sub-assertions unchanged.
+2. `SESSION-47 post-backoff re-solve gate` — passes with all nine original sub-assertions plus the one
+   new restamp assertion.
+3. `probe_inside_grace_holds` — a fresh PLAN-STALE loss inside the grace returns `HOLD_LOST` and does
+   NOT enter `VISUAL_RECOVERY`; past the grace it does. Assert the state, not just the absence of a
+   turn.
+4. `no_second_grace_variant` — grep the module and assert the grace comparison against
+   `loss_backoff_grace_s` appears in at most the two intended places, so Fix A did not fork the rule.
+
+**Verify.** All eight suites under the project venv, **0 failures** — the tree must be green again
+before chunk 6 runs.
+
+---
+
+## CHUNK 6 — direction gate on the PLAN-STALE visual trigger
 
 **Module Objective.** Fix Finding 2 on the remaining path. One conjunct, applied twice.
 
@@ -573,7 +641,7 @@ unreadable.
 
 ---
 
-## CHUNK 6 — corner (bounding-box) goals drawn blue, and a visualizer self-test
+## CHUNK 7 — corner (bounding-box) goals drawn blue, and a visualizer self-test
 
 **Module Objective.** Distinguish bbox corner-tour goals from frontier goals on the map panel, and
 give `visualizer.py` the self-test entry point it currently lacks.
@@ -615,7 +683,7 @@ give `visualizer.py` the self-test entry point it currently lacks.
 
 ---
 
-## CHUNK 7 — binary PLY writer with marker clusters
+## CHUNK 8 — binary PLY writer with marker clusters
 
 **Module Objective.** Teach `MapStore.save_ply` to emit binary PLY and to embed marker clusters.
 Pure writer work — no caller changes.
@@ -658,12 +726,12 @@ to prove nothing upstream regressed.
 
 ---
 
-## CHUNK 8 — per-SLAM-frame PLY sequence in perception
+## CHUNK 9 — per-SLAM-frame PLY sequence in perception
 
 **Module Objective.** Emit one PLY per fused SLAM frame with frozen goal anchors, plus the sidecar
 manifest, behind an off-by-default config flag, with loud counted failure handling.
 
-**Required Context/Dependencies.** Chunk 7 (`save_ply` accepts `markers=` and `binary=`).
+**Required Context/Dependencies.** Chunk 8 (`save_ply` accepts `markers=` and `binary=`).
 Contracts C10, C11 (the `diag:` keys).
 
 **Target Files.** `config.yaml`, `perception_worker.py`.
@@ -728,12 +796,12 @@ that helper already does — leave no files in `OUTPUT/diag/`.
 
 ---
 
-## CHUNK 9 — documentation and resume state
+## CHUNK 10 — documentation and resume state
 
 **Module Objective.** Leave the tree self-describing so the next session can resume cold from
 `STATE.md` alone. Mandated by `CLAUDE.md` — a plan is not complete until this is done.
 
-**Required Context/Dependencies.** Chunks 1-8 applied.
+**Required Context/Dependencies.** Chunks 1-9 applied.
 
 **Target Files.** `plans/session57-planlost-recovery-and-direction-aware-lkg.md` (new),
 `PROGRESS.md`, `STATE.md`.
@@ -742,8 +810,16 @@ that helper already does — leave no files in `OUTPUT/diag/`.
 
 - **New plan file.** Follow the structure of `plans/session56-settle-gate-currency-and-lkg-freeze.md`:
   Origin (the flight, the three findings with their real log lines and the 30-vs-56 episode counts),
-  Design (one section per contract group), Traps caught, Files touched, Verification. Record the two
-  ideas that were considered and dropped, so they are not re-proposed:
+  Design (one section per contract group), Traps caught, Files touched, Verification.
+  **The trap this session actually hit, and must record:** the one-shot ticket was implicitly acting
+  as the 15° probe's grace gate — spent on the opening PLAN-LOST tick, it made `_step_stale` skip the
+  *ungated* Step-2c hand-off so the grace-checking late entry handled the probe instead. Removing the
+  ticket from the PLAN-LOST path exposed that ungated hand-off, and a probe that TURNS could fire at
+  t=0.1 s of a loss. Caught by `SESSION-52 chunk 4 visual-probe reachability` failing on
+  `probe waits out the grace before turning`; fixed in chunk 5 by enforcing the grace explicitly at
+  the hand-off. Lesson worth the words: a one-shot latch that gates several consumers is load-bearing
+  for all of them, and removing it from one path silently un-gates the others.
+  Also record the two ideas that were considered and dropped, so they are not re-proposed:
   - a general CV veto over clearance decisions — unsound, because LKG matching is not continuously
     active and therefore cannot continuously veto anything;
   - any raycast change — investigated and cleared. `MapStore.clearance` is a flat HORIZONTAL fan with

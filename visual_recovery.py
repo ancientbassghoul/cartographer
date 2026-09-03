@@ -42,13 +42,27 @@ BANNER_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 @dataclass
 class VisualMatch:
-    """One verdict from matching a live frame against F_LKG (the cached last-known-good frame)."""
+    """One verdict from matching a live frame against F_LKG (the cached last-known-good frame).
+
+    Session 57: `scale` (the homography's linear determinant) is a poor direction estimator on its
+    own -- diagnosed off a real flight where it read 1.44 -> 1.31 -> 0.53 -> 0.59 -> 0.67 -> 1.33 ->
+    1.85 within one second on ~30 inliers, because it conflates perspective foreshortening with a
+    weak-fit homography. `spread_lkg`/`spread_live`/`size_ratio`/`closer` add a LINEAR, RANSAC-inlier-
+    only measure (RMS distance from centroid) of how much screen area the matched features actually
+    span in each frame -- far less sensitive to one stray inlier, and directly answers "which frame is
+    the feature cluster bigger in" without going through a projective determinant at all. `scale` is
+    kept (never removed) so the two estimators can be compared side by side on real flights."""
     has_lkg: bool                  # a reference frame exists to match against at all
     matched: bool = False          # inliers >= min_inliers
     inliers: int = 0
     contained: bool = False        # F_live is a zoomed-in crop of F_LKG (2a: nose closer to the same surface)
     planar_like: bool = False      # high inlier ratio -> nose-to-a-flat-surface (2b)
     scale: float | None = None     # homography linear scale (LKG->live); only meaningful when matched
+    # --- session 57 ---
+    spread_lkg: float | None = None    # RMS px distance of INLIER keypoints from their centroid, in F_LKG
+    spread_live: float | None = None   # same, in the live frame
+    size_ratio: float | None = None    # spread_live / spread_lkg; None unless both spreads are usable
+    closer: str = "UNKNOWN"            # "LIVE" | "LKG" | "EQUAL" | "UNKNOWN"
     debug_image: "np.ndarray | None" = None   # BGR canvas (F_LKG | live + inliers), only when debug=True
 
 
@@ -57,10 +71,17 @@ class VisualRecoveryProbe:
     See the module docstring for why this is CPU-only SIFT, copied (not imported) from
     `benchmark_detectors.SiftDetector`."""
 
-    def __init__(self, *, min_inliers=SIFT_MIN_INLIERS, planar_inlier_ratio=0.85, contain_margin_frac=0.02):
+    def __init__(self, *, min_inliers=SIFT_MIN_INLIERS, planar_inlier_ratio=0.85,
+                 contain_margin_frac=0.02,
+                 size_ratio_hi: float = 1.25, size_ratio_lo: float = 0.80,
+                 size_min_inliers: int = 20):
         self.min_inliers = int(min_inliers)
         self.planar_inlier_ratio = float(planar_inlier_ratio)
         self.contain_margin_frac = float(contain_margin_frac)
+        # --- session 57: inlier-spread direction verdict thresholds, see `match()`'s `closer` field ---
+        self.size_ratio_hi = float(size_ratio_hi)
+        self.size_ratio_lo = float(size_ratio_lo)
+        self.size_min_inliers = int(size_min_inliers)
         self.sift = cv2.SIFT_create()
         self.matcher = cv2.BFMatcher(cv2.NORM_L2)
         self._lkg = None    # cached BGR frame (last known good — SLAM was TRACKING when it was captured)
@@ -123,6 +144,21 @@ class VisualRecoveryProbe:
         return self.sift.detectAndCompute(gray, None)
 
     @staticmethod
+    def _inlier_spread(points: "np.ndarray") -> float | None:
+        """RMS distance of `points` (N,2 float) from their centroid, in pixels.
+
+        Returns None when fewer than 2 points, or when the result is not finite.
+        A LINEAR measure of how much screen area the matched features span -- directly comparable
+        to the homography `scale`, but far less sensitive to one stray inlier than a hull area.
+        """
+        if points is None or len(points) < 2:
+            return None
+        centroid = points.mean(axis=0)
+        d = np.sqrt(np.mean(np.sum((points - centroid) ** 2, axis=1)))
+        val = float(d)
+        return val if np.isfinite(val) else None
+
+    @staticmethod
     def _pad_to_height(img, target_h):
         """Zero-pad `img` at the bottom to `target_h` rows — NEVER resize/scale (IMAGE INTEGRITY,
         CLAUDE.md). A no-op when `img` is already tall enough."""
@@ -155,10 +191,12 @@ class VisualRecoveryProbe:
             body = np.hstack([self._pad_to_height(lkg, h_max), self._pad_to_height(frame, h_max)])
         banner_strip = np.zeros((BANNER_H, body.shape[1], 3), dtype=np.uint8)
         scale_txt = f"{out.scale:.2f}" if out.scale is not None else "n/a"
+        ratio_txt = f"{out.size_ratio:.2f}" if out.size_ratio is not None else "n/a"
         line1 = banner or ""
         age_txt = f"{time.monotonic() - self._lkg_t:.1f}s" if self._lkg_t is not None else "n/a"
         line2 = (f"has_lkg={out.has_lkg} matched={out.matched} inliers={out.inliers} "
                  f"contained={out.contained} planar_like={out.planar_like} scale={scale_txt} "
+                 f"size={ratio_txt} closer={out.closer} "
                  f"lkg_src={self._lkg_src} age={age_txt}")
         cv2.putText(banner_strip, line1, (6, 13), BANNER_FONT, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(banner_strip, line2, (6, 29), BANNER_FONT, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
@@ -184,7 +222,13 @@ class VisualRecoveryProbe:
         descriptors, <4 good matches, a degenerate homography, or a match below `min_inliers`), since
         seeing exactly where/why the match failed is the whole point of the window. `banner` is an
         optional caller-supplied context line (e.g. FSM state + plan status) rendered verbatim on the
-        canvas; it never affects the match itself."""
+        canvas; it never affects the match itself.
+
+        Session 57: once matched, also computes `spread_lkg`/`spread_live` (RMS distance of the RANSAC
+        INLIER points from their centroid, in each frame) and derives `size_ratio = spread_live /
+        spread_lkg` and a `closer` verdict ("LIVE" | "LKG" | "EQUAL" | "UNKNOWN"). See the `VisualMatch`
+        docstring for why this linear spread measure was added alongside `scale` rather than replacing
+        it."""
         if self._lkg is None or frame is None:
             return VisualMatch(has_lkg=self._lkg is not None)
         kp0, des0 = self._reference_keypoints()      # session 51: memoised per reference, not per call
@@ -219,6 +263,22 @@ class VisualRecoveryProbe:
                                                        banner=banner)
             return out
         out.planar_like = (inliers / float(len(good))) >= self.planar_inlier_ratio
+        # Session 57: direction verdict from RANSAC-inlier spread (see VisualMatch docstring, Finding 3
+        # in the session-57 spec -- `scale` alone is too noisy to gate a physical back-off on).
+        src_in = src.reshape(-1, 2)[mask]      # F_LKG inlier points
+        dst_in = dst.reshape(-1, 2)[mask]      # live inlier points
+        out.spread_lkg = self._inlier_spread(src_in)
+        out.spread_live = self._inlier_spread(dst_in)
+        if (out.spread_lkg is not None and out.spread_live is not None and out.spread_lkg > 1e-6):
+            out.size_ratio = out.spread_live / out.spread_lkg
+            if inliers < self.size_min_inliers:
+                out.closer = "UNKNOWN"
+            elif out.size_ratio > self.size_ratio_hi:
+                out.closer = "LIVE"
+            elif out.size_ratio < self.size_ratio_lo:
+                out.closer = "LKG"
+            else:
+                out.closer = "EQUAL"
         try:
             out.scale = float(np.sqrt(abs(np.linalg.det(H[:2, :2]))))
         except (np.linalg.LinAlgError, ValueError):
@@ -510,6 +570,73 @@ def run_self_test():
          f"unchanged, and does NOT invalidate the reference SIFT memo "
          f"(stored={stored_56}, lkg_still_frameA={lkg_still_frameA}, memo_unchanged={memo_unchanged})",
          stored_56 is False and lkg_still_frameA and memo_unchanged)
+
+    # ---- SESSION 57 SPREAD RATIO — direction-aware "closer" verdict from RANSAC-inlier spread, in
+    # place of the noisy homography `scale` (Finding 3: same flight, same second, ~30 inliers, `scale`
+    # read 1.44 -> 1.31 -> 0.53 -> 0.59 -> 0.67 -> 1.33 -> 1.85). ------------------------------------------
+
+    ref57 = _textured_image(seed=7)
+    h57, w57 = ref57.shape[:2]
+    center57 = (w57 / 2.0, h57 / 2.0)
+
+    # 57-1/2. zoom_in / zoom_out: a KNOWN-scale affine warp about the frame centre (no source resize --
+    # cv2.warpAffine renders the magnified/shrunk content directly into a same-size canvas).
+    zoom_factor = 1.6
+    M_in = cv2.getRotationMatrix2D(center57, 0, zoom_factor)
+    live_zoom_in = cv2.warpAffine(ref57, M_in, (w57, h57), borderMode=cv2.BORDER_REPLICATE)
+    M_out = cv2.getRotationMatrix2D(center57, 0, 1.0 / zoom_factor)
+    live_zoom_out = cv2.warpAffine(ref57, M_out, (w57, h57), borderMode=cv2.BORDER_REPLICATE)
+
+    probe57_in = VisualRecoveryProbe()
+    probe57_in.update_reference(ref57, True)
+    vm57_in = probe57_in.match(live_zoom_in)
+    case(f"(57-1) zoom_in -> matched, size_ratio>1.0, closer=LIVE "
+         f"(matched={vm57_in.matched} size_ratio={vm57_in.size_ratio} closer={vm57_in.closer})",
+         vm57_in.matched and vm57_in.size_ratio is not None and vm57_in.size_ratio > 1.0
+         and vm57_in.closer == "LIVE")
+
+    probe57_out = VisualRecoveryProbe()
+    probe57_out.update_reference(ref57, True)
+    vm57_out = probe57_out.match(live_zoom_out)
+    case(f"(57-2) zoom_out -> matched, size_ratio<1.0, closer=LKG "
+         f"(matched={vm57_out.matched} size_ratio={vm57_out.size_ratio} closer={vm57_out.closer})",
+         vm57_out.matched and vm57_out.size_ratio is not None and vm57_out.size_ratio < 1.0
+         and vm57_out.closer == "LKG")
+
+    # 57-3. identical: reference matched against itself -> size_ratio ~1, closer=EQUAL.
+    probe57_id = VisualRecoveryProbe()
+    probe57_id.update_reference(ref57, True)
+    vm57_id = probe57_id.match(ref57)
+    case(f"(57-3) identical frame -> size_ratio in [0.95, 1.05], closer=EQUAL "
+         f"(size_ratio={vm57_id.size_ratio} closer={vm57_id.closer})",
+         vm57_id.size_ratio is not None and 0.95 <= vm57_id.size_ratio <= 1.05
+         and vm57_id.closer == "EQUAL")
+
+    # 57-4. unmatched_is_unknown: no correspondence at all -> size_ratio/spreads None, closer=UNKNOWN.
+    probe57_un = VisualRecoveryProbe()
+    probe57_un.update_reference(ref57, True)
+    vm57_un = probe57_un.match(_textured_image(seed=123))
+    case(f"(57-4) unmatched -> matched=False, size_ratio=None, closer=UNKNOWN, spreads None "
+         f"(matched={vm57_un.matched} size_ratio={vm57_un.size_ratio} closer={vm57_un.closer} "
+         f"spread_lkg={vm57_un.spread_lkg} spread_live={vm57_un.spread_live})",
+         vm57_un.matched is False and vm57_un.size_ratio is None and vm57_un.closer == "UNKNOWN"
+         and vm57_un.spread_lkg is None and vm57_un.spread_live is None)
+
+    # 57-5. low_inliers_is_unknown: an absurdly high size_min_inliers forces UNKNOWN even on a clean
+    # match, while size_ratio itself is still populated (weak CV must not fabricate certainty).
+    probe57_lo = VisualRecoveryProbe(size_min_inliers=10_000)
+    probe57_lo.update_reference(ref57, True)
+    vm57_lo = probe57_lo.match(live_zoom_in)
+    case(f"(57-5) size_min_inliers=10000 -> closer=UNKNOWN despite a normal match, size_ratio populated "
+         f"(matched={vm57_lo.matched} closer={vm57_lo.closer} size_ratio={vm57_lo.size_ratio})",
+         vm57_lo.matched and vm57_lo.closer == "UNKNOWN" and vm57_lo.size_ratio is not None)
+
+    # 57-6. spread_none_on_degenerate: _inlier_spread returns None for <2 points.
+    one_pt = np.array([[1.0, 2.0]])
+    empty_pt = np.zeros((0, 2))
+    case("(57-6) _inlier_spread(1 point)=None, _inlier_spread(empty)=None",
+         VisualRecoveryProbe._inlier_spread(one_pt) is None
+         and VisualRecoveryProbe._inlier_spread(empty_pt) is None)
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
