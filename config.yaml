@@ -463,6 +463,9 @@ autonomy:
                                           # 71 MB resident — a general platform-latency bound, not a room
                                           # answer. 0 = disabled (legacy live-frame behaviour; logged LOUD
                                           # once at startup, NO SILENT FALLBACK).
+    visrec_lkg_ageout_log_interval_s: 5.0   # session 56: rate-limit for the F_LKG age-out warning.
+                                            # Was a one-shot `_lkg_ring_warned` flag, so a defect that
+                                            # ran for 31 of 34 minutes logged exactly once, at 16:56:07.
     blind_contact_escalate_after: 2   # after this many blind back-off reflexes against the same obstacle
                                       #   with no confirmed recovery in between, stop repeating a reflex that
                                       #   is demonstrably not working and escalate into the FALLBACK sweep

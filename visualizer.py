@@ -116,16 +116,19 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
     FSM state (with time-in-state), current vs. desired (autopilot-locked) height, plan status,
     (while the plan is valid) live straight-line distance to the current goal, the SLAM_HOLD
-    forced-hop countdown (session 52), and a 1-2 line notice block surfacing the latest timeout
-    (`control["notice"]`) and/or the latest planner event (`plan["planner_event"]`) so the
-    operator always has these visible instead of only on the map's transient overlay text or the
-    console log. `control` is the latest TOPIC_CONTROL payload (autopilot -> io_bridge, state +
-    target_altitude_y + state_since_s + slam_hold + notice); `plan` is the latest TOPIC_PLAN
-    payload (perception_worker, pos_y + pos/goal + plan-status fields). NO SILENT FALLBACK: an
+    forced-hop countdown (session 52), the F_LKG age-out state (session 56, appended to the SLAM
+    row), and a 1-2 line notice block surfacing the latest timeout (`control["notice"]`) and/or
+    the latest planner event (`plan["planner_event"]`) so the operator always has these visible
+    instead of only on the map's transient overlay text or the console log. `control` is the
+    latest TOPIC_CONTROL payload (autopilot -> io_bridge, state + target_altitude_y +
+    state_since_s + slam_hold + notice + visrec_lkg); `plan` is the latest TOPIC_PLAN payload
+    (perception_worker, pos_y + pos/goal + plan-status fields). NO SILENT FALLBACK: an
     unavailable reading prints as `--` (never a stale or guessed number), the SLAMHOLD row prints
-    as `SLAMHOLD  --` when no slam_hold payload is present, the notice block renders nothing when
-    neither source has content, and the whole panel says so explicitly if autopilot.py isn't
-    running at all."""
+    as `SLAMHOLD  --` when no slam_hold payload is present, the LKG segment prints as `LKG=--`
+    when no visrec_lkg payload is present and `LKG=STALE x<ageouts>` in red when the reference is
+    degraded (kept stale rather than faked live), the notice block renders nothing when neither
+    source has content, and the whole panel says so explicitly if autopilot.py isn't running at
+    all."""
     if control is None:
         return _placeholder(w, h, "waiting for autopilot on the control bus ...")
     panel = np.full((h, w, 3), 30, np.uint8)
@@ -172,6 +175,20 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     ms_color = (0, 0, 255) if (ms is not None and ms >= 1000.0) else (255, 255, 255)  # red once >= slow threshold
     cv2.putText(panel, f"SLAM     ms={ms_txt}", (8, 168),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, ms_color, 1)
+
+    # F_LKG age-out state (session 56), appended to the SLAM row above (no new row -- panel is full).
+    # NO SILENT FALLBACK: absent payload -> "--"; a degraded reference (the previous F_LKG kept because
+    # SLAM solve latency outran the ring, per run_explore) reads STALE x<ageouts> in red instead of
+    # quietly naming a fake "live" source.
+    visrec_lkg = control.get("visrec_lkg")
+    if visrec_lkg is None:
+        cv2.putText(panel, "LKG=--", (190, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    else:
+        lkg_degraded = bool(visrec_lkg.get("degraded"))
+        lkg_txt = (f"LKG=STALE x{visrec_lkg.get('ageouts')}" if lkg_degraded
+                  else f"LKG={visrec_lkg.get('src')}")
+        lkg_color = (0, 0, 255) if lkg_degraded else (255, 255, 255)
+        cv2.putText(panel, lkg_txt, (190, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.45, lkg_color, 1)
 
     # SLAM_HOLD forced-hop countdown (session 52): mirrors the SLAM ms= red-past-threshold
     # treatment above so an operator sees a stuck hold approaching its forced-hop deadline

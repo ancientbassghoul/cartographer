@@ -1,7 +1,50 @@
 # Cartographer — Progress & Resume Handoff
 
-_Last updated **2026-09-02** (branch **`all-bets-are-off`**, session 55 **BUILT — self-tests ALL
-GREEN (0 failures), LIVE-FLY PENDING** for sessions 52-55; `main` unaffected)._
+_Last updated **2026-09-03** (branch **`all-bets-are-off`**, session 56 **BUILT — self-tests ALL
+GREEN (0 failures) across all 8 suites, LIVE-FLY PENDING** for sessions 52-56; `main` unaffected)._
+
+_**Session 56 — SLAM was slow the whole flight, the settle gate was arithmetically unreachable, so
+every state paid its 15 s escape; F_LKG was silently replaced by the live frame, so visual recovery
+matched frames against themselves (BUILT — self-tests ALL PASS across all 8 suites, live-fly
+PENDING).** Same source flight as session 55, `20260902_165340` (~34 min): **391 SLAM solves, median
+1699 ms, p75 3227 ms, p95 17867 ms, max 90774 ms**, against a settle gate requiring 6 *consecutive*
+frames under 1000 ms — unreachable once p25 alone is already 1251 ms, so every `SLAM_HOLD`/`SETTLE`/
+`TRIM_RESUME_WAIT` exit came from the 15 s dead-band escape, not the gate. TRIM starved on
+reachability (never entered `SETTLE`/`ADVANCE` for a 4m15s stretch, fired 3 ms after `ADVANCE` was
+finally reached). Separately, F_LKG's cache gate read `plan_valid` off a plan of *any* age —
+`PLAN-LOST` is a pure age verdict, so a stale-but-`plan_valid` plan re-stored the reference every tick
+of a loss; once the true frame aged out of the 160-entry ring, the code substituted the *live* frame,
+so visual recovery matched a frame against itself (`17:00:32.140`: `inliers=732 contained=True
+planar_like=True scale=1.00`) — manufacturing exactly the "too close" evidence that drives BACKOFF.
+Fixed by replacing the gate's *fastness* proof with a *currency* proof — `_settle_gate_poll` now
+demands one solve of a frame captured at/after the gate opened (`_slam_gate_since`), not 6 fast ones —
+plus a release-grace stamp at every gated release so the now-much-faster gate can't turn into a 3.5 s
+`ADVANCE`↔`SLAM_HOLD` limit cycle (identical ordering trap as the existing forced-hop rescue: the
+grace must stamp AFTER `_enter`, or `_enter` wipes it). F_LKG's cache gate now requires `status=="OK"`
+in addition to `plan_valid`, and a ring age-out no longer substitutes a fake live frame — it keeps the
+old true reference and makes the degradation visible (`visrec_lkg_ageouts` counter, sticky
+`visrec_lkg_degraded` flag, rate-limited CRITICAL log, `LKG=STALE x<n>` in red on the telemetry panel,
+`LKG=slam:<id>` in normal flight). Also made TRIM reachable directly from `SLAM_HOLD` (closing the
+4m15s starvation above) without it looking like a trust restoration — the episode clock and
+`_recovering`/`_history_broken` survive a TRIM detour untouched, proven by a dedicated self-test.
+Every load-bearing fix proven against its own defect on a scratch copy, restored byte-identical
+(SHA-256-verified): the currency-proof revert fails 6 gate-sharing tests including its own
+`SESSION-56 GATE CURRENCY`; the release-grace revert fails only `SESSION-56 RELEASE GRACE`; the F_LKG
+`status=="OK"` revert fails only `SESSION-56 F_LKG FREEZE`; the `_TRIM_TRIGGER_STATES` revert fails 4
+of 5 `SESSION-56 TRIM FROM SLAM_HOLD` sub-checks (the 5th, `HOLD_LOST` staying excluded, correctly
+stays green). **One honest gap found, not glossed over**: reverting the `run_explore` ring age-out
+branch itself (the actual bug's integration site) produced **zero** self-test failures — the four
+`F_LKG AGE-OUT` tests cover the counter/flag/telemetry/panel mechanics but nothing drives
+`run_explore`'s live loop end-to-end, so there is currently no automated assertion over the exact site
+the bug lived in; recorded as backlog, not claimed as covered. Replay arithmetic against the real
+flight's five worst dead-band holds (15.0s/15.8s/21.4s/74.5s/89.2s, back-computed from each episode's
+own start time): the new gate would resolve each in ~3.5s median / ~5s p75 instead — **215.9s of old
+hover across just those five samples becomes ~17.5-25.0s**, without SLAM itself getting any faster.
+`autopilot.py --self-test`, `visual_recovery.py --self-test`, `frontier_planner.py --self-test`,
+`flight_replay.py --self-test`, `ground_grid.py --self-test`, `map_store.py`,
+`salvage_flight.py --self-test`, `perception_worker.py --self-test` (venv): **ALL PASS, 0 failures,
+all 8 suites.** See `plans/session56-settle-gate-currency-and-lkg-freeze.md` for the full trace,
+design, trap list, and revert-proof matrix. **NEXT = LIVE-FLY** — watch list below._
 
 _**Session 55 — a live unattended flight was lost to a GPU-driver TDR bugcheck mid-run; investigation
 found almost all of it actually survived, and a new tool + three in-flight hardening changes now
@@ -1264,8 +1307,33 @@ plan-of-record pointers), and **Documentation** (what we tried, in date order, b
 
 ### >>> IMMEDIATE NEXT TASK (branch `all-bets-are-off`) <<<
 
-**LIVE-FLY session 55** (`python fly.py` — full stack), on top of sessions 49-54 (all already built,
-all still live-fly PENDING). Watch list, in priority order:
+**LIVE-FLY session 56** (`python fly.py` — full stack), on top of sessions 49-55 (all already built,
+all still live-fly PENDING; session 56's own additions have never been flown). Watch list, in
+priority order — see `plans/session56-settle-gate-currency-and-lkg-freeze.md` for the full design and
+revert-proof trace:
+
+1. **`SLAM_HOLD_FORCED_HOP` / `SETTLE_DEADBAND` become rare, not the normal exit.** Before this
+   session every gate release on this flight came from the 15s dead-band escape; now the currency
+   proof should release most holds in roughly one capture-gap-plus-one-solve (this flight's own
+   numbers: ~3.5s median, ~5s p75 — see the plan file's replay-arithmetic table for the five worst
+   holds recomputed against real timestamps).
+2. **No 3.5s `ADVANCE`↔`SLAM_HOLD` limit cycle.** This is exactly the failure mode the release-grace
+   stamp (`_slam_slow_hop_deadline`, stamped at every gated release) exists to prevent — if it shows
+   up, the grace isn't landing; check it's being stamped AFTER `_enter`, not before (the same ordering
+   trap the forced-hop rescue already had to solve).
+3. **`[VISREC]` bursts gone.** A held-still loss should log a handful of matches, not the 438/minute
+   this flight showed. Zero `scale=1.00 inliers=7xx contained=True` self-matches anywhere in the log —
+   that fingerprint must not recur.
+4. **The debug window banner shows a frozen reference with a growing `age=` during a loss, never a
+   live view.** `LKG=` on the telemetry panel reads `slam:<id>` in normal flight and goes red
+   (`LKG=STALE x<n>`) only when genuinely degraded — watch for it going red and staying there
+   (expected under a long solve-latency spike) vs. flickering constantly (would mean the ring is too
+   shallow for this room, `visrec_lkg_ring_len`).
+5. **TRIM fires while parked in `SLAM_HOLD`**, not just from `SETTLE`/`ADVANCE` — and the drone
+   visibly holds height through a long slow-SLAM patch instead of drifting the way it did between
+   `17:16:36.961`-`17:20:51.888` on the diagnosing flight.
+6. Everything below this item (sessions 49-55's own still-unconfirmed watch items) remains open and
+   unchanged by this session — re-watch all of it on the same flight:
 
 1. **Session 55's own crash-survivability additions** (`plans/session55-crash-survivability.md`) —
    none of this has been exercised on a real flight yet:
@@ -1386,6 +1454,29 @@ used to fill this section, now superseded by the 2026-09-01 confirmation above.
 ---
 
 ## Future (backlog)
+- **Session 56 backlog — recorded, deliberately not implemented (operator's explicit call to defer):**
+  - **`visrec_min_inliers`=12 is too low to trust a homography *scale* for a physical BACKOFF
+    reaction.** The `17:21:40.711` BACKOFF on the diagnosing flight was decided on ~19 inliers whose
+    scale swung 0.65→27.4 within half a second. Session 56's chunks 4+5 removed the *fake* reference
+    that made a bad match look self-consistent; they did not raise the trust bar on a real match.
+  - `SETTLE`'s dead-band escape measures `self.t_state`, not an episode clock (`autopilot.py:4217`) —
+    the same shape session 53 already fixed for `SLAM_HOLD`. Low priority now that the escape stops
+    being the *normal* path (session 56's currency gate should make it rare).
+  - Session 54's four streak-gated states (see the dead-band class entry right below) are untouched
+    by session 56: `CALIB_LOST_HOLD`, `CALIB_ESCAPE` (still has no bounded escape at all),
+    `POSTLUDE_LOST_HOLD`, and the legacy `use_slam_stepback_on_slow=True` arm.
+  - **GATE A allows exactly one visual match per loss episode** (session 50/51) — correct for session
+    48's 2.4s median loss, blind for this flight's 71s and 89s ones. Needs its own session and a
+    decision about what a *second* look during a long loss is even for.
+  - **The SLAM choke itself is still undiagnosed** (max solve 90.8s on this flight; leading theory
+    below is MASt3R-SLAM's workload growing with the keyframe graph). Session 56 is damage control
+    around the choke, not a cure — see "STILL OPEN, TOP OF THE LIST" above.
+  - **A `run_explore`-level integration test is missing.** Session 56's revert-proof exercise found
+    that reverting the F_LKG ring age-out fix at its actual integration site (inside `run_explore`,
+    not unit-testable the way the FSM `step()` helpers are) produced zero self-test failures — the
+    four `F_LKG AGE-OUT` self-test blocks cover the surrounding mechanics only. Worth a harness that
+    can drive `run_explore` itself if this bug class recurs. See
+    `plans/session56-settle-gate-currency-and-lkg-freeze.md`'s revert-proof matrix for the full trace.
 - **The `_slam_fast_streak` dead-band class — three remaining sites (found session 54, not fixed).**
   Same signature each time: the ONLY exit predicate is `_slam_fast_streak >= N` or `not
   self._slam_slow`, with no wall-clock cap and no `has_any_capture` blackout guard — grep for that

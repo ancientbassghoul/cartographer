@@ -64,11 +64,14 @@ class VisualRecoveryProbe:
         self.sift = cv2.SIFT_create()
         self.matcher = cv2.BFMatcher(cv2.NORM_L2)
         self._lkg = None    # cached BGR frame (last known good — SLAM was TRACKING when it was captured)
-        # Session 52: which frame `_lkg` actually IS -- "live" (the tick's own frame, legacy behaviour),
-        # "slam:<frame_id>" (the exact frame the plan was computed from, pulled from run_explore's ring),
-        # or "live(aged-out)" (the plan's frame_id fell off the ring -- degraded to live, logged LOUD by
-        # the caller). A LABEL ONLY: never read by match(), just surfaced on the debug banner.
+        # Session 52: which frame `_lkg` actually IS -- "live" (the tick's own frame, legacy behaviour) or
+        # "slam:<frame_id>" (the exact frame the plan was computed from, pulled from run_explore's ring). A
+        # LABEL ONLY: never read by match(), just surfaced on the debug banner. Session 56: an aged-out plan
+        # frame no longer degrades this to a fake "live" reference (see run_explore) -- the caller simply
+        # does not call update_reference that tick, so `_lkg_src` keeps naming whatever reference is still
+        # held, and `_lkg_t` (below) lets the banner show how OLD it now is.
         self._lkg_src = "none"
+        self._lkg_t = None   # monotonic timestamp of the last successful update_reference (age display)
         # Session 51: LAZY, memoised SIFT for the REFERENCE half of a match. `None` = not computed yet;
         # once computed it holds the (keypoints, descriptors) tuple for the CURRENT `_lkg` and is reused
         # until a new reference replaces it. The flag is the TUPLE SLOT, never the descriptors: a
@@ -84,17 +87,23 @@ class VisualRecoveryProbe:
         keeps a short ring of recent (frame_id, frame) pairs and, when possible, passes the EXACT frame the
         SLAM plan was computed from (this flight measured solve latency up to 14.9s, so "the live frame at
         this tick" and "the frame the plan describes" can be seconds apart). `src` is a caller-supplied
-        LABEL for which frame this is ("slam:<frame_id>" | "live" | "live(aged-out)") -- stored verbatim for
-        the debug banner (`_compose_debug`) and never consulted by matching logic. Cheap (a copy); SIFT only
-        runs at match() time.
+        LABEL for which frame this is ("slam:<frame_id>" | "live") -- stored verbatim for the debug banner
+        (`_compose_debug`) and never consulted by matching logic. Cheap (a copy); SIFT only runs at
+        match() time.
 
         Session 51: returns True when it actually STORED a new reference (so run_explore can invalidate
         its own per-tick match memo on that exact edge rather than duplicating this condition), else
-        False. Storing also drops the cached reference features — see `_lkg_feats`."""
+        False. Storing also drops the cached reference features — see `_lkg_feats`.
+
+        Session 56: a `tracked=False` call (e.g. the caller's plan frame aged out of its ring) touches
+        NEITHER `_lkg`, `_lkg_src`, `_lkg_t` NOR `_lkg_feats` -- the previous reference is kept exactly as
+        it was, memoised features included, so a run of age-outs costs nothing extra and never churns the
+        SIFT memo."""
         if tracked and frame is not None:
             self._lkg = frame.copy()
             self._lkg_feats = None      # new reference -> the memoised SIFT no longer describes it
             self._lkg_src = str(src)
+            self._lkg_t = time.monotonic()
             return True
         return False
 
@@ -147,9 +156,10 @@ class VisualRecoveryProbe:
         banner_strip = np.zeros((BANNER_H, body.shape[1], 3), dtype=np.uint8)
         scale_txt = f"{out.scale:.2f}" if out.scale is not None else "n/a"
         line1 = banner or ""
+        age_txt = f"{time.monotonic() - self._lkg_t:.1f}s" if self._lkg_t is not None else "n/a"
         line2 = (f"has_lkg={out.has_lkg} matched={out.matched} inliers={out.inliers} "
                  f"contained={out.contained} planar_like={out.planar_like} scale={scale_txt} "
-                 f"lkg_src={self._lkg_src}")
+                 f"lkg_src={self._lkg_src} age={age_txt}")
         cv2.putText(banner_strip, line1, (6, 13), BANNER_FONT, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(banner_strip, line2, (6, 29), BANNER_FONT, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
         canvas = np.vstack([banner_strip, body])
@@ -485,6 +495,21 @@ def run_self_test():
     banner_has_src = (vm_lkg3.debug_image is not None
                        and any("slam:777" in t for t in _put_text_calls))
     case(f"(52-lkg-3) debug banner names the reference src (lkg_src={p_lkg3._lkg_src!r})", banner_has_src)
+
+    # ---- SESSION 56 F_LKG AGE-OUT — a tracked=False call (the caller's plan frame aged out of its ring)
+    # must KEEP the previous reference untouched, not silently substitute whatever frame WAS live. Also
+    # proves the memoised SIFT features on the kept reference are not churned by the no-op call.
+    p56_1 = VisualRecoveryProbe()
+    p56_1.update_reference(frameA, True)          # store frame A as the reference
+    p56_1.match(frameB)                            # force the reference SIFT memo to be computed
+    memo_before = p56_1._lkg_feats
+    stored_56 = p56_1.update_reference(frameB, False)   # caller's age-out branch: tracked=False
+    lkg_still_frameA = bool(np.array_equal(p56_1._lkg, frameA))
+    memo_unchanged = p56_1._lkg_feats is memo_before
+    case(f"(56-lkg-1) update_reference_false_keeps_previous: tracked=False returns False, keeps F_LKG "
+         f"unchanged, and does NOT invalidate the reference SIFT memo "
+         f"(stored={stored_56}, lkg_still_frameA={lkg_still_frameA}, memo_unchanged={memo_unchanged})",
+         stored_56 is False and lkg_still_frameA and memo_unchanged)
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

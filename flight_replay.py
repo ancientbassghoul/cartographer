@@ -448,7 +448,9 @@ function updateVisualRecovery(idx) {
     `<span class="k">F_LKG cached</span> ${yn(vr.has_lkg)}<br>` +
     `<span class="k">matched</span> ${yn(vr.matched)} <span class="k">inliers</span> <span class="v">${vr.inliers != null ? vr.inliers : '—'}</span><br>` +
     `<span class="k">contained</span> ${yn(vr.contained)}  <span class="k">planar-like</span> ${yn(vr.planar_like)}<br>` +
-    `<span class="k">scale</span> <span class="v">${fmt(vr.scale, 2)}</span>` +
+    `<span class="k">scale</span> <span class="v">${fmt(vr.scale, 2)}</span><br>` +
+    `<span class="k">lkg src</span> <span class="v">${vr.lkg_src || '—'}</span> ` +
+    `<span class="k">age-outs</span> <span class="v">${vr.lkg_ageouts != null ? vr.lkg_ageouts : '—'}</span>` +
     (vr.debug_image ? `<br><a href="${vr.debug_image}" target="_blank">` +
                       `<img src="${vr.debug_image}" style="width:100%;margin-top:6px;border:1px solid #444">` +
                       `</a>` : '') +
@@ -866,7 +868,8 @@ def _self_test():
          "visual_recovery_detail": {"phase": "MATCH", "cum_deg": 15.0, "has_lkg": True, "matched": True,
                                     "inliers": 34, "contained": False, "planar_like": True, "scale": 1.02,
                                     "debug_image": "20260101_000000_visrec/00-00-01_500.png",
-                                    "window_failed": False, "save_failed": True}},
+                                    "window_failed": False, "save_failed": True,
+                                    "lkg_src": "slam:67719", "lkg_ageouts": 3}},
         {"t_wall": "", "t_mono": 1.5, "ev_kind": "slam_start", "frame_id": 6, "slam_ms": 700.0,
          "slam": "[00:00:01.100] SLAM had currently began working on this frame. (#6)"},
         {"t_wall": "", "t_mono": 2.2, "ev_kind": "slam_finish", "frame_id": 6, "slam_ms": 700.0,
@@ -976,9 +979,12 @@ def _self_test():
                     and vr_rec["visual_recovery_detail"]["debug_image"] == "20260101_000000_visrec/00-00-01_500.png"
                     and vr_rec["visual_recovery_detail"]["window_failed"] is False
                     and vr_rec["visual_recovery_detail"]["save_failed"] is True
+                    and vr_rec["visual_recovery_detail"]["lkg_src"] == "slam:67719"
+                    and vr_rec["visual_recovery_detail"]["lkg_ageouts"] == 3
                     and "updateVisualRecovery" in html and 'id="visrec"' in html and 'id="visrecBtn"' in html
                     and "vr.matched" in html and "vr.scale" in html and "F_LKG cached" in html
-                    and "vr.debug_image" in html and "vr.window_failed" in html and "vr.save_failed" in html)
+                    and "vr.debug_image" in html and "vr.window_failed" in html and "vr.save_failed" in html
+                    and "vr.lkg_src" in html and "vr.lkg_ageouts" in html)
         print(f"[self-test] {'PASS' if c_visrec else 'FAIL'}  visual-recovery panel "
               f"(phase/match verdict + session-49 debug canvas path/failure flags survive + render code wired)")
         ok = ok and c_visrec
