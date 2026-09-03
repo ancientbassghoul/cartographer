@@ -6,15 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **Always create a task list** at the start of any multi-step implementation, using the TaskCreate tool. Mark each task `in_progress` when you start it and `completed` as soon as it's done. This lets the user see live progress.
 - Add log lines freely when diagnosing issues — the user is happy to re-run and share output.
-- Never commit unless the user explicitly asks.
+- Never commit unless the user explicitly asks. **When the user does ask to commit: right before creating the commit, update both `PROGRESS.md` and `STATE.md` to reflect current state, then create the commit, then push.** This push is pre-authorized by this standing rule specifically for this update→commit→push sequence — do not stop to ask permission for the push itself each time; the user has explicitly asked for it to be automatic. (Ordinary git safety practice still applies: review what's staged, and stop and ask if anything looks destructive or off-scope beyond this normal commit.)
 
-### PROGRESS.md — the resume/handoff file
+### STATE.md + PROGRESS.md — the resume/handoff files
 
-`PROGRESS.md` is the single file to read first on resume and to keep current. It is three-fold: (1) a detailed memory note so Claude re-loads the project's large context after a clear; (2) short-term instructions to resume in-flight work; and (3) a record the user draws on to describe his path with this task (e.g. a presentation).
+**`STATE.md`** is the cheap, concise file to read first on resume: current status, the live watch/resume pointer, and a pointer to the standing rules — kept short (~150-200 lines) on purpose so reloading context after a clear doesn't cost a large fraction of the window.
 
-Because of (3), keep the **documentation** parts (the session log / what's been tried) VERY concise and narrative — "We wanted X. We tried Y. It failed because Z. So we tried W." — never the boring implementation details. The **up-next** part may be as detailed as needed; but once an up-next item is done or abandoned, translate it INTO the concise "tried that" one-liner style and move it to the documentation part. Detailed designs live in `plans/*.md` (referenced from PROGRESS.md), not inline.
+**`PROGRESS.md`** is the full session-by-session history and presentation record — read it only when `STATE.md` doesn't have enough depth, or when reconstructing the "why" behind a past decision (e.g. for a presentation). It is two-fold: (1) a detailed memory note so Claude can re-load deep project context after a clear if `STATE.md` isn't enough, and (2) a record the user draws on to describe his path with this task.
 
-**Every plan MUST end with two closing steps, always the last items in the task list:** (1) **update `PROGRESS.md`** — fold the completed/abandoned work into the concise narrative, refresh the "Next" resume pointer, and reference any new `plans/*.md`; (2) **get ready for a context clear** — leave the tree and PROGRESS.md in a clean, self-describing state so the next session can resume cold from PROGRESS.md alone (self-tests noted, loose ends captured, nothing important living only in this conversation). Treat these two steps as non-negotiable — a plan is not complete until they are done.
+Keep the **documentation** parts of `PROGRESS.md` (the session log / what's been tried) VERY concise and narrative — "We wanted X. We tried Y. It failed because Z. So we tried W." — never the boring implementation details. Detailed designs live in `plans/*.md` (referenced from PROGRESS.md), not inline. `STATE.md`'s resume/up-next section may be as detailed as needed; but once an up-next item is done or abandoned, translate it INTO the concise "tried that" one-liner style and move it into `PROGRESS.md`'s session log, refreshing `STATE.md`'s pointer to whatever's next.
+
+**Every plan MUST end with two closing steps, always the last items in the task list:** (1) **update `STATE.md` and `PROGRESS.md`** — fold completed/abandoned work into `PROGRESS.md`'s concise narrative, refresh `STATE.md`'s resume pointer, and reference any new `plans/*.md`; (2) **get ready for a context clear** — leave the tree, `STATE.md`, and `PROGRESS.md` in a clean, self-describing state so the next session can resume cold from `STATE.md` alone (self-tests noted, loose ends captured, nothing important living only in this conversation). Treat these two steps as non-negotiable — a plan is not complete until they are done.
 
 ### CRITICAL CODING STANDARD: NO SILENT FALLBACKS
 
