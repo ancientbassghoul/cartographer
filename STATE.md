@@ -18,22 +18,25 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**. **Session 59 is BUILT, GATED and FLOWN**
-(`OUTPUT/diag/20260904_103342_*`, ~37 min, 2026-09-04). All 9 suites green at HEAD.
+Branch **`all-bets-are-off`**. **Session 60 is BUILT and GATED, NOT YET FLOWN** — all 9 self-test
+suites green at HEAD, spec archived at `plans/session60-spec.md`.
 
-Session 59's results: the 23-minute corner lockup **did not recur** — zero `ALREADY-excluded`
-warnings against 29 the flight before, and no drop→re-commit loop. Caveat kept deliberately:
-`CORNER-RETIRE-EN-ROUTE` never fired because no corner went dead mid-tour, so the fix is *not
-contradicted* rather than *confirmed*. The camera trigger **did** fire, once and correctly
-(`LIVE=21 ratio=1.00 over 3.0s`) — the first time the camera rather than the map asked for a maneuver.
-
-**Session 60's spec is written and verified-parsing but NOT YET BUILT** — that is the next action.
+Session 60 was diagnosed off session 59's own flight (`OUTPUT/diag/20260904_103342_*`, ~37 min,
+2026-09-04), whose centrepiece was a **15.3-minute PLAN-STALE** during which SLAM was *not* choked
+(median `slam_ms` 1902) — it was tracking-lost, i.e. recovery logic failing, not SLAM speed. Four
+fixes went in: F_LKG moved to perception (the reconstruct-from-ID ring, 34 age-outs/median 0.55s
+shortfall last flight, is deleted); a back-off's own reverse could re-arm the bump latch it was
+supposed to be exempt from, letting one wall contact permanently blacklist a goal (fixed); the 15°
+rotation probe (0 recoveries in 9.4 min across 139 logs) is deleted in favour of a `SERVO` phase
+inside `FALLBACK` that steers to the F_LKG viewpoint instead of just spinning; and the LKG debug
+canvas moved from a standalone `cv2` window into a new visualizer dashboard column. Full detail:
+`plans/session60-spec.md`; concise narrative: `PROGRESS.md` session 60.
 
 `main` is unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one
 open problem: height.
 
 ## STILL OPEN, THE DOMINANT PROBLEM: why does SLAM choke
-Nothing in session 59 addresses this — it's damage control around the choke, not a cure. The
+Nothing in sessions 59-60 addresses this — it's damage control around the choke, not a cure. The
 2026-09-04 flight is the best measurement yet — **30 of its 47 minutes were spent blind**
 (`HOLD_LOST` 1348 s + `FALLBACK` 471 s):
 
@@ -59,58 +62,23 @@ workload growing with the keyframe graph/retrieval DB, its backend optimization 
 contention from the visualizer's `--record` MP4 encode, and the LKG debug window (`cv2.imshow` + PNG
 writes).
 
-## >>> IMMEDIATE NEXT: BUILD session 60 <<<
-```
-python sonnet_runner.py --plan C:\Users\owner\.claude\plans\valiant-waddling-spark.md
-```
-7 chunks, parse-verified, all 29 source anchors confirmed. Chunk 7 copies the spec to
-`plans/session60-spec.md`, so afterwards the repo holds its own record.
+## >>> IMMEDIATE NEXT: FLY session 60, then watch for <<<
 
-**What it does, and why.** Diagnosed off `OUTPUT/diag/20260904_103342_*`, whose centrepiece is a
-**15.3-minute PLAN-STALE** during which SLAM was *not* choked (median `slam_ms` 1902) — it was
-tracking-lost. Four findings:
+1. **Zero** `F_LKG AGE-OUT` lines (34 last flight) — the message no longer exists.
+2. `src=slam:<id>` in the telemetry `LKG=` field advancing during the ~3 s `OK` blips, which is
+   exactly where it used to freeze.
+3. No two bump pulses from one contact; no permanent blacklist off a single wall touch.
+4. No `VISUAL_RECOVERY` anywhere in the log; a `SERVO` phase engaging on a sustained match with
+   `_fallback_cum_deg` frozen while it holds; FALLBACK never reaching `STUCK` (only the corner
+   give-up path still can).
+5. The LKG panel visible in the dashboard's new leftmost column, and grey (not black) when idle.
+6. Kill switches, if either half needs isolating: `use_visual_matching: false`
+   (`autonomy.explore`) disables all SIFT matching; `visrec_debug_window: false` disables the
+   canvas build/publish/save entirely — the one real SLAM-choke experiment this session enables.
+7. Flights still end by **manual stop**; no bounded-survey mechanism exists.
+8. **Carry forward every still-unconfirmed session-49-to-57 item below** (unchanged from session 59).
 
-1. **F_LKG cannot refresh.** The autopilot reconstructs it by looking the plan's `frame_id` up in a
-   160-slot ring, but the plan naming a frame arrives ~15 s after that frame went past. Ring span
-   ≈17.6 s for 71 MB; median age-out shortfall **0.55 s** (min 6 ids, max 1143); **34 age-outs**.
-   Fix: **perception publishes the frame it tracked on**; the ring and all its age-out machinery are
-   deleted. Note the timing that makes this bite — 66% of `OK` periods last exactly the 3.0 s
-   `plan_timeout_s`, and those blips are when F_LKG is meant to refresh.
-2. **One wall contact can permanently blacklist a goal.** `rearm_bump_if_disengaged` re-arms on any
-   `reverse > 0`, which a back-off always commands — so the latch meant to make one contact count
-   once is defeated by the back-off itself (pulses #3/#4 4.3 s apart → `BLACKLIST PERMANENT`).
-   Fix: the latch ignores our own `BACKOFF`/`BLIND_BACKOFF` reverse. **`backoff_hold_s` deliberately
-   unchanged** — operator accepts the double back-offs for now.
-3. **The 15° probe has never recovered SLAM** — 0 recoveries in 9.4 min of exposure across 139 flight
-   logs, vs FALLBACK's 11 in 61.5 min. Mechanism: the probe only *rotates*, so it cannot return to a
-   viewpoint the drone has drifted from. Meanwhile the blind sweep matched **98 times**, including 11
-   consecutive `EQUAL` verdicts over 5.6 s, and swept straight through it into `STUCK` 34 s before
-   recovery. Fix: **delete the probe**; `PLAN-STALE` → 12 s grace → FALLBACK, with a **servo** inside
-   FALLBACK that nudges forward/back to `EQUAL`, holds for **3 solved frames** (a count, not a timer —
-   it self-calibrates to any solve latency), freezes the sweep budget while servoing, and never
-   exhausts to `STUCK`.
-4. **The probe's grace notice printed 413 times** — latched.
-
-Also: the **LKG panel moves into the visualizer** (stacked, new left column, grey when idle) so it
-lands in the `--record` MP4; the standalone `cv2` window is retired. **This is NOT a SLAM-choke
-mitigation** — the match, the composition and the PNG writes all still happen; only `imshow` moves,
-and an encode + IPC hop are added, so total work goes slightly *up*. The only real choke experiment is
-a flight with `visrec_debug_window: false`, and it is mutually exclusive with having the panel.
-
-Watch on the flight AFTER session 60 is built:
-
-1. **Zero** `F_LKG AGE-OUT` lines — the message no longer exists — and `src=slam:<id>` advancing
-   during the ~3 s `OK` blips, which is exactly where it used to freeze.
-2. No two bump pulses from one contact; no permanent blacklist off a single wall touch.
-3. No `VISUAL_RECOVERY` anywhere; a `SERVO` phase engaging on a sustained match with
-   `_fallback_cum_deg` frozen; FALLBACK never reaching `STUCK`.
-4. The LKG panel visible in the dashboard and grey when idle.
-5. Kill switches: `use_visual_matching: false` disables all matching; `visrec_debug_window: false`
-   disables the canvas.
-6. Flights end by **manual stop**, as every flight has; no bounded-survey mechanism exists.
-7. **Carry forward every still-unconfirmed session-49-to-57 item below.**
-
-**Operator's decision rule (2026-09-04):** if this flight is clean, stop here and ship the
+**Operator's decision rule (2026-09-04), unchanged:** if this flight is clean, stop here and ship the
 Blender/PLY presentation work. If goal problems recur, **rebuild goal management from scratch**
 against a written behaviour spec — the operator's own judgement is that it is over-complicated, and
 the evidence agrees: two independent death registries (`_blacklist` with soft/permanent/active, and
@@ -167,9 +135,11 @@ Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-f
    landing — check it's stamped AFTER `_enter`, not before.
 3. **`[VISREC]` bursts gone.** A held-still loss should log a handful of matches, not hundreds/minute.
    Zero `scale=1.00 inliers=7xx contained=True` self-matches anywhere in the log.
-4. **The LKG debug window shows a frozen reference with growing `age=` during a loss, never a live
-   view.** `LKG=` on the telemetry panel should read `slam:<id>` normally and go red
-   (`LKG=STALE x<n>`) only when genuinely degraded.
+4. **RESOLVED by session 60, not open.** This item asked whether `LKG=` would go red
+   (`LKG=STALE x<n>`) only when genuinely degraded — session 60 made that condition structurally
+   impossible (F_LKG is now published straight from perception, no reconstruct-from-ID ring to age
+   out) and removed the indicator entirely, and moved the window itself into the visualizer's LKG
+   panel. Watched fresh at IMMEDIATE NEXT items 1-2 and 5 above.
 5. **TRIM fires while parked in `SLAM_HOLD`**, not just from `SETTLE`/`ADVANCE`.
 6. **Everything from sessions 49-55 is still itself unconfirmed** (their flights kept getting cut
    short by the bugs sessions 53-56 fixed) — re-watch on this same flight:
@@ -179,10 +149,11 @@ Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-f
    - `TRIM` exits within ~3s of its pulse even at 1500-2700ms SLAM latency (a `FORCED after N.Ns`
      log line means the backstop fired, not a bug, but means the primary fix isn't landing).
    - `SLAM_HOLD`↔`HOLD_LOST` limit cycle still can't persist past ~18s (regression check only).
-   - `VISUAL_RECOVERY` actually executes a probe turn (never yet observed on a real flight);
-     `TRIM enter (DOWN)` firing (every flight so far only showed sag/UP); no back-off suppressed
-     notice unless one was genuinely about to fire; no goal committed inside a permanently
-     blacklisted region; the LKG debug window drawing inliers + saving PNGs.
+   - `VISUAL_RECOVERY` executing a probe turn: **moot** — session 60 deleted the probe STATE outright
+     (it never once recovered SLAM in 139 logs; see PROGRESS.md session 60), so this no longer applies.
+     Still open: `TRIM enter (DOWN)` firing (every flight so far only showed sag/UP); no back-off
+     suppressed notice unless one was genuinely about to fire; no goal committed inside a permanently
+     blacklisted region; the LKG canvas drawing inliers + saving PNGs (now via the visualizer panel).
    - Session 50: `SETTLE gate blocked ... -> forcing REPLAN` in place of a 91.6s park. If it fires
      OFTEN, that's an honest signal SLAM is chronically slow, not a bug in the fix.
    - Session 51: pure waste removal — expect **zero** decision changes vs. earlier flights.

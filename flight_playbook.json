@@ -37,6 +37,10 @@
     "  back_off<- 20260628_092608: 5 deliberate continuous back-off presses, median ~0.30s of 's'. Manual",
     "             's' ramps reverse toward ~0.9 peak; constant reverse 0.7 for ~0.3s impulse-matches one",
     "             nudge. (Multi-tap back-offs reached ~0.6s of 's' / ~2x retreat; the single nudge was chosen.)",
+    "  nudge_forward (session 60, C7) = the forward counterpart of back_off, for the FALLBACK SERVO phase",
+    "             stepping toward F_LKG's viewpoint: trigger 0.55 (forward preset's own cruise magnitude,",
+    "             not measured) for 0.3s, mirroring back_off's impulse duration. A platform control dynamic,",
+    "             TUNABLE live -- NOT a room distance.",
     "All durations are platform-dynamics medians and are TUNABLE live.",
     "  reverse_probe = a SUSTAINED reverse (experiment: does straight-back translation keep MASt3R-SLAM",
     "             TRACKING while a big turn breaks it?). reverse 0.7 like back_off; the 4.0s duration is a",
@@ -81,6 +85,7 @@
       {"btnCdown": true, "duration_s": 0.16}
     ],
     "back_off": [{"reverse": 0.7, "duration_s": 0.3}],
+    "nudge_forward": [{"trigger": 0.55, "duration_s": 0.3}],
     "reverse_probe": [{"reverse": 0.7, "duration_s": 4.0}],
     "strafe": [{"joy_horizontal": 1.0, "duration_s": 0.25}],
     "trim_up": [

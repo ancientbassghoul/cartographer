@@ -5,12 +5,38 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-04**, branch `all-bets-are-off`, session 59: built, gated and **live-flown**
-(`OUTPUT/diag/20260904_103342_*`). The corner lockup did not recur and the camera drove its first-ever
-back-off. That flight's 15.3-minute PLAN-STALE is what session 60's spec addresses. See `STATE.md`._
+_Last updated **2026-09-04**, branch `all-bets-are-off`, session 60: **built and gated, not yet
+flown**. It answers the four things session 59's own flight surfaced — F_LKG moved to perception,
+the bump-latch fix, the probe deleted in favour of a FALLBACK servo, and the LKG panel moved into the
+visualizer. See `STATE.md` for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **60** — The session 59 flight's 15.3-minute `PLAN-STALE` turned out to be tracking-lost, not
+  SLAM-choked (169 frames, median `slam_ms` 1902) — recovery logic failing, not speed. Four fixes.
+  First, F_LKG could never refresh: the autopilot reconstructed it by looking a plan's `frame_id` up
+  in a 160-slot/17.6s ring, but the plan naming a frame arrives ~15s after that frame passed — median
+  age-out shortfall 0.55s, 34 age-outs last flight. Moved F_LKG to its source: perception now
+  publishes the exact frame it tracked on over its own bus, and the ring plus all its age-out
+  machinery are deleted. Second, one wall contact could permanently blacklist a goal, because
+  `rearm_bump_if_disengaged` re-armed the bump latch on any `reverse > 0` — which a back-off always
+  commands — so the latch meant to make one contact count once was defeated by the back-off itself
+  (two pulses 4.3s apart on the same contact reached `BLACKLIST PERMANENT`). Fixed the latch to
+  ignore our own `BACKOFF`/`BLIND_BACKOFF` reverse; left `backoff_hold_s` alone, per the operator's
+  call to live with the occasional double back-off. Third, the 15° rotation probe: zero recoveries in
+  9.4 minutes of exposure across 139 flight logs, because it only rotates and can't return to a
+  viewpoint the drone has drifted from — meanwhile the blind FALLBACK sweep that follows it matched
+  98 times on the diagnosing flight, including 11 consecutive `EQUAL` verdicts over 5.6s, and swept
+  straight through the view into `STUCK` 34s before recovery. Deleted the probe STATE (kept the SIFT
+  matcher, which still feeds session 59's `HOLD_LOST` back-off trigger); `PLAN-STALE` now waits the
+  same 12s grace then goes straight to FALLBACK, which gained a `SERVO` phase that steers toward
+  `EQUAL` (backs off on `LIVE`, nudges forward on `LKG`, holds on `EQUAL` for 3 *solved* frames — a
+  count, not a timer, so it self-calibrates to any solve latency) and no longer exhausts to `STUCK`.
+  Fourth, the probe's grace notice (413 prints on the diagnosing flight) is latched to fire once.
+  Also moved the LKG debug canvas into the visualizer as a new dashboard column (grey when idle) and
+  retired the standalone `cv2` window — explicitly **not** a SLAM-choke mitigation, since the match,
+  the canvas composition and the PNG writes all still happen and an encode+IPC hop is added on top.
+  All 9 self-test suites green. `plans/session60-spec.md` — **BUILT 2026-09-04, not yet flown.**
 - **59** — Flew session 58 and its own two fixes held up: the grace fix cut wasted matches from
   233/253 (92%) to 45/1454 (3%), and the dead-goal drop fired correctly every time. But the same
   flight rammed glass at corner `[-1.5, -3.9]` for 23.3 minutes, and it turned out session 58's own

@@ -153,6 +153,11 @@ class Pipeline:
         self.PLAN_PUB_INTERVAL = float(e.get("replan_period_s", 0.5))
         self.GROUND_RASTER = 160
         self.last_plan_pub = 0.0
+        # Session 60 (Finding A): whether the plan just computed in _plan_payload() is a genuine
+        # TRACKING solve (F_LKG source). run() publishes THIS frame directly on lkg_frame_port when
+        # true, replacing the autopilot's old frame_id-indexed ring (which aged out ~15s later,
+        # when the plan naming a frame finally arrived, because the frame had already left the ring).
+        self.last_plan_valid = False
         # Forward clearance: cast a ground-plane ray fan into the voxel map we built and report the
         # nearest hit distance on TOPIC_PLAN, so the autopilot stops BEFORE ramming a wall (a head-on
         # ram freezes the image and kills monocular SLAM). General stand-off, NOT a room answer (the wall
@@ -354,6 +359,9 @@ class Pipeline:
         cc = res.camera_center
         pos = [float(cc[0]), float(cc[2])] if cc is not None else None
         valid = (res.mode == "TRACKING") and pos is not None and heading_deg is not None
+        # Session 60 (Finding A): stash so run() can publish THIS frame as F_LKG right away, instead
+        # of the autopilot reconstructing it later from a frame_id it may no longer hold.
+        self.last_plan_valid = bool(valid)
         payload = {
             "plan_valid": bool(valid), "mode": res.mode, "tracking_mode": res.tracking_mode,
             # Strictly-consecutive SLAM invocation counter (diagnostic session, see __init__/step) --
@@ -698,6 +706,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
     pstate_port = cfg["network"]["perception_state_port"]
     obj_port = cfg["network"]["object_state_port"]
     ctrl_port = cfg["network"]["autonomy_control_port"]
+    lkg_port = cfg["network"]["lkg_frame_port"]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")   # shared by the diag CSVs + the shutdown map export
     out_dir = Path(REPO) / "OUTPUT" / "diag"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -718,6 +727,12 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
         pipe.enable_diag(ts=ts)
     frame_sub = frame_bus.FrameSubscriber(frame_port)
     state_pub = frame_bus.StatePublisher(pstate_port)  # binds; fail-fast if taken
+    # Session 60 (Finding A): F_LKG at its source. The plan naming a frame arrives ~15s after that
+    # frame went past (SLAM solve latency), so the autopilot's old frame_id-indexed ring had to hold
+    # ~17.6s of history to look it back up -- and still aged out (median miss 0.55s, 34 times one
+    # flight). Publishing the frame directly, the instant its solve is confirmed TRACKING, replaces
+    # that reconstruction entirely: the autopilot just takes the newest one (CONFLATE=1 below).
+    lkg_pub = frame_bus.FramePublisher(lkg_port)
     # SUB to object_worker's detections (lazy connect — fine whether or not it's running yet).
     det_sub = frame_bus.StateSubscriber(obj_port, topics=[frame_bus.TOPIC_DETECTION])
     # SUB to the autopilot's advance-blocked BUMP pulses (event-driven 2-bump blacklist). Lazy connect;
@@ -832,6 +847,11 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
 
             n_ply_markers_before = len(pipe.ply_markers)
             _, _, panel, map_updated = pipe.step(frame, meta, state_pub, show)
+            # Session 60 (Finding A): publish THIS frame as F_LKG iff its solve just confirmed TRACKING
+            # -- i.e. this is the exact frame the plan the autopilot is about to receive was computed
+            # from. No ring, no ID lookup, no age-out.
+            if pipe.last_plan_valid:
+                lkg_pub.publish(frame, meta)
             if ply_sequence and len(pipe.ply_markers) > n_ply_markers_before:
                 _write_markers_sidecar(pipe, seq_dir)
 
@@ -907,6 +927,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
         pipe.close_diag()
         frame_sub.close()
         state_pub.close()
+        lkg_pub.close()
         det_sub.close()
         apevent_sub.close()
         if show:
@@ -1092,6 +1113,10 @@ def run_self_test(cfg):
     print(f"[perception][self-test] {'PASS' if ok_ply else 'FAIL'}  SESSION-57 PLY SEQUENCE")
     assert ok_ply
 
+    ok_lkg = _self_test_f_lkg_source(cfg)
+    print(f"[perception][self-test] {'PASS' if ok_lkg else 'FAIL'}  SESSION-60 F_LKG SOURCE")
+    assert ok_lkg
+
     print("[perception][self-test] PASS")
 
 
@@ -1263,6 +1288,77 @@ def _self_test_ply_sequence(cfg):
             seq10.mkdir(parents=True, exist_ok=True)   # mirrors run_live's gating
         check("disabled_writes_nothing -- config default ply_sequence=False -> dir never created",
               (not ply_sequence_default) and not seq10.exists())
+
+    return ok
+
+
+def _self_test_f_lkg_source(cfg):
+    """SESSION-60 F_LKG SOURCE (Finding A): `last_plan_valid` must track `_plan_payload`'s own `valid`
+    local exactly -- it's what run_live() checks to decide whether THIS frame is F_LKG (see the
+    lkg_pub.publish() call beside pipe.step()). A false positive would publish a frame SLAM was NOT
+    actually tracking on; a false negative starves F_LKG entirely and reintroduces the age-out this
+    session removes the ring to fix. No GPU/SLAM needed: GroundGrid + FrontierPlanner + MapStore,
+    duck-typed as a Pipeline substitute (mirrors _self_test_checkpoint_livemap/_self_test_ply_sequence)
+    -- _plan_payload only touches the fields set below."""
+    import types
+
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    e = explore_cfg(cfg)
+
+    def _make_pipe():
+        p = types.SimpleNamespace(
+            ground=GroundGrid(cfg), planner=FrontierPlanner(cfg), mapstore=MapStore(0.1),
+            _slam_seq=0, last_planner_event=[], GROUND_RASTER=160, last_plan_valid=False,
+            clearance_fan_deg=float(e.get("clearance_fan_deg", 15.0)),
+            clearance_fan_n=int(e.get("clearance_fan_n", 3)),
+            clearance_skip=float(e.get("clearance_skip", 0.25)),
+            clearance_min_count=int(e.get("clearance_min_count", 2)),
+            clearance_max_range=float(e.get("clearance_max_range", 10.0)),
+            clearance_min_hit_fraction=float(e.get("clearance_min_hit_fraction", 0.0)),
+            clearance_ring_step=float(e.get("turn_step_deg", 45.0)),
+            ring_max_range=float(e.get("ring_max_range", 1.5)),
+            reposition_inset=float(e.get("reposition_inset", 0.8)),
+            _last_clearance=None, _last_pos_y=None, _last_ring_fb=None,
+            _sweep_target_logged=None, _sweep_logged=False,
+            ply_markers=[], ply_sequence_markers=0,
+        )
+        p._consume_planner_event = lambda: (
+            "; ".join(p.last_planner_event) if p.last_planner_event else None)
+        return p
+
+    def _res(mode, pos_ok, tracking_mode="MASt3R"):
+        cc = np.array([1.0, 0.0, 2.0]) if pos_ok else None
+        return types.SimpleNamespace(mode=mode, tracking_mode=tracking_mode, camera_center=cc)
+
+    meta = {"mono_ts": 0.0, "frame_id": 1, "sim_time": 0.0}
+
+    pipe = _make_pipe()
+    check("fresh_pipe -- last_plan_valid starts False", pipe.last_plan_valid is False)
+
+    Pipeline._plan_payload(pipe, _res("TRACKING", True), meta, heading_deg=0.0)
+    check("tracking_pose_heading -- all three present -> last_plan_valid True",
+          pipe.last_plan_valid is True)
+
+    pipe_mode = _make_pipe()
+    Pipeline._plan_payload(pipe_mode, _res("LOST", True), meta, heading_deg=0.0)
+    check("mode_not_tracking -- mode='LOST' -> last_plan_valid False",
+          pipe_mode.last_plan_valid is False)
+
+    pipe_pos = _make_pipe()
+    Pipeline._plan_payload(pipe_pos, _res("TRACKING", False), meta, heading_deg=0.0)
+    check("missing_pose -- camera_center=None -> last_plan_valid False",
+          pipe_pos.last_plan_valid is False)
+
+    pipe_hdg = _make_pipe()
+    Pipeline._plan_payload(pipe_hdg, _res("TRACKING", True), meta, heading_deg=None)
+    check("missing_heading -- heading_deg=None -> last_plan_valid False",
+          pipe_hdg.last_plan_valid is False)
 
     return ok
 

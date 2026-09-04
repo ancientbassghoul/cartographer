@@ -30,14 +30,18 @@ It also (optionally) subscribes to the frame bus (`frame_bus_port`, default :560
 live input frame — the frame bus is conflated PUB/SUB, so an extra subscriber is free and never
 steals frames from the perception worker.
 
+It also subscribes to `visrec_canvas_port` (session 60, C9) — the composed F_LKG/LIVE debug canvas
+`autopilot.py` used to show in its own OS window (imshow), now published here instead and rendered
+as the dashboard's leftmost column, so it lands in the `--record` MP4 too.
+
 This process owns no GPU and no SLAM; it is pure display. NO SILENT FALLBACKS (per CLAUDE.md):
 `tracking_mode` and reloc events are surfaced prominently in the status strip — a degraded or
 non-default SLAM state is always visible, never hidden. If nothing has been received yet the
 panels say so rather than faking content.
 
-Layout:  [ status strip                         ]
-         [ input frame    ] [                     ]
-         [ telemetry panel] [   top-down map + traj  ]
+Layout:  [ status strip                                     ]
+         [ LKG canvas ] [ input frame    ] [                     ]
+         [            ] [ telemetry panel] [   top-down map + traj  ]
 """
 
 import argparse
@@ -116,19 +120,18 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
     FSM state (with time-in-state), current vs. desired (autopilot-locked) height, plan status,
     (while the plan is valid) live straight-line distance to the current goal, the SLAM_HOLD
-    forced-hop countdown (session 52), the F_LKG age-out state (session 56, appended to the SLAM
-    row), and a 1-2 line notice block surfacing the latest timeout (`control["notice"]`) and/or
-    the latest planner event (`plan["planner_event"]`) so the operator always has these visible
-    instead of only on the map's transient overlay text or the console log. `control` is the
-    latest TOPIC_CONTROL payload (autopilot -> io_bridge, state + target_altitude_y +
-    state_since_s + slam_hold + notice + visrec_lkg); `plan` is the latest TOPIC_PLAN payload
-    (perception_worker, pos_y + pos/goal + plan-status fields). NO SILENT FALLBACK: an
-    unavailable reading prints as `--` (never a stale or guessed number), the SLAMHOLD row prints
-    as `SLAMHOLD  --` when no slam_hold payload is present, the LKG segment prints as `LKG=--`
-    when no visrec_lkg payload is present and `LKG=STALE x<ageouts>` in red when the reference is
-    degraded (kept stale rather than faked live), the notice block renders nothing when neither
-    source has content, and the whole panel says so explicitly if autopilot.py isn't running at
-    all."""
+    forced-hop countdown (session 52), the F_LKG source (session 60: F_LKG now arrives pre-resolved
+    off its own bus, so age-out is structurally impossible and no longer rendered here), and a 1-2
+    line notice block surfacing the latest timeout (`control["notice"]`) and/or the latest planner
+    event (`plan["planner_event"]`) so the operator always has these visible instead of only on the
+    map's transient overlay text or the console log. `control` is the latest TOPIC_CONTROL payload
+    (autopilot -> io_bridge, state + target_altitude_y + state_since_s + slam_hold + notice +
+    visrec_lkg); `plan` is the latest TOPIC_PLAN payload (perception_worker, pos_y + pos/goal +
+    plan-status fields). NO SILENT FALLBACK: an unavailable reading prints as `--` (never a stale
+    or guessed number), the SLAMHOLD row prints as `SLAMHOLD  --` when no slam_hold payload is
+    present, the LKG segment prints as `LKG=--` when no visrec_lkg payload is present, the notice
+    block renders nothing when neither source has content, and the whole panel says so explicitly
+    if autopilot.py isn't running at all."""
     if control is None:
         return _placeholder(w, h, "waiting for autopilot on the control bus ...")
     panel = np.full((h, w, 3), 30, np.uint8)
@@ -176,19 +179,13 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     cv2.putText(panel, f"SLAM     ms={ms_txt}", (8, 168),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, ms_color, 1)
 
-    # F_LKG age-out state (session 56), appended to the SLAM row above (no new row -- panel is full).
-    # NO SILENT FALLBACK: absent payload -> "--"; a degraded reference (the previous F_LKG kept because
-    # SLAM solve latency outran the ring, per run_explore) reads STALE x<ageouts> in red instead of
-    # quietly naming a fake "live" source.
+    # F_LKG source (session 60), appended to the SLAM row above (no new row -- panel is full). F_LKG now
+    # arrives pre-resolved off its own bus (run_explore's lkg_sub), so age-out can no longer occur -- the
+    # red STALE indicator this used to carry is retired along with it. NO SILENT FALLBACK: absent payload
+    # still prints "--", never a guessed source.
     visrec_lkg = control.get("visrec_lkg")
-    if visrec_lkg is None:
-        cv2.putText(panel, "LKG=--", (190, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    else:
-        lkg_degraded = bool(visrec_lkg.get("degraded"))
-        lkg_txt = (f"LKG=STALE x{visrec_lkg.get('ageouts')}" if lkg_degraded
-                  else f"LKG={visrec_lkg.get('src')}")
-        lkg_color = (0, 0, 255) if lkg_degraded else (255, 255, 255)
-        cv2.putText(panel, lkg_txt, (190, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.45, lkg_color, 1)
+    lkg_txt = "LKG=--" if visrec_lkg is None else f"LKG={visrec_lkg.get('src')}"
+    cv2.putText(panel, lkg_txt, (190, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     # SLAM_HOLD forced-hop countdown (session 52): mirrors the SLAM ms= red-past-threshold
     # treatment above so an operator sees a stuck hold approaching its forced-hop deadline
@@ -415,6 +412,34 @@ def render_map_panel(m, size=MAP_SIZE, target=None):
     return img
 
 
+def render_lkg_panel(canvas, w=PANEL_W, h=MAP_SIZE):
+    """Session 60 (C9): the retired OS debug window's replacement. `autopilot.py` composes the
+    F_LKG/LIVE canvas (`visual_recovery.VisualRecoveryProbe._compose_debug(..., stacked=True)`) at
+    every visual-match decision instant and publishes it on `visrec_canvas_port` instead of showing
+    it with imshow; this renders that canvas as the dashboard's new leftmost column so it lands in
+    the recording too.
+
+    IMAGE INTEGRITY (CLAUDE.md) disclosure — the ONE display-only scale in this session: the canvas
+    arrives at its native (512px-wide transport-frame-derived) resolution; this column is a fixed
+    `PANEL_W` wide, so it is fit-scaled here preserving aspect and letterboxed, never cropped. This
+    touches no model input — the full-resolution canvas still reaches the PNG evidence trail under
+    OUTPUT/diag/<ts>_visrec/ completely unchanged (see `_visrec_debug_sink`).
+
+    GREY placeholder (not black, matching every other "waiting" panel in this file) until the first
+    canvas arrives — idle must read as idle, never as signal-lost.
+    """
+    if canvas is None:
+        return _placeholder(w, h, "LKG: waiting for autopilot canvas ...")
+    ch, cw = canvas.shape[:2]
+    scale = min(w / cw, h / ch)
+    new_w, new_h = max(1, int(round(cw * scale))), max(1, int(round(ch * scale)))
+    resized = cv2.resize(canvas, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    panel = np.full((h, w, 3), 30, np.uint8)
+    y0, x0 = (h - new_h) // 2, (w - new_w) // 2
+    panel[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return panel
+
+
 def render_status(pose, width, reloc_active, target=None):
     # Two-line strip: SLAM state on top, the target estimate below.
     strip = np.full((STATUS_H, width, 3), 45, np.uint8)
@@ -467,6 +492,7 @@ class Dashboard:
         self.target = None
         self.plan = None
         self.control = None    # latest TOPIC_CONTROL payload (autopilot's own control bus)
+        self.lkg_canvas = None  # Session 60 (C9): latest F_LKG/LIVE canvas off visrec_canvas_port
         self.cam_track = deque(maxlen=600)   # recent world camera centers (live, per-frame)
         self._map_img = None
         self._map_sig = None
@@ -500,6 +526,7 @@ class Dashboard:
         return self._map_img
 
     def render(self):
+        lkg_p = render_lkg_panel(self.lkg_canvas)               # (MAP_SIZE, PANEL_W) -- session 60 (C9)
         frame_p = render_frame_panel(self.frame)
         tel_p = render_telemetry_panel(self.control, self.plan)
         # Cached voxel/keyframe base + live camera overlay (per-frame, so position feels live).
@@ -510,7 +537,7 @@ class Dashboard:
         col_gap = np.zeros((GAP, PANEL_W, 3), np.uint8)
         left = np.vstack([frame_p, col_gap, tel_p])            # (MAP_SIZE, PANEL_W)
         row_gap = np.zeros((left.shape[0], GAP, 3), np.uint8)
-        body = np.hstack([left, row_gap, map_p])               # (MAP_SIZE, width)
+        body = np.hstack([lkg_p, row_gap, left, row_gap, map_p])  # (MAP_SIZE, width)
 
         reloc_active = (time.monotonic() - self._last_reloc) < RELOC_FLASH_S
         status = render_status(self.pose, body.shape[1], reloc_active, self.target)
@@ -529,7 +556,7 @@ def _open_video_writer(fps):
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(out_dir, f"{ts}_visualizer.mp4")
-    width = PANEL_W + GAP + MAP_SIZE
+    width = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE   # session 60 (C9): + the new leftmost LKG column
     height = STATUS_H + MAP_SIZE
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
@@ -543,16 +570,21 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
     pstate_port = cfg["network"]["perception_state_port"]
     frame_port = cfg["network"]["frame_bus_port"]
     ctrl_port = cfg["network"]["autonomy_control_port"]
+    canvas_port = cfg["network"]["visrec_canvas_port"]
     state_sub = frame_bus.StateSubscriber(pstate_port)  # all topics (pose/map/plan/target)
     frame_sub = frame_bus.FrameSubscriber(frame_port) if show_frame else None
     # A second, independent SUB on autopilot.py's own control bus (io_bridge already reads this
     # to drive Unity) -- purely to read `state`/`target_altitude_y` for the telemetry panel.
     # Lazy-connect: fine whether or not autopilot.py is running yet.
     ctrl_sub = frame_bus.StateSubscriber(ctrl_port, topics=[frame_bus.TOPIC_CONTROL])
+    # Session 60 (C9): the retired OS debug window's replacement -- autopilot.py publishes the composed
+    # F_LKG/LIVE canvas here instead of showing it with imshow. Lazy-connect, same as ctrl_sub.
+    canvas_sub = frame_bus.FrameSubscriber(canvas_port)
 
     print(f"[visualizer] state bus SUB :{pstate_port} (pose+map+plan+target)"
           + (f" | frame bus SUB :{frame_port}" if frame_sub else " | input frame OFF")
-          + f" | control bus SUB :{ctrl_port} (autopilot state+target_altitude_y)")
+          + f" | control bus SUB :{ctrl_port} (autopilot state+target_altitude_y)"
+          + f" | LKG canvas SUB :{canvas_port}")
     print("[visualizer] === READY === waiting for perception_worker ('q' to quit).\n")
 
     writer = _open_video_writer(record_fps) if record else None
@@ -586,6 +618,9 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
                 fr = frame_sub.recv(timeout_ms=0)
                 if fr is not None:
                     dash.frame = fr[0]
+            cv_frame = canvas_sub.recv(timeout_ms=0)
+            if cv_frame is not None:
+                dash.lkg_canvas = cv_frame[0]
             img = dash.render()
             cv2.imshow(WINDOW, img)
             if writer is not None:
@@ -603,6 +638,7 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
         print("[visualizer] shutting down ...")
         state_sub.close()
         ctrl_sub.close()
+        canvas_sub.close()
         if frame_sub is not None:
             frame_sub.close()
         if writer is not None:
@@ -649,6 +685,28 @@ def run_self_test():
     case(f"(57-3) missing_flag_defaults_yellow (yellow={has_bgr(img_missing, (0, 255, 255))} "
          f"blue={has_bgr(img_missing, (255, 0, 0))})",
          has_bgr(img_missing, (0, 255, 255)) and not has_bgr(img_missing, (255, 0, 0)))
+
+    # ---- SESSION-60 LKG PANEL: new leftmost column -- grey placeholder until a canvas has arrived,
+    # then a fit-scaled (aspect-preserved, letterboxed, never cropped) render of whatever autopilot.py
+    # published; the composed width always follows the new 4-panel formula in EITHER state. -----------
+    dash60 = Dashboard()
+    img_no_canvas = dash60.render()
+    expected_w = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE
+    case(f"(60-1) no canvas yet -> composes without raising, width == PANEL_W+GAP+PANEL_W+GAP+MAP_SIZE "
+         f"(got {img_no_canvas.shape[1]}, want {expected_w})",
+         img_no_canvas.shape[1] == expected_w)
+
+    dash60.lkg_canvas = np.full((288, 512, 3), 200, np.uint8)   # a stacked-looking canvas, unrelated size
+    img_with_canvas = dash60.render()
+    case(f"(60-2) canvas present -> composes without raising, SAME width as the no-canvas case "
+         f"(got {img_with_canvas.shape[1]})",
+         img_with_canvas.shape[1] == expected_w == img_no_canvas.shape[1])
+
+    lkg_panel_placeholder = render_lkg_panel(None)
+    lkg_panel_filled = render_lkg_panel(np.full((288, 512, 3), 200, np.uint8))
+    case(f"(60-3) render_lkg_panel: both states return (MAP_SIZE, PANEL_W) regardless of input "
+         f"(placeholder={lkg_panel_placeholder.shape} filled={lkg_panel_filled.shape})",
+         lkg_panel_placeholder.shape == (MAP_SIZE, PANEL_W, 3) == lkg_panel_filled.shape)
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

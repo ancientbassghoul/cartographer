@@ -18,6 +18,8 @@ network:
   object_state_port: 5604               # object_worker -> UI/report: target detections (bbox/center)
   frame_bus_hires_port: 5605            # io_bridge -> object_worker: high-res frames for Qwen grounding
   autonomy_control_port: 5606           # autopilot (P5) -> io_bridge: TOPIC_CONTROL desired control fields
+  lkg_frame_port: 5607                  # perception -> autopilot: the frame SLAM last TRACKED on (F_LKG)
+  visrec_canvas_port: 5608              # autopilot -> visualizer: composed F_LKG|LIVE debug canvas
 
 perception:
   target_processing_fps: 10             # sub-sample 30 -> 10 into the GPU workers
@@ -419,59 +421,45 @@ autonomy:
     use_rewind_on_stale: false   # session 31 (operator ask): REWIND never once visibly helped recover a stale plan across
                                  #   many real flights -- config-gated OFF rather than deleted; flip true to bring it back.
     command_history_s: 12.0      # (legacy) full-rewind horizon; the consuming rewind now drains the whole queue (maxlen 100)
-    # --- VISUAL RECOVERY (session 35 ALT): "the live NDI image tells us why tracking dropped and what to do
-    #     about it." At the exact loss-instant check session 34 already runs (cached clearance), a CONTAINED
-    #     (zoomed-in crop) or PLANAR-LIKE (flat-surface) SIFT match of the live frame against F_LKG (the last
-    #     frame SLAM was TRACKING on) is the same "too close" verdict -- catches the case geometry can't (SLAM
-    #     never integrated the wall we flew into, so the cached ray-cast clearance reads "clear"). If THAT is
-    #     also inconclusive, an explicit 15° open-loop turn-probe (VISUAL_RECOVERY) re-tests the image after
-    #     each step, BEFORE ever falling to the blind FALLBACK sweep. Config-gated, default OFF -- ships
-    #     live-fly-untested, same convention as use_rewind_on_stale above. ---
-    use_visual_recovery_on_stale: true   # off by default; live-fly-untested
+    # --- VISUAL MATCHING (session 35 ALT; probe STATE deleted session 60 -- see MISSION CONTEXT Finding C:
+    #     139 flight logs, 9.4 min of VISUAL_RECOVERY exposure, 0 recoveries -- rotating in place cannot
+    #     reproduce a view the drone has drifted away from). The SIFT/RANSAC matcher itself SURVIVES: it
+    #     still feeds the loss-instant too-close check right below, the HOLD_LOST back-off trigger (session
+    #     59), and the FALLBACK sweep's SERVO phase (session 60) -- "the live NDI image tells us why
+    #     tracking dropped and what to do about it" still holds, just without the dead open-loop turn-probe.
+    use_visual_matching: true    # session 60 (renamed from use_visual_recovery_on_stale): gates ONLY the
+                                 #   matcher's construction now -- every consumer downstream just checks
+                                 #   whether a match is available.
     visrec_min_inliers: 12                # reuse the project's already-validated SIFT/RANSAC inlier threshold (benchmark_detectors.py)
     visrec_planar_inlier_ratio: 0.85      # inlier fraction of all good matches to call a match "planar-like" (nose-to-a-flat-surface)
     visrec_contain_margin_frac: 0.02      # slack (fraction of frame size) for the corner-containment test (zoomed-in-crop verdict)
-    visrec_close_scale: 1.15              # homography linear scale >= this => the live frame is magnified (closer) => BACKOFF
     visrec_size_ratio_hi: 1.25    # session 57: inlier-SPREAD ratio (live/LKG) above this => the live frame is
                                   #   MAGNIFIED => we moved CLOSER => a pending back-off is justified.
     visrec_size_ratio_lo: 0.80    # session 57: below this (= 1/1.25) the LKG frame is the closer one => we are
                                   #   already farther than the evidence describes => HOLD, never back off.
     visrec_size_min_inliers: 20   # session 57: a direction verdict resting on fewer inliers than this is "not
                                   #   sure" -> UNKNOWN, which never suppresses a back-off (weak CV must not veto).
-    visrec_turn_step_deg: 15.0            # the probe's discrete open-loop rotation step (operator's exact value; independent of
-                                          #   recovery_turn_step_deg below, so FALLBACK's own sweep structure is never altered)
-    visrec_max_rotation_deg: 720.0        # cumulative probe budget (2 full rotations) before "exhausted" -> hand off to FALLBACK
-    visrec_wait_recover_s: 30.0           # bounded wait for a SLAM re-anchor after a farther/same re-match, before giving up -> STUCK
     visrec_match_min_interval_s: 0.5      # session 51: while a consumer is live but the drone is HOLDING
                                           # STILL (session 48's own grace invariant), the match answer cannot
                                           # change -- so recompute at most this often instead of on every one
                                           # of ~32 ticks/s. A fresh compute is FORCED regardless on: the loss
-                                          # edge, the probe's MATCH phase, any commanded motion since the last
-                                          # match, and a replaced F_LKG. General robustness interval, not a
-                                          # room answer.
-    visrec_debug_window: true             # session 49: open an OS window showing F_LKG | LIVE with the SIFT
+                                          # edge, any commanded motion since the last match, and a replaced
+                                          # F_LKG. General robustness interval, not a room answer.
+    visrec_debug_window: true             # session 49: build the F_LKG | LIVE debug canvas with the SIFT
                                           # inlier correspondences drawn, so the operator can SEE what the CV
                                           # probe is matching against. Also saves the canvas at decision
                                           # instants to OUTPUT/diag/<ts>_visrec/. Default OFF (same convention
-                                          # as use_rewind_on_stale / use_visual_recovery_on_stale).
+                                          # as use_rewind_on_stale / use_visual_matching). Session 60 (C9): the
+                                          # OS window (imshow) this used to also drive is RETIRED -- the canvas
+                                          # is published on visrec_canvas_port and rendered in the visualizer's
+                                          # LKG panel instead. This flag is still the one real choke experiment
+                                          # (set false to skip building/publishing/saving the canvas entirely).
     visrec_save_max: 200                  # hard cap on saved canvases per flight (bounded disk, like the
                                           # STUCK log-suppression cap) — general bound, not a room answer.
-    visrec_lkg_ring_len: 160              # session 52: F_LKG must be the EXACT frame SLAM's plan was
-                                          # computed from, not just "whatever frame was live when plan_valid
-                                          # ticked true" — this flight measured a 2s median / 14.9s WORST
-                                          # SLAM solve latency, so those can be seconds apart. run_explore
-                                          # keeps this many trailing (frame_id, frame) pairs and looks the
-                                          # plan's own frame_id up in it. A frame count, not a duration: at
-                                          # perception.target_processing_fps=10, 160 ≈ 16s of history, chosen
-                                          # to exceed the worst observed solve latency above. MEMORY COST IS
-                                          # REAL: each ring slot holds a full processing_width x
-                                          # processing_height x 3 BGR frame (512x288x3 = 442 KB), so 160 ≈
-                                          # 71 MB resident — a general platform-latency bound, not a room
-                                          # answer. 0 = disabled (legacy live-frame behaviour; logged LOUD
-                                          # once at startup, NO SILENT FALLBACK).
-    visrec_lkg_ageout_log_interval_s: 5.0   # session 56: rate-limit for the F_LKG age-out warning.
-                                            # Was a one-shot `_lkg_ring_warned` flag, so a defect that
-                                            # ran for 31 of 34 minutes logged exactly once, at 16:56:07.
+    # Session 60 (Finding A): visrec_lkg_ring_len / visrec_lkg_ageout_log_interval_s are GONE -- F_LKG is
+    # now published directly by perception_worker (the exact frame its TRACKING solve was computed from)
+    # and consumed straight off the bus, so the reconstruct-from-frame_id ring -- and the age-out it could
+    # suffer when SLAM solve latency outran the ring's depth -- no longer exist. See MISSION CONTEXT.
     use_visual_backoff_trigger: true   # session 59: let the CAMERA request a back-off, not merely veto one
     visual_backoff_min_window_s: 3.0   # confident-evidence window that must elapse before it may fire
     visual_backoff_live_ratio: 0.66    # LIVE / (LIVE + EQUAL + LKG) needed to call it "closing"
@@ -488,13 +476,14 @@ autonomy:
     # --- FALLBACK sweep (session 31, replaces the session-29 shuffled-direction-queue-with-per-direction-
     #     tries-and-opposite-phase search -- live flights showed LOCKING a push direction across several tries
     #     produced bad, unpredictable results). Deliberately simple 4-phase cycle: wait -> turn -> push (a
-    #     FRESH random direction every single cycle, no per-direction budget or retry) -> wait -> repeat, until
-    #     the cumulative commanded turn reaches fallback_max_rotation_deg -> STUCK. ---
+    #     FRESH random direction every single cycle, no per-direction budget or retry) -> wait -> repeat,
+    #     indefinitely (session 60: fallback_max_rotation_deg / the STUCK exhaustion it drove are GONE --
+    #     operator: "continue forever ... either it'd recover, or I'd stop it manually"; see the SERVO phase
+    #     below instead, which is what actually ends a sweep early on a recovered view). ---
     fallback_initial_wait_s: 20.0    # step 0: let a transient stale patch clear on its own before doing anything invasive
     fallback_post_push_wait_s: 10.0  # step 3: settle after each push, BLIND fixed wait (a genuine recovery to status==OK
                                      #   exits the sweep immediately regardless, via the generic recovery convergence -- this
                                      #   wait is only ever fully spent while still genuinely stale)
-    fallback_max_rotation_deg: 720.0 # exhaustion cap: 2 full rotations (48 cycles @ 15deg) with no recovery -> STUCK
     fallback_push_fwd_back_s: 1.0    # forward/backward push: FULL throttle (1.0), held this long INCLUDING ramp-up
                                      #   (operator-measured: ~2s of held full reverse is what it actually takes to matter)
     fallback_push_strafe_s: 0.25      # left/right push: FULL magnitude (+-1.0); joy_horizontal isn't ramped at all
@@ -508,6 +497,12 @@ autonomy:
                                  #   flavor: NOT gated on fast/OK (a genuine re-lock exits recovery at the step() top).
     recovery_settle_max_s: 10.0   # bounded escape for the REWIND inter-step settle above: if the pipeline is dead (no fresh
                                  #   frames), end the settle after this and still proceed to the next re-exposure maneuver.
+    # --- FALLBACK SERVO (session 60, Finding C / C6): once the sweep's SIFT matcher reports a sustained
+    #     confident verdict against F_LKG, stop sweeping and steer to the F_LKG viewpoint instead. ---
+    servo_min_window_s: 1.5   # sustained-confidence window before the servo may act on a verdict
+    servo_min_samples: 3      # confident verdicts required in that window (UNKNOWN never counts)
+    servo_hold_frames: 3      # SLAM frames CAPTURED at the held EQUAL pose that must be SOLVED before
+                              #   giving up and resuming the sweep
     # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
     #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are

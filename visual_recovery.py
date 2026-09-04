@@ -168,18 +168,53 @@ class VisualRecoveryProbe:
         pad_shape = (target_h - h,) + img.shape[1:]
         return np.vstack([img, np.zeros(pad_shape, dtype=img.dtype)])
 
-    def _compose_debug(self, frame, out, kp0=None, kp1=None, good=None, mask=None, banner=None):
-        """Build the operator canvas: F_LKG (left) | live (right), with the RANSAC INLIER
-        correspondences drawn when a homography survived, and a two-line header.
+    @staticmethod
+    def _pad_to_width(img, target_w):
+        """Zero-pad `img` at the right to `target_w` columns — NEVER resize/scale (IMAGE INTEGRITY,
+        CLAUDE.md). A no-op when `img` is already wide enough. Session 60 (C8): the STACKED layout
+        pads columns (not rows) since the two frames sit one above the other."""
+        w = img.shape[1]
+        if w >= target_w:
+            return img
+        pad_shape = (img.shape[0], target_w - w) + img.shape[2:]
+        return np.hstack([img, np.zeros(pad_shape, dtype=img.dtype)])
 
-        IMAGE INTEGRITY (CLAUDE.md): NOTHING here resizes, crops or downscales either frame. The canvas
-        width is exactly w_lkg + w_live. If the two frames differ in height (they do not in this
-        pipeline — both are the 512x288 transport frame) the SHORTER one is zero-PADDED, never scaled.
+    def _compose_debug(self, frame, out, kp0=None, kp1=None, good=None, mask=None, banner=None,
+                       *, stacked: bool = False):
+        """Build the operator canvas: F_LKG | live, with the RANSAC INLIER correspondences drawn when
+        a homography survived, and a two-line header.
+
+        IMAGE INTEGRITY (CLAUDE.md): NOTHING here resizes, crops or downscales either frame.
+
+        `stacked` (session 60, C8; keyword-only, default False preserves the original layout exactly):
+          - False (default): SIDE-BY-SIDE, F_LKG (left) | live (right) via `cv2.drawMatches`. Canvas
+            width is exactly w_lkg + w_live; a height mismatch is zero-padded (never scaled). This is
+            still the shape saved to the PNG evidence trail — UNCHANGED.
+          - True: STACKED, F_LKG (top) / live (bottom) — the visualizer's LKG panel column (see
+            visualizer.py PANEL_W x MAP_SIZE) is tall and narrow, not wide and short, so a second
+            canvas in this orientation is composed for that column only. `cv2.drawMatches` only ever
+            builds a side-by-side canvas, so the inlier lines are drawn by hand here: for each inlier,
+            a line from (x_lkg, y_lkg) to (x_live, y_live + h_lkg). A width mismatch is zero-padded
+            (never scaled).
 
         Returns a BGR ndarray.
         """
         lkg = self._lkg
-        if kp0 is not None and kp1 is not None and good is not None and mask is not None:
+        if stacked:
+            w_max = max(lkg.shape[1], frame.shape[1])
+            top = self._pad_to_width(lkg, w_max)
+            bot = self._pad_to_width(frame, w_max)
+            body = np.vstack([top, bot])
+            if kp0 is not None and kp1 is not None and good is not None and mask is not None:
+                h_lkg_body = lkg.shape[0]
+                for m, keep in zip(good, mask):
+                    if not keep:
+                        continue
+                    x0, y0 = kp0[m.queryIdx].pt
+                    x1, y1 = kp1[m.trainIdx].pt
+                    cv2.line(body, (int(round(x0)), int(round(y0))),
+                            (int(round(x1)), int(round(y1)) + h_lkg_body), (0, 255, 0), 1, cv2.LINE_AA)
+        elif kp0 is not None and kp1 is not None and good is not None and mask is not None:
             # cv2.drawMatches already allocates a (max(h1,h2), w1+w2) canvas and top-left-aligns each
             # image into its half — the same zero-pad-not-scale behaviour _pad_to_height gives the
             # fallback branch below, done internally.
@@ -201,11 +236,18 @@ class VisualRecoveryProbe:
         cv2.putText(banner_strip, line1, (6, 13), BANNER_FONT, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(banner_strip, line2, (6, 29), BANNER_FONT, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
         canvas = np.vstack([banner_strip, body])
-        w_lkg = lkg.shape[1]
-        cv2.putText(canvas, "F_LKG (reference)", (6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
-                   (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "LIVE", (w_lkg + 6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
-                   (0, 255, 255), 1, cv2.LINE_AA)
+        if stacked:
+            h_lkg = lkg.shape[0]
+            cv2.putText(canvas, "F_LKG (reference)", (6, BANNER_H + h_lkg - 8), BANNER_FONT, 0.45,
+                       (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, "LIVE", (6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
+                       (0, 255, 255), 1, cv2.LINE_AA)
+        else:
+            w_lkg = lkg.shape[1]
+            cv2.putText(canvas, "F_LKG (reference)", (6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
+                       (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, "LIVE", (w_lkg + 6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
+                       (0, 255, 255), 1, cv2.LINE_AA)
         return canvas
 
     def match(self, frame, debug: bool = False, banner: str | None = None) -> VisualMatch:
@@ -448,6 +490,28 @@ def run_self_test():
     case("banner text renders without raising; banner=None is safe; banner never changes canvas size",
          vm10a.debug_image is not None and vm10b.debug_image is not None
          and vm10a.debug_image.shape == vm10b.debug_image.shape)
+
+    # ---- SESSION-60 LKG PANEL — C8: _compose_debug gains stacked=True (F_LKG-over-LIVE) for the
+    # visualizer's tall/narrow panel column, WITHOUT disturbing the default side-by-side shape that
+    # still feeds the PNG evidence trail (unchanged). ------------------------------------------------
+    probe11 = VisualRecoveryProbe()
+    probe11.update_reference(base, True)
+    vm11 = probe11.match(zoomed, debug=True)
+    canvas_default = probe11._compose_debug(zoomed, vm11)
+    canvas_explicit_false = probe11._compose_debug(zoomed, vm11, stacked=False)
+    case(f"(60-1) stacked=False reproduces today's side-by-side shape exactly "
+         f"(default={canvas_default.shape} explicit={canvas_explicit_false.shape})",
+         canvas_default.shape == canvas_explicit_false.shape
+         and canvas_default.shape[1] == base.shape[1] + zoomed.shape[1])
+
+    canvas_stacked = probe11._compose_debug(zoomed, vm11, stacked=True)
+    h_lkg11, w_lkg11 = base.shape[:2]
+    h_live11, w_live11 = zoomed.shape[:2]
+    case(f"(60-2) stacked=True composes F_LKG-over-LIVE: taller than wide, height >= h_lkg+h_live, "
+         f"width == max(w_lkg, w_live) (shape={canvas_stacked.shape})",
+         canvas_stacked.shape[0] > canvas_stacked.shape[1]
+         and canvas_stacked.shape[0] >= h_lkg11 + h_live11
+         and canvas_stacked.shape[1] == max(w_lkg11, w_live11))
 
     # ---- SESSION 51 — lazy, memoised SIFT on the REFERENCE half -----------------------------------------
     # match() used to recompute SIFT on _lkg every single call; during a loss the reference is frozen
