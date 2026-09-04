@@ -65,6 +65,15 @@ MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left colu
 STATUS_H = 48                 # two lines: SLAM state + target estimate
 RELOC_FLASH_S = 2.0           # keep the RELOC banner up this long after the event
 
+LKG_CANVAS_STALE_S = 2.0    # session 61: no canvas for this long -> grey it out. >= 4x the slowest
+                            #   publish cadence (visrec_match_min_interval_s 0.5s), so this can only
+                            #   fire when the autopilot really stopped publishing -- NEVER because
+                            #   the plan is healthy (operator's requirement).
+LKG_TEXT_SCALE = 0.42       # drawn at PANEL resolution, so this is the size actually seen
+LKG_TEXT_LINE_H = 15
+LKG_TEXT_PAD = 8
+LKG_TEXT_MAX_LINES = 6
+
 
 def load_config(path=None):
     path = path or os.path.join(REPO, "config.yaml")
@@ -108,6 +117,47 @@ def _wrap_text(text, max_chars):
     return lines
 
 
+def _wrap_text_segments(segments, max_px, font, scale):
+    """Greedily pack whole `segments` (list[str]) into lines whose rendered width, per
+    cv2.getTextSize(line, font, scale, 1)[0][0], is <= max_px. Segments joined by two spaces.
+
+    Session 61: segments are NEVER split mid-token, so no field can render half-visible (Finding D
+    lost scale/size/closer/src/age off the right edge of a 512px canvas). NO SILENT FALLBACK: a lone
+    segment wider than max_px gets its own hard-split line (like the existing char-based
+    `_wrap_text`) — never a truncation. Returns [] for a falsy `segments`.
+    """
+    if not segments:
+        return []
+    lines = []
+    cur = ""
+    for seg in segments:
+        candidate = f"{cur}  {seg}" if cur else seg
+        if cv2.getTextSize(candidate, font, scale, 1)[0][0] <= max_px:
+            cur = candidate
+            continue
+        if cur:
+            lines.append(cur)
+            cur = ""
+        if cv2.getTextSize(seg, font, scale, 1)[0][0] <= max_px:
+            cur = seg
+            continue
+        # A single segment alone is still too wide -- hard-split it character by character rather
+        # than truncate (NO SILENT FALLBACK: every character must land somewhere on screen).
+        piece = ""
+        for ch in seg:
+            candidate_piece = piece + ch
+            if cv2.getTextSize(candidate_piece, font, scale, 1)[0][0] <= max_px:
+                piece = candidate_piece
+            else:
+                if piece:
+                    lines.append(piece)
+                piece = ch
+        cur = piece
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
     if frame is None:
         return _placeholder(w, h, "input: no frame bus")
@@ -120,8 +170,10 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
     FSM state (with time-in-state), current vs. desired (autopilot-locked) height, plan status,
     (while the plan is valid) live straight-line distance to the current goal, the SLAM_HOLD
-    forced-hop countdown (session 52), the F_LKG source (session 60: F_LKG now arrives pre-resolved
-    off its own bus, so age-out is structurally impossible and no longer rendered here), and a 1-2
+    forced-hop countdown (session 52), the F_LKG source + age (session 60: F_LKG now arrives
+    pre-resolved off its own bus, so AGE-OUT is structurally impossible and no longer rendered here;
+    session 61 (C9) adds back a plain elapsed-time AGE reading, a different thing -- how old the
+    current reference is, not a staleness verdict), and a 1-2
     line notice block surfacing the latest timeout (`control["notice"]`) and/or the latest planner
     event (`plan["planner_event"]`) so the operator always has these visible instead of only on the
     map's transient overlay text or the console log. `control` is the latest TOPIC_CONTROL payload
@@ -184,7 +236,11 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     # red STALE indicator this used to carry is retired along with it. NO SILENT FALLBACK: absent payload
     # still prints "--", never a guessed source.
     visrec_lkg = control.get("visrec_lkg")
-    lkg_txt = "LKG=--" if visrec_lkg is None else f"LKG={visrec_lkg.get('src')}"
+    if visrec_lkg is None:
+        lkg_txt = "LKG=--"
+    else:
+        _lkg_age = visrec_lkg.get("age_s")
+        lkg_txt = f"LKG={visrec_lkg.get('src')} age={'n/a' if _lkg_age is None else f'{_lkg_age}s'}"
     cv2.putText(panel, lkg_txt, (190, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     # SLAM_HOLD forced-hop countdown (session 52): mirrors the SLAM ms= red-past-threshold
@@ -412,12 +468,11 @@ def render_map_panel(m, size=MAP_SIZE, target=None):
     return img
 
 
-def render_lkg_panel(canvas, w=PANEL_W, h=MAP_SIZE):
+def render_lkg_panel(canvas, info=None, age_s=None, w=PANEL_W, h=MAP_SIZE):
     """Session 60 (C9): the retired OS debug window's replacement. `autopilot.py` composes the
-    F_LKG/LIVE canvas (`visual_recovery.VisualRecoveryProbe._compose_debug(..., stacked=True)`) at
-    every visual-match decision instant and publishes it on `visrec_canvas_port` instead of showing
-    it with imshow; this renders that canvas as the dashboard's new leftmost column so it lands in
-    the recording too.
+    F_LKG/LIVE canvas (`visual_recovery.VisualRecoveryProbe.compose_stacked_live`) on a cadence and
+    publishes it on `visrec_canvas_port` instead of showing it with imshow; this renders that canvas
+    as the dashboard's new leftmost column so it lands in the recording too.
 
     IMAGE INTEGRITY (CLAUDE.md) disclosure — the ONE display-only scale in this session: the canvas
     arrives at its native (512px-wide transport-frame-derived) resolution; this column is a fixed
@@ -427,16 +482,31 @@ def render_lkg_panel(canvas, w=PANEL_W, h=MAP_SIZE):
 
     GREY placeholder (not black, matching every other "waiting" panel in this file) until the first
     canvas arrives — idle must read as idle, never as signal-lost.
+
+    Session 61: `info` is the F_LKG/LIVE canvas's field segments (C5), drawn HERE at panel
+    resolution instead of baked into the 512px canvas and then downscaled — crisp and complete.
+    `age_s` is how long ago the canvas arrived; past LKG_CANVAS_STALE_S the panel greys out rather
+    than showing a frozen image that reads as current (the 22:40:29 failure).
     """
+    if age_s is not None and age_s > LKG_CANVAS_STALE_S:
+        return _placeholder(w, h, f"LKG canvas stale ({age_s:.1f}s)")
     if canvas is None:
         return _placeholder(w, h, "LKG: waiting for autopilot canvas ...")
+    lines = _wrap_text_segments(info, w - 12, cv2.FONT_HERSHEY_SIMPLEX, LKG_TEXT_SCALE)
+    lines = lines[:LKG_TEXT_MAX_LINES]
+    text_h = (len(lines) * LKG_TEXT_LINE_H + LKG_TEXT_PAD) if lines else 0
+    avail_h = h - text_h
     ch, cw = canvas.shape[:2]
-    scale = min(w / cw, h / ch)
+    scale = min(w / cw, avail_h / ch)
     new_w, new_h = max(1, int(round(cw * scale))), max(1, int(round(ch * scale)))
     resized = cv2.resize(canvas, (new_w, new_h), interpolation=cv2.INTER_AREA)
     panel = np.full((h, w, 3), 30, np.uint8)
-    y0, x0 = (h - new_h) // 2, (w - new_w) // 2
+    x0 = (w - new_w) // 2
+    y0 = text_h + (avail_h - new_h) // 2
     panel[y0:y0 + new_h, x0:x0 + new_w] = resized
+    for i, line in enumerate(lines):
+        cv2.putText(panel, line, (6, LKG_TEXT_LINE_H * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX,
+                   LKG_TEXT_SCALE, (220, 220, 220), 1)
     return panel
 
 
@@ -493,6 +563,9 @@ class Dashboard:
         self.plan = None
         self.control = None    # latest TOPIC_CONTROL payload (autopilot's own control bus)
         self.lkg_canvas = None  # Session 60 (C9): latest F_LKG/LIVE canvas off visrec_canvas_port
+        self.lkg_canvas_info = None   # Session 61 (C5): the canvas's field segments (banner_fields)
+        self.lkg_canvas_t = None      # Session 61: time.monotonic() when the last canvas ARRIVED --
+                                       # drives the stale-placeholder guard (LKG_CANVAS_STALE_S)
         self.cam_track = deque(maxlen=600)   # recent world camera centers (live, per-frame)
         self._map_img = None
         self._map_sig = None
@@ -526,7 +599,10 @@ class Dashboard:
         return self._map_img
 
     def render(self):
-        lkg_p = render_lkg_panel(self.lkg_canvas)               # (MAP_SIZE, PANEL_W) -- session 60 (C9)
+        # Session 61: age_s drives the stale-placeholder guard -- None (never a canvas yet) is
+        # distinct from a real elapsed time, so it must not be coerced to 0.0 here.
+        age_s = None if self.lkg_canvas_t is None else time.monotonic() - self.lkg_canvas_t
+        lkg_p = render_lkg_panel(self.lkg_canvas, self.lkg_canvas_info, age_s)  # (MAP_SIZE, PANEL_W)
         frame_p = render_frame_panel(self.frame)
         tel_p = render_telemetry_panel(self.control, self.plan)
         # Cached voxel/keyframe base + live camera overlay (per-frame, so position feels live).
@@ -621,6 +697,9 @@ def run(cfg, show_frame=True, record=False, record_fps=15.0, stop_file=None):
             cv_frame = canvas_sub.recv(timeout_ms=0)
             if cv_frame is not None:
                 dash.lkg_canvas = cv_frame[0]
+                # Session 61 (C11): meta carries banner_fields()'s 12 segments as {"info": [...]}.
+                dash.lkg_canvas_info = (cv_frame[1] or {}).get("info") or []
+                dash.lkg_canvas_t = time.monotonic()
             img = dash.render()
             cv2.imshow(WINDOW, img)
             if writer is not None:
@@ -707,6 +786,105 @@ def run_self_test():
     case(f"(60-3) render_lkg_panel: both states return (MAP_SIZE, PANEL_W) regardless of input "
          f"(placeholder={lkg_panel_placeholder.shape} filled={lkg_panel_filled.shape})",
          lkg_panel_placeholder.shape == (MAP_SIZE, PANEL_W, 3) == lkg_panel_filled.shape)
+
+    # ---- SESSION-61 LKG PANEL TEXT: the info block wraps between whole segments (never mid-field,
+    # Finding D) drawn at PANEL resolution, and the panel greys out ONLY when the publisher truly
+    # went silent (never when the plan is merely healthy -- operator's requirement). ------------------
+    font61 = cv2.FONT_HERSHEY_SIMPLEX
+    max_px61 = PANEL_W - 12
+
+    segs61 = ["HOLD_LOST / PLAN-LOST", "src=slam:19385", "lkg_age=12.3s", "live=#20741",
+             "matched=T", "inliers=42", "cont=F", "planar=T", "scale=1.23", "size=0.98",
+             "closer=LIVE", "lines=17"]
+    wrapped61 = _wrap_text_segments(segs61, max_px61, font61, LKG_TEXT_SCALE)
+    all_fit61 = all(cv2.getTextSize(l, font61, LKG_TEXT_SCALE, 1)[0][0] <= max_px61 for l in wrapped61)
+    joined61 = "  ".join(wrapped61)
+    all_present61 = all(seg in joined61 for seg in segs61)
+    empty_none61 = _wrap_text_segments(None, max_px61, font61, LKG_TEXT_SCALE) == []
+    empty_list61 = _wrap_text_segments([], max_px61, font61, LKG_TEXT_SCALE) == []
+    wrapped_long61 = _wrap_text_segments(["x" * 400], max_px61, font61, LKG_TEXT_SCALE)
+    long_fits61 = (len(wrapped_long61) > 1
+                  and all(cv2.getTextSize(l, font61, LKG_TEXT_SCALE, 1)[0][0] <= max_px61
+                         for l in wrapped_long61))
+    case(f"(61-1) _wrap_text_segments: every line fits max_px, no segment dropped, []/None safe, "
+         f"a 400-char segment hard-splits (all_fit={all_fit61}, all_present={all_present61}, "
+         f"empty_none={empty_none61}, empty_list={empty_list61}, long_fits={long_fits61})",
+         all_fit61 and all_present61 and empty_none61 and empty_list61 and long_fits61)
+
+    case(f"(61-2) realistic 12-segment banner_fields list wraps to <= LKG_TEXT_MAX_LINES lines "
+         f"(n_lines={len(wrapped61)}, max={LKG_TEXT_MAX_LINES})",
+         len(wrapped61) <= LKG_TEXT_MAX_LINES)
+
+    canvas61 = np.full((576, 512, 3), 200, np.uint8)
+    panel61 = render_lkg_panel(canvas61, info=segs61, age_s=0.1)
+    has_image_px61 = bool(np.any(np.all(panel61 == 200, axis=-1)))
+    case(f"(61-3a) render_lkg_panel(512x576 canvas, 12 segs, age_s=0.1) -> shape=(MAP_SIZE,PANEL_W,3), "
+         f"image region non-empty (shape={panel61.shape}, has_image_pixels={has_image_px61})",
+         panel61.shape == (MAP_SIZE, PANEL_W, 3) and has_image_px61)
+
+    segs61_20 = segs61 + [f"extra{i}=value{i}" for i in range(8)]
+    panel61b = render_lkg_panel(canvas61, info=segs61_20, age_s=0.1)
+    has_image_px61b = bool(np.any(np.all(panel61b == 200, axis=-1)))
+    case(f"(61-3b) 20-segment worst case -> shape=(MAP_SIZE,PANEL_W,3), image region non-empty "
+         f"(shape={panel61b.shape}, has_image_pixels={has_image_px61b})",
+         panel61b.shape == (MAP_SIZE, PANEL_W, 3) and has_image_px61b)
+
+    panel_stale61 = render_lkg_panel(canvas61, info=segs61, age_s=LKG_CANVAS_STALE_S + 0.1)
+    panel_fresh61 = render_lkg_panel(canvas61, info=segs61, age_s=0.1)
+    differs61 = not np.array_equal(panel_stale61, panel_fresh61)
+    stale_has_no_image61 = not bool(np.any(np.all(panel_stale61 == 200, axis=-1)))
+    case(f"(61-4) age_s > LKG_CANVAS_STALE_S -> grey stale placeholder, differs from age_s=0.1 "
+         f"(differs={differs61}, stale_has_no_image={stale_has_no_image61})",
+         differs61 and stale_has_no_image61)
+
+    panel_none61 = render_lkg_panel(None)
+    case(f"(61-5) render_lkg_panel(None) -> waiting placeholder, shape=(MAP_SIZE,PANEL_W,3) "
+         f"(shape={panel_none61.shape})",
+         panel_none61.shape == (MAP_SIZE, PANEL_W, 3))
+
+    expected_w61 = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE
+    expected_h61 = STATUS_H + MAP_SIZE
+    dash61 = Dashboard()
+    img_no_canvas61 = dash61.render()
+    dash61.lkg_canvas = canvas61
+    dash61.lkg_canvas_info = segs61
+    dash61.lkg_canvas_t = time.monotonic()
+    img_fresh61 = dash61.render()
+    dash61.lkg_canvas_t = time.monotonic() - (LKG_CANVAS_STALE_S + 1.0)
+    img_stale61 = dash61.render()
+    expected_shape61 = (expected_h61, expected_w61, 3)
+    case(f"(61-6) Dashboard.render() composes to the fixed size in all three states: "
+         f"no-canvas/fresh/stale (shapes={img_no_canvas61.shape}, {img_fresh61.shape}, "
+         f"{img_stale61.shape}, expected={expected_shape61})",
+         img_no_canvas61.shape == expected_shape61 and img_fresh61.shape == expected_shape61
+         and img_stale61.shape == expected_shape61)
+
+    # (61-7) telemetry row (C9): spy cv2.putText to read back the EXACT string drawn, since pixels
+    # alone aren't OCR-able -- same technique visual_recovery.py's (52-lkg-3) uses for its own banner.
+    _put_text_calls61 = []
+    _real_put_text61 = cv2.putText
+
+    def _spy_put_text61(img, text, *rest, **kw):
+        _put_text_calls61.append(text)
+        return _real_put_text61(img, text, *rest, **kw)
+
+    cv2.putText = _spy_put_text61
+    try:
+        render_telemetry_panel({"state": "SLAM_HOLD", "visrec_lkg": {"src": "slam:42", "age_s": 1.4}}, {})
+        lkg_float_txt61 = next((t for t in _put_text_calls61 if t.startswith("LKG=")), None)
+        _put_text_calls61.clear()
+        render_telemetry_panel({"state": "SLAM_HOLD", "visrec_lkg": {"src": "none", "age_s": None}}, {})
+        lkg_none_txt61 = next((t for t in _put_text_calls61 if t.startswith("LKG=")), None)
+        _put_text_calls61.clear()
+        render_telemetry_panel({"state": "SLAM_HOLD"}, {})
+        lkg_missing_txt61 = next((t for t in _put_text_calls61 if t.startswith("LKG=")), None)
+    finally:
+        cv2.putText = _real_put_text61
+    case(f"(61-7) telemetry row: 'age=<float>s' for a float, 'age=n/a' for None, 'LKG=--' for a "
+         f"missing payload (float={lkg_float_txt61!r}, none={lkg_none_txt61!r}, "
+         f"missing={lkg_missing_txt61!r})",
+         lkg_float_txt61 == "LKG=slam:42 age=1.4s" and lkg_none_txt61 == "LKG=none age=n/a"
+         and lkg_missing_txt61 == "LKG=--")
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

@@ -5,13 +5,32 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-04**, branch `all-bets-are-off`, session 60: **built and gated, not yet
-flown**. It answers the four things session 59's own flight surfaced — F_LKG moved to perception,
-the bump-latch fix, the probe deleted in favour of a FALLBACK servo, and the LKG panel moved into the
-visualizer. See `STATE.md` for the watch list on the next flight._
+_Last updated **2026-09-05**, branch `all-bets-are-off`, session 61: **built and gated, not yet
+flown**. Session 60 flew clean the same day — the F_LKG rework held up — but its own debug panel
+turned out to be lying to the operator; session 61 fixes the panel, not the plumbing. See `STATE.md`
+for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **61** — The LKG debug panel, not the F_LKG plumbing underneath it, was lying. It published only at
+  SIFT-match instants, so during a 7-minute flight with just 16 matches it sat ~50s and 8 SLAM solves
+  stale while the map arrow and telemetry stayed live — the operator caught this from a screenshot at
+  22:40:29 where the frozen F_LKG image aimed the wrong way entirely. It also never drew the RANSAC
+  inlier lines (the correspondences were `match()`-local, thrown away) and clipped its info line at
+  74 of ~135 characters in the 512px-wide canvas, losing `scale`/`size`/`closer`/`src`/`age`. We
+  wanted the panel to publish on a timer instead of a match, draw the real lines, and show every
+  field. Fixed by retaining each match's draw set so a later composer can use it, publishing the
+  canvas on a cadence with the reason for "no lines yet" spelled out in words, and moving all text
+  into the visualizer at panel resolution instead of baking it into the transport-width canvas.
+  Considered hiding the panel outside loss episodes instead — rejected: it costs no GPU time and only
+  ~0.3ms of a 26-31ms tick, and "stop publishing when the plan is fine" has exactly the same failure
+  mode as the bug being fixed (a missed stand-down leaves the last canvas frozen forever). All 9
+  self-test suites green. `plans/session61-spec.md`.
+- **60 (flown 2026-09-04 22:34-22:41, `OUTPUT/diag/20260904_223410_*`)** — The F_LKG rework held up:
+  135 distinct `slam:<id>` references, zero age-outs, no `VISUAL_RECOVERY`, no double bump pulses.
+  FALLBACK was never entered on this flight, though, so the new SERVO phase remains unobserved. The
+  choke is undiminished — an 11.1s solve at 22:40:06 and a 15.5s solve at 22:40:30, inside a
+  7-minute flight. This same flight is what surfaced session 61's panel bug, above.
 - **60** — The session 59 flight's 15.3-minute `PLAN-STALE` turned out to be tracking-lost, not
   SLAM-choked (169 frames, median `slam_ms` 1902) — recovery logic failing, not speed. Four fixes.
   First, F_LKG could never refresh: the autopilot reconstructed it by looking a plan's `frame_id` up

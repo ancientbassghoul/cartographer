@@ -881,6 +881,11 @@ class ExploreController:
         # Session 49: the operator-visible LKG debug window (F_LKG | LIVE + drawn inliers) -- what the CV
         # matcher is matching against, live. Default OFF, mirrors use_visual_matching's convention.
         self.visrec_match_min_interval_s = float(e.get("visrec_match_min_interval_s", 0.5))
+        # Session 61 (C1): LKG-panel republish cadences -- general UI timing, not a room answer. The
+        # panel must stay live even when no match is permitted yet (loss_backoff_grace_s window), so
+        # it gets its OWN cadence rather than reusing visrec_match_min_interval_s.
+        self.visrec_canvas_loss_interval_s = float(e.get("visrec_canvas_loss_interval_s", 0.1))
+        self.visrec_canvas_idle_interval_s = float(e.get("visrec_canvas_idle_interval_s", 0.5))
         self.visrec_debug_window = bool(e.get("visrec_debug_window", False))
         self.visrec_save_max = int(e.get("visrec_save_max", 200))
         # Session 60 (Finding A): the F_LKG ring + its age-out apparatus are GONE -- see config.yaml.
@@ -5067,6 +5072,70 @@ def _visrec_should_match(ctrl, *, needs_match, has_frame, loss_edge, moved_since
     return memo_age_s >= ctrl.visrec_match_min_interval_s
 
 
+def _visrec_canvas_due(now, last_pub_t, idle_interval_s, loss_interval_s,
+                       loss_now, fresh_match, matching_active) -> bool:
+    """Session 61: should the LKG panel canvas be published on THIS tick?
+
+    Pure; no I/O, no state. Rules, in order:
+      1. `fresh_match`      -> True always. A lined canvas is never skipped, whatever the timers say.
+      2. `matching_active`  -> False. A LINED canvas is due within visrec_match_min_interval_s, so
+                               unlined intermediates are suppressed rather than flickering the lines
+                               onto 1 published frame in 5. (`matching_active` is GATE A's own
+                               predicate, so the two cadences can never disagree about whether a
+                               match tick is coming.)
+      3. otherwise          -> (now - last_pub_t) >= (loss_interval_s if loss_now
+                                                      else idle_interval_s)
+
+    INVARIANT (asserted in the self-test): no combination of inputs can leave a publish gap of
+    LKG_CANVAS_STALE_S or more while `loss_now` — the panel must never grey out mid-loss
+    (operator's requirement). Rule 2's worst case is visrec_match_min_interval_s (0.5s), rule 3's
+    is loss_interval_s (0.1s); the visualizer's timeout is 2.0s.
+    """
+    if fresh_match:
+        return True
+    if matching_active:
+        return False
+    return (now - last_pub_t) >= (loss_interval_s if loss_now else idle_interval_s)
+
+
+def _visrec_no_match_reason(ctrl, *, needs_match, has_frame, matching_active,
+                            now, status, memo_age_s) -> "str | None":
+    """Session 61: WHY no fresh match backs this tick's canvas — so "no lines" is a named state
+    rather than a silent blank (Finding B: GATE A forbids matching for the first
+    loss_backoff_grace_s of every loss episode, which is exactly the window the operator most needs
+    to read).
+
+    Returns None when a fresh match DID run this tick (the caller passes n_lines instead), else one
+    of exactly these shapes:
+        "plan OK"                              not needs_match
+        "no live frame"                        needs_match and not has_frame
+        "loss grace 7.2/12.0s"                 not matching_active, status in ("PLAN-LOST",
+                                                 "NO-PLAN") and ctrl._loss_episode_t0 is not None
+                                                 -> f"loss grace {now - ctrl._loss_episode_t0:.1f}/"
+                                                    f"{ctrl.loss_backoff_grace_s:.1f}s"
+        "loss grace pending"                   not matching_active, same statuses, but
+                                                 _loss_episode_t0 is None (no episode stamped yet)
+        "snapshot spent"                       not matching_active, any other status (GATE A's
+                                                 one-shot ticket is used up for this episode)
+        "verdict reused (0.3s)"                matching_active but GATE B reused the memo
+                                                 -> f"verdict reused ({memo_age_s:.1f}s)"
+
+    Evaluated in that order; the first matching clause wins.
+    """
+    if not needs_match:
+        return "plan OK"
+    if not has_frame:
+        return "no live frame"
+    if not matching_active:
+        if status in ("PLAN-LOST", "NO-PLAN"):
+            if ctrl._loss_episode_t0 is not None:
+                waited = now - ctrl._loss_episode_t0
+                return f"loss grace {waited:.1f}/{ctrl.loss_backoff_grace_s:.1f}s"
+            return "loss grace pending"
+        return "snapshot spent"
+    return f"verdict reused ({memo_age_s:.1f}s)"
+
+
 def _visrec_debug_sink(ctrl, diag, canvas, save, stamp, saved_count):
     """When `save` is True, write `canvas` under OUTPUT/diag/<flight_ts>_visrec/<stamp>.png.
 
@@ -5162,6 +5231,13 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
           if no_takeoff else "Will ARM + TAKE OFF automatically (same recipes as the mission), then explore."))
     print("[autopilot][explore] On io_bridge press 'm' to hand control over; any flight key aborts. "
           "REQUIRES perception_worker running (it publishes the frontier plan).")
+    # Session 61 (NO SILENT FALLBACK): visrec_debug_window asks for the LKG panel but use_visual_matching
+    # is off, so visrec_probe is None and nothing will ever publish on canvas_port -- an unexplained grey
+    # panel for the whole flight is exactly the ambiguity Finding A/D removed everywhere else.
+    if ctrl.visrec_debug_window and visrec_probe is None:
+        print("[autopilot][explore] visrec_debug_window is on but use_visual_matching is off -> no "
+              "VisualRecoveryProbe was built -> the LKG panel will stay idle (grey) for this whole "
+              "flight; set use_visual_matching: true to enable it.")
 
     seq = 0
     bump_seq = 0          # dedup id for TOPIC_AUTOPILOT_EVENT bump pulses (perception drops repeats)
@@ -5195,6 +5271,10 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     visrec_memo_t = 0.0
     visrec_moved_since_match = False
     visrec_matches = 0          # total real matches computed this flight (waste-reduction gauge)
+    # Session 61 (Finding A): the LKG panel canvas now publishes on a CADENCE, not only at match
+    # instants -- these track when it last went out and how many times, independent of visrec_matches.
+    visrec_canvas_pub_t = 0.0
+    visrec_canvas_n = 0         # canvases published this flight (cadence gauge)
     # Session 60 (Finding A): the reconstruct-from-ID ring is GONE -- F_LKG arrives pre-resolved on
     # lkg_sub (see its construction above), so age-out is now structurally impossible.
     # [TRIGGER] tracking (diagnostic session): the exact wall-time the forward-push command engages/
@@ -5287,6 +5367,10 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             # label -- mirrors slam_hold's shape/placement, minus the retired ageouts/degraded fields.
             visrec_lkg = {
                 "src": visrec_probe._lkg_src if visrec_probe is not None else "none",
+                # Session 61 (C9): how old the CURRENT F_LKG is, so a frozen panel can be told apart
+                # from a healthy one carrying an old-but-still-current reference.
+                "age_s": (round(now - visrec_probe._lkg_t, 1)
+                          if visrec_probe is not None and visrec_probe._lkg_t is not None else None),
             }
             pub.publish(frame_bus.TOPIC_CONTROL,
                         _full_vector(active, seq, now, state, ctrl.target_altitude_y,
@@ -5553,13 +5637,33 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                             visrec_saved += 1
                             visrec_episode_saved = True
                             visrec_last_saved_rel = rel
-                        # Session 60 (C9): a SEPARATE STACKED (F_LKG-over-LIVE) composition for the
-                        # visualizer's LKG panel column, which is tall/narrow rather than wide/short (see
-                        # visualizer.py PANEL_W x MAP_SIZE) -- the side-by-side canvas above stays the
-                        # unchanged PNG evidence format. No correspondence lines here (kp0/kp1/good/mask
-                        # are match()-local, not carried on VisualMatch) -- the PNG keeps the inlier detail.
-                        canvas_pub.publish(
-                            visrec_probe._compose_debug(frame, visual_match, banner=banner, stacked=True), {})
+                # Session 61 (Finding A): the LKG panel canvas publishes on a CADENCE, not only at match
+                # instants -- the old match-gated publish left the panel showing a canvas ~50s/8 solves
+                # stale (the 22:40:29 failure) because 16 [VISREC] lines fired in 7 minutes of flight.
+                # `matching_active` reuses GATE A's own predicate so the two cadences can never disagree
+                # about whether a match tick is coming; `fresh_match` decides whether THIS tick's canvas
+                # gets its inlier lines drawn (Finding C).
+                matching_active = ctrl.wants_visual_match(now=now, status=status)
+                fresh_match = bool(do_match)
+                if ctrl.visrec_debug_window and _visrec_canvas_due(
+                        now, visrec_canvas_pub_t, ctrl.visrec_canvas_idle_interval_s,
+                        ctrl.visrec_canvas_loss_interval_s, loss_now, fresh_match, matching_active):
+                    composed = visrec_probe.compose_stacked_live(frame, draw_lines=fresh_match)
+                    if composed is not None:
+                        composed_canvas, n_lines = composed
+                        # Session 61 (Finding B): a suppressed match (e.g. mid loss_backoff_grace_s) must
+                        # be a NAMED reason on the panel, never a silent blank indistinguishable from a
+                        # failed match.
+                        reason = None if fresh_match else _visrec_no_match_reason(
+                            ctrl, needs_match=needs_match, has_frame=(frame is not None),
+                            matching_active=matching_active, now=now, status=status,
+                            memo_age_s=(now - visrec_memo_t))
+                        info = visrec_probe.banner_fields(
+                            visual_match, state_status=f"{ctrl.state} / {status}",
+                            live_frame_id=(meta or {}).get("frame_id"), n_lines=n_lines,
+                            lines_reason=reason)
+                        canvas_pub.publish(composed_canvas, {"info": info})
+                        visrec_canvas_pub_t, visrec_canvas_n = now, visrec_canvas_n + 1
                 visrec_prev_status = status
 
             # ---- step the controller + publish ----
@@ -10664,15 +10768,19 @@ def run_self_test(cfg):
           f"deleted_attrs_gone (still_present={_still_present})")
 
     # (60-lkg-2) _full_vector: visrec_lkg is ALWAYS present (never omitted; None when the caller passes
-    # none of the new kwargs), and round-trips ONLY `src` when the caller does -- no ageouts/degraded.
+    # none of the new kwargs), and round-trips `src` + `age_s` (session 61, C9) when the caller does --
+    # age_s may itself be None (no F_LKG timestamp yet) -- no ageouts/degraded.
     v60_empty = _full_vector({}, 1, 0.0, "WAIT")
     tel60a_ok = ("visrec_lkg" in v60_empty and v60_empty["visrec_lkg"] is None)
-    v60_full = _full_vector({}, 1, 0.0, "SLAM_HOLD", visrec_lkg={"src": "slam:67719"})
-    tel60b_ok = (v60_full["visrec_lkg"] == {"src": "slam:67719"})
-    telemetry_payload_shape = tel60a_ok and tel60b_ok
+    v60_full = _full_vector({}, 1, 0.0, "SLAM_HOLD", visrec_lkg={"src": "slam:67719", "age_s": 3.4})
+    tel60b_ok = (v60_full["visrec_lkg"] == {"src": "slam:67719", "age_s": 3.4})
+    v60_age_none = _full_vector({}, 1, 0.0, "SLAM_HOLD", visrec_lkg={"src": "none", "age_s": None})
+    tel60c_ok = (v60_age_none["visrec_lkg"] == {"src": "none", "age_s": None})
+    telemetry_payload_shape = tel60a_ok and tel60b_ok and tel60c_ok
     ok = ok and telemetry_payload_shape
     print(f"[self-test] {'PASS' if telemetry_payload_shape else 'FAIL'}  SESSION-60 F_LKG CONSUMER "
-          f"telemetry_payload_shape (present/None when omitted={tel60a_ok}, round-trips={tel60b_ok})")
+          f"telemetry_payload_shape (present/None when omitted={tel60a_ok}, round-trips_src+age={tel60b_ok}, "
+          f"age_s_may_be_none={tel60c_ok})")
 
     # (60-lkg-3) visualizer.render_telemetry_panel composes without raising both with NO visrec_lkg
     # payload and with a real one carrying only `src` -- shape-only smoke test, not a pixel-content check.
@@ -11213,6 +11321,159 @@ def run_self_test(cfg):
           f"loss_edge_resets_tally (filled_before_ok={filled_before_ok}, "
           f"samples_after={c59h._vis_tally.samples})")
     print(f"[self-test] {'PASS' if backoff_wiring_ok else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING overall")
+
+    # ---- SESSION-61 CANVAS CADENCE — _visrec_canvas_due / _visrec_no_match_reason (Findings A/B:
+    # the panel must republish on a cadence, not only at match instants, and every gap in the lines
+    # must be a NAMED reason, never a silent blank). Pure functions, no `run_explore` entry. ---------
+    due_fresh_match = _visrec_canvas_due(now=100.0, last_pub_t=100.0, idle_interval_s=0.5,
+                                         loss_interval_s=0.1, loss_now=False, fresh_match=True,
+                                         matching_active=True)
+    case61_1 = due_fresh_match is True
+    print(f"[self-test] {'PASS' if case61_1 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"fresh_match_always_due (due={due_fresh_match})")
+
+    not_due_matching_idle = _visrec_canvas_due(now=110.0, last_pub_t=100.0, idle_interval_s=0.5,
+                                               loss_interval_s=0.1, loss_now=False, fresh_match=False,
+                                               matching_active=True)
+    not_due_matching_loss = _visrec_canvas_due(now=110.0, last_pub_t=100.0, idle_interval_s=0.5,
+                                               loss_interval_s=0.1, loss_now=True, fresh_match=False,
+                                               matching_active=True)
+    case61_2 = (not_due_matching_idle is False and not_due_matching_loss is False)
+    print(f"[self-test] {'PASS' if case61_2 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"matching_active_suppresses_unlined (idle={not_due_matching_idle}, loss={not_due_matching_loss})")
+
+    due_loss_interval = _visrec_canvas_due(now=100.2, last_pub_t=100.0, idle_interval_s=0.5,
+                                           loss_interval_s=0.1, loss_now=True, fresh_match=False,
+                                           matching_active=False)
+    case61_3 = due_loss_interval is True
+    print(f"[self-test] {'PASS' if case61_3 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"loss_interval_due_at_0.2s (due={due_loss_interval})")
+
+    not_due_idle_early = _visrec_canvas_due(now=100.2, last_pub_t=100.0, idle_interval_s=0.5,
+                                            loss_interval_s=0.1, loss_now=False, fresh_match=False,
+                                            matching_active=False)
+    due_idle_late = _visrec_canvas_due(now=100.6, last_pub_t=100.0, idle_interval_s=0.5,
+                                       loss_interval_s=0.1, loss_now=False, fresh_match=False,
+                                       matching_active=False)
+    case61_4 = (not_due_idle_early is False and due_idle_late is True)
+    print(f"[self-test] {'PASS' if case61_4 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"idle_interval_not_due_at_0.2s_due_at_0.6s (early={not_due_idle_early}, late={due_idle_late})")
+
+    import visualizer
+    ctrl61 = ExploreController(cfg)
+    # Session 61 (C10 lands in a LATER chunk): visualizer.LKG_CANVAS_STALE_S does not exist on disk
+    # yet, so fall back to C10's own documented value (2.0) rather than requiring it early -- this
+    # keeps the invariant meaningful today and automatically starts reading the real constant once
+    # that chunk lands, with no code change here.
+    lkg_canvas_stale_s = getattr(visualizer, "LKG_CANVAS_STALE_S", 2.0)
+    worst_case_loss_gap = max(ctrl61.visrec_canvas_loss_interval_s, ctrl61.visrec_match_min_interval_s)
+    case61_5 = worst_case_loss_gap < lkg_canvas_stale_s
+    print(f"[self-test] {'PASS' if case61_5 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"invariant_never_stale_mid_loss (worst_case_gap={worst_case_loss_gap}, "
+          f"lkg_canvas_stale_s={lkg_canvas_stale_s})")
+
+    reason_plan_ok = _visrec_no_match_reason(ctrl61, needs_match=False, has_frame=True,
+                                             matching_active=False, now=100.0, status="OK",
+                                             memo_age_s=0.0)
+    reason_no_frame = _visrec_no_match_reason(ctrl61, needs_match=True, has_frame=False,
+                                              matching_active=False, now=100.0, status="PLAN-LOST",
+                                              memo_age_s=0.0)
+    ctrl61._loss_episode_t0 = 100.0 - 7.2
+    ctrl61.loss_backoff_grace_s = 12.0
+    reason_grace = _visrec_no_match_reason(ctrl61, needs_match=True, has_frame=True,
+                                           matching_active=False, now=100.0, status="PLAN-LOST",
+                                           memo_age_s=0.0)
+    ctrl61._loss_episode_t0 = None
+    reason_grace_pending = _visrec_no_match_reason(ctrl61, needs_match=True, has_frame=True,
+                                                   matching_active=False, now=100.0, status="NO-PLAN",
+                                                   memo_age_s=0.0)
+    reason_snapshot_spent = _visrec_no_match_reason(ctrl61, needs_match=True, has_frame=True,
+                                                     matching_active=False, now=100.0, status="FALLBACK",
+                                                     memo_age_s=0.0)
+    reason_reused = _visrec_no_match_reason(ctrl61, needs_match=True, has_frame=True,
+                                            matching_active=True, now=100.0, status="OK",
+                                            memo_age_s=0.3)
+    case61_6 = (reason_plan_ok == "plan OK" and reason_no_frame == "no live frame"
+               and reason_grace == "loss grace 7.2/12.0s" and reason_grace_pending == "loss grace pending"
+               and reason_snapshot_spent == "snapshot spent" and reason_reused == "verdict reused (0.3s)")
+    print(f"[self-test] {'PASS' if case61_6 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"no_match_reason_six_shapes (plan_ok={reason_plan_ok!r}, no_frame={reason_no_frame!r}, "
+          f"grace={reason_grace!r}, grace_pending={reason_grace_pending!r}, "
+          f"snapshot_spent={reason_snapshot_spent!r}, reused={reason_reused!r})")
+
+    case61_7 = (ctrl61.visrec_canvas_loss_interval_s == 0.1 and ctrl61.visrec_canvas_idle_interval_s == 0.5)
+    print(f"[self-test] {'PASS' if case61_7 else 'FAIL'}  SESSION-61 CANVAS CADENCE "
+          f"config_defaults_from_repo_yaml (loss={ctrl61.visrec_canvas_loss_interval_s}, "
+          f"idle={ctrl61.visrec_canvas_idle_interval_s})")
+
+    cadence61_ok = (case61_1 and case61_2 and case61_3 and case61_4 and case61_5 and case61_6
+                   and case61_7)
+    ok = ok and cadence61_ok
+    print(f"[self-test] {'PASS' if cadence61_ok else 'FAIL'}  SESSION-61 CANVAS CADENCE overall")
+
+    # ---- SESSION-61 CANVAS PUBLISH — the cadence publish site itself (Findings A-D): the panel's
+    # telemetry payload, its downstream renderer, and the exact compose_stacked_live/banner_fields
+    # call sequence the new publish site performs. `run_explore` itself is never entered by this
+    # suite, so these assert the pieces it composes from. ------------------------------------------
+    import visual_recovery as _visrec_mod
+    import cv2 as _cv2_61   # session 61: `cv2` is shadowed earlier in this function (line ~6973's
+                            # `cv2, ev2 = _vpass(...)`), so re-import under a fresh local name here.
+
+    v61_lkg_full = _full_vector({}, 1, 0.0, "SLAM_HOLD", visrec_lkg={"src": "slam:99", "age_s": 2.1})
+    v61_lkg_none_age = _full_vector({}, 1, 0.0, "SLAM_HOLD", visrec_lkg={"src": "none", "age_s": None})
+    case61p_1 = (v61_lkg_full["visrec_lkg"] == {"src": "slam:99", "age_s": 2.1}
+                and v61_lkg_none_age["visrec_lkg"] == {"src": "none", "age_s": None})
+    print(f"[self-test] {'PASS' if case61p_1 else 'FAIL'}  SESSION-61 CANVAS PUBLISH "
+          f"visrec_lkg_round_trips_src_and_age_s (full={v61_lkg_full['visrec_lkg']}, "
+          f"none_age={v61_lkg_none_age['visrec_lkg']})")
+
+    panel_age = visualizer.render_telemetry_panel(
+        {"state": "SLAM_HOLD", "visrec_lkg": {"src": "slam:42", "age_s": 1.4}}, {})
+    panel_none_src = visualizer.render_telemetry_panel(
+        {"state": "SLAM_HOLD", "visrec_lkg": {"src": "none", "age_s": None}}, {})
+    panel_no_lkg = visualizer.render_telemetry_panel({"state": "SLAM_HOLD"}, {})
+    expected_shape61 = (visualizer.PANEL_H, visualizer.PANEL_W, 3)
+    case61p_2 = (panel_age.shape == expected_shape61 and panel_none_src.shape == expected_shape61
+                and panel_no_lkg.shape == expected_shape61)
+    print(f"[self-test] {'PASS' if case61p_2 else 'FAIL'}  SESSION-61 CANVAS PUBLISH "
+          f"render_telemetry_panel_accepts_age_s (shapes={panel_age.shape}, {panel_none_src.shape}, "
+          f"{panel_no_lkg.shape}, expected={expected_shape61})")
+
+    # End-to-end rehearsal of the exact call sequence the new publish site performs: update_reference
+    # -> match(debug=False) -> compose_stacked_live(draw_lines=True) -> banner_fields(...).
+    frameA61 = _visrec_mod._textured_image(seed=61)
+    h_a, w_a = frameA61.shape[:2]
+    cx0, cy0, cx1, cy1 = w_a // 4, h_a // 4, 3 * w_a // 4, 3 * h_a // 4
+    frameB61 = _cv2_61.resize(frameA61[cy0:cy1, cx0:cx1], (w_a, h_a))
+    h_b, w_b = frameB61.shape[:2]
+    probe61p = VisualRecoveryProbe()
+    probe61p.update_reference(frameA61, True, src="slam:7")
+    vm61p = probe61p.match(frameB61, debug=False)
+    composed61p = probe61p.compose_stacked_live(frameB61, draw_lines=True)
+    info61p = probe61p.banner_fields(vm61p, state_status="ADVANCE / OK", n_lines=composed61p[1])
+    case61p_3 = (composed61p is not None
+                and composed61p[0].shape == (h_a + h_b, max(w_a, w_b), 3)
+                and composed61p[1] > 0
+                and len(info61p) == 12 and info61p[1] == "src=slam:7")
+    print(f"[self-test] {'PASS' if case61p_3 else 'FAIL'}  SESSION-61 CANVAS PUBLISH "
+          f"end_to_end_compose_rehearsal (canvas_shape="
+          f"{None if composed61p is None else composed61p[0].shape}, "
+          f"n_lines={None if composed61p is None else composed61p[1]}, info_len={len(info61p)}, "
+          f"info[1]={info61p[1]!r})")
+
+    # Grep-style guard via inspect.getsource on `run_explore` specifically -- NOT a whole-file scan
+    # (open(__file__) would trivially self-match: this very guard has to spell the retired literal
+    # to compare against it). The session-60 call site lived in `run_explore`, so that function's
+    # own source is what must no longer mention it.
+    import inspect
+    _run_explore_src61 = inspect.getsource(run_explore)
+    case61p_4 = ("stacked=True" not in _run_explore_src61)
+    print(f"[self-test] {'PASS' if case61p_4 else 'FAIL'}  SESSION-61 CANVAS PUBLISH "
+          f"no_stacked_true_left_in_run_explore")
+
+    canvas_publish_ok = case61p_1 and case61p_2 and case61p_3 and case61p_4
+    ok = ok and canvas_publish_ok
+    print(f"[self-test] {'PASS' if canvas_publish_ok else 'FAIL'}  SESSION-61 CANVAS PUBLISH overall")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

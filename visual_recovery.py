@@ -66,6 +66,35 @@ class VisualMatch:
     debug_image: "np.ndarray | None" = None   # BGR canvas (F_LKG | live + inliers), only when debug=True
 
 
+def _draw_stacked_inliers(body, h_top, kp0, kp1, good, mask) -> int:
+    """Draw RANSAC-inlier correspondences on a STACKED (top=F_LKG / bottom=live) canvas, in place.
+
+    `cv2.drawMatches` only ever builds a side-by-side canvas, so for a stacked one each inlier is
+    drawn by hand: a line from (x_lkg, y_lkg) to (x_live, y_live + h_top).
+
+    Args:
+        body (np.ndarray): the stacked BGR canvas, modified IN PLACE.
+        h_top (int): pixel height of the TOP (F_LKG) half — the y-offset applied to live points.
+        kp0, kp1 (list[cv2.KeyPoint]): reference / live keypoints.
+        good (list[cv2.DMatch]): ratio-test matches (queryIdx -> kp0, trainIdx -> kp1).
+        mask (np.ndarray): boolean RANSAC inlier mask, one entry per `good`.
+
+    Returns:
+        int: how many lines were actually drawn (0 is a legitimate answer and MUST be reported by
+        the caller rather than being indistinguishable from "not attempted").
+    """
+    n = 0
+    for m, keep in zip(good, mask):
+        if not keep:
+            continue
+        x0, y0 = kp0[m.queryIdx].pt
+        x1, y1 = kp1[m.trainIdx].pt
+        cv2.line(body, (int(round(x0)), int(round(y0))),
+                (int(round(x1)), int(round(y1)) + h_top), (0, 255, 0), 1, cv2.LINE_AA)
+        n += 1
+    return n
+
+
 class VisualRecoveryProbe:
     """Caches F_LKG (the most recent frame SLAM was TRACKING on) and matches later frames against it.
     See the module docstring for why this is CPU-only SIFT, copied (not imported) from
@@ -99,6 +128,11 @@ class VisualRecoveryProbe:
         # featureless reference legitimately yields (kp, None), and keying on the descriptors would
         # recompute it forever.
         self._lkg_feats = None
+        # Session 61: THIS call's RANSAC draw set, so a caller composing its own canvas right after
+        # match() can draw the real inlier correspondences (they are match()-local; session 60's panel
+        # had none). Tuple of (kp0, kp1, good, mask) or None. Cleared at the TOP of every match() so it
+        # can never describe a previous call.
+        self._last_draw: "tuple | None" = None
 
     def update_reference(self, frame, tracked, src: str = "live"):
         """Cache `frame` as F_LKG whenever `tracked` is True. Called every tick from run_explore, gated on
@@ -179,42 +213,24 @@ class VisualRecoveryProbe:
         pad_shape = (img.shape[0], target_w - w) + img.shape[2:]
         return np.hstack([img, np.zeros(pad_shape, dtype=img.dtype)])
 
-    def _compose_debug(self, frame, out, kp0=None, kp1=None, good=None, mask=None, banner=None,
-                       *, stacked: bool = False):
-        """Build the operator canvas: F_LKG | live, with the RANSAC INLIER correspondences drawn when
-        a homography survived, and a two-line header.
+    def _compose_debug(self, frame, out, kp0=None, kp1=None, good=None, mask=None, banner=None):
+        """Build the operator canvas: F_LKG (left) | live (right), with the RANSAC INLIER
+        correspondences drawn when a homography survived, and a two-line header.
 
-        IMAGE INTEGRITY (CLAUDE.md): NOTHING here resizes, crops or downscales either frame.
+        IMAGE INTEGRITY (CLAUDE.md): NOTHING here resizes, crops or downscales either frame. The canvas
+        width is exactly w_lkg + w_live. If the two frames differ in height (they do not in this
+        pipeline — both are the 512x288 transport frame) the SHORTER one is zero-PADDED, never scaled.
 
-        `stacked` (session 60, C8; keyword-only, default False preserves the original layout exactly):
-          - False (default): SIDE-BY-SIDE, F_LKG (left) | live (right) via `cv2.drawMatches`. Canvas
-            width is exactly w_lkg + w_live; a height mismatch is zero-padded (never scaled). This is
-            still the shape saved to the PNG evidence trail — UNCHANGED.
-          - True: STACKED, F_LKG (top) / live (bottom) — the visualizer's LKG panel column (see
-            visualizer.py PANEL_W x MAP_SIZE) is tall and narrow, not wide and short, so a second
-            canvas in this orientation is composed for that column only. `cv2.drawMatches` only ever
-            builds a side-by-side canvas, so the inlier lines are drawn by hand here: for each inlier,
-            a line from (x_lkg, y_lkg) to (x_live, y_live + h_lkg). A width mismatch is zero-padded
-            (never scaled).
+        Session 61 (C6): the `stacked` parameter is retired — `compose_stacked_live` (C4) is now the
+        visualizer panel's own composer, and keeping two stacked-canvas code paths with different text
+        behaviour was a bug farm (Finding D). This function is side-by-side only again, feeding solely
+        the PNG evidence trail. `line2` now comes from `banner_fields` (C5) so the PNG and the panel can
+        never disagree about a field's value.
 
         Returns a BGR ndarray.
         """
         lkg = self._lkg
-        if stacked:
-            w_max = max(lkg.shape[1], frame.shape[1])
-            top = self._pad_to_width(lkg, w_max)
-            bot = self._pad_to_width(frame, w_max)
-            body = np.vstack([top, bot])
-            if kp0 is not None and kp1 is not None and good is not None and mask is not None:
-                h_lkg_body = lkg.shape[0]
-                for m, keep in zip(good, mask):
-                    if not keep:
-                        continue
-                    x0, y0 = kp0[m.queryIdx].pt
-                    x1, y1 = kp1[m.trainIdx].pt
-                    cv2.line(body, (int(round(x0)), int(round(y0))),
-                            (int(round(x1)), int(round(y1)) + h_lkg_body), (0, 255, 0), 1, cv2.LINE_AA)
-        elif kp0 is not None and kp1 is not None and good is not None and mask is not None:
+        if kp0 is not None and kp1 is not None and good is not None and mask is not None:
             # cv2.drawMatches already allocates a (max(h1,h2), w1+w2) canvas and top-left-aligns each
             # image into its half — the same zero-pad-not-scale behaviour _pad_to_height gives the
             # fallback branch below, done internally.
@@ -225,30 +241,111 @@ class VisualRecoveryProbe:
             h_max = max(lkg.shape[0], frame.shape[0])
             body = np.hstack([self._pad_to_height(lkg, h_max), self._pad_to_height(frame, h_max)])
         banner_strip = np.zeros((BANNER_H, body.shape[1], 3), dtype=np.uint8)
-        scale_txt = f"{out.scale:.2f}" if out.scale is not None else "n/a"
-        ratio_txt = f"{out.size_ratio:.2f}" if out.size_ratio is not None else "n/a"
         line1 = banner or ""
-        age_txt = f"{time.monotonic() - self._lkg_t:.1f}s" if self._lkg_t is not None else "n/a"
-        line2 = (f"has_lkg={out.has_lkg} matched={out.matched} inliers={out.inliers} "
-                 f"contained={out.contained} planar_like={out.planar_like} scale={scale_txt} "
-                 f"size={ratio_txt} closer={out.closer} "
-                 f"lkg_src={self._lkg_src} age={age_txt}")
+        line2 = "  ".join(self.banner_fields(out, state_status=line1))
         cv2.putText(banner_strip, line1, (6, 13), BANNER_FONT, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(banner_strip, line2, (6, 29), BANNER_FONT, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
         canvas = np.vstack([banner_strip, body])
-        if stacked:
-            h_lkg = lkg.shape[0]
-            cv2.putText(canvas, "F_LKG (reference)", (6, BANNER_H + h_lkg - 8), BANNER_FONT, 0.45,
-                       (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, "LIVE", (6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
-                       (0, 255, 255), 1, cv2.LINE_AA)
-        else:
-            w_lkg = lkg.shape[1]
-            cv2.putText(canvas, "F_LKG (reference)", (6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
-                       (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, "LIVE", (w_lkg + 6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
-                       (0, 255, 255), 1, cv2.LINE_AA)
+        w_lkg = lkg.shape[1]
+        cv2.putText(canvas, "F_LKG (reference)", (6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
+                   (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "LIVE", (w_lkg + 6, canvas.shape[0] - 8), BANNER_FONT, 0.45,
+                   (0, 255, 255), 1, cv2.LINE_AA)
         return canvas
+
+    def compose_stacked_live(self, live_frame, *, draw_lines: bool = False):
+        """F_LKG (top) over `live_frame` (bottom), zero-padded to a common width, NO text baked in.
+
+        Session 61: the panel canvas is now composed on a CADENCE rather than only at match instants
+        (Finding A: the panel sat ~50s / 8 solves stale), so this must work with or without a match
+        having just run.
+
+        Args:
+            live_frame (np.ndarray | None): the tick's live BGR frame.
+            draw_lines (bool): draw THIS tick's `_last_draw` inlier correspondences. Only ever True on
+                a tick whose `match()` just returned (see autopilot's publish site).
+
+        Returns:
+            tuple[np.ndarray, int] | None:
+              • (canvas, n_lines) where canvas is (h_lkg + h_live, max(w_lkg, w_live), 3) when an F_LKG
+                is held, or (h_live, w_live, 3) when there is NO F_LKG yet (live half only — the caller
+                NAMES that state via banner_fields' `src=none`, never a blank panel);
+              • None when `live_frame` is None (nothing honest to draw).
+            `n_lines` is 0 whenever `draw_lines` is False or `_last_draw` is None.
+        """
+        if live_frame is None:
+            return None
+        if self._lkg is None:
+            return live_frame, 0
+        w_max = max(self._lkg.shape[1], live_frame.shape[1])
+        top = self._pad_to_width(self._lkg, w_max)
+        bot = self._pad_to_width(live_frame, w_max)
+        canvas = np.vstack([top, bot])
+        n_lines = 0
+        if draw_lines and self._last_draw is not None:
+            kp0, kp1, good, mask = self._last_draw
+            n_lines = _draw_stacked_inliers(canvas, top.shape[0], kp0, kp1, good, mask)
+        return canvas, n_lines
+
+    def banner_fields(self, out, *, state_status, live_frame_id=None, n_lines=0,
+                      lines_reason=None) -> "list[str]":
+        """The LKG panel's info block, as ORDERED short segments (never a single joined string).
+
+        Returns EXACTLY 12 segments, always in this order and always present (placeholders, never
+        omission — a missing field must read as "n/a", not vanish):
+
+            [0]  "<state_status>"              e.g. "HOLD_LOST / PLAN-LOST"
+            [1]  "src=<self._lkg_src>"         e.g. "src=slam:19385"  |  "src=none"
+            [2]  "lkg_age=<age>"               "12.3s" from self._lkg_t, else "n/a"
+            [3]  "live=#<live_frame_id>"       else "live=#n/a"
+            [4]  "matched=<T|F>"
+            [5]  "inliers=<int>"
+            [6]  "cont=<T|F>"                  out.contained
+            [7]  "planar=<T|F>"                out.planar_like
+            [8]  "scale=<x.xx|n/a>"
+            [9]  "size=<x.xx|n/a>"             out.size_ratio
+            [10] "closer=<LIVE|LKG|EQUAL|UNKNOWN>"
+            [11] "lines=<n>"  when n_lines > 0
+                 "lines=none (<lines_reason>)"  when n_lines == 0 and lines_reason is not None
+                 "lines=none"                   when n_lines == 0 and lines_reason is None
+
+        Formatting rules (fixed, so the wrap arithmetic is predictable): bools render "T"/"F"; floats
+        render f"{v:.2f}"; ages render f"{v:.1f}s"; None renders "n/a". `out` may be None (no match has
+        ever run) -> segments [4]-[10] all render their "n/a"/"F"/0 placeholders.
+        """
+        if out is None:
+            matched_txt, inliers_txt, cont_txt, planar_txt = "F", "0", "F", "F"
+            scale_txt, size_txt, closer_txt = "n/a", "n/a", "UNKNOWN"
+        else:
+            matched_txt = "T" if out.matched else "F"
+            inliers_txt = str(out.inliers)
+            cont_txt = "T" if out.contained else "F"
+            planar_txt = "T" if out.planar_like else "F"
+            scale_txt = f"{out.scale:.2f}" if out.scale is not None else "n/a"
+            size_txt = f"{out.size_ratio:.2f}" if out.size_ratio is not None else "n/a"
+            closer_txt = out.closer if out.closer else "UNKNOWN"
+        lkg_age_txt = f"{time.monotonic() - self._lkg_t:.1f}s" if self._lkg_t is not None else "n/a"
+        live_seg = f"live=#{live_frame_id}" if live_frame_id is not None else "live=#n/a"
+        if n_lines > 0:
+            lines_seg = f"lines={n_lines}"
+        elif lines_reason is not None:
+            lines_seg = f"lines=none ({lines_reason})"
+        else:
+            lines_seg = "lines=none"
+        return [
+            f"{state_status}",
+            f"src={self._lkg_src}",
+            f"lkg_age={lkg_age_txt}",
+            live_seg,
+            f"matched={matched_txt}",
+            f"inliers={inliers_txt}",
+            f"cont={cont_txt}",
+            f"planar={planar_txt}",
+            f"scale={scale_txt}",
+            f"size={size_txt}",
+            f"closer={closer_txt}",
+            lines_seg,
+        ]
 
     def match(self, frame, debug: bool = False, banner: str | None = None) -> VisualMatch:
         """SIFT+RANSAC-homography match of `frame` against the cached F_LKG. H maps LKG -> live (same
@@ -271,6 +368,7 @@ class VisualRecoveryProbe:
         spread_lkg` and a `closer` verdict ("LIVE" | "LKG" | "EQUAL" | "UNKNOWN"). See the `VisualMatch`
         docstring for why this linear spread measure was added alongside `scale` rather than replacing
         it."""
+        self._last_draw = None    # session 61 (C2): cleared FIRST so it can never describe a stale call
         if self._lkg is None or frame is None:
             return VisualMatch(has_lkg=self._lkg is not None)
         kp0, des0 = self._reference_keypoints()      # session 51: memoised per reference, not per call
@@ -300,6 +398,7 @@ class VisualRecoveryProbe:
         out.inliers = inliers
         out.matched = inliers >= self.min_inliers
         if not out.matched:
+            self._last_draw = (kp0, kp1, good, mask)    # session 61 (C2): outside the debug guard
             if debug:
                 out.debug_image = self._compose_debug(frame, out, kp0=kp0, kp1=kp1, good=good, mask=mask,
                                                        banner=banner)
@@ -336,6 +435,7 @@ class VisualRecoveryProbe:
                                   and np.all(warped[:, 1] >= -my) and np.all(warped[:, 1] <= h_lkg + my))
         except np.linalg.LinAlgError:
             out.contained = False       # a singular H (degenerate match) can't be inverted -> not contained
+        self._last_draw = (kp0, kp1, good, mask)    # session 61 (C2): outside the debug guard
         if debug:
             out.debug_image = self._compose_debug(frame, out, kp0=kp0, kp1=kp1, good=good, mask=mask,
                                                    banner=banner)
@@ -491,27 +591,103 @@ def run_self_test():
          vm10a.debug_image is not None and vm10b.debug_image is not None
          and vm10a.debug_image.shape == vm10b.debug_image.shape)
 
-    # ---- SESSION-60 LKG PANEL — C8: _compose_debug gains stacked=True (F_LKG-over-LIVE) for the
-    # visualizer's tall/narrow panel column, WITHOUT disturbing the default side-by-side shape that
-    # still feeds the PNG evidence trail (unchanged). ------------------------------------------------
-    probe11 = VisualRecoveryProbe()
-    probe11.update_reference(base, True)
-    vm11 = probe11.match(zoomed, debug=True)
-    canvas_default = probe11._compose_debug(zoomed, vm11)
-    canvas_explicit_false = probe11._compose_debug(zoomed, vm11, stacked=False)
-    case(f"(60-1) stacked=False reproduces today's side-by-side shape exactly "
-         f"(default={canvas_default.shape} explicit={canvas_explicit_false.shape})",
-         canvas_default.shape == canvas_explicit_false.shape
-         and canvas_default.shape[1] == base.shape[1] + zoomed.shape[1])
+    # ---- SESSION-60 LKG PANEL — RETIRED (session 61, C6): _compose_debug's `stacked` parameter is
+    # gone. `compose_stacked_live` (C4) is now the panel's own composer — two stacked-canvas code
+    # paths with different text behaviour was a bug farm (Finding D: the operator lost scale/size/
+    # closer/lkg_src/age off the right edge of a 512px canvas). The side-by-side shape case (60-1)
+    # asserted is already covered by test 6 (NO-RESIZE CONTRACT) above; compose_stacked_live itself
+    # is covered by the SESSION-61 STACKED LIVE CANVAS block below. ------------------------------
 
-    canvas_stacked = probe11._compose_debug(zoomed, vm11, stacked=True)
-    h_lkg11, w_lkg11 = base.shape[:2]
-    h_live11, w_live11 = zoomed.shape[:2]
-    case(f"(60-2) stacked=True composes F_LKG-over-LIVE: taller than wide, height >= h_lkg+h_live, "
-         f"width == max(w_lkg, w_live) (shape={canvas_stacked.shape})",
-         canvas_stacked.shape[0] > canvas_stacked.shape[1]
-         and canvas_stacked.shape[0] >= h_lkg11 + h_live11
-         and canvas_stacked.shape[1] == max(w_lkg11, w_live11))
+    # ---- SESSION-61 STACKED LIVE CANVAS — compose_stacked_live / _last_draw / banner_fields
+    # (Findings A-D: the panel must stay live on a cadence, draw real inlier lines, and never clip
+    # a field off the right edge). --------------------------------------------------------------
+
+    # 1. F_LKG held -> stacked shape is (h_lkg+h_live, max(w_lkg,w_live), 3), no lines without a match.
+    probe61a = VisualRecoveryProbe()
+    probe61a.update_reference(base, True)
+    result61a = probe61a.compose_stacked_live(zoomed)
+    h_lkg61, w_lkg61 = base.shape[:2]
+    h_live61, w_live61 = zoomed.shape[:2]
+    case(f"(61-1) compose_stacked_live with F_LKG held -> shape (h_lkg+h_live, max(w), 3), n_lines=0 "
+         f"(result={None if result61a is None else result61a[0].shape})",
+         result61a is not None
+         and result61a[0].shape == (h_lkg61 + h_live61, max(w_lkg61, w_live61), 3)
+         and result61a[1] == 0)
+
+    # 2. compose_stacked_live(None) -> None (nothing honest to draw).
+    case("(61-2) compose_stacked_live(None) -> None",
+         probe61a.compose_stacked_live(None) is None)
+
+    # 3. Fresh probe, NO F_LKG -> live-half-only shape, not None, not blank.
+    probe61b = VisualRecoveryProbe()
+    result61b = probe61b.compose_stacked_live(zoomed)
+    case(f"(61-3) no F_LKG yet -> live-half-only shape (h_live,w_live,3), n_lines=0, not None "
+         f"(result={None if result61b is None else result61b[0].shape})",
+         result61b is not None and result61b[0].shape == (h_live61, w_live61, 3) and result61b[1] == 0)
+
+    # 4. _last_draw lifecycle: None on a fresh probe; None after a match() that returns before RANSAC
+    #    (a flat-black frame yields no descriptors); a 4-tuple after a homography survives.
+    probe61c = VisualRecoveryProbe()
+    last_draw_fresh = probe61c._last_draw
+    probe61c.update_reference(base, True)
+    probe61c.match(np.zeros((h, w, 3), dtype=np.uint8))     # flat black -> no descriptors, no RANSAC
+    last_draw_no_desc = probe61c._last_draw
+    probe61c.match(zoomed)                                    # real homography
+    last_draw_matched = probe61c._last_draw
+    case(f"(61-4) _last_draw: None on fresh probe, None after a no-descriptor match, 4-tuple after a "
+         f"matched homography (fresh={last_draw_fresh}, no_desc={last_draw_no_desc}, "
+         f"matched={'4-tuple' if isinstance(last_draw_matched, tuple) and len(last_draw_matched) == 4 else last_draw_matched})",
+         last_draw_fresh is None and last_draw_no_desc is None
+         and isinstance(last_draw_matched, tuple) and len(last_draw_matched) == 4)
+
+    # 5. After a matched match(), draw_lines=True yields n_lines>0 and a canvas that differs from
+    #    draw_lines=False (the lines are REALLY drawn, not just counted).
+    probe61d = VisualRecoveryProbe()
+    probe61d.update_reference(base, True)
+    probe61d.match(zoomed)
+    canvas_lines, n_lines61d = probe61d.compose_stacked_live(zoomed, draw_lines=True)
+    canvas_nolines, n_nolines61d = probe61d.compose_stacked_live(zoomed, draw_lines=False)
+    case(f"(61-5) draw_lines=True after a matched match() -> n_lines>0 and canvas pixel-differs from "
+         f"draw_lines=False (n_lines={n_lines61d}, n_nolines={n_nolines61d})",
+         n_lines61d > 0 and n_nolines61d == 0
+         and not np.array_equal(canvas_lines, canvas_nolines))
+
+    # 6. draw_lines=True with NO prior match (_last_draw is None) -> n_lines=0, no raise.
+    probe61e = VisualRecoveryProbe()
+    probe61e.update_reference(base, True)
+    result61e = probe61e.compose_stacked_live(zoomed, draw_lines=True)
+    case(f"(61-6) draw_lines=True with _last_draw=None -> n_lines=0, no raise (n_lines={result61e[1]})",
+         result61e is not None and result61e[1] == 0)
+
+    # 7. banner_fields: exactly 12 segments, in order, for a matched VisualMatch and for out=None;
+    #    the `lines=` formatting rules.
+    probe61f = VisualRecoveryProbe()
+    probe61f.update_reference(base, True)
+    vm61f = probe61f.match(zoomed)
+    fields_matched = probe61f.banner_fields(vm61f, state_status="HOLD_LOST / PLAN-LOST", n_lines=7)
+    fields_none = probe61f.banner_fields(None, state_status="OK")
+    fields_reason = probe61f.banner_fields(vm61f, state_status="OK", n_lines=0, lines_reason="plan OK")
+    fields_bare = probe61f.banner_fields(vm61f, state_status="OK", n_lines=0)
+    case(f"(61-7a) banner_fields returns exactly 12 segments for a matched VisualMatch and for out=None "
+         f"(matched_len={len(fields_matched)}, none_len={len(fields_none)})",
+         len(fields_matched) == 12 and len(fields_none) == 12
+         and fields_matched[0] == "HOLD_LOST / PLAN-LOST" and fields_none[0] == "OK")
+    case(f"(61-7b) lines= formatting: 'lines=7' / 'lines=none (plan OK)' / 'lines=none' "
+         f"(fields_matched[11]={fields_matched[11]!r}, fields_reason[11]={fields_reason[11]!r}, "
+         f"fields_bare[11]={fields_bare[11]!r})",
+         fields_matched[11] == "lines=7" and fields_reason[11] == "lines=none (plan OK)"
+         and fields_bare[11] == "lines=none")
+
+    # 8. REGRESSION: the side-by-side debug_image from a matched match(debug=True) still has shape
+    #    (max(h)+BANNER_H, w_lkg+w_live, 3), unchanged by the _compose_debug rewrite (C6).
+    probe61g = VisualRecoveryProbe()
+    probe61g.update_reference(base, True)
+    vm61g = probe61g.match(zoomed, debug=True)
+    case(f"(61-8) regression: side-by-side debug_image shape unchanged after C6's rewrite "
+         f"(shape={None if vm61g.debug_image is None else vm61g.debug_image.shape})",
+         vm61g.debug_image is not None
+         and vm61g.debug_image.shape == (max(base.shape[0], zoomed.shape[0]) + BANNER_H,
+                                         base.shape[1] + zoomed.shape[1], 3))
 
     # ---- SESSION 51 — lazy, memoised SIFT on the REFERENCE half -----------------------------------------
     # match() used to recompute SIFT on _lkg every single call; during a loss the reference is frozen

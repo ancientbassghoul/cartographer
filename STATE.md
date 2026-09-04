@@ -18,19 +18,18 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**. **Session 60 is BUILT and GATED, NOT YET FLOWN** — all 9 self-test
-suites green at HEAD, spec archived at `plans/session60-spec.md`.
+Branch **`all-bets-are-off`**. **Session 61 is BUILT and GATED, NOT YET FLOWN** — all 9 self-test
+suites green at HEAD, spec archived at `plans/session61-spec.md`.
 
-Session 60 was diagnosed off session 59's own flight (`OUTPUT/diag/20260904_103342_*`, ~37 min,
-2026-09-04), whose centrepiece was a **15.3-minute PLAN-STALE** during which SLAM was *not* choked
-(median `slam_ms` 1902) — it was tracking-lost, i.e. recovery logic failing, not SLAM speed. Four
-fixes went in: F_LKG moved to perception (the reconstruct-from-ID ring, 34 age-outs/median 0.55s
-shortfall last flight, is deleted); a back-off's own reverse could re-arm the bump latch it was
-supposed to be exempt from, letting one wall contact permanently blacklist a goal (fixed); the 15°
-rotation probe (0 recoveries in 9.4 min across 139 logs) is deleted in favour of a `SERVO` phase
-inside `FALLBACK` that steers to the F_LKG viewpoint instead of just spinning; and the LKG debug
-canvas moved from a standalone `cv2` window into a new visualizer dashboard column. Full detail:
-`plans/session60-spec.md`; concise narrative: `PROGRESS.md` session 60.
+Session 60 flew clean the same day (`OUTPUT/diag/20260904_223410_*`, ~7 min, 2026-09-04 22:34-22:41):
+the F_LKG rework held up (135 distinct `slam:<id>` references, zero age-outs, no `VISUAL_RECOVERY`,
+no double bump pulses), but the flight's own LKG debug panel turned out to be lying to the operator —
+published only at SIFT-match instants, it sat ~50s/8 solves stale while the map arrow and telemetry
+stayed live (a screenshot at 22:40:29 caught it aiming at the wrong part of the room entirely).
+Session 61 fixes the PANEL, not the plumbing: publishes the canvas on a cadence instead of only at
+match instants, restores the RANSAC inlier lines (previously computed then thrown away every tick),
+and moves the info text into the visualizer at panel resolution instead of clipping it in a 512px
+canvas. Full detail: `plans/session61-spec.md`; concise narrative: `PROGRESS.md` sessions 60/61.
 
 `main` is unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one
 open problem: height.
@@ -50,6 +49,10 @@ Nothing in sessions 59-60 addresses this — it's damage control around the chok
 | 25–30 | 86 | 1 783 | 4 402 | 37 209 |
 | 40–45 | 78 | 1 816 | 3 012 | 31 399 |
 
+Session 61's diagnosing flight (`OUTPUT/diag/20260904_223410_*`, 7 min) adds two more data points on
+top of the table: an **11.1 s** solve at 22:40:06 and a **15.5 s** solve at 22:40:30 — the choke shows
+up even in a short flight, not just the long ones the table above was built from.
+
 Worst wait between two solved frames: **72.9 s** at flight-minute 24.6. Nuance worth keeping: the
 median degrades 16× over the first 20 minutes but then **partially recovers** (min 25-30 back to
 1783 ms, again at 40-45) — evidence *against* the simplest "keyframe graph grows monotonically"
@@ -62,24 +65,44 @@ workload growing with the keyframe graph/retrieval DB, its backend optimization 
 contention from the visualizer's `--record` MP4 encode, and the LKG debug window (`cv2.imshow` + PNG
 writes).
 
-## >>> IMMEDIATE NEXT: FLY session 60, then watch for <<<
+## >>> IMMEDIATE NEXT: FLY session 61, then watch for <<<
 
-1. **Zero** `F_LKG AGE-OUT` lines (34 last flight) — the message no longer exists.
-2. `src=slam:<id>` in the telemetry `LKG=` field advancing during the ~3 s `OK` blips, which is
-   exactly where it used to freeze.
-3. No two bump pulses from one contact; no permanent blacklist off a single wall touch.
-4. No `VISUAL_RECOVERY` anywhere in the log; a `SERVO` phase engaging on a sustained match with
-   `_fallback_cum_deg` frozen while it holds; FALLBACK never reaching `STUCK` (only the corner
-   give-up path still can).
-5. The LKG panel visible in the dashboard's new leftmost column, and grey (not black) when idle.
-6. Kill switches, if either half needs isolating: `use_visual_matching: false`
-   (`autonomy.explore`) disables all SIFT matching; `visrec_debug_window: false` disables the
-   canvas build/publish/save entirely — the one real SLAM-choke experiment this session enables.
+1. **The LIVE half of the LKG panel moves continuously**; the F_LKG half changes whenever
+   telemetry's `src=slam:<id>` changes — no more ~50s/8-solve freeze (the 22:40:29 failure).
+2. Telemetry's `LKG=<src> age=<n>s` — the age should RESET to ~0 every time SLAM solves a fresh
+   frame, not climb unbounded.
+3. Green inlier lines drawn on the panel, steady at ~2 Hz once a loss episode matures past the 12s
+   `loss_backoff_grace_s` window; DURING that grace the pair should still be live, with
+   `lines=none (loss grace N/12.0s)` on screen — never a blank.
+4. The info block is COMPLETE: `closer`, `scale`, `size`, `src`, `age` all legible, nothing clipped
+   off the right edge (the old 512px-canvas failure, Finding D).
+5. **The panel must never grey out during `PLAN-LOST`/`PLAN-STALE`.** If it does, the publisher
+   (autopilot.py) stalled — that is a bug, not the expected idle state.
+6. Kill switches, unchanged in meaning: `visrec_debug_window: false` still kills compose + publish +
+   PNG saving outright (the one real SLAM-choke experiment); `use_visual_matching: false` now leaves
+   an EXPLAINED idle panel (a startup line states why) instead of a silent grey one.
 7. Flights still end by **manual stop**; no bounded-survey mechanism exists.
-8. **Carry forward every still-unconfirmed session-49-to-57 item below** (unchanged from session 59).
+8. **Carry forward, unchanged priority** (folded from session 60's now-flown watch list — see
+   `PROGRESS.md`'s session 60/61 entries for what that flight confirmed):
+   - **SLAM choke remains the dominant open problem** — see the table + 22:40 evidence above.
+   - **FALLBACK's new `SERVO` phase is still unobserved** — the diagnosing flight never entered
+     FALLBACK at all.
+   - **Bump-pulse latency** unresolved — a blacklisted goal takes 10-18s to become visible to the
+     autopilot (rides the next published plan; scales with SLAM latency). Three candidate designs
+     sketched, none built: `plans/session58-lkg-window-discipline-and-dead-goal-guard.md`'s
+     "Session-59 design sketch" section.
+   - **Staleness UI** — operator wants to discuss before it's built. Concrete case now on record:
+     at 22:40:29 the top status strip showed `SLAM=TRACKING kf=27 slam=2921.5ms` from 15s earlier
+     while perception was mid-solve on frame #153 (`slam_ms=15472.2`) — the only stale-looking field
+     left in the dashboard now that the LKG panel is fixed.
+   - **Goal-management rewrite decision rule** (below, unchanged) still applies if goal problems
+     recur.
+   - Future ideas, not yet built: **adaptive back-off strength** and closing session 47's **dead
+     `_backoff_resolve_since` gate** (both detailed below).
+   - Everything under "Session 56/57's watch list" below is still current and unconfirmed.
 
-**Operator's decision rule (2026-09-04), unchanged:** if this flight is clean, stop here and ship the
-Blender/PLY presentation work. If goal problems recur, **rebuild goal management from scratch**
+**Operator's decision rule (2026-09-04), unchanged:** if flights are clean from here, stop and ship
+the Blender/PLY presentation work. If goal problems recur, **rebuild goal management from scratch**
 against a written behaviour spec — the operator's own judgement is that it is over-complicated, and
 the evidence agrees: two independent death registries (`_blacklist` with soft/permanent/active, and
 `_swept_corners` which deliberately ignores the first), four mechanisms writing the first (2-bump,
@@ -88,7 +111,7 @@ stall, loop, stagnation), a third `_goal_db` disc structure, plus `corner_no_bla
 hole in the same invariant and one broke another. Before any rewrite, build the carve-out inventory
 ("this exemption exists because flight X did Y") so nothing hard-won is dropped by accident.
 
-**SESSION-61 CANDIDATES (deferred; none are in session 60's spec):**
+**FUTURE CANDIDATES (deferred; not addressed by session 60 or 61):**
 - **Adaptive back-off strength** (operator's idea, 2026-09-04) — scale the back-off to the measured
   clearance DEFICIT instead of a fixed `backoff_hold_s`. A single duration cannot serve the observed
   trigger range 0.25 … 1.20 (sizing for the worst overshoots the mildest ~6×), which is why
@@ -99,20 +122,8 @@ hole in the same invariant and one broke another. Before any rewrite, build the 
   `backoff_resolve_budget_s: 12.0`) is armed by `_step_backoff` on completion but only ever *checked*
   inside `_maybe_loss_snapshot_backoff`; session 57 moved the PLAN-LOST path onto
   `_step_lost_recovery`, which never checks it. Dead on that path since session 57.
-- **Staleness UI** — operator wants to discuss it first. `TOPIC_CONTROL` carries no plan status/age,
-  so the visualizer keeps drawing its last plan as `PLAN valid` with a healthy goal while the
-  autopilot has been blind for 20s+. FALLBACK ran 439s on the diagnosing flight — 234s under
-  PLAN-LOST, 205s under PLAN-STALE, **0 ticks** under OK. The state label was the only honest field
-  on screen.
-- **Bump-pulse latency** — a blacklisted goal retired only via the 2-bump rule takes 10-18s to
-  become a blacklist the autopilot can see (only rides the next published plan; `perception_worker.
-  run()` blocks 8-10s per SLAM solve), and **this cost scales with SLAM latency** — the 2026-09-04
-  flight measured solves up to 71.8s, which would stretch one bump to well over a minute. Three
-  candidate designs sketched, none built:
-  `plans/session58-lkg-window-discipline-and-dead-goal-guard.md`'s "Session-59 design sketch"
-  section.
 
-### Session 56/57's watch list (still current except the corner item above, confirmed 2026-09-03)
+### Session 56/57's watch list (still current — the corner/bump-latch item resolved 2026-09-04, see `PROGRESS.md`)
 Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-freeze.md` and
 `plans/session57-planlost-recovery-and-direction-aware-lkg.md`:
 

@@ -445,6 +445,11 @@ autonomy:
                                           # of ~32 ticks/s. A fresh compute is FORCED regardless on: the loss
                                           # edge, any commanded motion since the last match, and a replaced
                                           # F_LKG. General robustness interval, not a room answer.
+    visrec_canvas_loss_interval_s: 0.1    # session 61: LKG-panel republish period while the plan is
+                                          #   LOST/STALE and matching is not yet permitted (the 12s
+                                          #   loss_backoff_grace_s window) -- the pair must stay live
+    visrec_canvas_idle_interval_s: 0.5    # session 61: republish period while the plan is healthy
+                                          #   (~2Hz; the reference is still worth watching, cheaply)
     visrec_debug_window: true             # session 49: build the F_LKG | LIVE debug canvas with the SIFT
                                           # inlier correspondences drawn, so the operator can SEE what the CV
                                           # probe is matching against. Also saves the canvas at decision
