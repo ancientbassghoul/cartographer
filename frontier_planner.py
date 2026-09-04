@@ -528,6 +528,25 @@ class FrontierPlanner:
         if not self._corner_visited(cc):
             self._swept_corners.append(cc)
 
+    def _retire_corner_unseen(self, c, tag: str) -> None:
+        """Retire corner `c` WITHOUT the drone ever reaching it -- e.g. it sits inside (or was pulled into)
+        a permanent dead zone. Records the give-up on the per-disc entry and marks the corner visited so
+        the tour advances past it, exactly like `_pick_sweep_corner`'s original selection-time block
+        (session 52), now shared with the en-route re-check `select()` needs (session 59, Finding 1: a
+        corner committed while alive and blacklisted permanent AFTER commitment was never re-checked,
+        looping the drone into a condemned goal for 23 minutes). Deliberately does NOT set
+        `_gave_up_corner` -- that flag means an ABANDONED corner (never proximity-confirmed unreachable,
+        `force_retire_corner`'s far-corner give-up cap), whereas this is a CONFIRMED-unreachable
+        retirement (the corner sits inside a region already proven dead); setting it here would wrongly
+        route the mission into terminal STUCK instead of RETURN_TO_ORIGIN."""
+        e = self._db_entry([float(c[0]), float(c[1])])
+        e["corner_giveups"] += 1
+        e["is_corner"] = True
+        self._mark_corner_visited(c)
+        self.last_select_events.append(
+            f"{tag} goal=[{float(c[0]):.3f}, {float(c[1]):.3f}] inside a PERMANENT dead "
+            f"zone -> force-retired, tour advances")
+
     def force_retire_corner(self, goal):
         """A corner the autopilot GAVE UP reaching (session 24: `corner_giveup_limit` far-corner strikes,
         never once close enough for a real 2-bump) is retired anyway: mark it visited (the tour skips it,
@@ -570,13 +589,7 @@ class FrontierPlanner:
             if self._corner_visited(c):
                 continue
             if self._excluded_permanent(c):
-                e = self._db_entry([float(c[0]), float(c[1])])
-                e["corner_giveups"] += 1
-                e["is_corner"] = True
-                self._mark_corner_visited(c)
-                self.last_select_events.append(
-                    f"CORNER-SKIP goal=[{float(c[0]):.3f}, {float(c[1]):.3f}] inside a PERMANENT dead "
-                    f"zone -> force-retired, tour advances")
+                self._retire_corner_unseen(c, "CORNER-SKIP")
                 continue
             cand.append(c)
         if not cand:
@@ -699,19 +712,31 @@ class FrontierPlanner:
                 self._mark_corner_visited(c)
 
         if self.sweeping and self.sweep_target is not None:
-            if self._d(pos, self.sweep_target) > self.goal_reach_dist:
+            if self._excluded_permanent(self.sweep_target):
+                # Session 59 (Finding 1): a corner committed while ALIVE can be blacklisted permanent
+                # AFTER commitment (e.g. by the LOOP guard) -- the cached target above returned
+                # unconditionally forever, since the retirement check only ever ran at selection time
+                # inside `_pick_sweep_corner`. Diagnosed off flight 20260903_234939: the drone rammed
+                # corner [-1.5,-3.9] for 23.3 minutes because nothing re-checked the commitment once it
+                # went dead. Retire it here too and fall through so the tour advances THIS tick.
+                self._retire_corner_unseen(self.sweep_target, "CORNER-RETIRE-EN-ROUTE")
+                self.sweeping = False
+                self.sweep_target = None
+                # fall through to _pick_sweep_corner below -- the tour advances THIS tick
+            elif self._d(pos, self.sweep_target) > self.goal_reach_dist:
                 return list(self.sweep_target), len(frontiers), False   # still en route -> keep the static target
-            # Reached the current corner: mark it visited, drop the target, and retry frontiers from this
-            # fresh vantage before touring on.
-            self._mark_corner_visited(self.sweep_target)
-            self.sweeping = False
-            self.sweep_target = None
-            if frontiers:
-                self._whitelist_round()
-                g = self._select_reachable(frontiers, pos, heading_deg)
-                if g is not None:
-                    return g, len(frontiers), False
-            # else fall through to pick the NEXT corner.
+            else:
+                # Reached the current corner: mark it visited, drop the target, and retry frontiers from this
+                # fresh vantage before touring on.
+                self._mark_corner_visited(self.sweep_target)
+                self.sweeping = False
+                self.sweep_target = None
+                if frontiers:
+                    self._whitelist_round()
+                    g = self._select_reachable(frontiers, pos, heading_deg)
+                    if g is not None:
+                        return g, len(frontiers), False
+                # else fall through to pick the NEXT corner.
 
         # Pick the next unvisited corner (farthest-first; corners ignore the blacklist) + cache it STATICALLY.
         nxt = self._pick_sweep_corner(corners, pos)
@@ -985,6 +1010,55 @@ def run_self_test():
     check("(52-corner-5) _excluded_permanent ignores soft entries",
           p._excluded(A_pe) is True and p._excluded_permanent(A_pe) is False
           and p._excluded(B_pe) is True and p._excluded_permanent(B_pe) is True)
+
+    # (59-corner-1..5, session 59) a sweep corner committed while ALIVE, then blacklisted PERMANENT after
+    # commitment, must be re-checked and retired EN ROUTE -- not just at selection time. Diagnosed off
+    # flight 20260903_234939_autopilot.log: the LOOP guard blacklisted the already-committed corner
+    # [-1.5,-3.9] at 00:13:01, but `select()` kept returning the cached `sweep_target` unconditionally
+    # forever (the retirement check only ran inside `_pick_sweep_corner`, unreachable once `sweeping` was
+    # already True), ramming the wall for 23.3 minutes.
+    corners_59 = [[4.1, -4.1], [-1.0, -4.1], [-1.2, 8.4], [4.1, 8.4]]
+    pos_59 = [1.455, 3.2514]
+
+    p = FrontierPlanner(None)
+    g_commit, _, _ = p.select([], pos_59, sweep_corners=corners_59)   # commits to the farthest corner
+    committed = list(p.sweep_target)
+    commit_ok = p.sweeping is True and close(g_commit, committed)
+    p._blacklist_goal(committed, permanent=True)                     # goes dead AFTER commitment
+    g_after, _, done_after = p.select([], pos_59, sweep_corners=corners_59)
+    check("(59-corner-1) corner blacklisted permanent AFTER commitment is retired en route, "
+          "tour advances off it",
+          commit_ok and not close(g_after, committed) and p._corner_visited(committed)
+          and any("CORNER-RETIRE-EN-ROUTE" in s for s in p.last_select_events))
+
+    check("(59-corner-2) _gave_up_corner is NOT set by an en-route permanent-dead retirement",
+          p._gave_up_corner is False)
+
+    p = FrontierPlanner(None)
+    g_commit2, _, _ = p.select([], pos_59, sweep_corners=corners_59)
+    committed2 = list(p.sweep_target)
+    p._blacklist_goal(committed2, permanent=False)                   # SOFT -- must NOT retire it
+    g_soft, _, _ = p.select([], pos_59, sweep_corners=corners_59)
+    check("(59-corner-3) a SOFT blacklist on the committed target does NOT retire it",
+          close(g_soft, committed2)
+          and not any("CORNER-RETIRE-EN-ROUTE" in s for s in p.last_select_events))
+
+    p = FrontierPlanner(None)
+    tour_59_4 = [[0.0, 0.0], [5.0, 0.0], [-6.0, 0.0]]
+    g0_59, _, _ = p.select([], [0.0, 0.0], sweep_corners=tour_59_4)   # commits to farthest: [-6,0]
+    p._blacklist_goal(p.sweep_target, permanent=True)
+    g_adv, _, done_adv = p.select([], [0.0, 0.0], sweep_corners=tour_59_4)
+    check("(59-corner-4) the tour ADVANCES to the other unvisited corner, not None/not the dead one",
+          g_adv is not None and not close(g_adv, [-6.0, 0.0]) and close(g_adv, [5.0, 0.0])
+          and not done_adv)
+
+    p = FrontierPlanner(None); p._ever_had_frontiers = True
+    tour_59_5 = [[0.0, 0.0], [5.0, 0.0]]
+    g0_59_5, _, _ = p.select([], [0.0, 0.0], sweep_corners=tour_59_5)  # commits to [5,0]
+    p._blacklist_goal(p.sweep_target, permanent=True)                 # only unvisited corner goes dead
+    g_none, _, done_none_59 = p.select([], [0.0, 0.0], sweep_corners=tour_59_5)
+    check("(59-corner-5) all corners dead while committed -> retires + reports done, no loop",
+          g_none is None and done_none_59 and not p.sweeping)
 
     # (opt) clearance inset: a chosen frontier goal is run through the injected clearance_fn before commit,
     #       so committed==published; a None return commits the RAW goal and flags clearance_ok=False.

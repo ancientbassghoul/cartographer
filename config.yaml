@@ -472,6 +472,13 @@ autonomy:
     visrec_lkg_ageout_log_interval_s: 5.0   # session 56: rate-limit for the F_LKG age-out warning.
                                             # Was a one-shot `_lkg_ring_warned` flag, so a defect that
                                             # ran for 31 of 34 minutes logged exactly once, at 16:56:07.
+    use_visual_backoff_trigger: true   # session 59: let the CAMERA request a back-off, not merely veto one
+    visual_backoff_min_window_s: 3.0   # confident-evidence window that must elapse before it may fire
+    visual_backoff_live_ratio: 0.66    # LIVE / (LIVE + EQUAL + LKG) needed to call it "closing"
+    visual_backoff_min_samples: 5      # confident verdicts required (UNKNOWN never counts)
+    dead_goal_recommit_notice_after: 3 # session 59: consecutive drop -> re-commit cycles onto the same
+                                        # PERMANENTLY blacklisted region before a CRITICAL notice fires.
+                                        # A general disagreement-detection count, not a room answer.
     blind_contact_escalate_after: 2   # after this many blind back-off reflexes against the same obstacle
                                       #   with no confirmed recovery in between, stop repeating a reflex that
                                       #   is demonstrably not working and escalate into the FALLBACK sweep

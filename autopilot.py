@@ -695,6 +695,55 @@ def _plan_status(last_plan, plan_age, plan_timeout_s):
     return "OK"
 
 
+class VisualDirectionTally:
+    """Rolling per-episode tally of VisualMatch.closer verdicts (session 59). Finding 2: the camera's
+    `closer` verdict could VETO a cached-clearance back-off proposal but never REQUEST one on its own --
+    unreachable on glass, which reads clear in the map forever. This is pure bookkeeping (no I/O, no
+    clock of its own -- `now` is always passed in) feeding `ExploreController._visual_backoff_due`, the
+    operator's rule verbatim: fire only once the window has been open >= N seconds AND LIVE/(LIVE+EQUAL+
+    LKG) clears a ratio -- UNKNOWN is dropped entirely (neither a LIVE nor a hold-still signal)."""
+
+    def __init__(self):
+        self.t0 = None       # float | None -- monotonic time of the first COUNTED verdict
+        self.live = 0
+        self.equal = 0
+        self.lkg = 0
+
+    def reset(self):
+        self.t0 = None
+        self.live = 0
+        self.equal = 0
+        self.lkg = 0
+
+    def add(self, verdict, now):
+        if verdict == "LIVE":
+            self.live += 1
+        elif verdict == "EQUAL":
+            self.equal += 1
+        elif verdict == "LKG":
+            self.lkg += 1
+        else:
+            return   # UNKNOWN / None / anything else -- ignored entirely, t0 not stamped
+        if self.t0 is None:
+            self.t0 = now
+
+    @property
+    def samples(self):
+        return self.live + self.equal + self.lkg
+
+    @property
+    def ratio(self):
+        n = self.samples
+        return (self.live / n) if n > 0 else None
+
+    def window_s(self, now):
+        return 0.0 if self.t0 is None else (now - self.t0)
+
+    def summary(self):
+        r = "n/a" if self.ratio is None else f"{self.ratio:.2f}"
+        return f"LIVE={self.live} EQUAL={self.equal} LKG={self.lkg} samples={self.samples} ratio={r}"
+
+
 class ExploreController:
     """Pure per-leg state machine for frontier exploration. `step(now, plan, wall_contact)` is called
     only with a fresh, valid plan; it returns (active_fields, state, event). The caller handles the
@@ -848,12 +897,30 @@ class ExploreController:
         # Session 56: rate-limit for the F_LKG age-out warning below (was a one-shot `_lkg_ring_warned`
         # flag, so a defect that ran for 31 of 34 minutes logged exactly once).
         self.visrec_lkg_ageout_log_interval_s = float(e.get("visrec_lkg_ageout_log_interval_s", 5.0))
+        # Session 59 (finding 2): let the CAMERA's `closer` verdict REQUEST a back-off, not merely veto
+        # a map-clearance-proposed one -- unreachable on glass, which the map reads as clear forever.
+        # Operator's rule verbatim: fire only once a confident-evidence window has been open long enough
+        # AND LIVE/(LIVE+EQUAL+LKG) clears a ratio; UNKNOWN never counts. See VisualDirectionTally.
+        self.use_visual_backoff_trigger = bool(e.get("use_visual_backoff_trigger", True))
+        self.visual_backoff_min_window_s = float(e.get("visual_backoff_min_window_s", 3.0))
+        self.visual_backoff_live_ratio = float(e.get("visual_backoff_live_ratio", 0.66))
+        self.visual_backoff_min_samples = int(e.get("visual_backoff_min_samples", 5))
+        # Session 59 (finding 1): consecutive REPLAN commits landing back inside a region the autopilot just
+        # dropped as PERMANENTLY blacklisted, before the disagreement gets a loud one-shot CRITICAL notice.
+        self.dead_goal_recommit_notice_after = int(e.get("dead_goal_recommit_notice_after", 3))
         # NO SILENT FALLBACK (CLAUDE.md rules 2+3): two INDEPENDENT degradation states, each logged CRITICAL
         # once and each carried into the timeline, so the replay shows WHICH half died. A debug window must
         # never kill a flight, but it must never fail quietly either.
         self.visrec_window_failed = False    # imshow/waitKey raised (no display) -> window disabled, saving continues
         self.visrec_save_failed = False      # imwrite/makedirs raised -> saving disabled, window continues
         self.visrec_window_open = False      # Session 58: an LKG canvas is currently SHOWN in the OS window
+        self._vis_tally = VisualDirectionTally()   # session 59 (finding 2): see _visual_backoff_due
+        # Session 59 (finding 1): the last dead-goal drop discarded (SLAM_HOLD settle-resume) and how many
+        # consecutive REPLAN commits have landed back inside that same region since -- see the REPLAN
+        # goal-commit site. `_dead_goal_notice_fired` is a one-shot latch so the CRITICAL notice prints once.
+        self._dead_goal_dropped = None
+        self._dead_goal_recommits = 0
+        self._dead_goal_notice_fired = False
         # Session 56: F_LKG age-out counter/flag -- mirrors visrec_window_failed/visrec_save_failed exactly.
         # Set when the plan's frame_id has fallen out of the ring (SLAM solve latency exceeded the ring's
         # depth); the PREVIOUS reference is kept rather than substituting the live frame (see run_explore).
@@ -1349,6 +1416,10 @@ class ExploreController:
         self._loss_grace_noticed = False
         self._lost_hold_noticed = False      # session 57: and any in-flight LKG-closer hold notice
         self._backoff_gate_noticed = False   # session 52: and any in-flight post-backoff gate suppression
+        self._dead_goal_dropped = None       # session 59: and any in-flight dead-goal-recommit tracking
+        self._dead_goal_recommits = 0
+        self._dead_goal_notice_fired = False
+        self._vis_tally.reset()              # session 59 (finding 2): and any in-flight direction tally
         self._reset_visual_recovery()
         # Session-12 recovery flags. A manual takeover (the only caller of reset_leg) invalidates any in-flight
         # recovery, so clear them here; DURING a flight they persist across the PLAN-LOST/PLAN-STALE flicker.
@@ -2013,6 +2084,41 @@ class ExploreController:
                     and (now - self._loss_episode_t0) >= self.loss_backoff_grace_s)
         return not self._loss_snapshot_checked
 
+    def _visual_backoff_due(self, now):
+        """Session 59 (finding 2): pure predicate over `self._vis_tally` -- the operator's rule verbatim,
+        all five clauses required (short-circuit on the first failure). Reads state only, mutates
+        nothing; `_fire_visual_backoff` is the one place that acts on a True result."""
+        if not self.use_visual_backoff_trigger:
+            return False
+        if self._vis_tally.t0 is None:
+            return False
+        if self._vis_tally.window_s(now) < self.visual_backoff_min_window_s:
+            return False
+        if self._vis_tally.samples < self.visual_backoff_min_samples:
+            return False
+        return self._vis_tally.ratio >= self.visual_backoff_live_ratio
+
+    def _fire_visual_backoff(self, now, from_state):
+        """Session 59 (finding 2): the camera REQUESTS a back-off instead of merely vetoing the map's --
+        the operator's rule verbatim (see plans/session59-spec.md C6). MUST NOT touch
+        `_blind_contact_reacts` or call `_arm_loss_backoff` -- that wedge counter escalates to FALLBACK
+        at `blind_contact_escalate_after`, and routing this trigger through it would let a back-off
+        fired FROM FALLBACK re-escalate INTO FALLBACK. Entering BACKOFF directly, plus resetting the
+        tally below (forcing a whole fresh confident-evidence window before the next fire), is what
+        bounds it."""
+        tally = self._vis_tally.summary()
+        window = self._vis_tally.window_s(now)
+        self._vis_tally.reset()
+        self._loss_episode_t0 = now          # session 48/57 convention: a physical action restarts the wait
+        self._loss_grace_noticed = False
+        self._lost_hold_noticed = False
+        self._player = None
+        self._backoff_t0 = now
+        self._enter("BACKOFF", now)
+        return {}, "BACKOFF", (f"visual back-off: {tally} over {window:.1f}s "
+                               f"(>= {self.visual_backoff_min_window_s:.1f}s, ratio >= "
+                               f"{self.visual_backoff_live_ratio:.2f}) from {from_state} -> standoff back off")
+
     def _enter_visual_recovery(self, now, event):
         """Route into the 15° visual recovery probe (session 35 ALT; mirrors `_enter_fallback_sweep`). A
         TRUE fresh episode (`_visrec_phase is None`) starts at TURN; a RESUME after a PLAN-LOST/PLAN-STALE
@@ -2638,10 +2744,15 @@ class ExploreController:
         blocks BOTH the region blacklist and the corner retirement). Frontiers and near corners bump normally."""
         if self.leg_goal is None:
             return
-        if self._goal_is_blacklisted(plan, self.leg_goal):
+        if self._goal_is_blacklisted(plan, self.leg_goal) and not self._leg_is_corner:
             # Session 58: 22:40:25.165 -- a bump pulse fired 1.0s AFTER the planner already retired this
             # SAME goal PERMANENT (22:40:24.170), because nothing here re-checked the live blacklist. Stash
             # a MISSED-BUMP (never silent) instead of pulsing a dead region.
+            # Session 59: this guard also suppressed the pulse that reaches note_wall_hit's corner-retirement
+            # branch -- for a sweep-tour CORNER, the 2-bump IS the last escape from a committed dead goal
+            # (`_pick_sweep_corner`'s permanent-dead re-check never runs while `sweeping` stays True; see
+            # MISSION CONTEXT finding 1). Blocking it cost 23 minutes rammed into [-1.5, -3.9]. Frontier
+            # goals (not corners) keep the session-58 suppression exactly.
             self._missed_bump = (f"{reason} (goal {self.leg_goal} is already PERMANENTLY blacklisted "
                                  f"— no pulse; the planner retired it before this contact)")
             return
@@ -3169,9 +3280,16 @@ class ExploreController:
                 self._backoff_gate_noticed = False   # session 52: fresh episode, gate suppression may re-notice
                 self._lost_hold_noticed = False       # session 57: fresh episode, hold notice may re-notice
                 self._visrec_probe_armed = True       # session 52 (chunk 4): re-arm the probe's late entry
+                self._vis_tally.reset()               # session 59: a fresh loss edge starts a fresh tally
             if not lost:
                 self._loss_episode_t0 = None         # a genuine OK ended the episode -- next loss re-stamps
                 self._loss_grace_noticed = False
+            if lost:
+                # Session 59 (finding 2): feed every lost tick's verdict into the rolling tally so
+                # `_visual_backoff_due` can see the camera calling "closer" long before the map-clearance
+                # path (which reads clear forever on glass) ever proposes a back-off. `add()` already
+                # ignores None/"UNKNOWN", so no extra guard is needed here.
+                self._vis_tally.add(visual_match.closer if visual_match is not None else None, now)
             self._was_lost = lost
             # A plan loss DURING a height calibration must NOT drop us into the normal recovery (which forgets
             # the calibration and leaves the drone glued near the ceiling). Latch "interrupted", release
@@ -3226,6 +3344,10 @@ class ExploreController:
                     # contacts MUST be threaded through: while blind they are the only signal that can cut a
                     # randomized push short on an obstacle.
                     if st == "FALLBACK":
+                        # Session 59 (finding 2): the camera is the only sensor that sees glass at all --
+                        # let a confident "closer" verdict request a back-off instead of only vetoing one.
+                        if self._visual_backoff_due(now):
+                            return self._fire_visual_backoff(now, "FALLBACK")
                         return self._step_fallback_sweep(now, wall_contact, backwall_contact)
                     # Session 52 (chunk 4): the same session-46 fix, applied to the one remaining state that
                     # needed it. An in-flight VISUAL_RECOVERY probe (now reachable via the late entry in
@@ -3256,6 +3378,11 @@ class ExploreController:
                 # revisited and the back-off would be dead code rather than delayed.
                 # Session 57: `_step_lost_recovery` now owns the WHOLE PLAN-LOST/NO-PLAN decision --
                 # unconditional every tick, no ticket to check or spend -- see the fresh-entry site above.
+                # Session 59 (finding 2): let a confident visual verdict act BEFORE the map-clearance path
+                # gets its turn -- on glass the map reads clear forever, so `_step_lost_recovery`'s `pending`
+                # proposal is unreachable while the camera has been calling "closer" the whole time.
+                if self._visual_backoff_due(now):
+                    return self._fire_visual_backoff(now, "HOLD_LOST")
                 deferred = self._step_lost_recovery(plan, now, visual_match, status)
                 if deferred is not None:
                     return deferred
@@ -3424,6 +3551,10 @@ class ExploreController:
                     if self.leg_goal is not None and self._goal_is_blacklisted(plan, self.leg_goal):
                         dead_goal = self.leg_goal
                         self.leg_goal = None
+                        # Session 59: remember what was just dropped so the REPLAN commit site can tell
+                        # whether the planner immediately re-emits the SAME dead goal (finding 1 -- the
+                        # planner and autopilot disagreeing forever) instead of silently looping.
+                        self._dead_goal_dropped = list(dead_goal)
                         self._settle_to = "REPLAN"
                         self._enter("SETTLE", now)
                         return {}, "SETTLE", (f"SLAM settled after {waited:.1f}s but leg_goal {dead_goal} "
@@ -3979,6 +4110,23 @@ class ExploreController:
                 self._hop_start_dist = None               # judged (or unjudgeable) -> clear the pending eval
                 self._hop_start_goal = None
                 self.leg_goal = list(plan["goal"])
+                # Session 59 (finding 1): if the planner just re-emitted the SAME goal the autopilot dropped
+                # as PERMANENTLY blacklisted, count it -- a healthy planner should never land back inside a
+                # dead region, so a run of these means the two components disagree and the tour is stuck.
+                if (self._dead_goal_dropped is not None
+                        and self._dist(self.leg_goal, self._dead_goal_dropped) <= self.goal_area_radius):
+                    self._dead_goal_recommits += 1
+                else:
+                    self._dead_goal_recommits = 0
+                    self._dead_goal_dropped = None
+                if (self._dead_goal_recommits >= self.dead_goal_recommit_notice_after
+                        and not self._dead_goal_notice_fired):
+                    self._dead_goal_notice_fired = True
+                    self.note_timeout(
+                        "DEAD_GOAL_RECOMMIT",
+                        f"*** CRITICAL: planner re-committed to goal {self.leg_goal}, which the autopilot just "
+                        f"dropped as PERMANENTLY blacklisted, {self._dead_goal_recommits} times in a row -- "
+                        "planner and autopilot disagree about this goal ***", now)
                 self._leg_is_corner = bool(plan.get("goal_is_corner"))  # the new published goal is a sweep-tour corner?
                 # Per-goal height re-calibration (RESTORED session 21): on a GENUINE goal change (moved >
                 # calib_goal_change_dist) past the cooldown, re-tap the ceiling first to re-latch the mapping
@@ -9608,6 +9756,87 @@ def run_self_test(cfg):
           f"slam-hold-dead-goal-replans={slam_hold_dead_goal_replans_instead_of_backing_off}, "
           f"slam-hold-live-goal-backs-off={slam_hold_live_goal_still_backs_off})")
 
+    # ---- SESSION-59 DEAD-GOAL DISAGREEMENT -----------------------------------------------------------
+    # MISSION CONTEXT finding 1: session 58's bump guard above (correctly) stops a pulse against an
+    # already-PERMANENTLY-blacklisted goal for a FRONTIER -- but for a sweep-tour CORNER that guard also
+    # blocked the 2-bump that is the corner's ONLY escape once `sweeping` has latched (`_pick_sweep_corner`'s
+    # permanent-dead re-check never runs while sweeping stays True). Flight 20260903_234939 rammed
+    # [-1.5, -3.9] for 23.3 minutes because of exactly this. (a)/(b) prove the guard is now corner-aware.
+    c59a = ExploreController(cfg, no_takeoff=True)
+    c59a.leg_goal = [3.0, 0.0]
+    c59a._bump_armed = True
+    c59a._leg_is_corner = True
+    c59a._register_bump(_tplan(0.0, pos=(2.5, 0.0), goal=(3.0, 0.0), blacklist=[[3.0, 0.0]],
+                               blacklist_permanent=[True]), "clearance stand-off")
+    corner_pulse_goal, _, _, _ = c59a.take_bump_pulse()
+    corner_still_bumps_ok = (corner_pulse_goal == [3.0, 0.0])
+    ok = ok and corner_still_bumps_ok
+    print(f"[self-test] {'PASS' if corner_still_bumps_ok else 'FAIL'}  SESSION-59 corner_still_bumps "
+          f"(a PERMANENTLY blacklisted CORNER goal still emits a bump pulse -- its last escape)")
+
+    # (b) session-58 regression guard: a FRONTIER goal (not a corner) is unaffected -- still suppressed.
+    c59b = ExploreController(cfg, no_takeoff=True)
+    c59b.leg_goal = [3.0, 0.0]
+    c59b._bump_armed = True
+    c59b._leg_is_corner = False
+    c59b._register_bump(_tplan(0.0, goal=(3.0, 0.0), blacklist=[[3.0, 0.0]], blacklist_permanent=[True]),
+                        "clearance stand-off")
+    frontier_pulse_goal, _, _, _ = c59b.take_bump_pulse()
+    frontier_missed = c59b.take_missed_bump()
+    frontier_still_suppressed_ok = (frontier_pulse_goal is None and frontier_missed is not None
+                                    and "blacklisted" in frontier_missed)
+    ok = ok and frontier_still_suppressed_ok
+    print(f"[self-test] {'PASS' if frontier_still_suppressed_ok else 'FAIL'}  SESSION-59 "
+          f"frontier_still_suppressed (a PERMANENTLY blacklisted FRONTIER goal stays suppressed, session-58 "
+          f"regression guard)")
+
+    # (c) the planner re-emitting the SAME dead goal REPLAN-commit after REPLAN-commit is a disagreement --
+    # count it, and fire a one-shot CRITICAL notice once the count reaches dead_goal_recommit_notice_after.
+    c59c = ExploreController(cfg, no_takeoff=True)
+    dead_goal59 = [5.0, 0.0]
+    c59c._dead_goal_dropped = list(dead_goal59)
+    notices59 = []
+    t59 = 0.0
+    for i in range(c59c.dead_goal_recommit_notice_after + 1):   # one extra commit past the threshold
+        t59 += 0.1
+        c59c._enter("REPLAN", t59)
+        c59c.step(t59, _s45plan(dead_goal59, [0.0, 0.0], fid=i + 1, cap=t59), False)
+        notices59.append(c59c.take_notice())
+    fires59 = [n for n in notices59 if n is not None]
+    recommit_counts_and_notices_ok = (
+        len(fires59) == 1 and "[5.0, 0.0]" in fires59[0]
+        and f"{c59c.dead_goal_recommit_notice_after} times in a row" in fires59[0])
+    ok = ok and recommit_counts_and_notices_ok
+    print(f"[self-test] {'PASS' if recommit_counts_and_notices_ok else 'FAIL'}  SESSION-59 "
+          f"recommit_counts_and_notices (dead-goal re-commit CRITICAL notice fires exactly once, names "
+          f"the goal, does not re-fire on a further commit)")
+
+    # (d) a commit onto a MATERIALLY different goal (outside goal_area_radius) zeroes the recommit count
+    # and clears the tracked dead goal -- a genuinely new leg is not a disagreement.
+    c59d = ExploreController(cfg, no_takeoff=True)
+    c59d._dead_goal_dropped = [5.0, 0.0]
+    c59d._dead_goal_recommits = 2
+    c59d._enter("REPLAN", 0.0)
+    c59d.step(0.0, _s45plan([20.0, 0.0], [0.0, 0.0], fid=1, cap=0.0), False)
+    recommit_resets_on_different_goal_ok = (c59d._dead_goal_recommits == 0
+                                            and c59d._dead_goal_dropped is None)
+    ok = ok and recommit_resets_on_different_goal_ok
+    print(f"[self-test] {'PASS' if recommit_resets_on_different_goal_ok else 'FAIL'}  SESSION-59 "
+          f"recommit_resets_on_different_goal (a materially new goal zeroes the recommit tracking)")
+
+    # (e) reset_leg() (autonomy pause / manual takeover) clears all the dead-goal tracking state too.
+    c59e = ExploreController(cfg, no_takeoff=True)
+    c59e._dead_goal_dropped = [1.0, 1.0]
+    c59e._dead_goal_recommits = 5
+    c59e._dead_goal_notice_fired = True
+    c59e.reset_leg()
+    reset_leg_clears_state_ok = (c59e._dead_goal_dropped is None and c59e._dead_goal_recommits == 0
+                                 and c59e._dead_goal_notice_fired is False)
+    ok = ok and reset_leg_clears_state_ok
+    print(f"[self-test] {'PASS' if reset_leg_clears_state_ok else 'FAIL'}  SESSION-59 "
+          f"reset_leg_clears_state (reset_leg() clears _dead_goal_dropped/_dead_goal_recommits/"
+          f"_dead_goal_notice_fired)")
+
     # ---- SESSION 49 — LKG debug window sink (window/save fail INDEPENDENTLY, no silent fallback) -------
     import tempfile
 
@@ -10988,6 +11217,190 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if would_react_agrees else 'FAIL'}  SESSION-57 STALE DIRECTION GATE "
           f"would_react_agrees (live={would_react_live_ok}, lkg={would_react_lkg_ok})")
     print(f"[self-test] {'PASS' if dir57_ok else 'FAIL'}  SESSION-57 STALE DIRECTION GATE overall")
+
+    # ---- SESSION-59 VISUAL TALLY (chunk 3): pure measurement + predicate for finding 2 -- a camera
+    # verdict of "closing" can currently only VETO a map-proposed back-off, never REQUEST one on its own
+    # (unreachable on glass, which the cached map clearance reads as clear forever). This chunk wires
+    # NOTHING into the FSM yet; these cases exercise VisualDirectionTally + _visual_backoff_due in
+    # isolation only. ----
+    vt1 = VisualDirectionTally()
+    vt1.add("UNKNOWN", 100.0)
+    vt1.add(None, 100.0)
+    unknown_is_ignored = (vt1.samples == 0 and vt1.ratio is None and vt1.t0 is None
+                          and vt1.window_s(200.0) == 0.0)
+
+    vt2 = VisualDirectionTally()
+    vt2.add("EQUAL", 50.0)
+    t0_after_first = vt2.t0
+    vt2.add("LIVE", 60.0)
+    t0_stamps_on_first_counted = (t0_after_first == 50.0 and vt2.t0 == 50.0)
+
+    vt3 = VisualDirectionTally()
+    for _ in range(7):
+        vt3.add("LIVE", 10.0)
+    for _ in range(2):
+        vt3.add("EQUAL", 10.0)
+    vt3.add("LKG", 10.0)
+    ratio_math = (vt3.samples == 10 and vt3.ratio == 0.7)
+
+    c_due = ExploreController(cfg, no_takeoff=True)
+    c_due._vis_tally.t0 = 1000.0
+    c_due._vis_tally.live = 8
+    c_due._vis_tally.equal = 2
+    due_all_conditions = (c_due._visual_backoff_due(1003.1) is True
+                          and c_due._visual_backoff_due(1002.9) is False)
+
+    c_ratio = ExploreController(cfg, no_takeoff=True)
+    c_ratio._vis_tally.t0 = 1000.0
+    c_ratio._vis_tally.live = 5
+    c_ratio._vis_tally.equal = 5
+    due_needs_ratio = (c_ratio._visual_backoff_due(1010.0) is False)
+
+    c_samp = ExploreController(cfg, no_takeoff=True)
+    c_samp._vis_tally.t0 = 1000.0
+    c_samp._vis_tally.live = 3
+    due_needs_samples = (c_samp._visual_backoff_due(1010.0) is False)
+
+    c_flag = ExploreController(cfg, no_takeoff=True)
+    c_flag._vis_tally.t0 = 1000.0
+    c_flag._vis_tally.live = 8
+    c_flag._vis_tally.equal = 2
+    c_flag.use_visual_backoff_trigger = False
+    due_respects_flag = (c_flag._visual_backoff_due(1003.1) is False)
+
+    c_cfg = ExploreController(cfg, no_takeoff=True)
+    defaults_from_config = (c_cfg.use_visual_backoff_trigger is True
+                            and c_cfg.visual_backoff_min_window_s == 3.0
+                            and c_cfg.visual_backoff_live_ratio == 0.66
+                            and c_cfg.visual_backoff_min_samples == 5)
+
+    vt9 = VisualDirectionTally()
+    vt9.add("LIVE", 5.0)
+    vt9.add("EQUAL", 6.0)
+    vt9.add("LKG", 7.0)
+    vt9.reset()
+    reset_clears = (vt9.t0 is None and vt9.live == 0 and vt9.equal == 0 and vt9.lkg == 0)
+
+    vistally_ok = (unknown_is_ignored and t0_stamps_on_first_counted and ratio_math
+                  and due_all_conditions and due_needs_ratio and due_needs_samples
+                  and due_respects_flag and defaults_from_config and reset_clears)
+    ok = ok and vistally_ok
+    print(f"[self-test] {'PASS' if unknown_is_ignored else 'FAIL'}  SESSION-59 VISUAL TALLY unknown_is_ignored")
+    print(f"[self-test] {'PASS' if t0_stamps_on_first_counted else 'FAIL'}  SESSION-59 VISUAL TALLY "
+          f"t0_stamps_on_first_counted")
+    print(f"[self-test] {'PASS' if ratio_math else 'FAIL'}  SESSION-59 VISUAL TALLY ratio_math")
+    print(f"[self-test] {'PASS' if due_all_conditions else 'FAIL'}  SESSION-59 VISUAL TALLY due_all_conditions")
+    print(f"[self-test] {'PASS' if due_needs_ratio else 'FAIL'}  SESSION-59 VISUAL TALLY due_needs_ratio")
+    print(f"[self-test] {'PASS' if due_needs_samples else 'FAIL'}  SESSION-59 VISUAL TALLY due_needs_samples")
+    print(f"[self-test] {'PASS' if due_respects_flag else 'FAIL'}  SESSION-59 VISUAL TALLY due_respects_flag")
+    print(f"[self-test] {'PASS' if defaults_from_config else 'FAIL'}  SESSION-59 VISUAL TALLY defaults_from_config")
+    print(f"[self-test] {'PASS' if reset_clears else 'FAIL'}  SESSION-59 VISUAL TALLY reset_clears")
+    print(f"[self-test] {'PASS' if vistally_ok else 'FAIL'}  SESSION-59 VISUAL TALLY overall")
+
+    # ---- SESSION-59 VISUAL BACKOFF WIRING (chunk 4): the tally now DRIVES the FSM -- a confident
+    # "closer" verdict fires a back-off from HOLD_LOST/FALLBACK instead of only ever being vetoed by
+    # them (finding 2: this flight logged 496 closer=LIVE verdicts and zero drove any action). ----
+    def _mk_vm59(closer):
+        return VisualMatch(has_lkg=True, matched=True, inliers=50, contained=False, planar_like=True,
+                           scale=1.0, closer=closer)
+
+    def _drive_visual_tally(ctrl, enter_state, status, closer, n, dt=1.0, t0=0.0):
+        """Park `ctrl` in `enter_state`, then step it `n` times at `dt` spacing under `status`, feeding a
+        fixed `closer` verdict (VisualMatch, or None for UNKNOWN) each tick. Returns the final
+        (active, state, event). FALLBACK is entered via `_enter_fallback_sweep` (not the raw `_enter`) so
+        `_fallback_phase` is initialized -- a raw entry leaves it None, which `_step_fallback_sweep`
+        does not handle and only the visual trigger's own early-return would ever mask."""
+        if enter_state == "FALLBACK":
+            ctrl._enter_fallback_sweep(t0, "session 59 self-test setup")
+        else:
+            ctrl._enter(enter_state, t0)
+        t, active, state, event = t0, {}, ctrl.state, None
+        for _ in range(n):
+            vm = _mk_vm59(closer) if closer is not None else None
+            active, state, event = ctrl.step(t, {"plan_valid": False}, False, status=status, visual_match=vm)
+            t += dt
+        return active, state, event
+
+    # (1) fires_from_hold_lost: 5 ticks @ 1.0s spacing of closer="LIVE" clears both min_samples=5 and
+    #     min_window_s=3.0 on the SAME tick the 5th sample lands (t0 stamps on tick 1 @ t=0.0, so tick 5
+    #     @ t=4.0 reads window_s=4.0 >= 3.0) -> BACKOFF.
+    c59a = ExploreController(cfg, no_takeoff=True)
+    _a59a, s59a, ev59a = _drive_visual_tally(c59a, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
+    fires_from_hold_lost = (s59a == "BACKOFF" and ev59a is not None and "visual back-off" in ev59a)
+
+    # (2) fires_from_fallback: identical drive, parked in FALLBACK instead.
+    c59b = ExploreController(cfg, no_takeoff=True)
+    _a59b, s59b, ev59b = _drive_visual_tally(c59b, "FALLBACK", "PLAN-LOST", "LIVE", 5)
+    fires_from_fallback = (s59b == "BACKOFF" and ev59b is not None and "visual back-off" in ev59b)
+
+    # (3) no_fire_on_equal: EQUAL is confident evidence of NEITHER closing nor opening -- it fills
+    #     samples/window but never `live`, so `ratio` can never clear `visual_backoff_live_ratio`.
+    c59c = ExploreController(cfg, no_takeoff=True)
+    _a59c, s59c, _ev59c = _drive_visual_tally(c59c, "HOLD_LOST", "PLAN-LOST", "EQUAL", 20)
+    no_fire_on_equal = (s59c == "HOLD_LOST")
+
+    # (4) no_fire_on_unknown: `VisualDirectionTally.add` ignores UNKNOWN entirely -- t0 never stamps, so
+    #     `_visual_backoff_due` clause 2 (t0 is not None) never clears and the tally stays empty.
+    c59d = ExploreController(cfg, no_takeoff=True)
+    _a59d, s59d, _ev59d = _drive_visual_tally(c59d, "HOLD_LOST", "PLAN-LOST", "UNKNOWN", 20)
+    no_fire_on_unknown = (s59d == "HOLD_LOST" and c59d._vis_tally.samples == 0)
+
+    # (5) wedge_counter_untouched: `_fire_visual_backoff` must NOT touch `_blind_contact_reacts` -- the
+    #     BACKOFF<->FALLBACK loop guard (C6's CRITICAL paragraph: routing this trigger through
+    #     `_arm_loss_backoff` would let a back-off fired FROM FALLBACK re-escalate INTO FALLBACK).
+    c59e = ExploreController(cfg, no_takeoff=True)
+    before59e = c59e._blind_contact_reacts
+    _a59e, s59e, _ev59e = _drive_visual_tally(c59e, "FALLBACK", "PLAN-LOST", "LIVE", 5)
+    wedge_counter_untouched = (s59e == "BACKOFF" and c59e._blind_contact_reacts == before59e)
+
+    # (6) does_not_refire_immediately: `_fire_visual_backoff` resets the tally, so a single further LIVE
+    #     sample (samples=1 < min_samples=5) cannot clear the bars again.
+    c59f = ExploreController(cfg, no_takeoff=True)
+    _a59f, s59f, _ev59f = _drive_visual_tally(c59f, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
+    c59f._vis_tally.add("LIVE", 5.0)
+    does_not_refire_immediately = (s59f == "BACKOFF" and c59f._visual_backoff_due(5.0) is False)
+
+    # (7) flag_off_is_inert: the identical fires_from_hold_lost drive, but with the trigger disabled --
+    #     `_visual_backoff_due` clause 1 always returns False, so the hold never breaks.
+    c59g = ExploreController(cfg, no_takeoff=True)
+    c59g.use_visual_backoff_trigger = False
+    _a59g, s59g, _ev59g = _drive_visual_tally(c59g, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
+    flag_off_is_inert = (s59g == "HOLD_LOST")
+
+    # (8) loss_edge_resets_tally: a tally filled during one loss episode is EMPTY on the first tick of the
+    #     NEXT fresh loss edge (an intervening OK clears `_was_lost`, re-arming the fresh-edge reset at
+    #     the top of `step()`).
+    c59h = ExploreController(cfg, no_takeoff=True)
+    _drive_visual_tally(c59h, "HOLD_LOST", "PLAN-LOST", "LIVE", 3)
+    filled_before_ok = c59h._vis_tally.samples > 0
+    c59h.step(3.0, {"plan_valid": True, "done": False, "goal": [1.0, 0.0], "pos": [0.0, 0.0],
+                    "bearing_err": 0.0, "forward_clearance_dist": 5.0}, False, status="OK")
+    c59h.step(3.05, {"plan_valid": False}, False, status="PLAN-LOST", visual_match=_mk_vm59("LIVE"))
+    loss_edge_resets_tally = (filled_before_ok and c59h._vis_tally.samples == 1)
+
+    backoff_wiring_ok = (fires_from_hold_lost and fires_from_fallback and no_fire_on_equal
+                         and no_fire_on_unknown and wedge_counter_untouched
+                         and does_not_refire_immediately and flag_off_is_inert
+                         and loss_edge_resets_tally)
+    ok = ok and backoff_wiring_ok
+    print(f"[self-test] {'PASS' if fires_from_hold_lost else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"fires_from_hold_lost (state={s59a})")
+    print(f"[self-test] {'PASS' if fires_from_fallback else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"fires_from_fallback (state={s59b})")
+    print(f"[self-test] {'PASS' if no_fire_on_equal else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"no_fire_on_equal (state={s59c})")
+    print(f"[self-test] {'PASS' if no_fire_on_unknown else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"no_fire_on_unknown (state={s59d}, samples={c59d._vis_tally.samples})")
+    print(f"[self-test] {'PASS' if wedge_counter_untouched else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"wedge_counter_untouched (before={before59e}, after={c59e._blind_contact_reacts})")
+    print(f"[self-test] {'PASS' if does_not_refire_immediately else 'FAIL'}  SESSION-59 VISUAL BACKOFF "
+          f"WIRING does_not_refire_immediately")
+    print(f"[self-test] {'PASS' if flag_off_is_inert else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"flag_off_is_inert (state={s59g})")
+    print(f"[self-test] {'PASS' if loss_edge_resets_tally else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING "
+          f"loss_edge_resets_tally (filled_before_ok={filled_before_ok}, "
+          f"samples_after={c59h._vis_tally.samples})")
+    print(f"[self-test] {'PASS' if backoff_wiring_ok else 'FAIL'}  SESSION-59 VISUAL BACKOFF WIRING overall")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

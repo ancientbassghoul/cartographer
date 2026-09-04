@@ -5,12 +5,38 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-04**, branch `all-bets-are-off`, session 58: built, gated and **live-flown**
-(`OUTPUT/diag/20260903_234939_*`). Its own fixes verified; the flight exposed a 23-minute corner
-lockup that session 59's spec addresses. See `STATE.md`'s watch list._
+_Last updated **2026-09-04**, branch `all-bets-are-off`, session 59: built, gated and **live-flown**
+(`OUTPUT/diag/20260904_103342_*`). The corner lockup did not recur and the camera drove its first-ever
+back-off. That flight's 15.3-minute PLAN-STALE is what session 60's spec addresses. See `STATE.md`._
 
 ## Session Log (newest first)
 
+- **59** — Flew session 58 and its own two fixes held up: the grace fix cut wasted matches from
+  233/253 (92%) to 45/1454 (3%), and the dead-goal drop fired correctly every time. But the same
+  flight rammed glass at corner `[-1.5, -3.9]` for 23.3 minutes, and it turned out session 58's own
+  bump guard had closed the sweep tour's last escape hatch — a committed corner was never re-checked
+  against the blacklist that condemned it 2 minutes later, so `select()` kept re-emitting a goal the
+  autopilot had already given up on, 45 legs deep. Fixed the root cause (the corner is now re-checked
+  and force-retired on the spot when it goes permanently dead, so the tour advances the same tick) and
+  narrowed the bump guard so a corner can still earn its 2-bump escape even while a frontier goal
+  can't. Also gave the camera a voice it never had: 496 `closer=LIVE` verdicts fired last flight and
+  drove zero action, because the map's own clearance reading (which can't see glass at all) was the
+  only thing allowed to *propose* a back-off — the camera could only veto one already in flight. Built
+  the operator's own rule (a rolling LIVE/EQUAL/LKG tally; back off once it's been confident for 3s
+  and at least 66% LIVE) as a second, independent trigger the camera can fire on its own, wired into
+  both `HOLD_LOST` and `FALLBACK`, with a config kill switch. All 9 self-test suites green.
+  `plans/session59-spec.md` — **FLOWN 2026-09-04** (`OUTPUT/diag/20260904_103342_*`, ~37 min). The
+  corner lockup did not recur: **zero** `ALREADY-excluded` warnings against 29 the flight before, and
+  no drop→re-commit loop. Honest caveat: `CORNER-RETIRE-EN-ROUTE` never fired, because no corner went
+  dead mid-tour this flight — so the fix is *not contradicted* rather than *confirmed*. The camera
+  trigger DID fire, once and correctly (`LIVE=21 ratio=1.00 over 3.0s`) — the first time in the
+  project's history that the camera, rather than the map, asked for a maneuver. The flight then
+  surfaced four new things, all specced into session 60: F_LKG cannot refresh (the ring's median
+  age-out shortfall was 0.55 s on a 17.6 s window, 34 times); one wall contact can permanently
+  blacklist a goal, because a back-off's own reverse re-arms the bump latch; the 15° probe has never
+  once recovered SLAM in 139 flight logs, while the blind sweep that follows it found the matching
+  view 98 times and swept straight through it; and the probe's grace notice printed 413 times.
+  `plans/session60-spec.md`
 - **58** — Flew session 57 and its headline fix worked: all 25 loss episodes ran LKG matching — the
   diagnosing flight's 56-of-86 zero-match count went to **0 of 25**, settling session 57's own
   watch-item 1. But the same flight surfaced three new defects. First, the announced 12s grace was
