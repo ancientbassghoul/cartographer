@@ -5,12 +5,43 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-03**, branch `all-bets-are-off`, session 57: built and gated the PLAN-LOST
-recovery rewrite + direction-aware LKG matching spec end to end (all 10 chunks), all 9 self-test
-suites green. Not yet live-flown — see `STATE.md`'s watch list._
+_Last updated **2026-09-04**, branch `all-bets-are-off`, session 58: built, gated and **live-flown**
+(`OUTPUT/diag/20260903_234939_*`). Its own fixes verified; the flight exposed a 23-minute corner
+lockup that session 59's spec addresses. See `STATE.md`'s watch list._
 
 ## Session Log (newest first)
 
+- **58** — Flew session 57 and its headline fix worked: all 25 loss episodes ran LKG matching — the
+  diagnosing flight's 56-of-86 zero-match count went to **0 of 25**, settling session 57's own
+  watch-item 1. But the same flight surfaced three new defects. First, the announced 12s grace was
+  unreachable dead code: the pre-session-57 one-shot ticket that used to gate matching stayed
+  permanently unarmed on the PLAN-LOST path (session 57 had removed the only code that ever spent it
+  there), so it kept short-circuiting `wants_visual_match` to `True` before the grace clause could
+  run — 233 of 253 matches (92%) fired inside the announced 12s window and produced **zero**
+  decisions, a wasted SIFT+BFMatcher+RANSAC pass every 0.5s on the CPU while SLAM fought to
+  relocalize, and a live suspect for the still-open SLAM-choke question. Restructured
+  `wants_visual_match` so the grace clause is the sole authority on the PLAN-LOST/NO-PLAN path.
+  Second, the LKG debug window opened at arm and never closed — session 49's idle refresh had no
+  loss gate at all and fired every 0.5s for the whole flight from the first `plan_valid` plan, and it
+  flickered because the idle canvas drew F_LKG on both sides (mislabeling one pane "LIVE") racing
+  against the real match canvas at ~2Hz. Deleted the idle-refresh branch and scoped the window to
+  loss episodes (opens on a matured loss, closes on recovery). Third, a permanently-blacklisted goal
+  could still be bumped: `_register_bump` never checked the live blacklist, so 1.0s after
+  `[3.9, -3.6]` hit `BLACKLIST PERMANENT` a bump pulse fired against it anyway, because the
+  autopilot's own `leg_goal` was still pointed at the dead goal. Lifted the dead-goal predicate
+  already used by `_trim_resolve_resume` into `_goal_is_blacklisted`, guarded all eight
+  `_register_bump` call sites, and made the SLAM_HOLD settle-resume path converge via
+  SETTLE→REPLAN when the committed goal is dead. Deferred to session 59: the bump pulse itself still
+  takes 10-18s to become a blacklist the autopilot can see, since it only rides the next published
+  plan and `perception_worker.run()` blocks 8-10s per SLAM solve — three candidate designs sketched
+  (a provisional local bump count, an immediate planner event, a loss-surviving stall guard), none
+  built. Also noted: the flow-contact detector cannot see glass at all (zero WALL fires across three
+  confirmed glass rams this flight), so nothing in session 59 should assume a WALL fire will arrive.
+  All 9 self-test suites green. `plans/session58-lkg-window-discipline-and-dead-goal-guard.md`
+  — **FLOWN 2026-09-04** (`OUTPUT/diag/20260903_234939_*`, 47 min). Both fixes verified: matches
+  inside the grace fell from 233/253 (92%) to 45/1454 (3%), and the dead-goal drop fired correctly
+  every time. But the flight ended with the drone ramming glass at bounding-box corner
+  `[-1.5, -3.9]` for **23.3 minutes**, and the cause was partly this session's own guard — see 59.
 - **57** — Flew session 56 and it worked: fast, efficient, the SLAM_HOLD fix landed. But the operator
   watched the LKG window show a reference frame plainly *closer* than the live frame while the drone
   backed off anyway. Two causes. First, `planar_like` means "flat surface", not "closer" — it is

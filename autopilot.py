@@ -853,6 +853,7 @@ class ExploreController:
         # never kill a flight, but it must never fail quietly either.
         self.visrec_window_failed = False    # imshow/waitKey raised (no display) -> window disabled, saving continues
         self.visrec_save_failed = False      # imwrite/makedirs raised -> saving disabled, window continues
+        self.visrec_window_open = False      # Session 58: an LKG canvas is currently SHOWN in the OS window
         # Session 56: F_LKG age-out counter/flag -- mirrors visrec_window_failed/visrec_save_failed exactly.
         # Set when the plan's frame_id has fallen out of the ring (SLAM solve latency exceeded the ring's
         # depth); the PREVIOUS reference is kept rather than substituting the live frame (see run_explore).
@@ -1525,11 +1526,7 @@ class ExploreController:
                 resume, now, f"{msg} -> resume SLAM_HOLD ({resume} pending, episode still open)")
             return why
         pos, hd = plan.get("pos"), plan.get("heading_deg")
-        bl = plan.get("blacklist") or []
-        perm = plan.get("blacklist_permanent") or []
-        dead = g is not None and any(
-            (bool(perm[i]) if i < len(perm) else False) and self._dist(g, pt) <= self.goal_area_radius
-            for i, pt in enumerate(bl))
+        dead = self._goal_is_blacklisted(plan, g)   # session 58: shared predicate (was inline here)
         if g is not None and not dead and pos is not None and hd is not None:
             self.leg_goal = list(g)
             bearing = math.degrees(math.atan2(g[0] - pos[0], g[1] - pos[1]))   # 0=+Z, +90=+X (matches homing)
@@ -1986,12 +1983,17 @@ class ExploreController:
             for the rest of the episode.
           • `_step_visual_recovery`'s MATCH phase -- one match per turn cycle, and it must be the FRESH
             post-turn view.
-          • Session 57: `_step_lost_recovery`, once a PLAN-LOST/NO-PLAN episode has outlived
-            `loss_backoff_grace_s`. The one-shot ticket is spent the instant the FIRST tick of a loss reads
-            a clear cached clearance (see MISSION CONTEXT finding 1 in plans/session57-spec.md) -- 56 of 86
-            loss episodes in flight 20260903_083329 never ran a single match because of exactly this. This
-            clause re-opens the camera for every MATURED episode regardless of the ticket's state, without
-            touching the ticket itself.
+          • Session 57/58: `_step_lost_recovery`, once a PLAN-LOST/NO-PLAN episode has outlived
+            `loss_backoff_grace_s`. Session 57 added this clause but placed it BEHIND the ticket check
+            above, so on the PLAN-LOST/NO-PLAN path the ticket clause (re-armed False at every loss edge,
+            see `self._loss_snapshot_checked = False`) always fired first and returned True immediately --
+            the grace clause below it was unreachable dead code. Measured in flight
+            `20260903_223345_autopilot.log` (MISSION CONTEXT finding 1 in plans/session58-spec.md):
+            233 of 253 matches (92%) ran INSIDE a grace window no consumer could read, a full
+            SIFT + BFMatcher + RANSAC every 0.5s on the CPU while SLAM fights to relocalize. Session 58
+            fixes this by checking `status` FIRST on this path and never consulting the ticket there at
+            all -- PLAN-LOST/NO-PLAN now always evaluates the grace directly, so it looks exactly once the
+            episode has matured, never before.
         Everything else that touches `visual_match` (the timeline record, the debug canvas) is
         observability and already handles None. `run_explore` previously matched on EVERY tick of a loss:
         a full SIFT + brute-force BFMatcher + RANSAC at ~32Hz, i.e. ~380 complete matches across session
@@ -2001,14 +2003,15 @@ class ExploreController:
         NEVER a replacement for it. `_loss_snapshot_checked` starts False at construction and is only
         re-armed at a fresh loss edge, so it reads False throughout healthy flight before the first loss --
         using this predicate alone would start running SIFT on every healthy tracking frame, the exact
-        opposite of the point. The session 57 clause is an ADDITIONAL narrow permission on top of that --
-        `now`/`status` default to None so every pre-existing caller (and self-test) is unaffected."""
-        if (not self._loss_snapshot_checked) or self._visrec_phase == "MATCH":
+        opposite of the point. The session 57/58 PLAN-LOST/NO-PLAN clause is an ADDITIONAL narrow
+        permission on top of that -- `now`/`status` default to None so every pre-existing caller (and
+        self-test) is unaffected."""
+        if self._visrec_phase == "MATCH":
             return True
-        if (status in ("PLAN-LOST", "NO-PLAN") and now is not None and self._loss_episode_t0 is not None
-                and (now - self._loss_episode_t0) >= self.loss_backoff_grace_s):
-            return True
-        return False
+        if status in ("PLAN-LOST", "NO-PLAN"):
+            return (now is not None and self._loss_episode_t0 is not None
+                    and (now - self._loss_episode_t0) >= self.loss_backoff_grace_s)
+        return not self._loss_snapshot_checked
 
     def _enter_visual_recovery(self, now, event):
         """Route into the 15° visual recovery probe (session 35 ALT; mirrors `_enter_fallback_sweep`). A
@@ -2605,6 +2608,22 @@ class ExploreController:
         self._corner_giveup_counts.append({"goal": g, "count": 1})
         return 1
 
+    def _goal_is_blacklisted(self, plan, goal):
+        """True when `goal` sits inside a PERMANENTLY blacklisted region of the live plan.
+
+        Session 58: lifted verbatim out of `_trim_resolve_resume`'s inline `bl`/`perm`/`dead` block so
+        `_register_bump` and the SLAM_HOLD settle-resume path can share the SAME dead-goal predicate --
+        the 22:40:25.165 trace showed a bump pulse fired and a standoff back-off ran against a goal the
+        planner had ALREADY retired PERMANENT 1.0s earlier, because neither path re-checked the live
+        blacklist the way `_trim_resolve_resume` already did for its own resume goal."""
+        if goal is None:
+            return False
+        bl = plan.get("blacklist") or []
+        perm = plan.get("blacklist_permanent") or []
+        return any(
+            (bool(perm[i]) if i < len(perm) else False) and self._dist(goal, pt) <= self.goal_area_radius
+            for i, pt in enumerate(bl))
+
     # ------------------------------------------------- 2-bump blacklist latch (kinematic)
     def _register_bump(self, plan, reason="advance-blocked"):
         """Latch-gated bump for the event-driven 2-bump blacklist: on an advance-blocked stop (flow WALL /
@@ -2618,6 +2637,13 @@ class ExploreController:
         blacklist a distant corner it simply hasn't reached yet (the pulse never reaches note_wall_hit, which
         blocks BOTH the region blacklist and the corner retirement). Frontiers and near corners bump normally."""
         if self.leg_goal is None:
+            return
+        if self._goal_is_blacklisted(plan, self.leg_goal):
+            # Session 58: 22:40:25.165 -- a bump pulse fired 1.0s AFTER the planner already retired this
+            # SAME goal PERMANENT (22:40:24.170), because nothing here re-checked the live blacklist. Stash
+            # a MISSED-BUMP (never silent) instead of pulsing a dead region.
+            self._missed_bump = (f"{reason} (goal {self.leg_goal} is already PERMANENTLY blacklisted "
+                                 f"— no pulse; the planner retired it before this contact)")
             return
         if self._leg_is_corner:
             d = self._dist(plan.get("pos"), self.leg_goal)
@@ -3389,6 +3415,20 @@ class ExploreController:
                 # redundant), check the now-LIVE clearance before resuming -- don't wait out SETTLE -> REPLAN
                 # -> ORIENT -> ADVANCE to notice we re-locked right on top of a wall.
                 if nxt == "SETTLE":
+                    # Session 58: 22:40:24.170 BLACKLIST PERMANENT retired goal=[3.9,-3.6]; 1.0s later, at
+                    # 22:40:25.165, bump pulse #2 fired against that SAME dead goal and backed off, because
+                    # this clearance check never re-checked the live blacklist. `_register_bump`'s own guard
+                    # (below) now stops the pulse, but leg_goal must also stop being DEFENDED here -- this is
+                    # the one path that produced the observed event. Route straight to SETTLE->REPLAN, the
+                    # same convergence `_trim_resolve_resume` already uses for a goal that died mid-TRIM.
+                    if self.leg_goal is not None and self._goal_is_blacklisted(plan, self.leg_goal):
+                        dead_goal = self.leg_goal
+                        self.leg_goal = None
+                        self._settle_to = "REPLAN"
+                        self._enter("SETTLE", now)
+                        return {}, "SETTLE", (f"SLAM settled after {waited:.1f}s but leg_goal {dead_goal} "
+                                              f"was already PERMANENTLY blacklisted{trust_note} -> settle -> "
+                                              "replan (dead goal, no standoff back-off)")
                     clr = plan.get("forward_clearance_dist")
                     if self.stop_on_clearance and clr is not None and clr <= self.stop_clearance_dist:
                         self._register_bump(plan, "clearance stand-off (post-recovery settle)")
@@ -4981,6 +5021,7 @@ def _visrec_debug_sink(ctrl, diag, canvas, save, stamp, saved_count):
         try:
             cv2.imshow(VISREC_WINDOW, canvas)
             cv2.waitKey(1)
+            ctrl.visrec_window_open = True   # Session 58: window is loss-scoped -- track that it is up
         except Exception as exc:
             ctrl.visrec_window_failed = True
             line = (f"*** CRITICAL: LKG debug window unavailable ({exc}) -> window DISABLED for this "
@@ -5012,6 +5053,27 @@ def _visrec_debug_sink(ctrl, diag, canvas, save, stamp, saved_count):
             print(line, flush=True)
             diag.line(line)
     return rel
+
+
+def _visrec_close_window(ctrl, diag):
+    """Close the LKG debug window at the end of a loss episode. No-op unless one is open.
+
+    Session 58: the window is now loss-scoped (see MISSION CONTEXT finding 2 -- the old idle
+    refresh kept it open for the whole flight). Closing it on the loss->recovered edge makes its
+    on-screen appearance itself a SIGNAL that a loss outlived the grace, instead of a fixture that
+    is always there and says nothing."""
+    if not ctrl.visrec_window_open:
+        return
+    try:
+        cv2.destroyWindow(VISREC_WINDOW)
+        ctrl.visrec_window_open = False
+    except Exception as exc:
+        ctrl.visrec_window_failed = True
+        ctrl.visrec_window_open = False
+        line = (f"*** CRITICAL: LKG debug window close failed ({exc}) -> window DISABLED for this "
+                 f"flight; PNG evidence continues ***")
+        print(line, flush=True)
+        diag.line(line)
 
 
 def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
@@ -5076,7 +5138,9 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
     last_visrec_log = 0.0
     visrec_saved = 0            # canvases written this flight (visrec_save_max gauge) (session 49)
     visrec_prev_status = None   # previous tick's status, for the loss-EDGE decision instant (session 49)
-    visrec_last_idle_show = 0.0 # throttle for the idle "reference only" refresh (session 49)
+    visrec_episode_saved = False # Session 58: has THIS loss episode already saved a PNG? (see C5 --
+                                 # chunk 1 makes loss_edge ticks match-free, so `decision` can no longer
+                                 # key off loss_edge alone)
     # Session 51 GATE B: memoised VisualMatch + the invalidation trackers. The answer cannot change while
     # the drone holds still against a frozen F_LKG, so an unchanged value is reused rather than recomputed
     # ~32x/second. `visrec_moved_since_match` is the motion guard -- set on ANY non-empty published command
@@ -5439,13 +5503,23 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                 # as a force condition, so it must be computed BEFORE the match decision, not inside it.
                 loss_now = status in ("PLAN-LOST", "NO-PLAN", "PLAN-STALE")
                 loss_edge = loss_now and visrec_prev_status not in ("PLAN-LOST", "NO-PLAN", "PLAN-STALE")
+                # Session 58: the mirror image of loss_edge -- a loss episode just ENDED. The window is
+                # now loss-scoped (MISSION CONTEXT finding 2 -- the old idle refresh kept it open for the
+                # whole flight), so this is where it closes; its reappearance next episode is a SIGNAL a
+                # loss outlived the grace, not a fixture that is always on screen and says nothing.
+                recover_edge = (not loss_now) and visrec_prev_status in ("PLAN-LOST", "NO-PLAN", "PLAN-STALE")
+                if recover_edge and ctrl.visrec_debug_window:
+                    _visrec_close_window(ctrl, diag)
+                if loss_edge:
+                    visrec_episode_saved = False   # Session 58 (C5): new episode, no PNG written for it yet
                 needs_match = (loss_now or ctrl.state == "VISUAL_RECOVERY")
                 # ---- SESSION 51 gates A + B (see _visrec_should_match for the full rationale) ----
                 do_match = _visrec_should_match(
                     ctrl, needs_match=needs_match, has_frame=(frame is not None), loss_edge=loss_edge,
                     moved_since_match=visrec_moved_since_match, memo=visrec_memo,
                     memo_age_s=(now - visrec_memo_t), now=now, status=status)
-                if not do_match and needs_match and visrec_memo is not None and ctrl.wants_visual_match():
+                if not do_match and needs_match and visrec_memo is not None and ctrl.wants_visual_match(
+                        now=now, status=status):
                     visual_match = visrec_memo          # unchanged answer -- reuse, do not recompute
                 if do_match:
                     banner = f"{ctrl.state} / {status}"
@@ -5472,28 +5546,20 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                     # Session 49: a DECISION INSTANT is the first tick of a loss episode (the tick the
                     # loss-instant checks actually act on) or a VISUAL_RECOVERY re-match after a turn step.
                     # Those are the frames worth keeping; every other matched tick is shown live but not
-                    # written. (`loss_edge` is now computed above -- GATE B forces on it too.)
-                    decision = loss_edge or ctrl._visrec_phase == "MATCH"
+                    # written.
+                    # Session 58 (C5): chunk 1 stops `wants_visual_match` from returning True on the
+                    # loss_edge tick itself (the ticket it used to key off is no longer consulted on
+                    # PLAN-LOST/NO-PLAN), so a loss_edge tick is now usually match-free and `decision`
+                    # can no longer key off `loss_edge`. It saves the FIRST match of a loss episode
+                    # instead, tracked via `visrec_episode_saved`, or a VISUAL_RECOVERY probe re-match.
+                    decision = (loss_now and not visrec_episode_saved) or ctrl._visrec_phase == "MATCH"
                     if ctrl.visrec_debug_window and visual_match.debug_image is not None:
                         rel = _visrec_debug_sink(ctrl, diag, visual_match.debug_image, decision,
                                                  now_wall.strftime("%H-%M-%S_%f")[:-3], visrec_saved)
                         if rel is not None:
                             visrec_saved += 1
+                            visrec_episode_saved = True
                             visrec_last_saved_rel = rel
-                elif (ctrl.visrec_debug_window and visrec_probe._lkg is not None
-                      and (now - visrec_last_idle_show) >= 0.5):
-                    # Idle refresh: NO match was computed this tick -- either tracking is healthy, or
-                    # session 51's gates skipped one (nothing could read it / the memo is still current).
-                    # Show the cached reference so the window always answers "what is it looking for",
-                    # WITHOUT running SIFT. The banner states the REAL reason, so it can never claim
-                    # tracking is fine in the middle of a loss.
-                    why = "reference only - tracking OK" if not needs_match else \
-                          f"reference only - no new match needed ({ctrl.state} / {status})"
-                    idle_canvas = visrec_probe._compose_debug(
-                        visrec_probe._lkg, VisualMatch(has_lkg=True), banner=why)
-                    _visrec_debug_sink(ctrl, diag, idle_canvas, False,
-                                       now_wall.strftime("%H-%M-%S_%f")[:-3], visrec_saved)
-                    visrec_last_idle_show = now
                 visrec_prev_status = status
 
             # ---- step the controller + publish ----
@@ -9464,6 +9530,84 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if latch_ok else 'FAIL'}  2-bump latch "
           f"(one pulse/contact, stutter-suppressed, re-arm on move|reverse, standoff back-off re-arm)")
 
+    # ---- SESSION-58 DEAD-GOAL BUMP GUARD -----------------------------------------------------------
+    # 22:40:24.170 BLACKLIST PERMANENT retired goal=[3.9,-3.6] -> 22:40:25.165 bump pulse #2 fired against
+    # that SAME dead goal and backed off, because neither _register_bump nor the SLAM_HOLD settle-resume
+    # clearance check re-checked the live blacklist before defending `leg_goal`. `_goal_is_blacklisted`
+    # (lifted verbatim from `_trim_resolve_resume`'s old inline dead-goal check) now gates both.
+    cd1 = ExploreController(cfg, no_takeoff=True)
+    cd1.leg_goal = [3.0, 0.0]
+    cd1._bump_armed = True
+    cd1._register_bump(_tplan(0.0, goal=(3.0, 0.0), blacklist=[[3.0, 0.0]], blacklist_permanent=[True]),
+                       "clearance stand-off")
+    no_pulse_goal, _, _, _ = cd1.take_bump_pulse()
+    missed1 = cd1.take_missed_bump()
+    perm_blacklisted_goal_emits_no_pulse = (no_pulse_goal is None and missed1 is not None
+                                            and "blacklisted" in missed1)
+    # (b) same setup but SOFT blacklist (not permanent) -> still bumps (soft entries are retryable).
+    cd2 = ExploreController(cfg, no_takeoff=True)
+    cd2.leg_goal = [3.0, 0.0]
+    cd2._bump_armed = True
+    cd2._register_bump(_tplan(0.0, goal=(3.0, 0.0), blacklist=[[3.0, 0.0]], blacklist_permanent=[False]),
+                       "clearance stand-off")
+    soft_pulse_goal, _, _, _ = cd2.take_bump_pulse()
+    soft_blacklisted_goal_still_bumps = (soft_pulse_goal == [3.0, 0.0])
+    # (c) regression guard: no blacklist arrays at all -> the ordinary path still bumps.
+    cd3 = ExploreController(cfg, no_takeoff=True)
+    cd3.leg_goal = [3.0, 0.0]
+    cd3._bump_armed = True
+    cd3._register_bump(_tplan(0.0, goal=(3.0, 0.0)), "clearance stand-off")
+    clean_pulse_goal, _, _, _ = cd3.take_bump_pulse()
+    clean_goal_still_bumps = (clean_pulse_goal == [3.0, 0.0])
+    # (d) a PERMANENT blacklist point farther than goal_area_radius from leg_goal -> still bumps.
+    cd4 = ExploreController(cfg, no_takeoff=True)
+    cd4.leg_goal = [3.0, 0.0]
+    cd4._bump_armed = True
+    cd4._register_bump(_tplan(0.0, goal=(3.0, 0.0), blacklist=[[10.0, 10.0]], blacklist_permanent=[True]),
+                       "clearance stand-off")
+    far_pulse_goal, _, _, _ = cd4.take_bump_pulse()
+    guard_respects_radius = (far_pulse_goal == [3.0, 0.0])
+    # (e) SLAM_HOLD settle-resume: the clearance stand-off path must not defend a dead leg_goal -- it
+    #     replans instead of backing off (recipe follows the g4 cb24 pattern above: gate opens at t=0.0,
+    #     settle_fresh_frames of currency fills the settle gate, then one step resolves the resume).
+    cd5 = ExploreController(cfg, no_takeoff=True)
+    cd5.settle_gate_s = 0.2
+    cd5.leg_goal = [3.0, 0.0]
+    cd5._enter_slam_hold("SETTLE", 0.0, "test")
+    t = 0.0
+    for fid in range(cd5.settle_fresh_frames):
+        t += 0.05
+        cd5._update_slam({"slam_ms": 200.0, "frame_id": fid, "cap_ts": t})
+    plan5 = _tplan(0.0, pos=(0.0, 0.0), fcd=0.1, cap=t, fid=100 + cd5.settle_fresh_frames, goal=(3.0, 0.0),
+                   blacklist=[[3.0, 0.0]], blacklist_permanent=[True])
+    _a5, s5, ev5 = cd5.step(t, plan5, False)
+    slam_hold_dead_goal_replans_instead_of_backing_off = (
+        s5 == "SETTLE" and cd5._settle_to == "REPLAN" and cd5.leg_goal is None and "BACKOFF" not in (ev5 or ""))
+    # (f) identical setup, no blacklist arrays -> the live-goal clearance stand-off path is untouched.
+    cd6 = ExploreController(cfg, no_takeoff=True)
+    cd6.settle_gate_s = 0.2
+    cd6.leg_goal = [3.0, 0.0]
+    cd6._enter_slam_hold("SETTLE", 0.0, "test")
+    t = 0.0
+    for fid in range(cd6.settle_fresh_frames):
+        t += 0.05
+        cd6._update_slam({"slam_ms": 200.0, "frame_id": fid, "cap_ts": t})
+    plan6 = _tplan(0.0, pos=(0.0, 0.0), fcd=0.1, cap=t, fid=100 + cd6.settle_fresh_frames, goal=(3.0, 0.0))
+    _a6, s6, ev6 = cd6.step(t, plan6, False)
+    slam_hold_live_goal_still_backs_off = (s6 == "BACKOFF")
+    dead_goal_guard_ok = (perm_blacklisted_goal_emits_no_pulse and soft_blacklisted_goal_still_bumps
+                          and clean_goal_still_bumps and guard_respects_radius
+                          and slam_hold_dead_goal_replans_instead_of_backing_off
+                          and slam_hold_live_goal_still_backs_off)
+    ok = ok and dead_goal_guard_ok
+    print(f"[self-test] {'PASS' if dead_goal_guard_ok else 'FAIL'}  SESSION-58 DEAD-GOAL BUMP GUARD "
+          f"(perm-blacklisted-no-pulse={perm_blacklisted_goal_emits_no_pulse}, "
+          f"soft-still-bumps={soft_blacklisted_goal_still_bumps}, "
+          f"clean-still-bumps={clean_goal_still_bumps}, "
+          f"respects-radius={guard_respects_radius}, "
+          f"slam-hold-dead-goal-replans={slam_hold_dead_goal_replans_instead_of_backing_off}, "
+          f"slam-hold-live-goal-backs-off={slam_hold_live_goal_still_backs_off})")
+
     # ---- SESSION 49 — LKG debug window sink (window/save fail INDEPENDENTLY, no silent fallback) -------
     import tempfile
 
@@ -9559,6 +9703,90 @@ def run_self_test(cfg):
     ok = ok and no_log_ok
     print(f"[self-test] {'PASS' if no_log_ok else 'FAIL'}  visrec debug sink: a disabled AutopilotLog "
           f"(diag_dir=None) -> clean no-op, no crash")
+
+    # ---- SESSION-58 LKG WINDOW SCOPE: the window is now loss-scoped (opens on a match, closes on the
+    # loss->recovered edge) instead of staying up for the whole flight (MISSION CONTEXT finding 2). ----
+
+    # (1) window_open_flag_set: a working imshow leaves visrec_window_open True.
+    tmp_f1 = tempfile.mkdtemp()
+    ctrl_f1 = ExploreController(cfg, no_takeoff=True)
+    ctrl_f1.visrec_debug_window = True
+    diag_f1 = _FakeDiag(tmp_f1, "20260101_000000")
+    _visrec_debug_sink(ctrl_f1, diag_f1, canvas49, False, "00-00-04_000", 0)
+    window_open_flag_set_ok = ctrl_f1.visrec_window_open is True
+    ok = ok and window_open_flag_set_ok
+    print(f"[self-test] {'PASS' if window_open_flag_set_ok else 'FAIL'}  visrec window: a successful "
+          f"show sets visrec_window_open=True")
+
+    # (2) window_open_flag_clear_on_close: _visrec_close_window clears it (no display needed -- destroyWindow
+    # is patched to a no-op).
+    orig_destroy_f2 = _cv2mod.destroyWindow
+    _cv2mod.destroyWindow = lambda *a, **k: None
+    try:
+        _visrec_close_window(ctrl_f1, diag_f1)
+    finally:
+        _cv2mod.destroyWindow = orig_destroy_f2
+    window_open_flag_clear_ok = ctrl_f1.visrec_window_open is False
+    ok = ok and window_open_flag_clear_ok
+    print(f"[self-test] {'PASS' if window_open_flag_clear_ok else 'FAIL'}  visrec window: "
+          f"_visrec_close_window clears visrec_window_open")
+
+    # (3) close_is_noop_when_never_opened: nothing to close -> no raise, destroyWindow not called.
+    tmp_f3 = tempfile.mkdtemp()
+    ctrl_f3 = ExploreController(cfg, no_takeoff=True)
+    ctrl_f3.visrec_debug_window = True
+    diag_f3 = _FakeDiag(tmp_f3, "20260101_000000")
+    destroy_calls_f3 = []
+    orig_destroy_f3 = _cv2mod.destroyWindow
+    _cv2mod.destroyWindow = lambda *a, **k: destroy_calls_f3.append(1)
+    try:
+        _visrec_close_window(ctrl_f3, diag_f3)
+    finally:
+        _cv2mod.destroyWindow = orig_destroy_f3
+    close_noop_ok = (ctrl_f3.visrec_window_open is False and len(destroy_calls_f3) == 0
+                     and ctrl_f3.visrec_window_failed is False)
+    ok = ok and close_noop_ok
+    print(f"[self-test] {'PASS' if close_noop_ok else 'FAIL'}  visrec window: closing a never-opened "
+          f"window is a clean no-op")
+
+    # (4) close_failure_is_loud_and_isolated: destroyWindow raises -> window_failed=True, window_open=False,
+    # nothing propagates.
+    tmp_f4 = tempfile.mkdtemp()
+    ctrl_f4 = ExploreController(cfg, no_takeoff=True)
+    ctrl_f4.visrec_debug_window = True
+    diag_f4 = _FakeDiag(tmp_f4, "20260101_000000")
+    _visrec_debug_sink(ctrl_f4, diag_f4, canvas49, False, "00-00-05_000", 0)   # opens the window
+    orig_destroy_f4 = _cv2mod.destroyWindow
+    _cv2mod.destroyWindow = lambda *a, **k: (_ for _ in ()).throw(_cv2mod.error("no display"))
+    close_failure_ok = True
+    try:
+        _visrec_close_window(ctrl_f4, diag_f4)
+    except Exception:
+        close_failure_ok = False
+    finally:
+        _cv2mod.destroyWindow = orig_destroy_f4
+    close_failure_ok = (close_failure_ok and ctrl_f4.visrec_window_failed is True
+                        and ctrl_f4.visrec_window_open is False)
+    ok = ok and close_failure_ok
+    print(f"[self-test] {'PASS' if close_failure_ok else 'FAIL'}  visrec window: close failure is loud "
+          f"(window_failed=True) and isolated (does not propagate)")
+
+    # (5) window_failure_still_blocks_open_flag: imshow raises -> visrec_window_open stays False, PNG
+    # evidence is still written (reuses case (b)'s setup).
+    tmp_f5 = tempfile.mkdtemp()
+    ctrl_f5 = ExploreController(cfg, no_takeoff=True)
+    ctrl_f5.visrec_debug_window = True
+    diag_f5 = _FakeDiag(tmp_f5, "20260101_000000")
+    orig_imshow_f5 = _cv2mod.imshow
+    _cv2mod.imshow = lambda *a, **k: (_ for _ in ()).throw(_cv2mod.error("no display"))
+    try:
+        rel_f5 = _visrec_debug_sink(ctrl_f5, diag_f5, canvas49, True, "00-00-06_000", 0)
+    finally:
+        _cv2mod.imshow = orig_imshow_f5
+    window_failure_blocks_open_ok = (ctrl_f5.visrec_window_open is False and rel_f5 is not None)
+    ok = ok and window_failure_blocks_open_ok
+    print(f"[self-test] {'PASS' if window_failure_blocks_open_ok else 'FAIL'}  visrec window: a failed "
+          f"imshow leaves visrec_window_open False while the PNG is still written")
 
     # ---- SESSION-51: the visual match is computed only when someone can read it, and only when the answer
     # could have CHANGED. run_explore matched on EVERY tick of a loss: ~380 full SIFT+BFMatcher+RANSAC
@@ -10604,6 +10832,68 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if should_match_threads_args else 'FAIL'}  SESSION-57 PLAN-LOST "
           f"ALWAYS LOOKS should_match_threads_args")
     print(f"[self-test] {'PASS' if s57_looks_ok else 'FAIL'}  SESSION-57 PLAN-LOST ALWAYS LOOKS overall")
+
+    # ---- SESSION-58 GRACE BEFORE LOOKING: chunk 1 fixes the defect the SESSION-57 block above never
+    # covered -- every SESSION-57 case above builds with one_shot_spent=True, which is exactly why the
+    # ticket-first check masked the grace clause in real flight (the ticket is re-armed False at every
+    # loss edge, so it is ALWAYS armed when a real loss episode begins). These cases build with the
+    # ticket ARMED (one_shot_spent=False), the real flight condition, proving the grace is now honoured
+    # even though the ticket alone would have said "yes, look" (MISSION CONTEXT finding 1: 233 of 253
+    # matches ran inside an unreadable grace window in flight 20260903_223345). ----
+    c58g = _mk_gate_ctrl(one_shot_spent=False)          # ticket ARMED -- the real-flight condition
+    grace58 = c58g.loss_backoff_grace_s
+    t0_58 = 500.0
+    c58g._loss_episode_t0 = t0_58
+
+    # (1) armed_inside_grace_does_not_look -- today this returns True; that is the defect being fixed.
+    armed_inside_grace_does_not_look = c58g.wants_visual_match(
+        now=t0_58 + grace58 - 0.1, status="PLAN-LOST") is False
+
+    # (2) armed_matured_looks -- past the grace, the same armed controller looks.
+    armed_matured_looks = c58g.wants_visual_match(
+        now=t0_58 + grace58 + 0.1, status="PLAN-LOST") is True
+
+    # (3) armed_probe_still_looks -- the MATCH-phase probe is never gated by the loss grace.
+    c58probe = _mk_gate_ctrl(one_shot_spent=False, phase="MATCH")
+    c58probe._loss_episode_t0 = t0_58
+    armed_probe_still_looks = c58probe.wants_visual_match(
+        now=t0_58 + grace58 - 0.1, status="PLAN-LOST") is True
+
+    # (4) armed_stale_unaffected -- PLAN-STALE still falls through to the ticket, which is armed -> True.
+    armed_stale_unaffected = c58g.wants_visual_match(
+        now=t0_58 + grace58 + 0.1, status="PLAN-STALE") is True
+
+    # (5) armed_no_plan_matches_plan_lost -- NO-PLAN takes the identical status branch as PLAN-LOST.
+    armed_no_plan_inside_grace = c58g.wants_visual_match(
+        now=t0_58 + grace58 - 0.1, status="NO-PLAN") is False
+    armed_no_plan_matured = c58g.wants_visual_match(
+        now=t0_58 + grace58 + 0.1, status="NO-PLAN") is True
+    armed_no_plan_matches_plan_lost = armed_no_plan_inside_grace and armed_no_plan_matured
+
+    # (6) armed_gate_blocks_compute -- the predicate reaches the actual compute decision, not just itself.
+    gate_blocks_inside_grace = _gate(
+        c58g, memo=None, now=t0_58 + grace58 - 0.1, status="PLAN-LOST") is False
+    gate_allows_after_grace = _gate(
+        c58g, memo=None, now=t0_58 + grace58 + 0.1, status="PLAN-LOST") is True
+    armed_gate_blocks_compute = gate_blocks_inside_grace and gate_allows_after_grace
+
+    s58_grace_ok = (armed_inside_grace_does_not_look and armed_matured_looks
+                    and armed_probe_still_looks and armed_stale_unaffected
+                    and armed_no_plan_matches_plan_lost and armed_gate_blocks_compute)
+    ok = ok and s58_grace_ok
+    print(f"[self-test] {'PASS' if armed_inside_grace_does_not_look else 'FAIL'}  SESSION-58 GRACE BEFORE "
+          f"LOOKING armed_inside_grace_does_not_look")
+    print(f"[self-test] {'PASS' if armed_matured_looks else 'FAIL'}  SESSION-58 GRACE BEFORE LOOKING "
+          f"armed_matured_looks")
+    print(f"[self-test] {'PASS' if armed_probe_still_looks else 'FAIL'}  SESSION-58 GRACE BEFORE LOOKING "
+          f"armed_probe_still_looks")
+    print(f"[self-test] {'PASS' if armed_stale_unaffected else 'FAIL'}  SESSION-58 GRACE BEFORE LOOKING "
+          f"armed_stale_unaffected")
+    print(f"[self-test] {'PASS' if armed_no_plan_matches_plan_lost else 'FAIL'}  SESSION-58 GRACE BEFORE "
+          f"LOOKING armed_no_plan_matches_plan_lost")
+    print(f"[self-test] {'PASS' if armed_gate_blocks_compute else 'FAIL'}  SESSION-58 GRACE BEFORE LOOKING "
+          f"armed_gate_blocks_compute")
+    print(f"[self-test] {'PASS' if s58_grace_ok else 'FAIL'}  SESSION-58 GRACE BEFORE LOOKING overall")
 
     # ---- SESSION-57 STALE DIRECTION GATE (chunk 6): Finding 2 on the PLAN-STALE path -- `planar_like`
     # is a pure inlier-ratio test ("flat surface"), not a distance verdict, and is completely

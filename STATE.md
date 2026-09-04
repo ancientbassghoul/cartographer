@@ -18,44 +18,89 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**. **Session 57 is BUILT, LIVE-FLY PENDING** — all 10 chunks of
-`plans/session57-spec.md` applied (chunk 4's fix turned out to need a companion chunk 5 to close a
-trap it exposed; the spec file's own chunk numbering was renumbered in place to 1-10, see
-`plans/session57-planlost-recovery-and-direction-aware-lkg.md`). All **9** self-test suites are green
-at HEAD (`visualizer.py` joined the gate this session with its first `--self-test` entry point).
-Session 56 (BUILT and FLOWN on 2026-09-03, `OUTPUT/diag/20260903_083329_*`) is folded into this
-session's watch list below — its own fixes still haven't been re-flown in isolation. `main` is
-unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one open
-problem: height.
+Branch **`all-bets-are-off`**. **Session 58 is BUILT and FLOWN** (`OUTPUT/diag/20260903_234939_*`,
+47 min, 2026-09-04) — all 4 chunks of `plans/session58-spec.md` applied, all **9** self-test suites
+green at HEAD. **Both of its fixes verified live**: `[VISREC]` matches inside the loss grace fell
+from 233/253 (92%) to **45/1454 (3%)**, and the dead-goal drop fired correctly every time.
 
-## >>> IMMEDIATE NEXT: live-fly session 57 <<<
-Full design/traps/files-touched: `plans/session57-planlost-recovery-and-direction-aware-lkg.md`.
-**What it fixes and why** — the operator saw the LKG window show a reference frame plainly closer
-than the live frame while the drone backed off anyway. Of the diagnosing flight's 86 loss episodes
-only **30 ever ran a visual match**; 56 ran none, because the one-shot ticket that gated matching was
-almost always spent before any picture was taken. PLAN-LOST/NO-PLAN now always waits 12s, then always
-looks; the cached clearance only marks a back-off *pending*; a three-way inlier-spread `closer`
-verdict adjudicates it; and firing a back-off restarts the wait.
+**But that flight ended badly** — the drone rammed glass at bounding-box corner `[-1.5, -3.9]` for
+**23.3 minutes** (45 legs), and session 58's own bump guard was half the cause. **Session 59's spec
+is written and verified-parsing but NOT YET BUILT** — that is the next action, below.
 
-Watch these, in priority order, on the first live flight:
+`main` is unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one
+open problem: height.
 
-1. **Every** loss episode should now show `[VISREC]` lines after 12s, including clear-front ones.
-   Diagnosing flight: 56 of 86 episodes ran zero matches. Expect that count to go to **zero**.
-2. A `[VISREC]` line reading `closer=LKG` while a back-off was pending → the hold should fire and
-   **no** BACKOFF should follow. This is the operator-reported 08:51 symptom, directly.
-3. `size=` versus `scale=` on the same lines — does the spread ratio hold steady where `scale` swung
-   `0.27 → 1.85` within one second on the diagnosing flight?
-4. `LOST_VISUAL_HOLD` notices should appear and NOT repeat every tick.
-5. No two back-offs inside one loss episode should land closer together than `loss_backoff_grace_s` —
-   the restamp is what enforces this now that the one-shot ticket is gone from this path.
-6. Corner-tour goals should draw **blue** on the map panel; frontier goals stay yellow.
-7. If `diag.ply_sequence` is turned on, `OUTPUT/diag/<ts>_plyseq/` should fill, `markers.json` should
-   be written, and the first five markers should sit at identical world coordinates in an early and a
-   late frame. (Off by default — leave off for an ordinary flight, ~1.2GB/flight.)
-8. **Session 56's own watch list below still applies in full** — this is still its first live flight.
+## >>> IMMEDIATE NEXT: BUILD session 59 <<<
+```
+python sonnet_runner.py --plan C:\Users\owner\.claude\plans\valiant-waddling-spark.md
+```
+5 chunks, parse-verified, all source anchors confirmed to resolve. Chunk 5 copies the spec to
+`plans/session59-spec.md`, so after the run the repo holds its own record.
 
-### Session 56's watch list (still current — its fixes were flown once, on 2026-09-03)
-Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-freeze.md`:
+**Why it exists.** Flying session 58 confirmed both its fixes, then ran the drone into glass at
+corner `[-1.5, -3.9]` for 23.3 minutes. Three findings:
+
+1. **A committed sweep corner is never re-checked.** The tour committed to the corner at 00:11:06;
+   the LOOP guard permanently blacklisted it at 00:13:01; `select()` returns an already-committed
+   `sweep_target` unconditionally, forever, with no `_excluded_permanent` re-check. Session 52 built
+   exactly that guard, but it lives in `_pick_sweep_corner`, only reached when `sweeping` is
+   **False** — so it never ran once (zero `CORNER-SKIP` lines, 29 × `WARNING: pick landed on an
+   ALREADY-excluded goal`). The only remaining escape was `note_wall_hit`'s 2-bump, and **session 58's
+   own guard blocked it**, so the corner could never be retired and the tour never advanced. The
+   result was a 51-millisecond loop repeated for 23 minutes: session 58's drop and the planner's
+   re-emit fighting each other.
+2. **The `closer` verdict can veto a back-off but never request one.** 496 `closer=LIVE` verdicts,
+   **zero** actions — `_step_lost_recovery` returns early unless the *map's* cached clearance already
+   proposes a back-off, and on glass the map reads clear forever. Every back-off that did fire cited
+   `closer=UNKNOWN`. 555 of 1454 matches were computed in `FALLBACK`, which returns before any
+   consumer runs. Session 59 adds an operator-specified hysteresis trigger (3 s confident window,
+   ≥66% LIVE over LIVE+EQUAL+LKG, UNKNOWN discarded), kill switch
+   `use_visual_backoff_trigger: false`.
+3. **Deferred, operator wants to discuss first:** the staleness UI. `TOPIC_CONTROL` carries no plan
+   status/age, so the visualizer keeps drawing its last plan as `PLAN valid` with a healthy goal while
+   the autopilot has been blind for 20 s. FALLBACK ran 439 s this flight — 234 s under PLAN-LOST,
+   205 s under PLAN-STALE, **0 ticks** under OK. The state label was the only honest field on screen.
+
+Watch these on the flight AFTER session 59 is built:
+
+1. **The corner tour advances** — expect a `CORNER-RETIRE-EN-ROUTE` line and the next corner
+   committed within one plan publish. Expect **zero** `WARNING: pick landed on an ALREADY-excluded
+   goal` lines (29 last flight).
+2. **No drop→re-commit loop** — no `already PERMANENTLY blacklisted` line followed within a second by
+   an `ORIENT` toward that same goal. If they still disagree, session 59's `DEAD_GOAL_RECOMMIT`
+   notice must say so on the panel.
+3. **The camera fires at least once** — back-off lines citing a `LIVE=/EQUAL=/LKG=` tally rather than
+   only `closer=UNKNOWN`. None appearing is information, not necessarily a bug.
+4. **No BACKOFF↔FALLBACK oscillation** (the trap session 59 guards against).
+5. Regression: session 58's grace fix holds — `[VISREC]` inside a loss grace stays near zero.
+6. Flights end by **manual stop**, as every flight has; no bounded-survey mechanism exists.
+7. **Carry forward every still-unconfirmed session-49-to-57 item below.**
+
+**Operator's decision rule (2026-09-04):** if that flight is clean, stop here and ship the
+Blender/PLY presentation work. If goal problems recur, **rebuild goal management from scratch**
+against a written behaviour spec — the operator's own judgement is that it is over-complicated, and
+the evidence agrees: two independent death registries (`_blacklist` with soft/permanent/active, and
+`_swept_corners` which deliberately ignores the first), four mechanisms writing the first (2-bump,
+stall, loop, stagnation), a third `_goal_db` disc structure, plus `corner_no_blacklist_dist` /
+`corner_giveup_limit` / clearance-inset carve-outs. Sessions 52, 58 and 59 each patched a *different*
+hole in the same invariant and one broke another. Before any rewrite, build the carve-out inventory
+("this exemption exists because flight X did Y") so nothing hard-won is dropped by accident.
+
+### Session 56/57's watch list (still current except item 1 above, confirmed 2026-09-03)
+Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-freeze.md` and
+`plans/session57-planlost-recovery-and-direction-aware-lkg.md`:
+
+- A `[VISREC]` line reading `closer=LKG` while a back-off was pending → the hold should fire and
+  **no** BACKOFF should follow (the operator-reported 08:51 symptom). Not yet observed maturing on a
+  real flight — session 58's grace fix is what should finally let a decision-bearing match happen.
+- `size=` versus `scale=` on the same lines — does the spread ratio hold steady where `scale` swung
+  `0.27 → 1.85` within one second on the diagnosing flight?
+- `LOST_VISUAL_HOLD` notices should appear and NOT repeat every tick.
+- No two back-offs inside one loss episode should land closer together than `loss_backoff_grace_s`.
+- Corner-tour goals should draw **blue** on the map panel; frontier goals stay yellow.
+- If `diag.ply_sequence` is turned on, `OUTPUT/diag/<ts>_plyseq/` should fill, `markers.json` should
+  be written, and the first five markers should sit at identical world coordinates in an early and a
+  late frame. (Off by default — leave off for an ordinary flight, ~1.2GB/flight.)
 
 1. **`SLAM_HOLD_FORCED_HOP`/`SETTLE_DEADBAND` should become rare, not the normal exit.** Before
    this session every gate release came from the 15s dead-band escape; now most holds should
@@ -84,8 +129,37 @@ Full design/replay-arithmetic in `plans/session56-settle-gate-currency-and-lkg-f
      OFTEN, that's an honest signal SLAM is chronically slow, not a bug in the fix.
    - Session 51: pure waste removal — expect **zero** decision changes vs. earlier flights.
 
-**STILL OPEN, TOP OF THE LIST: why does SLAM choke** (plateaus at ~2000ms for minutes, worst gap
-90.8s on the session-52 flight)? **Three** theories now ruled out — autopilot loop rate (measured
+**SESSION-60 CANDIDATE (deferred twice now): bump-pulse latency.** A blacklisted goal retired only via the 2-bump
+rule takes 10-18s to become a blacklist the autopilot can see, because the pulse only rides the next
+published plan and `perception_worker.run()` blocks 8-10s per SLAM solve — on the diagnosing flight
+this stretched one goal's retirement to 4min10s across three glass rams. Design sketch (three
+candidates, none built, operator's call needed before any code):
+`plans/session58-lkg-window-discipline-and-dead-goal-guard.md`'s "Session-59 design sketch" section.
+**This cost SCALES with SLAM latency** — the 10-18s figure came from 8-10s solves; the 2026-09-04
+flight measured solves up to 71.8s, which would stretch one bump to well over a minute.
+
+**STILL OPEN, THE DOMINANT PROBLEM: why does SLAM choke.** The 2026-09-04 flight is the best
+measurement yet — **30 of its 47 minutes were spent blind** (`HOLD_LOST` 1348 s + `FALLBACK` 471 s):
+
+| flight min | frames | median | p90 | max |
+|---|---|---|---|---|
+| 0–5 | 151 | 791 ms | 2 829 | 13 970 |
+| 5–10 | 72 | 1 404 | 9 960 | 16 479 |
+| 10–15 | 56 | 2 436 | 10 860 | 37 197 |
+| 15–20 | 22 | 12 682 | 22 133 | 58 061 |
+| 20–25 | 16 | 5 056 | 41 969 | **71 774** |
+| 25–30 | 86 | 1 783 | 4 402 | 37 209 |
+| 40–45 | 78 | 1 816 | 3 012 | 31 399 |
+
+Worst wait between two solved frames: **72.9 s** at flight-minute 24.6. The median degrades 16× over
+the first 20 minutes — but then **partially recovers** (min 25-30 back to 1783 ms, again at 40-45).
+That is evidence *against* the simplest "keyframe graph grows monotonically" theory in the untested
+leads below, and is the most useful new datum this flight produced. **Session 58 removed ~230 wasted
+SIFT matches per flight and the choke persisted unchanged**, which weakens (does not kill — the
+window is still built, just rarer) the LKG-window lead below.
+
+Older framing, kept for context (plateaus at ~2000ms for minutes, worst gap
+90.8s on the session-52 flight): **Three** theories now ruled out — autopilot loop rate (measured
 32-38.5Hz throughout), Unity focus loss (tested directly, re-chokes ~2 frames after refocus), and
 **the clearance raycast** (session 57: `slam_ms` times *only* `slam.process(rgb)`
 (`perception_worker.py:218-220`) while the clearance fan runs afterwards in `_plan_payload`, outside
@@ -95,7 +169,10 @@ growing with the keyframe graph/retrieval DB, its backend optimization thread, G
 the visualizer's `--record` MP4 encode, and the session-49 LKG debug window (`cv2.imshow` + PNG
 writes; medians stepped from ~400ms to ~1300-1700ms on 2026-09-01 between the 17:22 and 21:48
 flights, which brackets when that window was built — correlation only, one flight with
-`visrec_debug_window: false` would settle it).
+`visrec_debug_window: false` would settle it). **Session 58 removed ~230 wasted SIFT matches/flight**
+(Finding 1's grace-bypass fix) — the next flight is a cheap natural experiment on the LKG-window lead
+above; a null result (choke persists unchanged) proves nothing on its own since the window itself is
+still built, just rarer, but a clear drop in choke frequency would be suggestive.
 
 ### `main` branch — next after that: diagnose the HEIGHT issue
 A 2026-09-01 live flight confirmed sessions 20-43 fly *tolerably* (operator's own call). Height is
