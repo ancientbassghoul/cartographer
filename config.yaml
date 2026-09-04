@@ -594,7 +594,7 @@ diag:
   timeline_map_period_s: 10.0         # autopilot: periodic map-backdrop record appended to the replay
                                        #   timeline (previously emitted ONCE, only at clean shutdown) so a
                                        #   crash still leaves a non-blank map in the report. 0 disables.
-  ply_sequence: false         # session 57: write one .ply per fused SLAM frame, for a Blender build-up animation.
+  ply_sequence: true         # session 57: write one .ply per fused SLAM frame, for a Blender build-up animation.
                               #   OFF by default -- roughly 1.2 GB per flight.
   ply_sequence_markers: 5     # session 57: freeze the first N committed goals into EVERY ply as alignment anchors.
   ply_sequence_max: 2000      # session 57: hard file cap per flight (mirrors visrec_save_max's bounded-disk rule).

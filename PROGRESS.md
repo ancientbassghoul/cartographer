@@ -26,6 +26,11 @@ for the watch list on the next flight._
   ~0.3ms of a 26-31ms tick, and "stop publishing when the plan is fine" has exactly the same failure
   mode as the bug being fixed (a missed stand-down leaves the last canvas frozen forever). All 9
   self-test suites green. `plans/session61-spec.md`.
+  **Same-day revision:** the operator found the grey stale-canvas swap-out itself more annoying than
+  useful once actually flown against — so `LKG_CANVAS_STALE_S` moved from 2s to 5 minutes (the guard
+  stays as a genuinely-dead-publisher backstop, just out of the way of ordinary flight), and the
+  yellow "F_LKG (reference)"/"LIVE" labels session 60's old canvas used to bake in, dropped when text
+  moved into the visualizer, are drawn back onto the panel.
 - **60 (flown 2026-09-04 22:34-22:41, `OUTPUT/diag/20260904_223410_*`)** — The F_LKG rework held up:
   135 distinct `slam:<id>` references, zero age-outs, no `VISUAL_RECOVERY`, no double bump pulses.
   FALLBACK was never entered on this flight, though, so the new SERVO phase remains unobserved. The

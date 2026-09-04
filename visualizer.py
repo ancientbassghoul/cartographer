@@ -65,10 +65,11 @@ MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left colu
 STATUS_H = 48                 # two lines: SLAM state + target estimate
 RELOC_FLASH_S = 2.0           # keep the RELOC banner up this long after the event
 
-LKG_CANVAS_STALE_S = 2.0    # session 61: no canvas for this long -> grey it out. >= 4x the slowest
-                            #   publish cadence (visrec_match_min_interval_s 0.5s), so this can only
-                            #   fire when the autopilot really stopped publishing -- NEVER because
-                            #   the plan is healthy (operator's requirement).
+LKG_CANVAS_STALE_S = 300.0  # session 61, revised same day: the operator found the grey swap-out
+                            #   more annoying than useful in normal flight, so this is pushed to 5
+                            #   minutes -- effectively never during an ordinary session -- rather
+                            #   than removing the guard outright. Still catches a genuinely dead
+                            #   publisher (a crashed/hung autopilot.py) without flapping the panel.
 LKG_TEXT_SCALE = 0.42       # drawn at PANEL resolution, so this is the size actually seen
 LKG_TEXT_LINE_H = 15
 LKG_TEXT_PAD = 8
@@ -486,7 +487,10 @@ def render_lkg_panel(canvas, info=None, age_s=None, w=PANEL_W, h=MAP_SIZE):
     Session 61: `info` is the F_LKG/LIVE canvas's field segments (C5), drawn HERE at panel
     resolution instead of baked into the 512px canvas and then downscaled — crisp and complete.
     `age_s` is how long ago the canvas arrived; past LKG_CANVAS_STALE_S the panel greys out rather
-    than showing a frozen image that reads as current (the 22:40:29 failure).
+    than showing a frozen image that reads as current (the 22:40:29 failure). Revised same day:
+    LKG_CANVAS_STALE_S is now 5 minutes (operator found the swap-out more annoying than useful in
+    normal flight), and the yellow "F_LKG (reference)"/"LIVE" labels session 60's canvas used to
+    bake in are drawn back HERE (compose_stacked_live composes no text at all).
     """
     if age_s is not None and age_s > LKG_CANVAS_STALE_S:
         return _placeholder(w, h, f"LKG canvas stale ({age_s:.1f}s)")
@@ -504,6 +508,15 @@ def render_lkg_panel(canvas, info=None, age_s=None, w=PANEL_W, h=MAP_SIZE):
     x0 = (w - new_w) // 2
     y0 = text_h + (avail_h - new_h) // 2
     panel[y0:y0 + new_h, x0:x0 + new_w] = resized
+    # Session 61, revised same day: the yellow "F_LKG (reference)" / "LIVE" labels session 60's
+    # side-by-side canvas used to bake in are back, drawn here instead since compose_stacked_live
+    # composes no text at all. Both halves of the source canvas are equal height (both come from the
+    # same 512x288 transport frame), so the split sits at the image's own vertical midpoint.
+    half_h = new_h // 2
+    cv2.putText(panel, "F_LKG (reference)", (x0 + 6, y0 + half_h - 8), cv2.FONT_HERSHEY_SIMPLEX,
+               0.45, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(panel, "LIVE", (x0 + 6, y0 + new_h - 8), cv2.FONT_HERSHEY_SIMPLEX,
+               0.45, (0, 255, 255), 1, cv2.LINE_AA)
     for i, line in enumerate(lines):
         cv2.putText(panel, line, (6, LKG_TEXT_LINE_H * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX,
                    LKG_TEXT_SCALE, (220, 220, 220), 1)

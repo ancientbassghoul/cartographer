@@ -75,14 +75,22 @@ writes).
    `loss_backoff_grace_s` window; DURING that grace the pair should still be live, with
    `lines=none (loss grace N/12.0s)` on screen — never a blank.
 4. The info block is COMPLETE: `closer`, `scale`, `size`, `src`, `age` all legible, nothing clipped
-   off the right edge (the old 512px-canvas failure, Finding D).
-5. **The panel must never grey out during `PLAN-LOST`/`PLAN-STALE`.** If it does, the publisher
-   (autopilot.py) stalled — that is a bug, not the expected idle state.
+   off the right edge (the old 512px-canvas failure, Finding D); yellow "F_LKG (reference)"/"LIVE"
+   labels visible on the panel again (same-day revision — dropped when session 61 moved text into
+   the visualizer, now drawn back at the image's own vertical midpoint).
+5. **The panel must never grey out during `PLAN-LOST`/`PLAN-STALE`.** Same-day revision:
+   `LKG_CANVAS_STALE_S` is now 5 minutes (was 2s — the operator found the swap-out more annoying than
+   useful), so this should be structurally near-impossible to observe on an ordinary flight; the
+   guard still exists purely as a dead-publisher backstop.
 6. Kill switches, unchanged in meaning: `visrec_debug_window: false` still kills compose + publish +
    PNG saving outright (the one real SLAM-choke experiment); `use_visual_matching: false` now leaves
    an EXPLAINED idle panel (a startup line states why) instead of a silent grey one.
 7. Flights still end by **manual stop**; no bounded-survey mechanism exists.
-8. **Carry forward, unchanged priority** (folded from session 60's now-flown watch list — see
+8. **`diag.ply_sequence` is now turned ON** (operator's own config change, 2026-09-05) for this next
+   flight — `OUTPUT/diag/<ts>_plyseq/` should fill with one `.ply` per fused SLAM frame + a
+   `markers.json` (~1.2GB/flight, capped at `ply_sequence_max=2000`). This is also the still-open
+   "Session 56/57" watch item below — first real chance to confirm it.
+9. **Carry forward, unchanged priority** (folded from session 60's now-flown watch list — see
    `PROGRESS.md`'s session 60/61 entries for what that flight confirmed):
    - **SLAM choke remains the dominant open problem** — see the table + 22:40 evidence above.
    - **FALLBACK's new `SERVO` phase is still unobserved** — the diagnosing flight never entered
