@@ -92,7 +92,8 @@ def _full_vector(active: dict, seq: int, now: float, state: str,
                  state_since_s: float | None = None,
                  slam_hold: dict | None = None,
                  notice: dict | None = None,
-                 visrec_lkg: dict | None = None) -> dict:
+                 visrec_lkg: dict | None = None,
+                 recovery: dict | None = None) -> dict:
     v = {"seq": seq, "mono_ts": now, "state": state}
     v.update(_NEUTRAL)
     v.update(active or {})
@@ -116,6 +117,10 @@ def _full_vector(active: dict, seq: int, now: float, state: str,
     # Session 56: F_LKG age-out state -- always present (never omitted), same fixed-panel-shape
     # convention as slam_hold/notice above.
     v["visrec_lkg"] = visrec_lkg
+    # Session 62: where the loss-recovery FSM currently is, or None outside a loss episode, so the
+    # telemetry panel can SAY which recovery phase we are in instead of leaving the operator to
+    # infer it from the console log. Same always-present convention as the three fields above.
+    v["recovery"] = recovery
     return v
 
 
@@ -925,6 +930,11 @@ class ExploreController:
         # while blind there's no live signal saying the back is any safer than the front.
         self.fallback_initial_wait_s = float(e.get("fallback_initial_wait_s", 20.0))    # step 0: let a transient stale patch clear on its own first
         self.fallback_post_push_wait_s = float(e.get("fallback_post_push_wait_s", 10.0))  # step 3: settle after each push
+        # Session 62: step 0b -- back off BEFORE the first turn, then dwell so the SIFT matcher gets a
+        # look from the widened viewpoint. See config.yaml for why (session 60 proved rotating cannot
+        # recover a view the drone has DRIFTED from, but only ever applied that to the deleted probe).
+        self.fallback_backoff_first = bool(e.get("fallback_backoff_first", True))
+        self.fallback_backoff_wait_s = float(e.get("fallback_backoff_wait_s", 5.0))
         self.fallback_push_fwd_back_s = float(e.get("fallback_push_fwd_back_s", 2.0))   # forward/backward push hold, FULL throttle, includes ramp-up
         self.fallback_push_strafe_s = float(e.get("fallback_push_strafe_s", 0.5))       # left/right push hold, FULL magnitude (joy_horizontal isn't ramped)
         # Session 46 (flight 20260901_124211): after this many blind back-off reflexes against the same
@@ -932,7 +942,8 @@ class ExploreController:
         # working and escalate into this FALLBACK sweep instead (see _blind_contact_backoff). A general
         # robustness COUNT, not a room answer.
         self.blind_contact_escalate_after = int(e.get("blind_contact_escalate_after", 2))
-        self._fallback_phase = None         # None | "INITIAL_WAIT" | "TURN" | "PUSH" | "WAIT_POST" | "SERVO"
+        self._fallback_phase = None         # None | "INITIAL_WAIT" | "BACKOFF" | "BACKOFF_WAIT" |
+                                            #   "TURN" | "PUSH" | "WAIT_POST" | "SERVO"
         self._fallback_phase_t0 = None      # 'now' the current phase began
         self._fallback_cum_deg = 0.0        # commanded turn this LAP (diagnostic only, session 60 -- reset every lap, see _step_fallback_sweep)
         self._fallback_cycle = 0            # diagnostic: completed turn+push+wait cycles this episode
@@ -948,10 +959,15 @@ class ExploreController:
         # "right distance", not "right place" -- the servo cannot fix an off-axis pose.
         self.servo_min_window_s = float(e.get("servo_min_window_s", 1.5))   # sustained-confidence window before the servo may act
         self.servo_min_samples = int(e.get("servo_min_samples", 3))        # confident verdicts required in that window (UNKNOWN never counts)
-        self.servo_hold_frames = int(e.get("servo_hold_frames", 3))        # SLAM frames CAPTURED at the held EQUAL pose that must be SOLVED before giving up and resuming the sweep
+        self.servo_hold_frames = int(e.get("servo_hold_frames", 3))
+        # Session 62: how long a lost/UNKNOWN match must PERSIST before SERVO gives up (see config.yaml).
+        self.servo_lost_grace_s = float(e.get("servo_lost_grace_s", 1.5))        # SLAM frames CAPTURED at the held EQUAL pose that must be SOLVED before giving up and resuming the sweep
         self._servo_tally = VisualDirectionTally()   # rolling evidence for the SERVO entry decision
         self._servo_cap_floor = None    # float | None: cap_ts floor stamped when EQUAL is first reached
         self._servo_frames_seen = 0     # int: solved frames CAPTURED at/after that floor (see _update_slam)
+        self._servo_lost_since = None   # session 62: float | None -- when the match first went away/UNKNOWN
+                                        #   inside SERVO; None whenever the last sample was confident.
+        self._servo_last_verdict = None # session 62: last CONFIDENT closer verdict, for the telemetry panel
         # --- SESSION 12 recovery redesign (see plans/strafe-throttle-and-recovery-loop.md D5) ---
         # A flickering SLAM status (PLAN-LOST<->PLAN-STALE) used to RESET recovery every ~3s, so STUCK was
         # unreachable and the rewind never emptied (flight 20260713 frantic loop). Fix: `_recovering` PERSISTS
@@ -2047,6 +2063,7 @@ class ExploreController:
         self._servo_tally.reset()           # session 60: a fresh episode starts a fresh servo-entry window
         self._servo_cap_floor = None
         self._servo_frames_seen = 0
+        self._servo_lost_since = None       # session 62: and a fresh servo-EXIT window
 
     def wants_visual_match(self, now=None, status=None):
         """Session 51: True only when THIS tick can actually CONSUME a visual match. There are exactly
@@ -2078,9 +2095,26 @@ class ExploreController:
         opposite of the point. The session 57/58 PLAN-LOST/NO-PLAN clause is an ADDITIONAL narrow
         permission on top of that -- `now`/`status` default to None so every pre-existing caller (and
         self-test) is unaffected."""
+        past_grace = (now is not None and self._loss_episode_t0 is not None
+                      and (now - self._loss_episode_t0) >= self.loss_backoff_grace_s)
         if status in ("PLAN-LOST", "NO-PLAN"):
-            return (now is not None and self._loss_episode_t0 is not None
-                    and (now - self._loss_episode_t0) >= self.loss_backoff_grace_s)
+            return past_grace
+        # Session 62 (flight 20260905_141148) -- THE ROOT CAUSE of SERVO never working. This predicate was
+        # written in session 57 for its two consumers of the day (the loss-instant one-shot, and
+        # `_step_lost_recovery`). Session 60 then added a THIRD -- the FALLBACK sweep's SIFT tally and its
+        # SERVO phase -- and nobody revisited the gate. So under PLAN-STALE, permission was ONLY the
+        # one-shot ticket, which is spent on the episode's first tick; every later PLAN-STALE tick
+        # computed no match at all. FALLBACK flaps between PLAN-STALE and PLAN-LOST constantly, and the
+        # log shows the consequence to the millisecond -- `plan status: PLAN-STALE` at 14:18:28.499 and
+        # `FALLBACK SERVO: match lost` at 14:18:28.499. The view was fine; the sensor was switched off.
+        # Session 62's back-off dwell was blocked by the identical gate (it ran 14:17:42-47 and the
+        # episode's FIRST match came at 14:17:51.8, after it had already given up).
+        # Scope is deliberately unchanged in the way that matters: this is still gated to a LOSS EPISODE
+        # past `loss_backoff_grace_s`, so session 51's removal of ~380 wasted matches per grace window
+        # stands -- healthy tracking still runs no SIFT at all. The one-shot clause below is kept
+        # BEFORE-grace permission, which is exactly when `_maybe_loss_snapshot_backoff` needs it.
+        if status == "PLAN-STALE" and past_grace:
+            return True
         return not self._loss_snapshot_checked
 
     def _visual_backoff_due(self, now):
@@ -2133,6 +2167,40 @@ class ExploreController:
         self._enter("FALLBACK", now)
         return {}, "FALLBACK", event
 
+    def recovery_status(self, now):
+        """Session 62: an operator-facing snapshot of WHERE we are in a loss episode, for the telemetry
+        panel. Returns None outside a loss episode (the panel then shows its normal notice block).
+
+        Pure read-only projection of state the FSM already owns -- it computes nothing, decides nothing,
+        and must never be read back by the controller. It exists because the operator flew three FALLBACK
+        episodes without being able to tell the phases apart on screen. `limit_s` is the phase's own
+        deadline where one exists (so the panel can render `elapsed/limit`) and None where the phase ends
+        on an event rather than a clock -- NO SILENT FALLBACK: a phase with no deadline must not be drawn
+        with an invented one."""
+        if self._loss_episode_t0 is None:
+            return None
+        phase = self._fallback_phase
+        elapsed = None if self._fallback_phase_t0 is None else (now - self._fallback_phase_t0)
+        limits = {"INITIAL_WAIT": self.fallback_initial_wait_s,
+                  "BACKOFF_WAIT": self.fallback_backoff_wait_s,
+                  "WAIT_POST": self.fallback_post_push_wait_s}
+        return {
+            "phase": phase,
+            "elapsed_s": None if elapsed is None else round(elapsed, 1),
+            "limit_s": limits.get(phase),
+            "cycle": self._fallback_cycle,
+            "cum_deg": round(self._fallback_cum_deg, 0),
+            "push_dirn": self._fallback_push_dirn,
+            "loss_elapsed_s": round(now - self._loss_episode_t0, 1),
+            "grace_s": self.loss_backoff_grace_s,
+            "servo_verdict": self._servo_last_verdict,
+            "servo_frames": self._servo_frames_seen,
+            "servo_hold_frames": self.servo_hold_frames,
+            "servo_lost_s": (None if self._servo_lost_since is None
+                             else round(now - self._servo_lost_since, 1)),
+            "servo_lost_grace_s": self.servo_lost_grace_s,
+        }
+
     def _step_fallback_servo(self, now, plan, visual_match):
         """FALLBACK's SERVO phase (session 60, Finding C / plan C6): servos along the ONE axis a
         RANSAC-inlier spread ratio can measure -- distance from the pose F_LKG was captured at.
@@ -2147,12 +2215,32 @@ class ExploreController:
         this servo cannot fix an off-axis pose."""
         matched = visual_match is not None and visual_match.matched
         verdict = visual_match.closer if matched else "UNKNOWN"
+        # Session 62 (flight 20260905_141148): this used to abandon SERVO on ONE non-confident sample,
+        # against an entry gate that demands servo_min_samples confident verdicts spanning
+        # servo_min_window_s -- an asymmetry that made the phase structurally unable to hold. All four
+        # SERVO episodes that flight died here, one of them 13ms after entering, and `servo_hold_frames`
+        # (the intended give-up path) consequently never ran once. The signal is intermittent BY NATURE
+        # -- 124 UNKNOWN against 99 confident verdicts on that flight -- so the exit has to be as patient
+        # as the entry. A confident verdict clears the window outright; only a SUSTAINED loss abandons.
+        # Deliberately NOT reached-through to the EQUAL block below: `_servo_cap_floor` and
+        # `_servo_frames_seen` are left INTACT across a brief dropout, so a flicker cannot silently
+        # restart the hold count. NO SILENT FALLBACK: the give-up still happens, still says why, and now
+        # names how long the match was actually gone.
         if not matched or verdict == "UNKNOWN":
+            if self._servo_lost_since is None:
+                self._servo_lost_since = now
+            lost_for = now - self._servo_lost_since
+            if lost_for < self.servo_lost_grace_s:
+                return {}, "FALLBACK", None          # hold still; the view may well come back
             self._player = None
             self._servo_cap_floor = None
             self._servo_frames_seen = 0
+            self._servo_lost_since = None
             self._fallback_phase, self._fallback_phase_t0 = "TURN", now
-            return {}, "FALLBACK", "FALLBACK SERVO: match lost -> resume sweep"
+            return {}, "FALLBACK", (f"FALLBACK SERVO: match lost for {lost_for:.1f}s "
+                                    f"(> {self.servo_lost_grace_s:.1f}s grace) -> resume sweep")
+        self._servo_lost_since = None                # a confident verdict clears the exit window
+        self._servo_last_verdict = verdict
         if verdict == "LIVE":
             if self._player is None:
                 self._player = self.pb.player("back_off")
@@ -2187,10 +2275,25 @@ class ExploreController:
 
     def _step_fallback_sweep(self, now, plan, wall_contact, backwall_contact, visual_match):
         """Per-tick FALLBACK sweep dispatch (session 31), on `self._fallback_phase`:
-          INITIAL_WAIT -> (fallback_initial_wait_s) -> TURN -> (recovery_turn_step_deg, unidirectional) ->
+          INITIAL_WAIT -> (fallback_initial_wait_s) -> BACKOFF -> BACKOFF_WAIT ->
+          (fallback_backoff_wait_s) -> TURN -> (recovery_turn_step_deg, unidirectional) ->
           PUSH -> (a FRESH random direction every cycle, full throttle/magnitude, fallback_push_fwd_back_s
           or fallback_push_strafe_s) -> WAIT_POST -> (fallback_post_push_wait_s) -> TURN again, forever
           (session 60: the sweep no longer exhausts to STUCK -- see below).
+
+        Session 62: BACKOFF/BACKOFF_WAIT are step 0b, and they run exactly ONCE per episode -- the cycle
+        above loops back to TURN, never through INITIAL_WAIT, so there is no flag to keep. The reasoning
+        is the repo's own: session 60 deleted the 15-degree visual probe because "rotating in place
+        cannot reproduce a view the drone has physically drifted away from" (139 logs, 9.4 min of
+        exposure, 0 recoveries) -- but that verdict was never applied HERE, where the sweep still turned
+        22.5 degrees before it ever considered translating, and then picked backward only 1 time in 4.
+        Backing off widens the view along the SAME bearing F_LKG was captured on, which is the geometry
+        SIFT can match; the dwell then simply gives it time to. Note that the SERVO tally above is
+        evaluated on EVERY tick regardless of phase, so the dwell needs no matcher wiring of its own --
+        a sustained match found during BACKOFF_WAIT hands off to SERVO exactly as one found mid-TURN
+        would. The two wedge escalations (`_blind_contact_backoff` and `_escalate_blind_contact`) still
+        jump straight to TURN on a FRESH sweep: they arrive precisely BECAUSE repeated back-offs already
+        failed, so repeating one there would be the maneuver that is known not to work.
         Each phase rebuilds `self._player` if it's `None` (build-if-None, the same pattern `REVERSE_PROBE`
         already uses) rather than assuming a player survived a PLAN-LOST/HOLD_LOST interruption intact — a
         resume after a flicker (see `_enter_fallback_sweep`) cleanly restarts just the CURRENT TURN/PUSH
@@ -2219,6 +2322,7 @@ class ExploreController:
                 self._player = None
                 self._servo_cap_floor = None
                 self._servo_frames_seen = 0
+                self._servo_lost_since = None       # session 62: enter SERVO with a clean exit window
                 self._fallback_phase, self._fallback_phase_t0 = "SERVO", now
                 return {}, "FALLBACK", f"FALLBACK: sustained visual match ({tally_summary}) -> SERVO to F_LKG"
         if self._fallback_phase == "SERVO":
@@ -2228,8 +2332,48 @@ class ExploreController:
         if phase == "INITIAL_WAIT":
             if elapsed < self.fallback_initial_wait_s:
                 return {}, "FALLBACK", None
+            nxt = "BACKOFF" if self.fallback_backoff_first else "TURN"
+            self._fallback_phase, self._fallback_phase_t0 = nxt, now
+            return {}, "FALLBACK", (f"FALLBACK: initial {self.fallback_initial_wait_s:.0f}s wait done -> "
+                                    f"{'back off, then look before turning' if nxt == 'BACKOFF' else 'turn'}")
+        if phase == "BACKOFF":
+            # Session 62: the SAME `back_off` playbook recipe FALLBACK SERVO and `_blind_contact_backoff`
+            # already play -- deliberately no new maneuver magnitude is introduced here (CLAUDE.md: a
+            # learned platform recipe is allowed; a fresh number tuned against one flight would not be).
+            if self._player is None:
+                # Session 62, revised after flight 20260905_155834: this first played the `back_off`
+                # PLAYBOOK recipe and the operator could not see it happen at all -- rightly so.
+                # `back_off` is `reverse 0.7 for 0.3s` scaled by `reverse_throttle: 0.2`, so it emitted
+                # reverse=0.2 for 0.3s: about a SEVENTEENTH of the impulse of the sweep's own backward
+                # PUSH (reverse=1.0 for `fallback_push_fwd_back_s`). That recipe is sized for "ADVANCE
+                # crept too close to a wall, ease off", not for "re-open a viewpoint we have drifted out
+                # of". Use the sweep's OWN backward-push parameters instead -- constructed the same way
+                # from the same config value, so this still introduces no new maneuver magnitude, and the
+                # backwall abort below still bounds it.
+                self._player = RecipePlayer(
+                    [{"reverse": 1.0, "duration_s": self.fallback_push_fwd_back_s}],
+                    name="fallback-backoff-first")
+            if backwall_contact:
+                # Same early-abort shape the backward PUSH uses below: a live contact is real information,
+                # and reversing into the back wall is the one way this step can make things worse.
+                self._player.i = len(self._player.steps)
+            active, done = self._player.fields(now)
+            if not done:
+                return active, "FALLBACK", None
+            self._player = None
+            self._fallback_phase, self._fallback_phase_t0 = "BACKOFF_WAIT", now
+            return {}, "FALLBACK", (f"FALLBACK: backed off{' (aborted on backwall contact)' if backwall_contact else ''}"
+                                    f" -> hold {self.fallback_backoff_wait_s:.0f}s for a visual match "
+                                    f"before sweeping")
+        if phase == "BACKOFF_WAIT":
+            # The SERVO tally checked at the top of this function runs on every tick, so THIS is where a
+            # match is most likely to be found -- same bearing as F_LKG, just wider. Nothing else to do
+            # but hold still and let it accumulate.
+            if elapsed < self.fallback_backoff_wait_s:
+                return {}, "FALLBACK", None
             self._fallback_phase, self._fallback_phase_t0 = "TURN", now
-            return {}, "FALLBACK", (f"FALLBACK: initial {self.fallback_initial_wait_s:.0f}s wait done -> turn")
+            return {}, "FALLBACK", (f"FALLBACK: no sustained match in {self.fallback_backoff_wait_s:.0f}s "
+                                    f"after the back-off -> begin the sweep")
         if phase == "TURN":
             if self._player is None:
                 self._player = self._build_turn(self.recovery_turn_step_deg)
@@ -5375,7 +5519,8 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
             pub.publish(frame_bus.TOPIC_CONTROL,
                         _full_vector(active, seq, now, state, ctrl.target_altitude_y,
                                     state_since_s=now - ctrl.t_state,
-                                    slam_hold=slam_hold, notice=notice, visrec_lkg=visrec_lkg))
+                                    slam_hold=slam_hold, notice=notice, visrec_lkg=visrec_lkg,
+                                    recovery=ctrl.recovery_status(now)))
             seq += 1
             last_pub = now
 
@@ -7846,6 +7991,7 @@ def run_self_test(cfg):
     cf.fallback_post_push_wait_s = 0.02
     cf.fallback_push_fwd_back_s = 0.02
     cf.fallback_push_strafe_s = 0.02
+    cf.fallback_backoff_wait_s = 0.02       # session 62: step 0b precedes the first TURN -- shrink it too
     cf.loss_backoff_grace_s = 0.0           # session 60: the grace hold before FALLBACK is timed elsewhere
     cf._ever_tracked = True                 # a MID-FLIGHT loss (history wiped by a wall hit), not startup warmup
     cf.command_history.clear()
@@ -8022,6 +8168,9 @@ def run_self_test(cfg):
     cfs = ExploreController(cfg, no_takeoff=True); cfs._ever_tracked = True
     cfs.fallback_initial_wait_s = 0.02; cfs.fallback_post_push_wait_s = 0.05
     cfs.fallback_push_fwd_back_s = 0.02; cfs.fallback_push_strafe_s = 0.02
+    cfs.fallback_backoff_first = False   # session 62: this case is about PUSH separation and the retired
+                                         #   STUCK exhaustion, not about step 0b -- the new BACKOFF/
+                                         #   BACKOFF_WAIT entry ordering has its own block below.
     cfs.loss_backoff_grace_s = 0.0     # session 60: the grace hold before FALLBACK is timed elsewhere
     cfs.command_history.clear()
     fb_settled, seen_fb, tfs, fidfs = False, set(), 0.0, 300
@@ -8046,6 +8195,9 @@ def run_self_test(cfg):
     cord = ExploreController(cfg, no_takeoff=True)
     cord._ever_tracked = True
     cord.fallback_initial_wait_s = 0.02
+    cord.fallback_backoff_wait_s = 0.02   # session 62: step 0b precedes the first TURN. Shrinking it (rather
+                                          #   than disabling it) keeps this case honest AND makes it prove the
+                                          #   new phase does not disturb the turn-then-push order it asserts.
     cord.loss_backoff_grace_s = 0.0     # session 60: the grace hold before FALLBACK is timed elsewhere
     cord.command_history.clear()
     saw_turn_yaw, cum_before_push, t = False, None, 0.0
@@ -8065,28 +8217,39 @@ def run_self_test(cfg):
           f"bounded-escape-when-dead={bounded_ok}, turn-before-push={order_ok})")
 
     # ---- FALLBACK sweep (session 31, replaces the session-29 direction-cycling search) ----
-    # (a) INITIAL_WAIT holds neutral for fallback_initial_wait_s before the first TURN begins.
+    # (a) INITIAL_WAIT holds neutral for fallback_initial_wait_s before anything invasive happens.
+    #     Session 62: what follows that wait is now BACKOFF (step 0b), not TURN -- so assert the full
+    #     route INITIAL_WAIT -> BACKOFF -> TURN rather than the old two-stop version. This is strictly
+    #     stronger than what it replaced: it still proves the wait is honoured and the sweep still
+    #     starts, and it additionally pins WHERE the back-off sits relative to both.
     caw = ExploreController(cfg, no_takeoff=True)
     caw._ever_tracked = True
     caw.fallback_initial_wait_s = 0.1
+    caw.fallback_backoff_wait_s = 0.02
+    caw.fallback_push_fwd_back_s = 0.02   # session 62: step 0b now plays the SWEEP'S backward push
+                                          #   (fallback_push_fwd_back_s, 1.0s shipped) rather than the
+                                          #   0.3s back_off recipe -- shrink it, or this window expires
+                                          #   mid-back-off and never reaches the TURN it asserts.
     caw.loss_backoff_grace_s = 0.0     # session 60: the grace hold before FALLBACK is timed elsewhere
     caw.command_history.clear()
     seen_aw, t = set(), 0.0
-    for _ in range(int(0.3 / 0.02)):
+    for _ in range(int(0.8 / 0.02)):
         _a, s, _ = caw.step(t, stale, False, status="PLAN-STALE")
         seen_aw.add((s, caw._fallback_phase))
         t += 0.02
-    initial_wait_ok = (("FALLBACK", "INITIAL_WAIT") in seen_aw and ("FALLBACK", "TURN") in seen_aw)
+    initial_wait_ok = (("FALLBACK", "INITIAL_WAIT") in seen_aw and ("FALLBACK", "BACKOFF") in seen_aw
+                       and ("FALLBACK", "TURN") in seen_aw)
     # (b) a full cycle visits TURN -> PUSH -> WAIT_POST, accumulates _fallback_cum_deg by recovery_turn_step_deg
     #     per cycle, and PUSH commands a FULL-magnitude move (no throttled knobs).
     ccy = ExploreController(cfg, no_takeoff=True)
     ccy._ever_tracked = True
     ccy.fallback_initial_wait_s = 0.02; ccy.fallback_post_push_wait_s = 0.02
     ccy.fallback_push_fwd_back_s = 0.02; ccy.fallback_push_strafe_s = 0.02
+    ccy.fallback_backoff_wait_s = 0.02  # session 62: step 0b precedes the first TURN -- shrink it too
     ccy.loss_backoff_grace_s = 0.0     # session 60: the grace hold before FALLBACK is timed elsewhere
     ccy.command_history.clear()
     seen_cy, saw_push_mag, t = set(), False, 0.0
-    for _ in range(int(2.0 / 0.02)):
+    for _ in range(int(3.0 / 0.02)):
         a, s, _ = ccy.step(t, stale, False, status="PLAN-STALE")
         seen_cy.add(ccy._fallback_phase)
         if ccy._fallback_phase == "PUSH":
@@ -8132,6 +8295,7 @@ def run_self_test(cfg):
     cex._ever_tracked = True
     cex.fallback_initial_wait_s = 0.02; cex.fallback_post_push_wait_s = 0.02
     cex.fallback_push_fwd_back_s = 0.02; cex.fallback_push_strafe_s = 0.02
+    cex.fallback_backoff_wait_s = 0.02  # session 62: else step 0b silently eats 5s of this 20s window
     cex.loss_backoff_grace_s = 0.0     # session 60: the grace hold before FALLBACK is timed elsewhere
     cex.command_history.clear()
     seen_ex, max_cum, s, t = set(), 0.0, None, 0.0
@@ -9767,6 +9931,288 @@ def run_self_test(cfg):
           f"visual_backoff_no_longer_fires_from_FALLBACK")
     print(f"[self-test] {'PASS' if servo_wiring_ok else 'FAIL'}  SESSION-60 FALLBACK SERVO overall")
 
+    # ---- SESSION-62 FALLBACK BACK-OFF-FIRST ----------------------------------------------------------
+    # Step 0b: back off ONCE before the sweep starts turning, then dwell there so the SIFT matcher gets a
+    # look from the widened viewpoint. Session 60 established that rotating in place cannot reproduce a
+    # view the drone has physically DRIFTED from (139 logs, 9.4 min exposure, 0 recoveries) and deleted
+    # the 15-degree probe on that basis -- but the sweep itself still turned 22.5 degrees before it ever
+    # translated, then chose backward only 1 time in 4. These cases pin the ORDERING and the once-per-
+    # episode property; they must not depend on what the operator currently has in config.yaml, so every
+    # timing is forced onto the instance (the same discipline the session-59/60 blocks above use).
+    stale62 = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None}
+
+    def _c62(backoff_first=True):
+        c = ExploreController(cfg, no_takeoff=True)
+        c._ever_tracked = True
+        c.fallback_backoff_first = backoff_first
+        c.fallback_initial_wait_s = 0.05
+        c.fallback_backoff_wait_s = 0.40
+        c.fallback_post_push_wait_s = 0.05
+        c.fallback_push_fwd_back_s = 0.02
+        c.fallback_push_strafe_s = 0.02
+        c.loss_backoff_grace_s = 0.0
+        c.command_history.clear()
+        c._enter_fallback_sweep(0.0, None)
+        return c
+
+    def _run62(c, ticks, dt=0.02, backwall=False, visual_match=None):
+        """Drive the sweep and return the ORDER in which phases were first seen, plus every reverse
+        command observed while in BACKOFF (proof the recipe actually played)."""
+        order, revs, t = [], [], 0.0
+        for _ in range(ticks):
+            a, _st, _ev = c.step(t, stale62, False, backwall_contact=backwall,
+                                 status="PLAN-STALE", visual_match=visual_match)
+            ph = c._fallback_phase
+            if ph is not None and (not order or order[-1] != ph):
+                order.append(ph)
+            if ph == "BACKOFF" and float(a.get("reverse", 0.0) or 0.0) > 0:
+                revs.append(float(a["reverse"]))
+            t += dt
+        return order, revs
+
+    # (62-1) config plumbing. Driven from SYNTHETIC configs with values deliberately unlike the shipped
+    #        defaults, so a regression that hardcoded the defaults fails here instead of passing.
+    _cfg62_on = copy.deepcopy(cfg)
+    _cfg62_on.setdefault("autonomy", {}).setdefault("explore", {}).update(
+        {"fallback_backoff_first": True, "fallback_backoff_wait_s": 7.5})
+    _cfg62_off = copy.deepcopy(cfg)
+    _cfg62_off.setdefault("autonomy", {}).setdefault("explore", {})["fallback_backoff_first"] = False
+    c62on = ExploreController(_cfg62_on, no_takeoff=True)
+    c62off = ExploreController(_cfg62_off, no_takeoff=True)
+    cfg62_ok = (c62on.fallback_backoff_first is True and c62off.fallback_backoff_first is False
+                and c62on.fallback_backoff_wait_s == 7.5)
+    print(f"[self-test] {'PASS' if cfg62_ok else 'FAIL'}  SESSION-62 FALLBACK BACK-OFF config plumbing "
+          f"(first={c62on.fallback_backoff_first}/{c62off.fallback_backoff_first} "
+          f"wait={c62on.fallback_backoff_wait_s})")
+
+    # (62-2) ORDERING: the whole point. BACKOFF and its dwell must both precede the first TURN.
+    order62, revs62 = _run62(_c62(), 120)
+    ord_ok = (order62[:4] == ["INITIAL_WAIT", "BACKOFF", "BACKOFF_WAIT", "TURN"])
+    print(f"[self-test] {'PASS' if ord_ok else 'FAIL'}  SESSION-62 back-off precedes the first turn "
+          f"(phases: {'->'.join(order62[:5])})")
+
+    # (62-3) the BACKOFF phase actually commands reverse (it plays the shared `back_off` recipe).
+    rev_ok = bool(revs62) and all(r > 0 for r in revs62)
+    print(f"[self-test] {'PASS' if rev_ok else 'FAIL'}  SESSION-62 BACKOFF commands reverse "
+          f"({len(revs62)} tick(s), max {max(revs62) if revs62 else 0:.2f})")
+
+    # (62-4) the dwell is HELD, not skipped: with fallback_backoff_wait_s=0.40 and dt=0.02, BACKOFF_WAIT
+    #        must occupy clearly more than a couple of ticks before TURN appears.
+    c62d = _c62()
+    held, t62 = 0, 0.0
+    for _ in range(120):
+        c62d.step(t62, stale62, False, status="PLAN-STALE")
+        if c62d._fallback_phase == "BACKOFF_WAIT":
+            held += 1
+        t62 += 0.02
+    dwell_ok = held >= 15          # 0.40s / 0.02s = 20 ticks, minus the tick that transitions out
+    print(f"[self-test] {'PASS' if dwell_ok else 'FAIL'}  SESSION-62 back-off dwell is held "
+          f"({held} ticks at 0.02s, expected ~20 for a 0.40s dwell)")
+
+    # (62-5) flag OFF restores the original session-31 ladder exactly -- BACKOFF never appears.
+    order62off, _ = _run62(_c62(backoff_first=False), 120)
+    off_ok = ("BACKOFF" not in order62off and "BACKOFF_WAIT" not in order62off
+              and order62off[:2] == ["INITIAL_WAIT", "TURN"])
+    print(f"[self-test] {'PASS' if off_ok else 'FAIL'}  SESSION-62 flag off -> unchanged ladder "
+          f"(phases: {'->'.join(order62off[:4])})")
+
+    # (62-6) ONCE per episode: the cycle loops back to TURN, never through INITIAL_WAIT, so a long run
+    #        covering several TURN/PUSH/WAIT_POST cycles must still show exactly one back-off.
+    order62long, _ = _run62(_c62(), 600)
+    once_ok = (order62long.count("BACKOFF") == 1 and order62long.count("TURN") >= 2)
+    print(f"[self-test] {'PASS' if once_ok else 'FAIL'}  SESSION-62 back-off runs once per episode "
+          f"({order62long.count('BACKOFF')} back-off(s) across {order62long.count('TURN')} turns)")
+
+    # (62-7) SERVO still wins from inside the dwell -- the tally is evaluated on EVERY tick regardless of
+    #        phase, which is exactly why the dwell needs no matcher wiring of its own. This is the
+    #        behaviour the whole change is FOR: a match found at the widened viewpoint ends the sweep.
+    c62s = _c62()
+    c62s.servo_min_window_s = 0.1; c62s.servo_min_samples = 3
+    order62s, _ = _run62(c62s, 120, visual_match=VisualMatch(has_lkg=True, matched=True,
+                                                             inliers=50, closer="EQUAL"))
+    servo_from_dwell_ok = ("SERVO" in order62s
+                           and order62s.index("SERVO") < (order62s.index("TURN") if "TURN" in order62s
+                                                          else len(order62s)))
+    print(f"[self-test] {'PASS' if servo_from_dwell_ok else 'FAIL'}  SESSION-62 sustained match during "
+          f"the dwell reaches SERVO before any turn (phases: {'->'.join(order62s[:5])})")
+
+    # (62-8) a live backwall contact aborts the back-off early (same shape as the backward PUSH's abort).
+    #        Compare tick counts spent in BACKOFF with and without the contact.
+    def _backoff_ticks(backwall):
+        c = _c62()
+        n, t = 0, 0.0
+        for _ in range(120):
+            c.step(t, stale62, False, backwall_contact=backwall, status="PLAN-STALE")
+            if c._fallback_phase == "BACKOFF":
+                n += 1
+            t += 0.02
+        return n
+    n_free, n_wall = _backoff_ticks(False), _backoff_ticks(True)
+    abort_ok = n_wall < n_free
+    print(f"[self-test] {'PASS' if abort_ok else 'FAIL'}  SESSION-62 backwall contact aborts the "
+          f"back-off ({n_wall} tick(s) vs {n_free} unobstructed)")
+
+    s62_ok = (cfg62_ok and ord_ok and rev_ok and dwell_ok and off_ok and once_ok
+              and servo_from_dwell_ok and abort_ok)
+    print(f"[self-test] {'PASS' if s62_ok else 'FAIL'}  SESSION-62 FALLBACK BACK-OFF-FIRST overall")
+    assert s62_ok, "session-62 FALLBACK back-off-first"
+
+    # ---- SESSION-62 SERVO EXIT GRACE -----------------------------------------------------------------
+    # Flight 20260905_141148: SERVO entered four times and every one died on "match lost" -- the shortest
+    # 13ms after entering -- so `servo_hold_frames`, the intended give-up path, never ran once. The entry
+    # gate demands servo_min_samples confident verdicts spanning servo_min_window_s; the exit took ONE
+    # non-confident sample, against a signal that was 124-UNKNOWN to 99-confident that flight. These
+    # cases pin the symmetry, and pin that the give-up still HAPPENS (a patient exit must not become no
+    # exit at all -- CLAUDE.md: no silent absorption of a failure).
+    def _c62s(lost_grace=1.5):
+        c = ExploreController(cfg, no_takeoff=True)
+        c._ever_tracked = True
+        c.servo_lost_grace_s = lost_grace
+        c._enter_fallback_sweep(0.0, None)
+        c._fallback_phase, c._fallback_phase_t0 = "SERVO", 0.0
+        c._servo_lost_since = None
+        c._servo_cap_floor = None
+        c._servo_frames_seen = 0
+        return c
+
+    _vm_eq = VisualMatch(has_lkg=True, matched=True, inliers=50, closer="EQUAL")
+    _vm_unk = VisualMatch(has_lkg=True, matched=True, inliers=50, closer="UNKNOWN")
+    plan62s = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None,
+               "cap_ts": 0.0}
+
+    # (62-9) one bad sample no longer evicts: still SERVO, and it holds still while it waits.
+    c9 = _c62s()
+    c9._step_fallback_servo(0.0, plan62s, _vm_eq)          # establish the EQUAL hold
+    a9, _s9, _e9 = c9._step_fallback_servo(0.1, plan62s, None)
+    one_sample_survives = (c9._fallback_phase == "SERVO" and a9 == {})
+    print(f"[self-test] {'PASS' if one_sample_survives else 'FAIL'}  SESSION-62 SERVO survives a single "
+          f"lost sample (phase={c9._fallback_phase}, cmd={a9})")
+
+    # (62-10) a sustained loss DOES still give up -- patience must not become paralysis.
+    c10 = _c62s()
+    c10._step_fallback_servo(0.0, plan62s, _vm_eq)
+    ev10, t10 = None, 0.1
+    while t10 < 5.0 and c10._fallback_phase == "SERVO":
+        _a, _s, ev = c10._step_fallback_servo(t10, plan62s, None)
+        if ev:
+            ev10 = ev
+        t10 += 0.1
+    sustained_gives_up = (c10._fallback_phase == "TURN" and ev10 is not None
+                          and "match lost for" in ev10)
+    print(f"[self-test] {'PASS' if sustained_gives_up else 'FAIL'}  SESSION-62 sustained loss still "
+          f"resumes the sweep (phase={c10._fallback_phase}, event={ev10!r})")
+
+    # (62-11) the grace is honoured to the boundary, not merely "eventually".
+    c11 = _c62s(lost_grace=1.0)
+    c11._step_fallback_servo(0.0, plan62s, _vm_eq)
+    c11._step_fallback_servo(0.10, plan62s, None)          # stamps _servo_lost_since = 0.10
+    c11._step_fallback_servo(1.05, plan62s, None)          # 0.95s lost -> still inside the grace
+    inside = c11._fallback_phase == "SERVO"
+    c11._step_fallback_servo(1.15, plan62s, None)          # 1.05s lost -> past it
+    boundary_ok = inside and c11._fallback_phase == "TURN"
+    print(f"[self-test] {'PASS' if boundary_ok else 'FAIL'}  SESSION-62 exit grace honoured at the "
+          f"boundary (inside_held={inside}, past_released={c11._fallback_phase == 'TURN'})")
+
+    # (62-12) a confident verdict CLEARS the window outright -- a flicker must not accumulate toward
+    #         eviction across unrelated dropouts.
+    c12 = _c62s(lost_grace=1.0)
+    c12._step_fallback_servo(0.0, plan62s, _vm_eq)
+    c12._step_fallback_servo(0.10, plan62s, None)
+    c12._step_fallback_servo(0.90, plan62s, _vm_eq)        # confident again -> window cleared
+    cleared = c12._servo_lost_since is None
+    c12._step_fallback_servo(1.50, plan62s, None)          # fresh window starts here, not at 0.10
+    flicker_ok = cleared and c12._fallback_phase == "SERVO"
+    print(f"[self-test] {'PASS' if flicker_ok else 'FAIL'}  SESSION-62 a confident verdict clears the "
+          f"exit window (cleared={cleared}, still_servo={c12._fallback_phase == 'SERVO'})")
+
+    # (62-13) UNKNOWN is treated as a lost sample (it was the MAJORITY verdict on the flight), and the
+    #         EQUAL hold count survives a brief dropout rather than silently restarting.
+    c13 = _c62s(lost_grace=1.0)
+    c13._step_fallback_servo(0.0, plan62s, _vm_eq)         # stamps the cap_ts floor
+    floor13 = c13._servo_cap_floor
+    c13._servo_frames_seen = 2
+    c13._step_fallback_servo(0.10, plan62s, _vm_unk)       # UNKNOWN -> inside grace, hold
+    unknown_counts_as_lost = c13._servo_lost_since is not None and c13._fallback_phase == "SERVO"
+    hold_count_preserved = (c13._servo_cap_floor == floor13 and c13._servo_frames_seen == 2)
+    print(f"[self-test] {'PASS' if unknown_counts_as_lost and hold_count_preserved else 'FAIL'}  "
+          f"SESSION-62 UNKNOWN is a lost sample and the EQUAL hold count survives it "
+          f"(lost_stamped={unknown_counts_as_lost}, frames_seen={c13._servo_frames_seen})")
+
+    # (62-14) config plumbing, driven from a synthetic config with a non-default value.
+    _cfg62s = copy.deepcopy(cfg)
+    _cfg62s.setdefault("autonomy", {}).setdefault("explore", {})["servo_lost_grace_s"] = 4.25
+    grace_cfg_ok = (ExploreController(_cfg62s, no_takeoff=True).servo_lost_grace_s == 4.25
+                    and ExploreController(cfg, no_takeoff=True).servo_lost_grace_s > 0.0)
+    print(f"[self-test] {'PASS' if grace_cfg_ok else 'FAIL'}  SESSION-62 servo_lost_grace_s config "
+          f"plumbing")
+
+    s62b_ok = (one_sample_survives and sustained_gives_up and boundary_ok and flicker_ok
+               and unknown_counts_as_lost and hold_count_preserved and grace_cfg_ok)
+    print(f"[self-test] {'PASS' if s62b_ok else 'FAIL'}  SESSION-62 SERVO EXIT GRACE overall")
+    assert s62b_ok, "session-62 SERVO exit grace"
+
+    # ---- SESSION-62 RECOVERY STATUS (telemetry projection) -------------------------------------------
+    # Read-only projection of the loss-recovery FSM for the visualizer's telemetry panel. It must be
+    # None outside a loss episode (the panel falls back to its notice block), must report a phase's own
+    # deadline where one exists and None where the phase ends on an event, and must never be read back
+    # by the controller -- it is a display, not a decision input.
+    c62r = ExploreController(cfg, no_takeoff=True)
+    rec_none_outside = c62r.recovery_status(10.0) is None
+    c62r._loss_episode_t0 = 100.0
+    c62r._fallback_phase, c62r._fallback_phase_t0 = "INITIAL_WAIT", 100.0
+    r1 = c62r.recovery_status(112.4)
+    rec_initial = (r1 is not None and r1["phase"] == "INITIAL_WAIT" and r1["elapsed_s"] == 12.4
+                   and r1["limit_s"] == c62r.fallback_initial_wait_s and r1["loss_elapsed_s"] == 12.4)
+    c62r._fallback_phase, c62r._fallback_phase_t0 = "BACKOFF", 120.0
+    r2 = c62r.recovery_status(120.4)
+    rec_no_deadline = (r2["limit_s"] is None and r2["elapsed_s"] == 0.4)   # ends on the recipe, not a clock
+    c62r._fallback_phase, c62r._fallback_phase_t0 = "BACKOFF_WAIT", 121.0
+    rec_dwell_limit = c62r.recovery_status(124.2)["limit_s"] == c62r.fallback_backoff_wait_s
+    c62r._fallback_phase = "SERVO"
+    c62r._servo_last_verdict = "EQUAL"; c62r._servo_frames_seen = 2; c62r._servo_lost_since = None
+    r3 = c62r.recovery_status(130.0)
+    rec_servo = (r3["servo_verdict"] == "EQUAL" and r3["servo_frames"] == 2
+                 and r3["servo_hold_frames"] == c62r.servo_hold_frames and r3["servo_lost_s"] is None)
+    c62r._servo_lost_since = 129.2
+    rec_servo_lost = c62r.recovery_status(130.0)["servo_lost_s"] == 0.8
+    # phase=None inside an episode is the grace hold -- still a status, never None.
+    c62r._fallback_phase, c62r._fallback_phase_t0 = None, None
+    r4 = c62r.recovery_status(107.2)
+    rec_grace = (r4 is not None and r4["phase"] is None and r4["elapsed_s"] is None
+                 and r4["loss_elapsed_s"] == 7.2 and r4["grace_s"] == c62r.loss_backoff_grace_s)
+    # `_full_vector` carries it, always-present like slam_hold/notice/visrec_lkg.
+    rec_on_wire = ("recovery" in _full_vector({}, 0, 0.0, "FALLBACK", recovery=r1)
+                   and _full_vector({}, 0, 0.0, "ADVANCE")["recovery"] is None)
+
+    s62c_ok = (rec_none_outside and rec_initial and rec_no_deadline and rec_dwell_limit
+               and rec_servo and rec_servo_lost and rec_grace and rec_on_wire)
+    print(f"[self-test] {'PASS' if s62c_ok else 'FAIL'}  SESSION-62 RECOVERY STATUS "
+          f"(none_outside={rec_none_outside}, deadlines={rec_initial and rec_dwell_limit}, "
+          f"no_invented_deadline={rec_no_deadline}, servo={rec_servo and rec_servo_lost}, "
+          f"grace={rec_grace}, on_wire={rec_on_wire})")
+    assert s62c_ok, "session-62 recovery status"
+
+    # The step-0b back-off must use the SWEEP'S OWN backward-push authority, not the gentle `back_off`
+    # playbook recipe: flight 20260905_155834 emitted reverse=0.2 for 0.3s and the operator could not
+    # see it happen. Assert the commanded magnitude, since that is the thing that was wrong.
+    c62p = ExploreController(cfg, no_takeoff=True)
+    c62p._ever_tracked = True
+    c62p.fallback_initial_wait_s = 0.02
+    c62p.loss_backoff_grace_s = 0.0
+    c62p.command_history.clear()
+    c62p._enter_fallback_sweep(0.0, None)
+    _stale62p = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None}
+    _max_rev, _t = 0.0, 0.0
+    for _ in range(120):
+        _a, _s, _e = c62p.step(_t, _stale62p, False, status="PLAN-STALE")
+        if c62p._fallback_phase == "BACKOFF":
+            _max_rev = max(_max_rev, float(_a.get("reverse", 0.0) or 0.0))
+        _t += 0.02
+    backoff_full_authority = _max_rev >= 0.999
+    print(f"[self-test] {'PASS' if backoff_full_authority else 'FAIL'}  SESSION-62 step-0b back-off uses "
+          f"FULL reverse authority (max reverse={_max_rev:.2f}, was 0.20 via the back_off recipe)")
+    assert backoff_full_authority, "session-62 step-0b back-off authority"
+
     # ---- SESSION-58 DEAD-GOAL BUMP GUARD -----------------------------------------------------------
     # 22:40:24.170 BLACKLIST PERMANENT retired goal=[3.9,-3.6] -> 22:40:25.165 bump pulse #2 fired against
     # that SAME dead goal and backed off, because neither _register_bump nor the SLAM_HOLD settle-resume
@@ -10942,10 +11388,27 @@ def run_self_test(cfg):
     # (3) no_args_is_unchanged -- every pre-existing caller (no now/status) keeps today's answer.
     no_args_is_unchanged = c57w.wants_visual_match() is False
 
-    # (4) plan_stale_unaffected -- PLAN-STALE still runs through `_maybe_loss_snapshot_backoff` only; the
-    #     new clause names PLAN-LOST/NO-PLAN exclusively.
-    plan_stale_unaffected = c57w.wants_visual_match(
-        now=t0_57 + grace57 + 0.1, status="PLAN-STALE") is False
+    # (4) SESSION-62 REPLACEMENT of session 57's `plan_stale_unaffected`. That case asserted PLAN-STALE
+    #     looked ONLY through `_maybe_loss_snapshot_backoff`'s one-shot ticket -- session 57's SCOPE, and
+    #     its own comment said as much ("the new clause names PLAN-LOST/NO-PLAN exclusively"), not a
+    #     safety property. SERVO did not exist yet; session 60 built it, added a third consumer of this
+    #     predicate, and nobody revisited the gate -- so the FALLBACK sweep's matcher was switched off on
+    #     every PLAN-STALE tick. Flight 20260905_141148 shows the cost to the millisecond: `plan status:
+    #     PLAN-STALE` at 14:18:28.499 and `FALLBACK SERVO: match lost` at 14:18:28.499, four times over,
+    #     and session 62's back-off dwell blocked by the same gate. Retired here, with the three
+    #     assertions that matter now in its place -- note the middle one is what still protects session
+    #     51's cost discipline (~380 wasted matches per grace window), so opening PLAN-STALE does NOT
+    #     re-open that door.
+    plan_stale_looks_past_grace = c57w.wants_visual_match(
+        now=t0_57 + grace57 + 0.1, status="PLAN-STALE") is True
+    plan_stale_silent_inside_grace = c57w.wants_visual_match(
+        now=t0_57 + grace57 - 0.1, status="PLAN-STALE") is False
+    c57w_fresh = _mk_gate_ctrl(one_shot_spent=False)
+    c57w_fresh._loss_episode_t0 = t0_57
+    plan_stale_oneshot_preserved = c57w_fresh.wants_visual_match(
+        now=t0_57 + grace57 - 0.1, status="PLAN-STALE") is True
+    plan_stale_gate_ok = (plan_stale_looks_past_grace and plan_stale_silent_inside_grace
+                          and plan_stale_oneshot_preserved)
 
     # (5) no_episode_stamp -- with no loss-episode stamp there is nothing to time, regardless of `now`.
     c57w_noep = _mk_gate_ctrl(one_shot_spent=True)
@@ -10961,7 +11424,7 @@ def run_self_test(cfg):
     should_match_threads_args = should_match_lost and should_match_ok
 
     s57_looks_ok = (spent_ticket_clear_front_still_looks and inside_grace_does_not_look
-                    and no_args_is_unchanged and plan_stale_unaffected and no_episode_stamp
+                    and no_args_is_unchanged and plan_stale_gate_ok and no_episode_stamp
                     and should_match_threads_args)
     ok = ok and s57_looks_ok
     print(f"[self-test] {'PASS' if spent_ticket_clear_front_still_looks else 'FAIL'}  SESSION-57 PLAN-LOST "
@@ -10970,8 +11433,9 @@ def run_self_test(cfg):
           f"ALWAYS LOOKS inside_grace_does_not_look")
     print(f"[self-test] {'PASS' if no_args_is_unchanged else 'FAIL'}  SESSION-57 PLAN-LOST "
           f"ALWAYS LOOKS no_args_is_unchanged")
-    print(f"[self-test] {'PASS' if plan_stale_unaffected else 'FAIL'}  SESSION-57 PLAN-LOST "
-          f"ALWAYS LOOKS plan_stale_unaffected")
+    print(f"[self-test] {'PASS' if plan_stale_gate_ok else 'FAIL'}  SESSION-62 PLAN-STALE ALSO LOOKS "
+          f"(past_grace={plan_stale_looks_past_grace}, silent_inside_grace={plan_stale_silent_inside_grace}, "
+          f"one_shot_preserved={plan_stale_oneshot_preserved})")
     print(f"[self-test] {'PASS' if no_episode_stamp else 'FAIL'}  SESSION-57 PLAN-LOST "
           f"ALWAYS LOOKS no_episode_stamp")
     print(f"[self-test] {'PASS' if should_match_threads_args else 'FAIL'}  SESSION-57 PLAN-LOST "

@@ -176,6 +176,75 @@ def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
     return p
 
 
+def recovery_lines(recovery):
+    """Session 62: turn `control["recovery"]` (autopilot's `ExploreController.recovery_status`) into at
+    most two operator-readable lines describing WHERE we are in a loss episode.
+
+    The panel's bottom two rows used to carry the session-52 notice/planner-event block, which the
+    operator judged uninformative in the situation that matters most -- a plan going stale, with three
+    FALLBACK episodes flown and no way to tell the phases apart on screen. So during a loss episode
+    these lines take that space, and the notice block returns the moment the episode ends (it is not
+    deleted, only outranked -- it is still the only surfacing of a timeout/forced-escape).
+
+    NO SILENT FALLBACK: a phase with no clock deadline is NOT drawn with an invented one (`limit_s` is
+    None and the elapsed time is shown bare), and an unknown/absent phase says so rather than guessing.
+    Returns [] for None, so the caller falls through to the notice block."""
+    if not recovery:
+        return []
+    phase = recovery.get("phase")
+    el, lim = recovery.get("elapsed_s"), recovery.get("limit_s")
+    if el is None:
+        clock = ""
+    elif lim is None:
+        clock = f" {el:.1f}s"
+    else:
+        clock = f" {el:.1f}/{lim:.0f}s"
+    cyc = recovery.get("cycle") or 0
+
+    if phase is None:
+        # In a loss episode but the sweep has not been entered yet -- this is the grace hold.
+        grace = recovery.get("grace_s")
+        lost = recovery.get("loss_elapsed_s")
+        head = "LOSS GRACE" + (f" {lost:.1f}/{grace:.0f}s" if lost is not None and grace else "")
+        return [f"{head}  holding still before FALLBACK"]
+    if phase == "INITIAL_WAIT":
+        body = f"INITIAL_WAIT{clock}  letting a transient patch clear"
+    elif phase == "BACKOFF":
+        body = "BACKOFF  backing off to widen the view"
+    elif phase == "BACKOFF_WAIT":
+        body = f"BACKOFF_WAIT{clock}  looking for F_LKG from here"
+    elif phase == "TURN":
+        body = f"TURN  cycle {cyc}  cum {recovery.get('cum_deg') or 0:.0f}deg"
+    elif phase == "PUSH":
+        body = f"PUSH {recovery.get('push_dirn') or '--'}  cycle {cyc}"
+    elif phase == "WAIT_POST":
+        body = f"WAIT_POST{clock}  cycle {cyc}  settling after the push"
+    elif phase == "SERVO":
+        lost_s = recovery.get("servo_lost_s")
+        if lost_s is not None:
+            g = recovery.get("servo_lost_grace_s")
+            body = f"SERVO  match lost {lost_s:.1f}/{g:.1f}s  holding" if g else f"SERVO  match lost {lost_s:.1f}s"
+        else:
+            v = recovery.get("servo_verdict") or "--"
+            if v == "EQUAL":
+                body = (f"SERVO  EQUAL  held {recovery.get('servo_frames') or 0}"
+                        f"/{recovery.get('servo_hold_frames') or 0} solved frames")
+            elif v == "LIVE":
+                body = "SERVO  LIVE (too close) -> backing off"
+            elif v == "LKG":
+                body = "SERVO  LKG (too far) -> nudging forward"
+            else:
+                body = f"SERVO  {v}"
+    else:
+        body = f"{phase}{clock}"
+
+    lost = recovery.get("loss_elapsed_s")
+    lines = [f"FALLBACK  {body}"]
+    if lost is not None:
+        lines.append(f"          blind for {lost:.0f}s")
+    return lines[:2]
+
+
 def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     """Live autopilot telemetry — replaces the DA-V2 depth panel (removed 2026-07-07). Shows the
     FSM state (with time-in-state), current vs. desired (autopilot-locked) height, plan status,
@@ -276,6 +345,18 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     # WHY the FSM did something unusual without having to scroll the console log. Capped at 2
     # rendered lines total; a truncated tail gets a trailing "..." (NO SILENT FALLBACK would be
     # dropping the line with no indication more text existed).
+    # Session 62: during a LOSS EPISODE these two rows carry the recovery FSM's own position instead
+    # -- which phase of the FALLBACK ladder we are in, and how far through it. The operator flew three
+    # FALLBACK episodes unable to tell the phases apart on screen and judged the notice block useless in
+    # exactly that situation. The notice block is NOT removed, only outranked: it comes straight back the
+    # moment the episode ends, and it remains the only place a timeout/forced-escape is surfaced.
+    # Drawn CYAN so it reads as live state, distinct from the orange after-the-fact notice.
+    rec_lines = recovery_lines(control.get("recovery"))
+    if rec_lines:
+        for i, line in enumerate(rec_lines[:2]):
+            cv2.putText(panel, line, (8, 210 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
+        return panel
+
     notice_lines = []
     notice = control.get("notice")
     if notice is not None:
@@ -906,6 +987,59 @@ def run_self_test():
          f"missing={lkg_missing_txt61!r})",
          lkg_float_txt61 == "LKG=slam:42 age=1.4s" and lkg_none_txt61 == "LKG=none age=n/a"
          and lkg_missing_txt61 == "LKG=--")
+
+    # ---- SESSION-62 RECOVERY PANEL LINES -------------------------------------------------------
+    # The panel's bottom two rows carried the session-52 notice/planner-event block, which the operator
+    # judged useless in the one situation that matters most -- three FALLBACK episodes flown with no way
+    # to tell the ladder's phases apart on screen. During a loss episode those rows now carry the
+    # recovery FSM's own position. These cases pin that every phase renders something specific, that a
+    # phase with no clock deadline is not drawn with an invented one, and (load-bearing) that the notice
+    # block is only OUTRANKED, never removed.
+    _rl = recovery_lines
+    case("(62-1) recovery_lines(None) -> [] so the notice block still renders",
+         _rl(None) == [] and _rl({}) == [])
+    _phases = {
+        "INITIAL_WAIT": {"elapsed_s": 12.4, "limit_s": 20.0},
+        "BACKOFF": {"elapsed_s": 0.4, "limit_s": None},
+        "BACKOFF_WAIT": {"elapsed_s": 3.2, "limit_s": 5.0},
+        "TURN": {"cycle": 3, "cum_deg": 68},
+        "PUSH": {"push_dirn": "left", "cycle": 3},
+        "WAIT_POST": {"elapsed_s": 4.1, "limit_s": 10.0, "cycle": 3},
+        "SERVO": {"servo_verdict": "EQUAL", "servo_frames": 2, "servo_hold_frames": 3},
+    }
+    _all_named = True
+    for _ph, _extra in _phases.items():
+        _out = _rl(dict({"phase": _ph, "loss_elapsed_s": 30.0}, **_extra))
+        if not _out or _ph not in _out[0] and _ph not in ("SERVO",):
+            _all_named = False
+    case(f"(62-2) every FALLBACK phase renders a line naming itself ({len(_phases)} phases)", _all_named)
+    case("(62-3) a phase with NO clock deadline shows elapsed bare, never an invented limit "
+         "(BACKOFF: limit_s=None)",
+         "/" not in _rl({"phase": "BACKOFF", "elapsed_s": 0.4, "limit_s": None})[0])
+    case("(62-4) a phase WITH a deadline shows elapsed/limit",
+         "3.2/5s" in _rl({"phase": "BACKOFF_WAIT", "elapsed_s": 3.2, "limit_s": 5.0})[0])
+    case("(62-5) phase=None inside an episode is the pre-FALLBACK grace hold, not a blank",
+         "LOSS GRACE" in _rl({"phase": None, "loss_elapsed_s": 7.2, "grace_s": 12.0})[0])
+    _servo = {"phase": "SERVO", "servo_verdict": "EQUAL", "servo_frames": 2, "servo_hold_frames": 3}
+    case("(62-6) SERVO distinguishes a live verdict from a lost match",
+         "held 2/3" in _rl(_servo)[0]
+         and "match lost" in _rl(dict(_servo, servo_lost_s=0.8, servo_lost_grace_s=1.5))[0])
+    case("(62-7) never more than the 2 rows the panel has",
+         all(len(_rl(dict({"phase": _ph, "loss_elapsed_s": 99.0}, **_ex))) <= 2
+             for _ph, _ex in _phases.items()))
+    _ctrl_rec = {"state": "FALLBACK", "recovery": {"phase": "TURN", "cycle": 1, "cum_deg": 22,
+                                                   "loss_elapsed_s": 40.0},
+                 "notice": {"kind": "TIMEOUT", "age_s": 3.0, "text": "something"}}
+    _ctrl_no_rec = {"state": "ADVANCE", "recovery": None,
+                    "notice": {"kind": "TIMEOUT", "age_s": 3.0, "text": "something"}}
+    # Crop to the two NOTICE rows (y>=200) before colour-testing: the panel's own `PLAN STALE` row at
+    # y=102 is drawn in the same orange, so a whole-panel test would be measuring that instead.
+    _p_rec = render_telemetry_panel(_ctrl_rec, {})[200:, :]
+    _p_notice = render_telemetry_panel(_ctrl_no_rec, {})[200:, :]
+    case("(62-8) recovery OUTRANKS the notice block (cyan present, orange gone) and the notice "
+         "block returns when the episode ends (orange back)",
+         has_bgr(_p_rec, (255, 255, 0)) and not has_bgr(_p_rec, (0, 165, 255))
+         and has_bgr(_p_notice, (0, 165, 255)))
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

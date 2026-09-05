@@ -110,31 +110,53 @@ Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
 
 ## >>> IMMEDIATE NEXT <<<
 
-1. **FALLBACK reordering (agreed 2026-09-05, not yet built).** Insert a back-off + dwell between
-   `INITIAL_WAIT` and `TURN`, so the ladder becomes
-   `INITIAL_WAIT -> BACKOFF -> BACKOFF_WAIT -> TURN -> PUSH -> WAIT_POST -> TURN -> ...`. Rationale,
-   and it is the repo's own: session 60 deleted the 15° visual probe because *"rotating in place
-   cannot reproduce a view the drone has physically drifted away from"* (139 logs, 9.4 min exposure,
-   0 recoveries) — but that verdict was never applied to the FALLBACK sweep, which still turns 22.5°
-   FIRST and only then picks a push direction at random (backward is a 1-in-4 shot, by which point the
-   bearing F_LKG was captured on is gone). Backing off widens the view along the same bearing, the one
-   geometry where SIFT-vs-F_LKG can match. Expected trade: a fraction of the time cost, far fewer
-   stale plans. Notes for whoever builds it: the SERVO/SIFT gate at `autopilot.py:2212` already runs
-   on EVERY tick before the phase ladder, so the "let Visual Recovery try here" half needs **no new
-   wiring** — only a phase that dwells; reuse the existing `back_off` playbook recipe (no new maneuver
-   magnitudes); abort on `backwall_contact` exactly as the backward PUSH does; the dwell should exceed
-   `servo_min_window_s` (1.5 s) with margin; it is naturally once-per-episode because the ladder loops
-   back to `TURN`, never through `INITIAL_WAIT`; the two wedge-escalation bypasses
-   (`autopilot.py:2531`, `:2766`) should keep jumping straight to `TURN` since they arrive *because*
-   repeated back-offs already failed; and the self-test at `:8032` asserts FALLBACK reaches
-   `WAIT_POST` inside a 5 s simulated window, so it will need updating.
-2. **Review the session-61 panel watch list against the three 2026-09-05 flights.** Session 61 is
+1. **Parallax-push measurement (agreed 2026-09-05; steps 1-2 are the next work).** An
+   operator-reported corner trap opened this: blocked behind and to the left, the drone loops
+   orient -> parallax push -> hits the wall -> gets straightened by it -> PLAN-LOST for ~1 min ->
+   repeat, until the goal is blacklisted; a new goal in the same area is then picked (legitimately --
+   the distance is reasonable) and the loop resumes.
+   `PARALLAX_PUSH` already closes the loop on measured displacement for the BACKWARD push
+   (`traveled >= parallax_push_dist`, `autopilot.py:4635`) -- but the gate almost never fires:
+   **121 of 124 backward pushes across seven 2026-09-05 flights ended on the `parallax_push_s: 2.0`
+   safety timer**, median measured displacement **~0.07u against the 0.5u target** (best ever: 0.487u,
+   once). Strafes and the D2 `reposition_fwd` escape are timed holds by design and check nothing.
+   Reconstructed from the timeline's `pos` field, because `traveled` is computed and then DISCARDED --
+   never logged, which is exactly step 1:
+   - free cycles drift **0.34-0.64u**; trapped cycles drift **0.05-0.18u** -- a 3-4x separation.
+   - per-push displacement separates worse: free 0.087-0.191 vs trapped 0.027-0.048 on the trap flight,
+     but `20260905_162522` had a NORMAL median of 0.052u, so the distributions overlap across flights.
+     **Net cycle drift is the better signal**, and it also gives SLAM more chances to deliver a pose.
+   - **6 of 11 pushes had only ONE distinct pose** (7 of 8 inside the trap): the measurement is
+     unavailable exactly when it is most needed. Any verdict must therefore be three-state --
+     moved / stuck / **unknown** -- and "unknown" must never be silently read as "didn't move"
+     (CLAUDE.md), or the drone will fly forward on the strength of a missing reading.
+   Agreed plan: **(1)** log `traveled` + the distinct-pose count on every push-done (event line +
+   timeline row), no behaviour change; **(2)** track net cycle drift and publish a three-state verdict
+   to the telemetry panel, to WATCH before anything acts on it; **(3)** only then trigger the EXISTING
+   guarded forward escape `reposition_fwd` (the D2 scrape guard, which aborts on
+   `forward_clearance_dist <= stop_clearance_dist`) rather than reviving the retired forward parallax
+   push -- with the threshold set from real logged data. Steps 1-2 next; **step 3 is not yet decided.**
+
+2. **FALLBACK reordering: BUILT + FLOWN 2026-09-05 — watch it.** The ladder is now
+   `INITIAL_WAIT -> BACKOFF -> BACKOFF_WAIT -> TURN -> PUSH -> WAIT_POST -> TURN -> ...`, once per
+   episode, aborting on `backwall_contact`. Flying it found and fixed two deeper bugs: `wants_visual_match`
+   had the SIFT matcher switched OFF during PLAN-STALE (40% of a FALLBACK episode -- the root cause of
+   SERVO never once working since session 60 built it), and the SERVO exit bailed on ONE bad sample
+   against an entry gate needing 3 over 1.5s (`servo_lost_grace_s` now mirrors the entry). Step 0b also
+   had to be re-sized: it first played the `back_off` recipe (reverse 0.2 for 0.3s, ~1/17th the sweep's
+   own backward push) and was invisible in flight; it now uses `fallback_push_fwd_back_s` at full
+   reverse. **Watch for:** `FALLBACK SERVO: held EQUAL for N solved frames` -- the intended give-up
+   path, which fired for the FIRST time ever on `20260905_155834`. If it becomes common, revisit whether
+   `servo_hold_frames: 3` (~38s at that flight's `slam_ms`) is too patient. Also watch the new telemetry
+   panel rows, and whether the back-off is now visible from the cockpit.
+
+3. **Review the session-61 panel watch list against the three 2026-09-05 flights.** Session 61 is
    flown but its items below were never checked off. Also unreviewed: `diag.ply_sequence` is ON and
    `OUTPUT/diag/20260905_113348_plyseq/` did fill — the marker-stability check was never run.
-3. **Read the timing report after every flight from now on** — `fly.py` now passes `--log`, so the
+4. **Read the timing report after every flight from now on** — `fly.py` now passes `--log`, so the
    CSV always exists. `venv\Scripts\python.exe perception_timing_report.py` (no argument = newest).
-4. **Decide on a choke cure** using the ranked stages above. Nothing is committed to yet.
-5. **Housekeeping, offered and not yet done:** three July orphan flights (`20260720_133111`,
+5. **Decide on a choke cure** using the ranked stages above. Nothing is committed to yet.
+6. **Housekeeping, offered and not yet done:** three July orphan flights (`20260720_133111`,
    `_135245`, `_135307`) still trip `fly.py`'s crash-recovery prompt at every launch. Moving them to
    `OUTPUT/diag/_orphans_2026-07/` silences it permanently and reversibly — the detector globs that
    directory non-recursively.

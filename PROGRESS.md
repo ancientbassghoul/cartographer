@@ -12,6 +12,57 @@ for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **62b — FALLBACK reordering, and the reason SERVO never worked** (four flights, 2026-09-05
+  afternoon). The operator asked for a small change: back off BEFORE the sweep starts turning, and let
+  the SIFT matcher look from there. It turned out to be the repo's own argument -- session 60 deleted
+  the 15-degree visual probe because *"rotating in place cannot reproduce a view the drone has
+  physically drifted away from"* (139 logs, 9.4 min exposure, 0 recoveries), but never applied that
+  verdict to the FALLBACK sweep, which still turned 22.5 degrees first and only then picked a push
+  direction at random. So the ladder gained `BACKOFF -> BACKOFF_WAIT` between `INITIAL_WAIT` and
+  `TURN`, once per episode, aborting on `backwall_contact`.
+  The first flight with it showed the back-off firing and finding nothing -- and the log said why. The
+  visual matcher was **switched off** during PLAN-STALE: `wants_visual_match` was written in session 57
+  for its two consumers of the day, session 60 then added a third (the sweep's SIFT tally and SERVO),
+  and nobody revisited the gate, so under PLAN-STALE the only permission was a one-shot ticket spent on
+  the episode's first tick. FALLBACK flaps between PLAN-STALE and PLAN-LOST constantly; the log showed
+  `plan status: PLAN-STALE` and `FALLBACK SERVO: match lost` in the *same millisecond*, four times over.
+  SERVO had been reading a sensor that was dark 40% of the time (52.0s of a 130.8s episode) since the
+  day it was built -- which is why it had never once been seen working. Second bug found alongside it:
+  entry needed 3 confident verdicts spanning 1.5s, the exit needed ONE bad sample, against a signal that
+  was 124-UNKNOWN to 99-confident that flight. Fixed both -- PLAN-STALE now looks past the same 12s
+  grace PLAN-LOST already used (still gated to a loss episode, so session 51's ~380-wasted-matches
+  removal stands), and `servo_lost_grace_s` makes the exit as patient as the entry.
+  Result on the next flight: SERVO episodes went from 0.013-7.2s (4 of 4 ending on "match lost") to
+  3.9s and 17.3s, and `held EQUAL for 3 solved frames, no recovery -> resume sweep` -- the intended
+  give-up path -- **fired for the first time in the project's history**.
+  The operator then reported not being able to SEE the back-off. Correct: step 0b had been wired to the
+  `back_off` playbook recipe, which is `reverse 0.7 for 0.3s` scaled by `reverse_throttle: 0.2`, about a
+  seventeenth of the impulse of the sweep's own backward push. Right instinct (reuse an existing recipe,
+  invent no new magnitude), wrong recipe -- `back_off` is sized for "ADVANCE crept too close, ease off".
+  It now uses the sweep's own backward-push parameters instead.
+  Also: the telemetry panel's bottom two rows carried the session-52 notice block, which the operator
+  judged useless in exactly the situation that matters. During a loss episode they now carry the
+  recovery FSM's own position (`ExploreController.recovery_status` over `TOPIC_CONTROL`) -- which phase
+  of the ladder, how far through it, and the SERVO verdict. The notice block is outranked, not removed,
+  and returns the moment the episode ends.
+  One session-57 self-test was deliberately retired: it asserted PLAN-STALE looked only through the
+  one-shot, which was that session's *scope* (its own comment said so), not a safety property. Replaced
+  with three stronger assertions, one of which is what now protects session 51's cost discipline.
+- **Parallax push measurement, opened not closed.** Investigating an operator-reported corner trap
+  (blocked behind and left; orient -> push -> hit wall -> plan lost -> repeat -> goal blacklisted -> a
+  new goal in the same area -> same loop) turned up that `PARALLAX_PUSH` *does* close the loop on
+  measured displacement for the backward push (`traveled >= parallax_push_dist`), but that the gate
+  essentially never fires: across four flights, **47 backward pushes, 121 of 124 across seven flights
+  ending on the 2.0s safety timer**, median measured displacement **~0.07u against a 0.5u target**.
+  Reconstructing per-push motion from the timeline's `pos` field showed the trap clearly -- free cycles
+  drift 0.34-0.64u, trapped cycles 0.05-0.18u -- but also that per-push displacement overlaps too much
+  between flights to be a safe trigger on its own, and that 6 of 11 pushes had only ONE distinct pose
+  (7 of 8 inside the trap), so the measurement is frequently unavailable exactly when it is most
+  needed. `traveled` is computed and then discarded -- never logged. Next step agreed: log it, track net
+  cycle drift with an explicit three-state verdict (moved / stuck / unknown), and only then consider
+  triggering the EXISTING guarded forward escape (`reposition_fwd`, the D2 scrape guard) rather than
+  reviving the retired forward parallax push.
+
 - **62 (flown 2026-09-05 11:33-12:08, `OUTPUT/diag/20260905_113346_*`)** — A proposal came in to split
   `Pipeline` into a tracking thread and a background mapping thread, on the theory that CPU-side
   `MapStore.integrate()` / `GroundGrid.integrate()` is what progressively slows the pipeline as the

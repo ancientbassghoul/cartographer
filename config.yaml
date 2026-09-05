@@ -486,6 +486,19 @@ autonomy:
     #     operator: "continue forever ... either it'd recover, or I'd stop it manually"; see the SERVO phase
     #     below instead, which is what actually ends a sweep early on a recovered view). ---
     fallback_initial_wait_s: 20.0    # step 0: let a transient stale patch clear on its own before doing anything invasive
+    # Session 62: step 0b -- BACK OFF once before the sweep starts turning, then DWELL there so the
+    #   SIFT matcher gets a fair look from the widened viewpoint. Session 60's own finding was that
+    #   rotating in place cannot reproduce a view the drone has physically drifted away from (139
+    #   logs, 9.4 min of exposure, 0 recoveries) -- but that verdict was only ever applied to the
+    #   15-degree probe it deleted, NOT to this sweep, which still TURNS first and only then picks a
+    #   push direction at random (backward is 1-in-4, and by then the bearing F_LKG was captured on
+    #   is gone). Backing off widens the view along the SAME bearing -- the one geometry in which
+    #   SIFT-vs-F_LKG can actually match -- for a fraction of a sweep's time cost.
+    fallback_backoff_first: true     # step 0b: play the back_off recipe once, before the first TURN
+    fallback_backoff_wait_s: 5.0     # dwell after that back-off so the SERVO tally can mature there.
+                                     #   Derived from the servo's OWN gates (servo_min_window_s 1.5s at
+                                     #   servo_min_samples 3 confident verdicts) with margin -- not from
+                                     #   any measured flight, and carries no room-specific answer.
     fallback_post_push_wait_s: 10.0  # step 3: settle after each push, BLIND fixed wait (a genuine recovery to status==OK
                                      #   exits the sweep immediately regardless, via the generic recovery convergence -- this
                                      #   wait is only ever fully spent while still genuinely stale)
@@ -508,6 +521,15 @@ autonomy:
     servo_min_samples: 3      # confident verdicts required in that window (UNKNOWN never counts)
     servo_hold_frames: 3      # SLAM frames CAPTURED at the held EQUAL pose that must be SOLVED before
                               #   giving up and resuming the sweep
+    # Session 62 (flight 20260905_141148): SERVO entered FOUR times and every single one died on
+    #   "match lost" -- one at 0.013s, i.e. a single tick. Entry needs 3 confident verdicts spanning
+    #   1.5s; the exit needed ONE bad sample, and UNKNOWN was the MAJORITY verdict that flight (124
+    #   UNKNOWN vs 99 confident). `servo_hold_frames` never once fired because nothing survived long
+    #   enough to reach it. This grace makes the exit as patient as the entry.
+    servo_lost_grace_s: 1.5   # a lost/UNKNOWN match must persist this long before SERVO abandons and
+                              #   resumes the sweep. Mirrors servo_min_window_s deliberately: the same
+                              #   evidence window in both directions. Holds still while it waits, and a
+                              #   single confident verdict inside the window clears it outright.
     # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
     #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are
