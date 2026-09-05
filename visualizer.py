@@ -176,6 +176,26 @@ def render_frame_panel(frame, w=PANEL_W, h=PANEL_H):
     return p
 
 
+def push_lines(push):
+    """Session 62: one line describing what the last PARALLAX_PUSH achieved, for the telemetry panel.
+
+    Watch-only -- nothing in the autopilot branches on this verdict yet; it is here so the operator can
+    see whether the stuck/moved call would have been right before it is wired to anything. NO SILENT
+    FALLBACK: `unknown` (SLAM gave too few distinct poses to judge) renders as its own word, never as
+    `stuck` -- the two mean completely different things and only one of them justifies a reaction."""
+    if not push:
+        return []
+    v = push.get("verdict") or "--"
+    t = push.get("traveled")
+    d = push.get("drift")
+    t_txt = "--" if t is None else f"{t:.2f}u"
+    d_txt = "--" if d is None else f"{d:.2f}u"
+    run = push.get("stuck_run") or 0
+    tail = f"  x{run}" if v == "stuck" and run > 1 else ""
+    return [f"PUSH {push.get('dir') or '--'} {push.get('why') or '--'}: moved {t_txt} "
+            f"drift {d_txt} ({push.get('poses') or 0}p) -> {v}{tail}"]
+
+
 def recovery_lines(recovery):
     """Session 62: turn `control["recovery"]` (autopilot's `ExploreController.recovery_status`) into at
     most two operator-readable lines describing WHERE we are in a loss episode.
@@ -351,10 +371,23 @@ def render_telemetry_panel(control, plan, w=PANEL_W, h=PANEL_H):
     # exactly that situation. The notice block is NOT removed, only outranked: it comes straight back the
     # moment the episode ends, and it remains the only place a timeout/forced-escape is surfaced.
     # Drawn CYAN so it reads as live state, distinct from the orange after-the-fact notice.
+    # Session 62 priority for these two rows, highest first: an active loss episode (where we are in the
+    # recovery ladder) > the last parallax push's measurement (watch-only) > the session-52 notice block.
+    # Each outranks the next only while it has something to say, so nothing is permanently hidden.
     rec_lines = recovery_lines(control.get("recovery"))
     if rec_lines:
         for i, line in enumerate(rec_lines[:2]):
             cv2.putText(panel, line, (8, 210 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
+        return panel
+
+    psh_lines = push_lines(control.get("push"))
+    if psh_lines:
+        # Amber for `stuck`, plain white otherwise -- a verdict worth noticing should look different from
+        # a routine one, but `unknown` must NOT borrow the alarm colour (it is an absence of evidence).
+        _stuck = (control.get("push") or {}).get("verdict") == "stuck"
+        for i, line in enumerate(psh_lines[:2]):
+            cv2.putText(panel, line, (8, 210 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (0, 200, 255) if _stuck else (200, 200, 200), 1)
         return panel
 
     notice_lines = []
@@ -1040,6 +1073,34 @@ def run_self_test():
          "block returns when the episode ends (orange back)",
          has_bgr(_p_rec, (255, 255, 0)) and not has_bgr(_p_rec, (0, 165, 255))
          and has_bgr(_p_notice, (0, 165, 255)))
+
+    # ---- SESSION-62 PUSH MEASUREMENT ROW -------------------------------------------------------
+    _pl = push_lines
+    case("(62-9) push_lines(None) -> [] so the notice block still renders",
+         _pl(None) == [] and _pl({}) == [])
+    _pmoved = {"dir": "backward", "why": "timer", "traveled": 0.106, "drift": 0.400,
+               "poses": 3, "verdict": "moved", "stuck_run": 0}
+    _pstuck = {"dir": "backward", "why": "timer", "traveled": 0.034, "drift": 0.048,
+               "poses": 4, "verdict": "stuck", "stuck_run": 3}
+    _punk = {"dir": "backward", "why": "timer", "traveled": None, "drift": None,
+             "poses": 1, "verdict": "unknown", "stuck_run": 0}
+    case("(62-10) each verdict renders its own word, and unknown shows `--` rather than a fake 0.00",
+         "moved" in _pl(_pmoved)[0] and "stuck" in _pl(_pstuck)[0]
+         and "unknown" in _pl(_punk)[0] and "--" in _pl(_punk)[0])
+    case("(62-11) a repeated stuck verdict shows its run count",
+         "x3" in _pl(_pstuck)[0] and "x" not in _pl(_pmoved)[0].split("->")[-1])
+    _c_push = {"state": "SETTLE", "recovery": None, "push": _pstuck,
+               "notice": {"kind": "TIMEOUT", "age_s": 3.0, "text": "something"}}
+    _c_rec = {"state": "FALLBACK", "push": _pstuck,
+              "recovery": {"phase": "TURN", "cycle": 1, "cum_deg": 22, "loss_elapsed_s": 40.0}}
+    _rows_push = render_telemetry_panel(_c_push, {})[200:, :]
+    _rows_rec = render_telemetry_panel(_c_rec, {})[200:, :]
+    case("(62-12) push row outranks the notice block, and an active loss episode outranks the push row",
+         has_bgr(_rows_push, (0, 200, 255)) and not has_bgr(_rows_push, (0, 165, 255))
+         and has_bgr(_rows_rec, (255, 255, 0)) and not has_bgr(_rows_rec, (0, 200, 255)))
+    case("(62-13) `unknown` does NOT borrow the stuck alarm colour (absence of evidence is not alarm)",
+         not has_bgr(render_telemetry_panel({"state": "SETTLE", "recovery": None, "push": _punk},
+                                            {})[200:, :], (0, 200, 255)))
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

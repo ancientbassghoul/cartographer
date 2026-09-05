@@ -110,33 +110,27 @@ Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
 
 ## >>> IMMEDIATE NEXT <<<
 
-1. **Parallax-push measurement (agreed 2026-09-05; steps 1-2 are the next work).** An
-   operator-reported corner trap opened this: blocked behind and to the left, the drone loops
-   orient -> parallax push -> hits the wall -> gets straightened by it -> PLAN-LOST for ~1 min ->
-   repeat, until the goal is blacklisted; a new goal in the same area is then picked (legitimately --
-   the distance is reasonable) and the loop resumes.
-   `PARALLAX_PUSH` already closes the loop on measured displacement for the BACKWARD push
-   (`traveled >= parallax_push_dist`, `autopilot.py:4635`) -- but the gate almost never fires:
-   **121 of 124 backward pushes across seven 2026-09-05 flights ended on the `parallax_push_s: 2.0`
-   safety timer**, median measured displacement **~0.07u against the 0.5u target** (best ever: 0.487u,
-   once). Strafes and the D2 `reposition_fwd` escape are timed holds by design and check nothing.
-   Reconstructed from the timeline's `pos` field, because `traveled` is computed and then DISCARDED --
-   never logged, which is exactly step 1:
-   - free cycles drift **0.34-0.64u**; trapped cycles drift **0.05-0.18u** -- a 3-4x separation.
-   - per-push displacement separates worse: free 0.087-0.191 vs trapped 0.027-0.048 on the trap flight,
-     but `20260905_162522` had a NORMAL median of 0.052u, so the distributions overlap across flights.
-     **Net cycle drift is the better signal**, and it also gives SLAM more chances to deliver a pose.
-   - **6 of 11 pushes had only ONE distinct pose** (7 of 8 inside the trap): the measurement is
-     unavailable exactly when it is most needed. Any verdict must therefore be three-state --
-     moved / stuck / **unknown** -- and "unknown" must never be silently read as "didn't move"
-     (CLAUDE.md), or the drone will fly forward on the strength of a missing reading.
-   Agreed plan: **(1)** log `traveled` + the distinct-pose count on every push-done (event line +
-   timeline row), no behaviour change; **(2)** track net cycle drift and publish a three-state verdict
-   to the telemetry panel, to WATCH before anything acts on it; **(3)** only then trigger the EXISTING
-   guarded forward escape `reposition_fwd` (the D2 scrape guard, which aborts on
-   `forward_clearance_dist <= stop_clearance_dist`) rather than reviving the retired forward parallax
-   push -- with the threshold set from real logged data. Steps 1-2 next; **step 3 is not yet decided.**
+1. **>>> MAKE SLAM FAST AGAIN <<< — the operator's declared #1, everything else is nice-to-have.**
+   Flight `20260905_184034` is the sharpest evidence yet: `slam_ms` median **425ms** in minutes 0-5 vs
+   **23 816ms** in minutes 20-25 (a 56x degradation), of which **`backend_ms` is 19 851ms — 83%**.
+   RELOC median 7 284ms, backend 6 288 (86%). FALLBACK is NOT the problem: it recovered a 6-minute
+   plan-stale and, on a 10.5-minute one, handed SLAM good viewpoints that SLAM simply never solved.
+   The ranked cures are in the SLAM CHOKE section above (Stage A = `_run_backend()` off the
+   frame-critical path, 55%; the cheap `map_pub_ms`/`topdown_summary` fix, 4.6%; Stage B = decouple
+   `TOPIC_PLAN` from the SLAM cadence; Stage C = the original thread split, 3.3%). A plan for this is
+   the next thing to write.
 
+2. **Parallax-push measurement: BUILT (watch-only) and PARKED at step 3.** Steps 1-2 are in:
+   `traveled`, net cycle drift, distinct-pose count and a three-state verdict (moved / stuck /
+   **unknown**) now ride the push-done event, the timeline row and the telemetry panel. Threshold is a
+   fraction of `parallax_push_dist` (`push_stuck_drift_frac: 0.4`), never an absolute, since SLAM units
+   have no metric scale. **Nothing acts on the verdict.** Validation: replaying the operator's corner
+   trap gives three consecutive `stuck` verdicts on exactly the looping cycles and none on the free
+   ones; flight `20260905_184034` was a clean negative control (13 moved, 7 unknown, **zero stuck** on a
+   flight where the drone was never trapped). Caveat seen once: a `drift 6.245u` reading, almost
+   certainly a RELOC pose jump rather than real motion -- if step 3 is ever built, drift must be robust
+   to that. **Step 3 (trigger the existing guarded forward escape `reposition_fwd`) is deliberately NOT
+   built** — operator's call: slow SLAM outranks it.
 2. **FALLBACK reordering: BUILT + FLOWN 2026-09-05 — watch it.** The ladder is now
    `INITIAL_WAIT -> BACKOFF -> BACKOFF_WAIT -> TURN -> PUSH -> WAIT_POST -> TURN -> ...`, once per
    episode, aborting on `backwall_contact`. Flying it found and fixed two deeper bugs: `wants_visual_match`

@@ -12,6 +12,25 @@ for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **62c — parallax push measurement (watch-only), then parked.** `traveled` was computed at the
+  push-done gate and discarded, so "did that push achieve anything?" could only be answered by
+  reconstructing `pos` out of the timeline. It is now logged (event line + timeline row + telemetry
+  panel) alongside net cycle drift, the distinct-pose count, and a THREE-state verdict:
+  moved / stuck / **unknown**. The third state is load-bearing -- 6 of 11 pushes on the trap flight
+  delivered a single SLAM pose, and reading those as "didn't move" is what would eventually fly the
+  drone forward on a missing measurement. Threshold is a FRACTION of `parallax_push_dist`, never an
+  absolute, because SLAM units carry no metric scale. Replaying the operator's corner trap through the
+  logic gives three consecutive `stuck` verdicts on exactly the looping cycles and none on the free
+  ones; the next flight (`20260905_184034`) was a clean negative control -- 13 moved, 7 unknown, zero
+  stuck, on a flight where the drone was never actually trapped. Step 3 (triggering the existing
+  guarded forward escape `reposition_fwd`) is deliberately NOT built: the operator's call is that slow
+  SLAM is the number-one problem and this is a nice-to-have.
+- **The choke, confirmed again and worse.** Flight `20260905_184034`: `slam_ms` median 425ms in minutes
+  0-5 and **23 816ms in minutes 20-25** -- a 56x degradation -- of which `backend_ms` is **19 851ms
+  (83%)**. RELOC median 7 284ms, backend 6 288 (86%). `track_ms` also grew 417 -> 4 115ms. FALLBACK
+  itself performed well (a 6-minute plan-stale recovered; a 10.5-minute one handed SLAM good viewpoints
+  and SLAM simply never solved them), so the next work is SLAM speed, not recovery logic.
+
 - **62b — FALLBACK reordering, and the reason SERVO never worked** (four flights, 2026-09-05
   afternoon). The operator asked for a small change: back off BEFORE the sweep starts turning, and let
   the SIFT matcher look from there. It turned out to be the repo's own argument -- session 60 deleted

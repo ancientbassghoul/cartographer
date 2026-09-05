@@ -93,7 +93,8 @@ def _full_vector(active: dict, seq: int, now: float, state: str,
                  slam_hold: dict | None = None,
                  notice: dict | None = None,
                  visrec_lkg: dict | None = None,
-                 recovery: dict | None = None) -> dict:
+                 recovery: dict | None = None,
+                 push: dict | None = None) -> dict:
     v = {"seq": seq, "mono_ts": now, "state": state}
     v.update(_NEUTRAL)
     v.update(active or {})
@@ -121,6 +122,9 @@ def _full_vector(active: dict, seq: int, now: float, state: str,
     # telemetry panel can SAY which recovery phase we are in instead of leaving the operator to
     # infer it from the console log. Same always-present convention as the three fields above.
     v["recovery"] = recovery
+    # Session 62: the last parallax push's measurement, so the operator can WATCH the stuck/moved
+    # verdict accumulate before anything is wired to act on it. Same always-present convention.
+    v["push"] = push
     return v
 
 
@@ -167,7 +171,7 @@ def _timeline_goals(plan: dict, leg_goal=None) -> list:
 
 
 def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan: dict, cmd=None,
-                          leg_goal=None, plan_age_s=None, alt=None, visrec=None) -> dict:
+                          leg_goal=None, plan_age_s=None, alt=None, visrec=None, push=None) -> dict:
     """One structured replay record per explore step. Pose/heading/slam come straight off the plan payload
     (perception_worker._plan_payload, published ~2 Hz on a SLAM-paced pose), but the GOAL fields reflect
     what the CONTROLLER is actually doing: `goal` is the committed `leg_goal` (what "goal reached" is
@@ -197,6 +201,11 @@ def _timeline_step_record(t_wall, t_mono, rec_frame, state, event, status, plan:
         # total rays, fraction, closest/farthest, the min_hit_fraction vote outcome) -> the replay's
         # Clearance tab, so a "ring blocked" call is auditable instead of re-derived by hand.
         "clearance_detail": g("clearance_detail"),
+        # Session 62: what the last PARALLAX_PUSH actually achieved -- measured displacement, net drift
+        # across the cycle, how many DISTINCT SLAM poses backed the measurement, and the three-state
+        # verdict. `traveled` used to be computed at the push-done gate and thrown away, so answering
+        # "did that push do anything?" meant reconstructing `pos` out of this very file after the fact.
+        "push": push,
         # GOAL = the controller's committed leg_goal (acted-on); plan_goal = perception's async pick.
         "goal": ([round(float(leg_goal[0]), 4), round(float(leg_goal[1]), 4)] if leg_goal is not None else None),
         "plan_goal": g("goal"), "dist_to_goal": dist_to_goal, "plan_bearing_err": g("bearing_err"),
@@ -1351,6 +1360,9 @@ class ExploreController:
         # (legacy forward push magnitude; forward push retired -> backward/strafe only. Kept for compat.)
         self.parallax_push_throttle = float(e.get("parallax_push_throttle", 0.4))
         self.parallax_max_pushes = int(e.get("parallax_max_pushes", 8))
+        # Session 62 (watch-only -- nothing acts on these yet; see config.yaml for the flight evidence).
+        self.push_stuck_drift_frac = float(e.get("push_stuck_drift_frac", 0.4))
+        self.push_min_poses = int(e.get("push_min_poses", 2))
         # STRAFE recipe (platform control dynamic, manually calibrated by the operator): joy_horizontal is a
         # strafe axis (+1 right / -1 left); strafe is the most RESPONSIVE axis (near-zero warm-up) so a short
         # TIMED hold gives a reliable slight scoot (SLAM barely resolves 0.5u of a brief lateral move, so a
@@ -1386,6 +1398,15 @@ class ExploreController:
         self._push_dir = None                # active push axis: "forward"|"backward" (prelude nudge/calib-translate)
                                              #   or "backward"|"strafe_left"|"strafe_right" (PARALLAX_PUSH; never forward)
         self._push_start_pos = None          # SLAM pos at the start of the current push (distance gauge)
+        # Session 62 (watch-only): `traveled` was computed at the push-done gate and then DISCARDED, so
+        # "did that push achieve anything?" could only be answered by reconstructing `pos` out of the
+        # timeline after the fact. These carry the measurement instead. `_push_poses` counts DISTINCT
+        # poses seen during the push -- without it a frozen SLAM pose is indistinguishable from a drone
+        # pinned against a wall, and both read as zero displacement.
+        self._push_poses = []                # distinct SLAM poses observed during the current push
+        self._prev_push_start_pos = None     # previous push's start pose -> net drift across a whole cycle
+        self._last_push = None               # dict | None: the last completed push's measurement
+        self._push_stuck_run = 0             # consecutive "stuck" verdicts (the loop the operator reported)
         # A full give-up (backward AND both sides blocked) latches here so the NEXT direction pick (this leg's
         # re-ORIENT or a fresh PARALLAX_PUSH) doesn't immediately retry the same doomed backward push just
         # because the ring still (falsely) reads it as open. Cleared once the drone has moved
@@ -1427,6 +1448,10 @@ class ExploreController:
         self._push_dir = None
         self._push_after_reposition = None   # D2: the strafe dir queued behind a forward-reposition (scrape guard)
         self._push_start_pos = None
+        self._push_poses = []                # session 62: a new leg measures from scratch
+        self._prev_push_start_pos = None
+        self._last_push = None
+        self._push_stuck_run = 0
         self._after_orient = "ADVANCE"
         self._backoff_t0 = None
         self._fallback_retreat_forward = None
@@ -1648,6 +1673,62 @@ class ExploreController:
         if self._recovering:
             return
         self.command_history.append({"kind": kind, "value": float(value), "duration_s": float(max(0.0, duration))})
+
+    def _push_note_pose(self, plan):
+        """Session 62: record a DISTINCT SLAM pose seen during the current push. Distinctness is the
+        whole point -- `pos` only changes when SLAM solves a frame, so a pinned drone and a frozen
+        tracker both report zero displacement, and only the count of distinct poses separates them."""
+        pos = plan.get("pos")
+        if pos is None:
+            return
+        if not self._push_poses or self._push_poses[-1] != pos:
+            self._push_poses.append(list(pos))
+
+    def _push_begin(self, plan):
+        """Session 62: stamp the start of a push and roll the previous start forward, so the NEXT
+        completed push can report net drift across a whole orient->push->advance cycle."""
+        self._prev_push_start_pos = self._push_start_pos
+        self._push_start_pos = plan.get("pos")
+        self._push_poses = []
+        self._push_note_pose(plan)
+
+    def _push_finish(self, dirn, why, now):
+        """Session 62: measure what the push actually achieved, latch it for the telemetry panel and
+        the timeline, and return a short suffix for the event line.
+
+        WATCH-ONLY -- no caller branches on the verdict yet; it exists so the threshold can be chosen
+        from logged flight data instead of guessed at. Three states, never two: a push that SLAM could
+        not observe is `unknown`, NOT `stuck` (CLAUDE.md -- collapsing those would send the drone
+        forward on the strength of a missing reading). `drift` is measured between consecutive push
+        STARTS, which the 2026-09-05 timelines show separating a trapped cycle from a free one far
+        better than the per-push distance does, and which also gives SLAM more chances to deliver a
+        pose."""
+        n = len(self._push_poses)
+        traveled = (self._dist(self._push_poses[-1], self._push_poses[0]) if n >= 2 else None)
+        drift = self._dist(self._push_start_pos, self._prev_push_start_pos)
+        limit = self.push_stuck_drift_frac * self.parallax_push_dist
+        if n < self.push_min_poses:
+            verdict = "unknown"          # SLAM never gave us two poses -- we genuinely do not know
+        elif drift is None:
+            verdict = "unknown"          # first push of the leg: no previous start to compare against
+        elif drift < limit:
+            verdict = "stuck"
+        else:
+            verdict = "moved"
+        self._push_stuck_run = (self._push_stuck_run + 1) if verdict == "stuck" else (
+            0 if verdict == "moved" else self._push_stuck_run)
+        self._last_push = {
+            "dir": dirn, "why": why, "dur_s": round(now - self.t_state, 2),
+            "traveled": (None if traveled is None else round(traveled, 3)),
+            "drift": (None if drift is None else round(drift, 3)),
+            "poses": n, "verdict": verdict, "stuck_run": self._push_stuck_run,
+            "limit": round(limit, 3),
+        }
+        t_txt = "--" if traveled is None else f"{traveled:.3f}u"
+        d_txt = "--" if drift is None else f"{drift:.3f}u"
+        return (f" [moved {t_txt} of {self.parallax_push_dist:.2f}u | cycle drift {d_txt} "
+                f"vs {limit:.2f}u | {n} pose(s) -> {verdict}"
+                + (f", {self._push_stuck_run} in a row" if self._push_stuck_run > 1 else "") + "]")
 
     def _log_move_push(self, dirn, duration):
         """Log a completed PARALLAX_PUSH translation into the command history (backward -> reverse; strafe ->
@@ -4567,7 +4648,7 @@ class ExploreController:
                     event = pick_event
                 if self._push_dir is not None:
                     self._push_count += 1
-                    self._push_start_pos = plan.get("pos")
+                    self._push_begin(plan)          # session 62: measure this push
             if self.state == "PARALLAX_PUSH":    # still pushing (didn't bail to SETTLE above)
                 if self._push_dir == "backward":
                     active = dict(self.pb.recipe("back_off")[0])   # reverse magnitude, held continuously
@@ -4586,11 +4667,12 @@ class ExploreController:
                     # exactly as ADVANCE already did -- without this guard the forced hop could never survive its
                     # own push (see the _enter() note above; flight 20260901_112227).
                     self._log_move_push(self._push_dir, now - self.t_state)
+                    measured = self._push_finish(self._push_dir, "slam_slow", now)   # session 62
                     self._push_dir = None
                     self._settle_to = "REPLAN"
                     return self._enter_slam_hold("SETTLE", now,
-                                                 f"parallax push: SLAM slow ({self._slam_ms_latest:.0f}ms) -> "
-                                                 "hold to settle -> replan")
+                                                 f"parallax push: SLAM slow ({self._slam_ms_latest:.0f}ms)"
+                                                 f"{measured} -> hold to settle -> replan")
                 if self._push_dir == "reposition_fwd":
                     # D2: run the forward escape for strafe_reposition_fwd_s (or until the forward raycast says a
                     # wall got close), then HAND OFF to the queued strafe from the roomier position (no settle).
@@ -4601,7 +4683,7 @@ class ExploreController:
                         self._log_move("forward", float(self.forward_preset.get("trigger", 0.0)), now - self.t_state)
                         self._push_dir = self._push_after_reposition
                         self._push_after_reposition = None
-                        self._push_start_pos = plan.get("pos")
+                        self._push_begin(plan)      # session 62: the strafe is its own measured push
                         self._enter("PARALLAX_PUSH", now)          # reset the phase timer for the strafe hold
                         return {}, "PARALLAX_PUSH", (f"reposition forward done "
                                                      f"({'wall-close' if rep_blocked else 'timer'}) -> "
@@ -4628,10 +4710,11 @@ class ExploreController:
                                               "back/left/right either -> settle -> replan")
                     self._push_dir = new_dir
                     self._push_after_reposition = new_after_repo
-                    self._push_start_pos = plan.get("pos")
+                    self._push_begin(plan)      # session 62: the retry is its own measured push
                     self._enter("PARALLAX_PUSH", now)          # reset the phase timer for the new direction
                     ev = pick_event or f"strafe {new_dir}"
                     return {}, "PARALLAX_PUSH", f"parallax backward blocked ({why_blocked}) -> {ev}"
+                self._push_note_pose(plan)      # session 62: distinct poses, for the verdict below
                 traveled = self._dist(plan.get("pos"), self._push_start_pos)
                 if self._push_dir == "backward":
                     far, far_why = (traveled is not None and traveled >= self.parallax_push_dist), "dist"
@@ -4648,10 +4731,11 @@ class ExploreController:
                     # are visible. (Whether to actually emit a bump here is a deferred behavior decision.)
                     if blocked and self.leg_goal is not None:
                         self._missed_bump = f"parallax {dirn} push blocked by obstacle (this path emits no bump)"
+                    measured = self._push_finish(dirn, why, now)
                     self._push_dir = None
                     self._settle_to = "REPLAN"
                     self._enter("SETTLE", now)
-                    event = f"parallax {dirn} push done ({why}) -> settle -> replan"
+                    event = f"parallax {dirn} push done ({why}){measured} -> settle -> replan"
 
         elif st == "SETTLE":
             # Two-gate settle (session 24): a settle that will fly TOWARD A GOAL (nxt REPLAN/REVERSE_PROBE/…)
@@ -5520,7 +5604,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                         _full_vector(active, seq, now, state, ctrl.target_altitude_y,
                                     state_since_s=now - ctrl.t_state,
                                     slam_hold=slam_hold, notice=notice, visrec_lkg=visrec_lkg,
-                                    recovery=ctrl.recovery_status(now)))
+                                    recovery=ctrl.recovery_status(now), push=ctrl._last_push))
             seq += 1
             last_pub = now
 
@@ -5942,7 +6026,7 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                                                  "ceiling": ctrl._ceiling_y, "desired": ctrl._desired_y,
                                                  "delta": ctrl._trim_delta,
                                                  "trim_on": ctrl._trimming, "calib_on": ctrl._calib_active},
-                                            visrec=visrec_detail)
+                                            visrec=visrec_detail, push=ctrl._last_push)
                 # The transient planner_event was captured during the drain (the freshest plan may have
                 # already cleared it) and the un-counted contact from the controller — stitch both onto THIS
                 # step's record so the replay marks the exact frame of each.
@@ -10212,6 +10296,107 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if backoff_full_authority else 'FAIL'}  SESSION-62 step-0b back-off uses "
           f"FULL reverse authority (max reverse={_max_rev:.2f}, was 0.20 via the back_off recipe)")
     assert backoff_full_authority, "session-62 step-0b back-off authority"
+
+    # ---- SESSION-62 PARALLAX PUSH MEASUREMENT --------------------------------------------------------
+    # `traveled` was computed at the push-done gate and DISCARDED, so "did that push achieve anything?"
+    # could only be answered by reconstructing `pos` from the timeline afterwards. Doing exactly that
+    # across seven 2026-09-05 flights found 121 of 124 backward pushes ending on the SAFETY TIMER at a
+    # median ~0.07u against a 0.5u target, and an operator-reported corner trap in which free cycles
+    # drifted 0.34-0.64u while trapped cycles drifted 0.05-0.18u. These cases pin the measurement and,
+    # above all, pin that "SLAM could not observe this push" stays a THIRD answer -- collapsing it into
+    # "stuck" is what would eventually fly the drone forward on a missing reading.
+    def _c62m(**kw):
+        c = ExploreController(cfg, no_takeoff=True)
+        c.parallax_push_dist = 0.5
+        c.push_stuck_drift_frac = 0.4      # -> stuck below 0.20u of drift
+        c.push_min_poses = 2
+        for k, v in kw.items():
+            setattr(c, k, v)
+        c.t_state = 0.0
+        return c
+
+    def _do_push(c, start, poses):
+        """Drive one push: begin at `start`, feed `poses`, finish. Returns c._last_push."""
+        c._push_begin({"pos": list(start)})
+        for pz in poses:
+            c._push_note_pose({"pos": list(pz)})
+        c._push_finish("backward", "timer", 2.0)
+        return c._last_push
+
+    # (62-15) a MOVED cycle: the free-flight numbers off the trap flight (drift 0.400u).
+    c15 = _c62m()
+    _do_push(c15, (0.0, 0.0), [(0.0, 0.0), (-0.05, -0.07)])           # first push: no previous start
+    r15 = _do_push(c15, (-0.15, 0.70), [(-0.15, 0.70), (-0.22, 0.62)])
+    moved_ok = (r15["verdict"] == "moved" and r15["poses"] == 2
+                and abs(r15["traveled"] - 0.106) < 0.01 and r15["stuck_run"] == 0)
+    print(f"[self-test] {'PASS' if moved_ok else 'FAIL'}  SESSION-62 push verdict MOVED on a free cycle "
+          f"(drift={r15['drift']}, traveled={r15['traveled']}, poses={r15['poses']})")
+
+    # (62-16) a STUCK cycle: the operator's corner (drift 0.048u), and the run counter climbs.
+    c16 = _c62m()
+    _do_push(c16, (-1.34, -0.03), [(-1.34, -0.03), (-1.33, 0.01)])
+    r16a = _do_push(c16, (-1.38, -0.04), [(-1.38, -0.04), (-1.34, -0.02)])
+    r16b = _do_push(c16, (-1.37, -0.03), [(-1.37, -0.03), (-1.36, -0.01)])
+    stuck_ok = (r16a["verdict"] == "stuck" and r16b["verdict"] == "stuck"
+                and r16b["stuck_run"] == 2 and r16a["drift"] < 0.2)
+    print(f"[self-test] {'PASS' if stuck_ok else 'FAIL'}  SESSION-62 push verdict STUCK on the trap "
+          f"geometry, run climbs (drift={r16a['drift']}, run={r16b['stuck_run']})")
+
+    # (62-17) THE LOAD-BEARING ONE. One distinct pose -> `unknown`, never `stuck`, even though the
+    #         apparent displacement is exactly 0.0. 6 of 11 pushes on the trap flight looked like this.
+    c17 = _c62m()
+    _do_push(c17, (-1.34, -0.03), [(-1.34, -0.03), (-1.30, 0.01)])
+    r17 = _do_push(c17, (-1.35, -0.02), [(-1.35, -0.02)])              # SLAM delivered ONE pose
+    unknown_ok = (r17["verdict"] == "unknown" and r17["traveled"] is None and r17["poses"] == 1)
+    print(f"[self-test] {'PASS' if unknown_ok else 'FAIL'}  SESSION-62 a push SLAM could not observe is "
+          f"UNKNOWN, not STUCK (traveled={r17['traveled']}, verdict={r17['verdict']})")
+
+    # (62-18) `unknown` neither increments nor clears the stuck run -- absence of evidence changes nothing.
+    c18 = _c62m()
+    _do_push(c18, (-1.34, -0.03), [(-1.34, -0.03), (-1.30, 0.01)])
+    _do_push(c18, (-1.36, -0.02), [(-1.36, -0.02), (-1.35, -0.01)])     # stuck -> run 1
+    run_before = c18._push_stuck_run
+    _do_push(c18, (-1.37, -0.02), [(-1.37, -0.02)])                     # unknown
+    run_held = c18._push_stuck_run == run_before == 1
+    _do_push(c18, (-2.10, 0.40), [(-2.10, 0.40), (-2.20, 0.30)])        # moved -> clears
+    run_cleared = c18._push_stuck_run == 0
+    print(f"[self-test] {'PASS' if run_held and run_cleared else 'FAIL'}  SESSION-62 unknown holds the "
+          f"stuck run, moved clears it (held={run_held}, cleared={run_cleared})")
+
+    # (62-19) the first push of a leg has no previous start to compare against -> unknown, not stuck.
+    c19 = _c62m()
+    r19 = _do_push(c19, (0.0, 0.0), [(0.0, 0.0), (-0.05, -0.05)])
+    first_unknown = r19["verdict"] == "unknown" and r19["drift"] is None
+    print(f"[self-test] {'PASS' if first_unknown else 'FAIL'}  SESSION-62 first push of a leg is UNKNOWN "
+         f"(no previous start), drift={r19['drift']}")
+
+    # (62-20) the threshold is a FRACTION of parallax_push_dist, not an absolute -- SLAM units carry no
+    #         metric scale, so a fixed "u" number would mean something different on every flight.
+    c20 = _c62m(parallax_push_dist=2.0)          # same fraction, 4x the push distance
+    _do_push(c20, (0.0, 0.0), [(0.0, 0.0), (0.1, 0.0)])
+    r20 = _do_push(c20, (0.5, 0.0), [(0.5, 0.0), (0.6, 0.0)])   # drift 0.5u: "moved" at 0.5, "stuck" at 2.0
+    scales_ok = (r20["verdict"] == "stuck" and abs(r20["limit"] - 0.8) < 1e-6)
+    print(f"[self-test] {'PASS' if scales_ok else 'FAIL'}  SESSION-62 stuck threshold scales with "
+          f"parallax_push_dist (limit={r20['limit']} at push_dist=2.0, was 0.2 at 0.5)")
+
+    # (62-21) config plumbing + the measurement reaching both wires (timeline row and control payload).
+    _cfg62m = copy.deepcopy(cfg)
+    _cfg62m.setdefault("autonomy", {}).setdefault("explore", {}).update(
+        {"push_stuck_drift_frac": 0.85, "push_min_poses": 5})
+    _c = ExploreController(_cfg62m, no_takeoff=True)
+    _plan62 = {"pos": [0.0, 0.0], "plan_valid": False}
+    wires_ok = (_c.push_stuck_drift_frac == 0.85 and _c.push_min_poses == 5
+                and "push" in _timeline_step_record("00:00:01.000", 1.0, 1, "PARALLAX_PUSH", None,
+                                                    "OK", _plan62, push=r16a)
+                and _full_vector({}, 0, 0.0, "PARALLAX_PUSH", push=r16a)["push"] == r16a
+                and _full_vector({}, 0, 0.0, "ADVANCE")["push"] is None)
+    print(f"[self-test] {'PASS' if wires_ok else 'FAIL'}  SESSION-62 push config plumbing + timeline/"
+          f"control wiring")
+
+    s62d_ok = (moved_ok and stuck_ok and unknown_ok and run_held and run_cleared and first_unknown
+               and scales_ok and wires_ok)
+    print(f"[self-test] {'PASS' if s62d_ok else 'FAIL'}  SESSION-62 PARALLAX PUSH MEASUREMENT overall")
+    assert s62d_ok, "session-62 parallax push measurement"
 
     # ---- SESSION-58 DEAD-GOAL BUMP GUARD -----------------------------------------------------------
     # 22:40:24.170 BLACKLIST PERMANENT retired goal=[3.9,-3.6] -> 22:40:25.165 bump pulse #2 fired against
