@@ -11155,36 +11155,65 @@ def run_self_test(cfg):
     vt3.add("LKG", 10.0)
     ratio_math = (vt3.samples == 10 and vt3.ratio == 0.7)
 
-    c_due = ExploreController(cfg, no_takeoff=True)
+    # Session 62: every case below exercises the TRIGGER'S LOGIC, so none of them may depend on what
+    # the operator currently has in config.yaml. They used to build a bare ExploreController(cfg) and
+    # inherit the live tuning, which quietly made them a test of the CONFIG rather than of the code:
+    # the whole SESSION-59 block went red the moment `use_visual_backoff_trigger` was set false for a
+    # flight, with nothing wrong in autopilot.py at all. `_c59()` pins the four knobs these assertions'
+    # arithmetic is written against (see each case's comment for the 5-samples / 3.0s reasoning) --
+    # the same "force the flag on the instance" pattern the session-60 cases above already use. The
+    # OFF side stays covered by `due_respects_flag` and `flag_off_is_inert`, which override it back.
+    def _c59():
+        c = ExploreController(cfg, no_takeoff=True)
+        c.use_visual_backoff_trigger = True
+        c.visual_backoff_min_window_s = 3.0
+        c.visual_backoff_live_ratio = 0.66
+        c.visual_backoff_min_samples = 5
+        return c
+
+    c_due = _c59()
     c_due._vis_tally.t0 = 1000.0
     c_due._vis_tally.live = 8
     c_due._vis_tally.equal = 2
     due_all_conditions = (c_due._visual_backoff_due(1003.1) is True
                           and c_due._visual_backoff_due(1002.9) is False)
 
-    c_ratio = ExploreController(cfg, no_takeoff=True)
+    c_ratio = _c59()
     c_ratio._vis_tally.t0 = 1000.0
     c_ratio._vis_tally.live = 5
     c_ratio._vis_tally.equal = 5
     due_needs_ratio = (c_ratio._visual_backoff_due(1010.0) is False)
 
-    c_samp = ExploreController(cfg, no_takeoff=True)
+    c_samp = _c59()
     c_samp._vis_tally.t0 = 1000.0
     c_samp._vis_tally.live = 3
     due_needs_samples = (c_samp._visual_backoff_due(1010.0) is False)
 
-    c_flag = ExploreController(cfg, no_takeoff=True)
+    c_flag = _c59()
     c_flag._vis_tally.t0 = 1000.0
     c_flag._vis_tally.live = 8
     c_flag._vis_tally.equal = 2
     c_flag.use_visual_backoff_trigger = False
     due_respects_flag = (c_flag._visual_backoff_due(1003.1) is False)
 
-    c_cfg = ExploreController(cfg, no_takeoff=True)
-    defaults_from_config = (c_cfg.use_visual_backoff_trigger is True
-                            and c_cfg.visual_backoff_min_window_s == 3.0
-                            and c_cfg.visual_backoff_live_ratio == 0.66
-                            and c_cfg.visual_backoff_min_samples == 5)
+    # Session 62: this asserted `c_cfg.use_visual_backoff_trigger is True` against the LIVE config --
+    # a statement about the operator's config file, not about the code, and the single check most
+    # responsible for the red gate. What actually needs proving is that the controller READS these
+    # keys. Drive it from two synthetic configs, with values DELIBERATELY unlike the shipped defaults
+    # (2.5 / 0.75 / 7), so a regression that hardcoded the defaults would fail this instead of passing.
+    _cfg_on = copy.deepcopy(cfg)
+    _cfg_on.setdefault("autonomy", {}).setdefault("explore", {}).update({
+        "use_visual_backoff_trigger": True, "visual_backoff_min_window_s": 2.5,
+        "visual_backoff_live_ratio": 0.75, "visual_backoff_min_samples": 7})
+    _cfg_off = copy.deepcopy(cfg)
+    _cfg_off.setdefault("autonomy", {}).setdefault("explore", {})["use_visual_backoff_trigger"] = False
+    c_cfg_on = ExploreController(_cfg_on, no_takeoff=True)
+    c_cfg_off = ExploreController(_cfg_off, no_takeoff=True)
+    defaults_from_config = (c_cfg_on.use_visual_backoff_trigger is True
+                            and c_cfg_off.use_visual_backoff_trigger is False
+                            and c_cfg_on.visual_backoff_min_window_s == 2.5
+                            and c_cfg_on.visual_backoff_live_ratio == 0.75
+                            and c_cfg_on.visual_backoff_min_samples == 7)
 
     vt9 = VisualDirectionTally()
     vt9.add("LIVE", 5.0)
@@ -11236,7 +11265,7 @@ def run_self_test(cfg):
     # (1) fires_from_hold_lost: 5 ticks @ 1.0s spacing of closer="LIVE" clears both min_samples=5 and
     #     min_window_s=3.0 on the SAME tick the 5th sample lands (t0 stamps on tick 1 @ t=0.0, so tick 5
     #     @ t=4.0 reads window_s=4.0 >= 3.0) -> BACKOFF.
-    c59a = ExploreController(cfg, no_takeoff=True)
+    c59a = _c59()
     _a59a, s59a, ev59a = _drive_visual_tally(c59a, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
     fires_from_hold_lost = (s59a == "BACKOFF" and ev59a is not None and "visual back-off" in ev59a)
 
@@ -11246,20 +11275,20 @@ def run_self_test(cfg):
     #     exactly the dispatch this chunk removes) with its replacement: the identical LIVE drive, parked
     #     in FALLBACK, must NEVER become BACKOFF -- it hands off into FALLBACK's own SERVO sub-phase
     #     instead, and the state stays "FALLBACK".
-    c59b = ExploreController(cfg, no_takeoff=True)
+    c59b = _c59()
     _a59b, s59b, ev59b = _drive_visual_tally(c59b, "FALLBACK", "PLAN-LOST", "LIVE", 5)
     no_fire_from_fallback = (s59b == "FALLBACK" and c59b._fallback_phase == "SERVO"
                              and (ev59b is None or "visual back-off" not in ev59b))
 
     # (3) no_fire_on_equal: EQUAL is confident evidence of NEITHER closing nor opening -- it fills
     #     samples/window but never `live`, so `ratio` can never clear `visual_backoff_live_ratio`.
-    c59c = ExploreController(cfg, no_takeoff=True)
+    c59c = _c59()
     _a59c, s59c, _ev59c = _drive_visual_tally(c59c, "HOLD_LOST", "PLAN-LOST", "EQUAL", 20)
     no_fire_on_equal = (s59c == "HOLD_LOST")
 
     # (4) no_fire_on_unknown: `VisualDirectionTally.add` ignores UNKNOWN entirely -- t0 never stamps, so
     #     `_visual_backoff_due` clause 2 (t0 is not None) never clears and the tally stays empty.
-    c59d = ExploreController(cfg, no_takeoff=True)
+    c59d = _c59()
     _a59d, s59d, _ev59d = _drive_visual_tally(c59d, "HOLD_LOST", "PLAN-LOST", "UNKNOWN", 20)
     no_fire_on_unknown = (s59d == "HOLD_LOST" and c59d._vis_tally.samples == 0)
 
@@ -11268,21 +11297,21 @@ def run_self_test(cfg):
     #     `_arm_loss_backoff` would let a back-off fired FROM FALLBACK re-escalate INTO FALLBACK). Session
     #     60: driven from HOLD_LOST now (not FALLBACK) -- `_fire_visual_backoff` no longer fires from
     #     FALLBACK at all (see (2) above), so HOLD_LOST is the only place left this guard can be observed.
-    c59e = ExploreController(cfg, no_takeoff=True)
+    c59e = _c59()
     before59e = c59e._blind_contact_reacts
     _a59e, s59e, _ev59e = _drive_visual_tally(c59e, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
     wedge_counter_untouched = (s59e == "BACKOFF" and c59e._blind_contact_reacts == before59e)
 
     # (6) does_not_refire_immediately: `_fire_visual_backoff` resets the tally, so a single further LIVE
     #     sample (samples=1 < min_samples=5) cannot clear the bars again.
-    c59f = ExploreController(cfg, no_takeoff=True)
+    c59f = _c59()
     _a59f, s59f, _ev59f = _drive_visual_tally(c59f, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
     c59f._vis_tally.add("LIVE", 5.0)
     does_not_refire_immediately = (s59f == "BACKOFF" and c59f._visual_backoff_due(5.0) is False)
 
     # (7) flag_off_is_inert: the identical fires_from_hold_lost drive, but with the trigger disabled --
     #     `_visual_backoff_due` clause 1 always returns False, so the hold never breaks.
-    c59g = ExploreController(cfg, no_takeoff=True)
+    c59g = _c59()
     c59g.use_visual_backoff_trigger = False
     _a59g, s59g, _ev59g = _drive_visual_tally(c59g, "HOLD_LOST", "PLAN-LOST", "LIVE", 5)
     flag_off_is_inert = (s59g == "HOLD_LOST")
@@ -11290,7 +11319,7 @@ def run_self_test(cfg):
     # (8) loss_edge_resets_tally: a tally filled during one loss episode is EMPTY on the first tick of the
     #     NEXT fresh loss edge (an intervening OK clears `_was_lost`, re-arming the fresh-edge reset at
     #     the top of `step()`).
-    c59h = ExploreController(cfg, no_takeoff=True)
+    c59h = _c59()
     _drive_visual_tally(c59h, "HOLD_LOST", "PLAN-LOST", "LIVE", 3)
     filled_before_ok = c59h._vis_tally.samples > 0
     c59h.step(3.0, {"plan_valid": True, "done": False, "goal": [1.0, 0.0], "pos": [0.0, 0.0],

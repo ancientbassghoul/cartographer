@@ -195,7 +195,7 @@ def find_reference_vol_header(width, height, ffprobe=None, search_dir=None):
 
 
 def repair_mp4(path, fps=15.0, width=None, height=None, ffmpeg=None, vol_header_path=None,
-               out_path=None, search_dir=None):
+               out_path=None, search_dir=None, verify_frames=300):
     """Losslessly recover an un-finalized visualizer.py --record MP4. The frame payload in mdat is
     intact, undamaged GOV/VOP data — what's missing is the MPEG-4 Part 2 VOL header (width/height/
     profile), which a container stores ONCE in moov's `esds` box and NEVER repeats in mdat, so a
@@ -228,8 +228,12 @@ def repair_mp4(path, fps=15.0, width=None, height=None, ffmpeg=None, vol_header_
                          f"this repair path is for mp4v (visualizer.py's fourcc) only.")
 
     if width is None or height is None:
-        from visualizer import PANEL_W, GAP, MAP_SIZE, STATUS_H   # authoritative source, visualizer.py:511-512
-        width, height = (PANEL_W + GAP + MAP_SIZE), (STATUS_H + MAP_SIZE)
+        # Session 62: import the composed size, never re-derive it. This line USED to spell the
+        # formula out (`PANEL_W + GAP + MAP_SIZE`) -- a copy that silently went stale when session 60
+        # added the leftmost LKG column, and that is the whole reason flight 20260905_113346's first
+        # recovery decoded into garbage. visualizer.CANVAS_W is now the single definition.
+        from visualizer import CANVAS_W, CANVAS_H   # authoritative source, visualizer.py:73-74
+        width, height = CANVAS_W, CANVAS_H
     if vol_header_path is not None:
         with open(vol_header_path, "rb") as f:
             vol = f.read()
@@ -267,6 +271,25 @@ def repair_mp4(path, fps=15.0, width=None, height=None, ffmpeg=None, vol_header_
     if (ow, oh) != (width, height):
         raise RuntimeError(f"{out_path}: remuxed to {ow}x{oh}, expected {width}x{height} -- the "
                            f"borrowed VOL header may not actually match this recording")
+    # Session 62: the dimension check above is NECESSARY BUT NOT SUFFICIENT -- `ow/oh` are read back
+    # out of the very VOL header that `width/height` selected, so it agrees with itself by
+    # construction and CANNOT detect a wrong-sized header. That is exactly how flight 20260905_113346
+    # passed every guard here and still played as garbage: a stale canvas formula asked for 908x528,
+    # found a genuine 908x528 donor from a pre-LKG flight, and then validated its 908-wide output
+    # against its own 908-wide assumption. The only honest test is to DECODE the payload and find out
+    # whether the header actually fits it -- a mismatched width desynchronises every macroblock row
+    # and errors pour out of the first GOV onward. Fail LOUDLY (CLAUDE.md: no silent fallbacks); a
+    # bad recovery that looks successful is worse than none, because the operator trusts it.
+    verify = subprocess.run([ffmpeg, "-v", "error", "-i", out_path, "-frames:v", str(verify_frames),
+                             "-f", "null", "-"], capture_output=True, text=True)
+    errs = [ln for ln in verify.stderr.splitlines() if ln.strip()]
+    if errs:
+        raise RuntimeError(
+            f"{out_path}: the borrowed VOL header does not fit this payload -- decoding the first "
+            f"{verify_frames} frames produced {len(errs)} decoder error(s), first: {errs[0].strip()!r}. "
+            f"The usual cause is a wrong-sized header: this recording is probably NOT {width}x{height} "
+            f"(the visualizer layout changed between it and {os.path.basename(vol_source)}). Pass the "
+            f"true width/height explicitly, or --vol-header-from a recording made by the SAME layout.")
     return out_path
 
 

@@ -18,26 +18,67 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**. **Session 61 is BUILT and GATED, NOT YET FLOWN** — all 9 self-test
-suites green at HEAD, spec archived at `plans/session61-spec.md`.
+Branch **`all-bets-are-off`**. **Session 62 is BUILT, GATED and FLOWN** — all **10** self-test suites
+green at HEAD (`perception_timing_report.py` joined the gate), spec archived at
+`plans/session62-spec.md`. Session 61 is flown too (three flights on 2026-09-05); its panel watch
+list below has NOT been formally reviewed against those logs yet.
 
-Session 60 flew clean the same day (`OUTPUT/diag/20260904_223410_*`, ~7 min, 2026-09-04 22:34-22:41):
-the F_LKG rework held up (135 distinct `slam:<id>` references, zero age-outs, no `VISUAL_RECOVERY`,
-no double bump pulses), but the flight's own LKG debug panel turned out to be lying to the operator —
-published only at SIFT-match instants, it sat ~50s/8 solves stale while the map arrow and telemetry
-stayed live (a screenshot at 22:40:29 caught it aiming at the wrong part of the room entirely).
-Session 61 fixes the PANEL, not the plumbing: publishes the canvas on a cadence instead of only at
-match instants, restores the RANSAC inlier lines (previously computed then thrown away every tick),
-and moves the info text into the visualizer at panel resolution instead of clipping it in a 512px
-canvas. Full detail: `plans/session61-spec.md`; concise narrative: `PROGRESS.md` sessions 60/61.
+Session 62 was measurement only: it instrumented where `slam_ms` actually goes, and answered the
+question below. It also fixed `fly.py`, which had never passed `--log` to `perception_worker.py`, so
+**every flight from here on writes `OUTPUT/diag/<ts>_perception.csv`** with the full phase split.
+Read one with `venv\Scripts\python.exe perception_timing_report.py` (no argument = newest flight).
+
+**Live config note (operator, 2026-09-05): `use_visual_backoff_trigger` is `false` on purpose.**
+Flight `20260905_011112` showed the tradeoff: with it ON, PLAN never went stale, but goals got
+blacklisted as unreachable (justifiably) and the reconstruction was worse because the drone never dug
+into the corner areas. OFF costs ~2 PLAN-STALE events per flight and reconstructs better. Leaving it
+off, on the expectation that the FALLBACK reordering (next item) recovers the stale-plan cost.
+
+The 2026-09-05 11:33 flight ended in a **hardware crash** (suspected Intel Graphics; the operator has
+since disabled that card). It was salvaged with essentially no loss — see `PROGRESS.md` session 62 for
+the VOL-header bug that made the FIRST salvage attempt produce an unwatchable video, now fixed.
 
 `main` is unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one
 open problem: height.
 
-## STILL OPEN, THE DOMINANT PROBLEM: why does SLAM choke
-Nothing in sessions 59-60 addresses this — it's damage control around the choke, not a cure. The
-2026-09-04 flight is the best measurement yet — **30 of its 47 minutes were spent blind**
-(`HOLD_LOST` 1348 s + `FALLBACK` 471 s):
+## THE SLAM CHOKE — MEASURED (session 62). Stop guessing; the numbers are in.
+`OUTPUT/diag/20260905_113348_perception.csv`, 446 frames, 35 min, voxels 3 220 → 386 558, keyframes
+1 → 82. Phase closure residual median 0.1 ms, so the split is trustworthy. Of **2 010 s** in the loop:
+
+| phase | total | share | what it is |
+|---|---|---|---|
+| **`backend_ms`** | **1 113 s** | **55.4 %** | `_run_backend()`: retrieval update + `add_factors` + `solve_GN_rays()` |
+| `track_ms` | 602 s | 29.9 % | frame construction + the INIT/TRACKING/RELOC branch |
+| `map_pub_ms` | 93 s | 4.6 % | `_map_payload` + publish (`topdown_summary` is O(map)) |
+| `integrate_ms` | 39 s | 1.9 % | `mapstore.add_pose` + `mapstore.integrate` + `ground.integrate` |
+| `plan_ms` | 29 s | 1.4 % | `_plan_payload` (13 raycasts, frontiers, `planner.select`) + publish |
+| `pose_ms` + `kf_download_ms` + `publish_ms` | 2.9 s | 0.1 % | — |
+
+Net throughput: **0.22 Hz** (446 processed frames in 35 min).
+
+**On keyframe frames** (77 of 446): median `slam_ms` 9 818 ms = `backend_ms` 8 082 (**82 %**) +
+`integrate_ms` 339 (3 %). Ordinary frames: 1 652 ms with `backend_ms` 0. So the ~6× keyframe tax is
+almost entirely the backend, and this repo *chose* that — `slam_engine.py:38` records the deliberate
+collapse of upstream MASt3R-SLAM's separate backend **process** into this one, which is what put
+global optimization on the frame-critical path.
+
+**Two findings that survived the measurement and still need explaining:**
+- **`map_pub_ms`, not `integrate_ms`, is the CPU cost that scales with map size** — 4 → 70 → 138 →
+  231 → **1 238 ms** across voxel buckets up to 386 k. Cheap to fix (pure CPU, no CUDA sharing) and
+  worth more than `integrate` + `plan` combined.
+- **`track_ms` is non-monotonic.** TRACKING-only frames: 367 ms (24 kf) → 1 820-3 078 ms (61-74 kf) →
+  back down to 1 368 ms (82 kf). It rises 8× then partially *falls* while the keyframe graph keeps
+  growing — the same shape as the old table's puzzling minute-25-30 recovery. This flight also ended
+  in a hardware crash, so GPU/VRAM pressure is a live suspect. Current instrumentation cannot split
+  it further; a finer split inside the tracker would be needed.
+
+**Ruled out by this measurement:** CPU-side map integration as the driver of the choke (1.9 %), and
+with it the premise of the original async-refactor proposal. Ruled out earlier: autopilot loop rate
+(32-38.5 Hz throughout), Unity focus loss, and the clearance raycast.
+
+**The historical degradation table** (autopilot-side `slam_ms`, 2026-09-04 flight, 30 of 47 minutes
+blind — `HOLD_LOST` 1348 s + `FALLBACK` 471 s) is kept because it shows the *time* behaviour the
+single-flight attribution above cannot:
 
 | flight min | frames | median | p90 | max |
 |---|---|---|---|---|
@@ -49,23 +90,56 @@ Nothing in sessions 59-60 addresses this — it's damage control around the chok
 | 25–30 | 86 | 1 783 | 4 402 | 37 209 |
 | 40–45 | 78 | 1 816 | 3 012 | 31 399 |
 
-Session 61's diagnosing flight (`OUTPUT/diag/20260904_223410_*`, 7 min) adds two more data points on
-top of the table: an **11.1 s** solve at 22:40:06 and a **15.5 s** solve at 22:40:30 — the choke shows
-up even in a short flight, not just the long ones the table above was built from.
+Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
 
-Worst wait between two solved frames: **72.9 s** at flight-minute 24.6. Nuance worth keeping: the
-median degrades 16× over the first 20 minutes but then **partially recovers** (min 25-30 back to
-1783 ms, again at 40-45) — evidence *against* the simplest "keyframe graph grows monotonically"
-theory. And **session 58 removed ~230 wasted SIFT matches per flight and the choke persisted
-unchanged**, which weakens (does not kill) the LKG-debug-window lead. Three theories already ruled
-out: autopilot loop rate (32-38.5Hz throughout), Unity focus loss (re-chokes ~2 frames after
-refocus), and the clearance raycast (times outside `slam_ms`; `clearance_fan_deg`/`fan_n` unchanged
-since session 12, six weeks of 300-500ms medians followed). Untested leads: MASt3R-SLAM's own
-workload growing with the keyframe graph/retrieval DB, its backend optimization thread, GPU
-contention from the visualizer's `--record` MP4 encode, and the LKG debug window (`cv2.imshow` + PNG
-writes).
+**The three parked cures, now ranked by measured share** (full designs in `plans/session62-spec.md`):
+- **Stage A — move `_run_backend()` off the frame-critical path** into a backend thread inside
+  `slam_engine.py`. Targets **55 %**. The only change that can move `slam_ms` itself. Risky:
+  `factor_graph`, `keyframes` and `states` are shared CUDA-backed structures on one stream.
+- **Stage B — decouple `TOPIC_PLAN` publishing from the SLAM cadence.** Today a plan can only be
+  published from inside `step()`, so `PLAN_PUB_INTERVAL = 0.5 s` is a lie: during a 12 s solve the
+  autopilot gets no plan and no forward clearance at all. Must carry explicit `pose_age_s` /
+  `pose_frame_id`.
+- **Stage C — the original tracking/mapping thread split.** Targets **3.3 %**. If ever built:
+  `MapStore._grow` *reallocates* `_count`/`_color_sum`, so a concurrent raycast is a **torn** read,
+  not a stale one (needs a copy-on-write snapshot swap, not a "lightweight" lock); `clearance` and
+  `planner.select` must stay on one side of the fence or a single `_plan_payload` mixes two map
+  snapshots; and `flight_replay.py` / `salvage_flight.py` / the timeline all assume plan-frame
+  correspondence.
+- **New, cheap, unranked before:** `_map_payload`/`topdown_summary` at 4.6 % and growing.
 
-## >>> IMMEDIATE NEXT: FLY session 61, then watch for <<<
+## >>> IMMEDIATE NEXT <<<
+
+1. **FALLBACK reordering (agreed 2026-09-05, not yet built).** Insert a back-off + dwell between
+   `INITIAL_WAIT` and `TURN`, so the ladder becomes
+   `INITIAL_WAIT -> BACKOFF -> BACKOFF_WAIT -> TURN -> PUSH -> WAIT_POST -> TURN -> ...`. Rationale,
+   and it is the repo's own: session 60 deleted the 15° visual probe because *"rotating in place
+   cannot reproduce a view the drone has physically drifted away from"* (139 logs, 9.4 min exposure,
+   0 recoveries) — but that verdict was never applied to the FALLBACK sweep, which still turns 22.5°
+   FIRST and only then picks a push direction at random (backward is a 1-in-4 shot, by which point the
+   bearing F_LKG was captured on is gone). Backing off widens the view along the same bearing, the one
+   geometry where SIFT-vs-F_LKG can match. Expected trade: a fraction of the time cost, far fewer
+   stale plans. Notes for whoever builds it: the SERVO/SIFT gate at `autopilot.py:2212` already runs
+   on EVERY tick before the phase ladder, so the "let Visual Recovery try here" half needs **no new
+   wiring** — only a phase that dwells; reuse the existing `back_off` playbook recipe (no new maneuver
+   magnitudes); abort on `backwall_contact` exactly as the backward PUSH does; the dwell should exceed
+   `servo_min_window_s` (1.5 s) with margin; it is naturally once-per-episode because the ladder loops
+   back to `TURN`, never through `INITIAL_WAIT`; the two wedge-escalation bypasses
+   (`autopilot.py:2531`, `:2766`) should keep jumping straight to `TURN` since they arrive *because*
+   repeated back-offs already failed; and the self-test at `:8032` asserts FALLBACK reaches
+   `WAIT_POST` inside a 5 s simulated window, so it will need updating.
+2. **Review the session-61 panel watch list against the three 2026-09-05 flights.** Session 61 is
+   flown but its items below were never checked off. Also unreviewed: `diag.ply_sequence` is ON and
+   `OUTPUT/diag/20260905_113348_plyseq/` did fill — the marker-stability check was never run.
+3. **Read the timing report after every flight from now on** — `fly.py` now passes `--log`, so the
+   CSV always exists. `venv\Scripts\python.exe perception_timing_report.py` (no argument = newest).
+4. **Decide on a choke cure** using the ranked stages above. Nothing is committed to yet.
+5. **Housekeeping, offered and not yet done:** three July orphan flights (`20260720_133111`,
+   `_135245`, `_135307`) still trip `fly.py`'s crash-recovery prompt at every launch. Moving them to
+   `OUTPUT/diag/_orphans_2026-07/` silences it permanently and reversibly — the detector globs that
+   directory non-recursively.
+
+### Session 61's panel watch list (BUILT + FLOWN 2026-09-05, not yet reviewed)
 
 1. **The LIVE half of the LKG panel moves continuously**; the F_LKG half changes whenever
    telemetry's `src=slam:<id>` changes — no more ~50s/8-solve freeze (the 22:40:29 failure).
@@ -75,39 +149,39 @@ writes).
    `loss_backoff_grace_s` window; DURING that grace the pair should still be live, with
    `lines=none (loss grace N/12.0s)` on screen — never a blank.
 4. The info block is COMPLETE: `closer`, `scale`, `size`, `src`, `age` all legible, nothing clipped
-   off the right edge (the old 512px-canvas failure, Finding D); yellow "F_LKG (reference)"/"LIVE"
-   labels visible on the panel again (same-day revision — dropped when session 61 moved text into
-   the visualizer, now drawn back at the image's own vertical midpoint).
-5. **The panel must never grey out during `PLAN-LOST`/`PLAN-STALE`.** Same-day revision:
-   `LKG_CANVAS_STALE_S` is now 5 minutes (was 2s — the operator found the swap-out more annoying than
-   useful), so this should be structurally near-impossible to observe on an ordinary flight; the
-   guard still exists purely as a dead-publisher backstop.
+   off the right edge; yellow "F_LKG (reference)"/"LIVE" labels visible on the panel.
+5. **The panel must never grey out during `PLAN-LOST`/`PLAN-STALE`.** `LKG_CANVAS_STALE_S` is now 5
+   minutes, so this should be near-impossible to observe; the guard exists as a dead-publisher
+   backstop.
 6. Kill switches, unchanged in meaning: `visrec_debug_window: false` still kills compose + publish +
    PNG saving outright (the one real SLAM-choke experiment); `use_visual_matching: false` now leaves
    an EXPLAINED idle panel (a startup line states why) instead of a silent grey one.
 7. Flights still end by **manual stop**; no bounded-survey mechanism exists.
-8. **`diag.ply_sequence` is now turned ON** (operator's own config change, 2026-09-05) for this next
-   flight — `OUTPUT/diag/<ts>_plyseq/` should fill with one `.ply` per fused SLAM frame + a
-   `markers.json` (~1.2GB/flight, capped at `ply_sequence_max=2000`). This is also the still-open
-   "Session 56/57" watch item below — first real chance to confirm it.
-9. **Carry forward, unchanged priority** (folded from session 60's now-flown watch list — see
-   `PROGRESS.md`'s session 60/61 entries for what that flight confirmed):
-   - **SLAM choke remains the dominant open problem** — see the table + 22:40 evidence above.
-   - **FALLBACK's new `SERVO` phase is still unobserved** — the diagnosing flight never entered
-     FALLBACK at all.
-   - **Bump-pulse latency** unresolved — a blacklisted goal takes 10-18s to become visible to the
-     autopilot (rides the next published plan; scales with SLAM latency). Three candidate designs
-     sketched, none built: `plans/session58-lkg-window-discipline-and-dead-goal-guard.md`'s
-     "Session-59 design sketch" section.
-   - **Staleness UI** — operator wants to discuss before it's built. Concrete case now on record:
-     at 22:40:29 the top status strip showed `SLAM=TRACKING kf=27 slam=2921.5ms` from 15s earlier
-     while perception was mid-solve on frame #153 (`slam_ms=15472.2`) — the only stale-looking field
-     left in the dashboard now that the LKG panel is fixed.
-   - **Goal-management rewrite decision rule** (below, unchanged) still applies if goal problems
-     recur.
-   - Future ideas, not yet built: **adaptive back-off strength** and closing session 47's **dead
-     `_backoff_resolve_since` gate** (both detailed below).
-   - Everything under "Session 56/57's watch list" below is still current and unconfirmed.
+8. **`diag.ply_sequence` is ON** — `OUTPUT/diag/<ts>_plyseq/` should hold one `.ply` per fused SLAM
+   frame + a `markers.json` (~1.2GB/flight, capped at `ply_sequence_max=2000`); the first five markers
+   should sit at identical world coordinates in an early and a late frame.
+
+### Carry forward, unchanged priority
+Folded from session 60's now-flown watch list — see `PROGRESS.md`'s session 60/61/62 entries for what
+those flights confirmed.
+
+- **The SLAM choke is now MEASURED, not mysterious** (see the section above) — what remains open is
+  choosing and building a cure, not diagnosing it.
+- **FALLBACK's `SERVO` phase (session 60) is still unobserved on a flight.** The reordering in
+  IMMEDIATE NEXT #1 touches this same ladder, so watch for both together.
+- **Bump-pulse latency** unresolved — a blacklisted goal takes 10-18s to become visible to the
+  autopilot (rides the next published plan; scales with SLAM latency). Three candidate designs
+  sketched, none built: `plans/session58-lkg-window-discipline-and-dead-goal-guard.md`'s
+  "Session-59 design sketch" section.
+- **Staleness UI** — operator wants to discuss before it's built. Concrete case on record: at
+  22:40:29 the top status strip showed `SLAM=TRACKING kf=27 slam=2921.5ms` from 15s earlier while
+  perception was mid-solve on frame #153 (`slam_ms=15472.2`) — the only stale-looking field left in
+  the dashboard now that the LKG panel is fixed. Session 62's Stage B (explicit `pose_age_s` /
+  `pose_frame_id` on the plan) is the plumbing this would render.
+- **Goal-management rewrite decision rule** (below, unchanged) still applies if goal problems recur.
+- Future ideas, not yet built: **adaptive back-off strength** and closing session 47's **dead
+  `_backoff_resolve_since` gate** (both detailed below).
+- Everything under "Session 56/57's watch list" below is still current and unconfirmed.
 
 **Operator's decision rule (2026-09-04), unchanged:** if flights are clean from here, stop and ship
 the Blender/PLY presentation work. If goal problems recur, **rebuild goal management from scratch**

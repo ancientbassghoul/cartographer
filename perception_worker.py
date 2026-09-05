@@ -45,6 +45,19 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 
 MAP_GRID = 200              # resolution of the compact top-down occupancy summary on TOPIC_MAP
 
+# Session 62: the diag_perf CSV schema, promoted to a module constant so enable_diag(), the
+# self-test and perception_timing_report.py all read ONE definition. The first nine names and
+# their order are FROZEN — files written before 2026-09-05 have exactly that header, and the
+# report reads by column NAME so old and new flights stay comparable in the same tool.
+DIAG_PERF_FIELDS: tuple[str, ...] = (
+    "wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+    "n_keyframes", "n_voxels", "reloc",
+    # --- SLAM-internal phases (slam_engine.SLAM_PHASE_FIELDS) ---
+    "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+    # --- post-SLAM phases, measured in Pipeline.step ---
+    "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+)
+
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
 # frame of the PLY sequence (Pipeline._record_ply_marker / _write_frame_ply) so a Blender viewer can
 # always tell which anchor is which without reading markers.json.
@@ -181,6 +194,14 @@ class Pipeline:
         # it's consumed. The forward-cruise stand-off keeps the full clearance_max_range (it wants distant walls).
         self.ring_max_range = float(e.get("ring_max_range", 1.5))
         self._last_clearance = None       # last published forward_clearance_dist (for the report line)
+        # Session 62: last observed duration of each phase, in ms. STICKY — a phase that did not run this
+        # frame keeps its previous value here, so the 1 Hz console line stays readable across the frames
+        # where the map/plan timers don't fire. The CSV is the honest record (0.0 for "did not run"); THIS
+        # dict is a console convenience only and must never be logged, published or used for a decision.
+        self._last_phase_ms: dict[str, float] = {
+            "track": 0.0, "backend": 0.0, "pose": 0.0, "kf_download": 0.0,
+            "integrate": 0.0, "map_pub": 0.0, "plan": 0.0, "publish": 0.0,
+        }
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
         self._sweep_logged = False       # True while the planner is touring corners (one-shot per-corner log below)
@@ -214,9 +235,7 @@ class Pipeline:
 
     def enable_diag(self, ts=None, out_dir=None):
         """Open CSV diagnostic logs (per-frame timing + per-lift hit geometry)."""
-        self.diag_perf = DiagLog("perception", [
-            "wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
-            "n_keyframes", "n_voxels", "reloc"], out_dir=out_dir, ts=ts)
+        self.diag_perf = DiagLog("perception", list(DIAG_PERF_FIELDS), out_dir=out_dir, ts=ts)
         self.diag_lift = DiagLog("lift", [
             "wall_ts", "frame_id", "found", "bbox_area", "center_x", "center_y",
             "pose_found", "cam_x", "cam_y", "cam_z", "ray_x", "ray_y", "ray_z",
@@ -243,12 +262,6 @@ class Pipeline:
         if res.pose is not None and fid is not None:
             self._remember_pose(int(fid), res.pose)
 
-        self.diag_perf.row(
-            wall_ts=round(t_step, 4), frame_id=fid, loop_dt=round(loop_dt, 4),
-            slam_ms=round(slam_ms, 1), mode=res.mode, new_keyframe=int(bool(res.new_keyframe)),
-            n_keyframes=res.n_keyframes, n_voxels=len(self.mapstore),
-            reloc=int(bool(res.reloc_event)))
-
         # One-time geometry sanity: the center-pixel ray (camera frame) should point forward.
         if self.debug_lift and not self._geom_logged and self.slam.ray_field is not None:
             h, w = self.slam.ray_hw
@@ -262,6 +275,7 @@ class Pipeline:
         # dense and "remembers" the whole flight (previously add_pose was keyframe-gated → ~1 pt/kf,
         # a sparse path that froze between keyframes). Voxel integration still happens per keyframe.
         map_updated = False
+        t_integrate = time.perf_counter()
         if res.camera_center is not None:
             self.mapstore.add_pose(res.camera_center)
         if res.new_keyframe and res.kf_points is not None and len(res.kf_points):
@@ -270,11 +284,18 @@ class Pipeline:
                 # Same per-keyframe data feeds the 2D free/unknown/occupied ground layer.
                 self.ground.integrate(res.camera_center, res.kf_points)
             map_updated = True
+        integrate_ms = (time.perf_counter() - t_integrate) * 1000.0
 
         heading_deg = heading_from_pose(res.pose)
 
+        publish_ms = 0.0
+        map_pub_ms = 0.0
+        plan_ms = 0.0
+        map_pub_fired = False
+        plan_fired = False
         if state_pub is not None:
             cc = res.camera_center
+            t_publish = time.perf_counter()
             state_pub.publish(frame_bus.TOPIC_POSE, {
                 "tracking_mode": res.tracking_mode, "mode": res.mode,
                 "n_keyframes": res.n_keyframes, "n_voxels": len(self.mapstore),
@@ -289,18 +310,42 @@ class Pipeline:
                 "controls": meta.get("controls"),
                 "rec_frame": meta.get("rec_frame"),
             })
+            publish_ms = (time.perf_counter() - t_publish) * 1000.0
             # Top-down occupancy snapshot: on a new keyframe (cells changed) OR on a timer, so the
             # DENSE trajectory reaches the visualizer without waiting for the next (sparse) keyframe.
             # Each message is a full self-contained snapshot, so a late joiner catches up immediately.
             now_mono = time.monotonic()
             if map_updated or (now_mono - self.last_map_pub) >= self.MAP_PUB_INTERVAL:
+                t_map_pub = time.perf_counter()
                 state_pub.publish(frame_bus.TOPIC_MAP, self._map_payload(res, meta))
+                map_pub_ms = (time.perf_counter() - t_map_pub) * 1000.0
                 self.last_map_pub = now_mono
+                map_pub_fired = True
             # Map mode: republish the explore plan (goal/bearing/done + ground layer) on a timer.
             if (now_mono - self.last_plan_pub) >= self.PLAN_PUB_INTERVAL:
+                t_plan = time.perf_counter()
                 state_pub.publish(frame_bus.TOPIC_PLAN,
                                   self._plan_payload(res, meta, heading_deg, slam_ms))
+                plan_ms = (time.perf_counter() - t_plan) * 1000.0
                 self.last_plan_pub = now_mono
+                plan_fired = True
+
+        # Session 62: sticky console phase record (C3) — write a key only when that phase actually ran
+        # this frame, so the 1 Hz line below keeps showing the last REAL value instead of flashing to 0
+        # on frames where a phase is legitimately skipped (no new keyframe, map/plan timer not due yet).
+        self._last_phase_ms["track"] = res.track_ms
+        self._last_phase_ms["backend"] = res.backend_ms
+        self._last_phase_ms["pose"] = res.pose_ms
+        if res.new_keyframe:
+            self._last_phase_ms["kf_download"] = res.kf_download_ms
+        if map_updated:
+            self._last_phase_ms["integrate"] = integrate_ms
+        if state_pub is not None:
+            self._last_phase_ms["publish"] = publish_ms
+        if map_pub_fired:
+            self._last_phase_ms["map_pub"] = map_pub_ms
+        if plan_fired:
+            self._last_phase_ms["plan"] = plan_ms
 
         now = time.monotonic()
         if now - self.last_report >= 1.0:
@@ -309,11 +354,28 @@ class Pipeline:
             py = f"{self._last_pos_y:+.2f}" if self._last_pos_y is not None else " -- "
             rf, rb = self._last_ring_fb
             rfb = (f"{rf:.2f}" if rf is not None else "--") + "/" + (f"{rb:.2f}" if rb is not None else "--")
+            p = self._last_phase_ms
             print(f"[perception] SLAM {res.mode:<8} kf {res.n_keyframes:3d} | "
                   f"vox {len(self.mapstore):6d} | slam {slam_ms:5.1f} ms | "
+                  f"[trk {p['track']:.0f} bk {p['backend']:.0f} dl {p['kf_download']:.0f}] | "
+                  f"intg {p['integrate']:.0f} plan {p['plan']:.0f} map {p['map_pub']:.0f} ms | "
                   f"ray_clear {rc} | y {py} | ring f/b {rfb} | "
                   f"trigger {c.get('trigger')} yaw {c.get('yaw')}")
             self.last_report = now
+
+        # Session 62: the row moved from just-after-SLAM to end-of-step so it can carry the POST-SLAM
+        # phases too. One documented consequence: `n_voxels` is now the count AFTER this frame's
+        # integrate rather than before it (off by one keyframe's worth against pre-2026-09-05 files);
+        # `loop_dt` and every other column are unchanged.
+        self.diag_perf.row(
+            wall_ts=round(t_step, 4), frame_id=fid, loop_dt=round(loop_dt, 4),
+            slam_ms=round(slam_ms, 1), mode=res.mode, new_keyframe=int(bool(res.new_keyframe)),
+            n_keyframes=res.n_keyframes, n_voxels=len(self.mapstore),
+            reloc=int(bool(res.reloc_event)),
+            track_ms=round(res.track_ms, 1), backend_ms=round(res.backend_ms, 1),
+            pose_ms=round(res.pose_ms, 1), kf_download_ms=round(res.kf_download_ms, 1),
+            integrate_ms=round(integrate_ms, 1), map_pub_ms=round(map_pub_ms, 1),
+            plan_ms=round(plan_ms, 1), publish_ms=round(publish_ms, 1))
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -1117,6 +1179,14 @@ def run_self_test(cfg):
     print(f"[perception][self-test] {'PASS' if ok_lkg else 'FAIL'}  SESSION-60 F_LKG SOURCE")
     assert ok_lkg
 
+    ok_phases = _self_test_slam_phase_fields()
+    print(f"[perception][self-test] {'PASS' if ok_phases else 'FAIL'}  SESSION-62 SLAM PHASE FIELDS")
+    assert ok_phases
+
+    ok_timing = _self_test_phase_timing(cfg)
+    print(f"[perception][self-test] {'PASS' if ok_timing else 'FAIL'}  SESSION-62 PHASE TIMING SCHEMA")
+    assert ok_timing
+
     print("[perception][self-test] PASS")
 
 
@@ -1282,12 +1352,19 @@ def _self_test_ply_sequence(cfg):
         check("failure_is_counted -- OSError on a missing dir increments ply_seq_failures + degrades",
               p9.ply_seq_failures == 1 and p9.ply_seq_degraded is True)
 
-        ply_sequence_default = bool((cfg.get("diag") or {}).get("ply_sequence", False))
-        seq10 = td / "seq10_never_created"
-        if ply_sequence_default:
-            seq10.mkdir(parents=True, exist_ok=True)   # mirrors run_live's gating
-        check("disabled_writes_nothing -- config default ply_sequence=False -> dir never created",
-              (not ply_sequence_default) and not seq10.exists())
+        # Session 62: this read the LIVE config's `diag.ply_sequence` and asserted it was False, so it
+        # could only ever pass while the operator had the feature OFF -- it went red the moment
+        # ply_sequence was enabled for a flight (commit 9574a1f), reporting a config choice as a code
+        # defect and taking the whole suite (and the chunk gate) down with it. What run_live's gate
+        # actually promises is a BICONDITIONAL: the sequence dir exists iff the flag is set. Drive both
+        # branches from explicit locals so the result depends on the logic, not on config.yaml.
+        for gate, name in ((False, "seq10_gate_off"), (True, "seq11_gate_on")):
+            seq = td / name
+            if gate:
+                seq.mkdir(parents=True, exist_ok=True)   # mirrors run_live's gating
+            check(f"gate_{'on_creates_dir' if gate else 'off_writes_nothing'} -- "
+                  f"ply_sequence={gate} -> seq dir {'created' if gate else 'never created'}",
+                  seq.exists() is gate)
 
     return ok
 
@@ -1359,6 +1436,136 @@ def _self_test_f_lkg_source(cfg):
     Pipeline._plan_payload(pipe_hdg, _res("TRACKING", True), meta, heading_deg=None)
     check("missing_heading -- heading_deg=None -> last_plan_valid False",
           pipe_hdg.last_plan_valid is False)
+
+    return ok
+
+
+def _self_test_slam_phase_fields():
+    """SESSION-62 SLAM PHASE FIELDS: `SlamResult` gained four per-phase timing fields
+    (`slam_engine.SLAM_PHASE_FIELDS`) that must default to 0.0 (never None -- a None becomes a blank
+    CSV cell and a ragged row downstream, per CLAUDE.md's no-silent-fallback rule), stay present on
+    a pre-session-62-style construction, and round-trip real values. No GPU/SLAM needed: SlamResult
+    is a plain dataclass."""
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("phase_fields_tuple -- SLAM_PHASE_FIELDS is the frozen four, in order",
+          slam_engine.SLAM_PHASE_FIELDS == ("track_ms", "backend_ms", "pose_ms", "kf_download_ms"))
+
+    r = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False)
+    check("defaults_present_and_zero -- all four phase fields default to 0.0",
+          all(getattr(r, f) == 0.0 for f in slam_engine.SLAM_PHASE_FIELDS))
+    check("defaults_are_float -- each phase field is a float",
+          all(isinstance(getattr(r, f), float) for f in slam_engine.SLAM_PHASE_FIELDS))
+
+    r2 = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False,
+        track_ms=12.5, backend_ms=900.0, pose_ms=1.5, kf_download_ms=70.0)
+    check("roundtrip -- explicit phase values come back unchanged",
+          (r2.track_ms, r2.backend_ms, r2.pose_ms, r2.kf_download_ms) == (12.5, 900.0, 1.5, 70.0))
+
+    return ok
+
+
+def _self_test_phase_timing(cfg):
+    """SESSION-62 PHASE TIMING SCHEMA: DIAG_PERF_FIELDS must keep its frozen 9-column prefix (so
+    pre-2026-09-05 files stay readable by name), carry every SlamResult phase field plus the four
+    post-SLAM phase columns exactly once each, and DiagLog must round-trip a fully-populated row
+    while leaving OMITTED phase keywords as blank cells -- not silently zeroed (CLAUDE.md: a missing
+    field must be visibly missing). No GPU/SLAM needed: DiagLog is pure stdlib CSV."""
+    import csv
+    import shutil
+    import tempfile
+
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("frozen_prefix -- first nine DIAG_PERF_FIELDS names/order unchanged since before session 62",
+          DIAG_PERF_FIELDS[:9] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+                                    "n_keyframes", "n_voxels", "reloc"))
+    check("slam_phase_fields_present -- every slam_engine.SLAM_PHASE_FIELDS name is a DIAG_PERF_FIELDS column",
+          all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_PHASE_FIELDS))
+    check("post_slam_fields_present -- integrate_ms/map_pub_ms/plan_ms/publish_ms are columns",
+          all(f in DIAG_PERF_FIELDS for f in ("integrate_ms", "map_pub_ms", "plan_ms", "publish_ms")))
+    check("no_duplicate_columns -- DIAG_PERF_FIELDS has no repeated name",
+          len(set(DIAG_PERF_FIELDS)) == len(DIAG_PERF_FIELDS))
+
+    tmp_dir = tempfile.mkdtemp(prefix="phase_timing_selftest_")
+    try:
+        log = DiagLog("perception", list(DIAG_PERF_FIELDS), out_dir=tmp_dir, ts="20260101_000000")
+        full_row = {f: (1 if f in ("frame_id", "new_keyframe", "n_keyframes", "n_voxels", "reloc")
+                        else ("TRACKING" if f == "mode" else 1.0))
+                    for f in DIAG_PERF_FIELDS}
+        log.row(**full_row)
+        log.row(wall_ts=2.0, frame_id=2, loop_dt=0.1, slam_ms=5.0, mode="TRACKING",
+                new_keyframe=0, n_keyframes=1, n_voxels=10, reloc=0)
+        log.close()
+
+        with open(log.path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            header_ok = reader.fieldnames == list(DIAG_PERF_FIELDS)
+            rows = list(reader)
+
+        first_row_ok = all(str(rows[0][f]) == str(full_row[f]) for f in DIAG_PERF_FIELDS)
+        omitted_phase_fields = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                                 "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms")
+        blanks_ok = all(rows[1][f] == "" for f in omitted_phase_fields)
+
+        check("csv_header_matches -- DictReader header equals list(DIAG_PERF_FIELDS)", header_ok)
+        check("csv_full_row_roundtrips -- fully-populated row's values come back unchanged", first_row_ok)
+        check("csv_omitted_phases_are_blank -- missing phase kwargs write '' not '0.0'", blanks_ok)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Session 62 CHUNK 3: the sticky console dict (C3) -- a types.SimpleNamespace stands in for the
+    # Pipeline so this stays a pure-stdlib test (no GPU/SLAM). Checks the fresh-dict shape, the
+    # stickiness contract (a phase that did NOT run this frame keeps its previous value), and that the
+    # console segment renders for both an all-zero and a populated dict.
+    import types
+
+    fresh_phase_ms = {
+        "track": 0.0, "backend": 0.0, "pose": 0.0, "kf_download": 0.0,
+        "integrate": 0.0, "map_pub": 0.0, "plan": 0.0, "publish": 0.0,
+    }
+    check("phase_ms_fresh -- a fresh _last_phase_ms dict has all eight keys, every value 0.0",
+          set(fresh_phase_ms) == {"track", "backend", "pose", "kf_download",
+                                   "integrate", "map_pub", "plan", "publish"}
+          and all(v == 0.0 for v in fresh_phase_ms.values()))
+
+    pipe = types.SimpleNamespace(_last_phase_ms=dict(fresh_phase_ms))
+    pipe._last_phase_ms["integrate"] = 42.0
+    map_updated = False               # sticky-update rule: only write "integrate" when this is True
+    if map_updated:
+        pipe._last_phase_ms["integrate"] = 7.0
+    check("sticky_integrate_unchanged -- map_updated=False leaves a previously-set integrate value",
+          pipe._last_phase_ms["integrate"] == 42.0)
+
+    def _render(p):
+        return (f"[trk {p['track']:.0f} bk {p['backend']:.0f} dl {p['kf_download']:.0f}] | "
+                f"intg {p['integrate']:.0f} plan {p['plan']:.0f} map {p['map_pub']:.0f} ms | ")
+
+    labels = ("trk ", "bk ", "dl ", "intg ", "plan ", "map ")
+    try:
+        seg_zero = _render(fresh_phase_ms)
+        seg_full = _render({"track": 12.0, "backend": 900.0, "pose": 1.5, "kf_download": 70.0,
+                             "integrate": 3.0, "map_pub": 4.0, "plan": 5.0, "publish": 6.0})
+        render_ok = all(tok in seg_zero for tok in labels) and all(tok in seg_full for tok in labels)
+    except Exception as e:
+        render_ok = False
+        print(f"[perception][self-test] phase segment render raised: {e}")
+    check("phase_segment_renders -- console segment formats without raising, all six labels present",
+          render_ok)
 
     return ok
 

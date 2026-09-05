@@ -110,7 +110,11 @@ def main():
 
     try:
         NEW_CONSOLE = subprocess.CREATE_NEW_CONSOLE   # separate window per service, just like a batch file
-        perception = subprocess.Popen([python_exe, "perception_worker.py", "--no-display", "--stop-file", perception_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
+        # Session 62: --log turns on perception_worker's diag CSVs (per-frame SLAM/loop/phase timing).
+        # It was never passed here, so pipe.enable_diag() never fired on a real flight and NO perception
+        # timing CSV existed after 2026-06-26 -- the SLAM-choke table in STATE.md had to be reconstructed
+        # from autopilot-side plan payloads. Matches how autopilot.py is launched on the next line.
+        perception = subprocess.Popen([python_exe, "perception_worker.py", "--no-display", "--log", "--stop-file", perception_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         # The autopilot writes the flight report; give it the stop-file so it can flush its map + timeline on exit.
         autopilot = subprocess.Popen([python_exe, "autopilot.py", "--explore", "--log", "--stop-file", stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         visualizer = subprocess.Popen([python_exe, "visualizer.py", "--record", "--stop-file", visualizer_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)

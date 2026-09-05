@@ -23,6 +23,7 @@ never hidden or auto-absorbed.
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +65,17 @@ class SlamResult:
     pose: np.ndarray | None = None        # (4,4) world<-camera Sim3 matrix [[sR,t],[0,1]] this frame
     kf_points: np.ndarray | None = None   # (N,3) world points of the NEW keyframe only
     kf_colors: np.ndarray | None = None   # (N,3) uint8, paired with kf_points
+    # Session 62 — per-phase wall-clock split of what `slam_ms` measures, so the choke can be
+    # attributed instead of guessed. Always present; 0.0 = the phase did not run this frame.
+    track_ms: float = 0.0          # frame construction + the INIT/TRACKING/RELOC mode branch
+    backend_ms: float = 0.0        # _run_backend(): retrieval update + add_factors + solve_GN_*
+    pose_ms: float = 0.0           # pose recovery (Act3 basis -> numpy pose_mat + center)
+    kf_download_ms: float = 0.0    # new-keyframe GPU->CPU pull (X_canon, pW, conf, uimg) + ray field
+
+
+# Session 62: the phase names in SlamResult, in pipeline order. Single source of truth shared by
+# perception_worker's CSV schema and the timing report — never re-type this list anywhere.
+SLAM_PHASE_FIELDS: tuple[str, ...] = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms")
 
 
 class SlamEngine:
@@ -219,6 +231,7 @@ class SlamEngine:
         if not self._initialized:
             self._lazy_state(rgb_float01)
 
+        _t0 = time.perf_counter()
         i = self._i
         mode = states_mode = self.states.get_mode()
         T_WC = (lietorch.Sim3.Identity(1, device=self.device)
@@ -258,8 +271,10 @@ class SlamEngine:
 
         # Backend runs for TRACKING/RELOC frames (not on the INIT-creating frame),
         # matching slam_offline.py's proven ordering.
+        _t_track = time.perf_counter()
         if not ran_init:
             self._run_backend()
+        _t_backend = time.perf_counter()
 
         # Recover the full pose using Act3 on origin + unit axes (act is safe; matrix()/Act4
         # is not — see _pose_basis). w[0]=center=t; w[i]-w[0]=sR·e_i = i-th column of sR.
@@ -269,6 +284,7 @@ class SlamEngine:
         pose_mat[:3, :3] = (w[1:] - w[0]).T
         pose_mat[:3, 3] = w[0]
         center = w[0].astype(np.float32).copy()
+        _t_pose = time.perf_counter()
 
         kf_points = kf_colors = None
         if new_kf:
@@ -285,10 +301,20 @@ class SlamEngine:
             self.ray_field = (X_canon / np.clip(norm, 1e-9, None)).astype(np.float32)
             self.ray_hw = (self.h, self.w)
 
+        _t_kf = time.perf_counter()
         self._i += 1
         cur_mode = Mode(self.states.get_mode()).name
+        # Session 62: attribute slam_ms instead of guessing at it. A phase that did not run reports a
+        # literal 0.0, never the sub-microsecond noise of an unentered branch — see CLAUDE.md's
+        # no-silent-fallback rule applied to measurement: "did not run" must be distinguishable.
+        track_ms = (_t_track - _t0) * 1000.0
+        backend_ms = 0.0 if ran_init else (_t_backend - _t_track) * 1000.0
+        pose_ms = (_t_pose - _t_backend) * 1000.0
+        kf_download_ms = (_t_kf - _t_pose) * 1000.0 if new_kf else 0.0
         return SlamResult(
             tracking_mode=self.tracking_mode, mode=cur_mode,
             n_keyframes=len(self.keyframes), frame_idx=i, camera_center=center,
             new_keyframe=new_kf, reloc_event=reloc_event, pose=pose_mat,
-            kf_points=kf_points, kf_colors=kf_colors)
+            kf_points=kf_points, kf_colors=kf_colors,
+            track_ms=track_ms, backend_ms=backend_ms, pose_ms=pose_ms,
+            kf_download_ms=kf_download_ms)

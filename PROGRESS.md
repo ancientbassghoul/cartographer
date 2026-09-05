@@ -12,6 +12,58 @@ for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **62 (flown 2026-09-05 11:33-12:08, `OUTPUT/diag/20260905_113346_*`)** — A proposal came in to split
+  `Pipeline` into a tracking thread and a background mapping thread, on the theory that CPU-side
+  `MapStore.integrate()` / `GroundGrid.integrate()` is what progressively slows the pipeline as the
+  voxel map grows. The repo's own instrumentation didn't support it: `slam_ms` brackets only
+  `slam.process()`, and the integrate / clearance / plan / publish work all happens *after* that
+  stopwatch stops — so the refactor would have moved work that isn't inside the number that's
+  degrading. The June archives agreed: non-SLAM time was ~78 ms and mildly *decreasing* while the map
+  tripled. So instead of building the threads we built the measurement — four phase timers inside
+  `slam_engine.process()` (`track` / `backend` / `pose` / `kf_download`), four more around the
+  post-SLAM block in `Pipeline.step()`, eight new CSV columns, a 1 Hz console breakdown, and a
+  standalone `perception_timing_report.py`. That also turned up why no perception CSV had existed
+  since 2026-06-26: `fly.py` launched `perception_worker.py` without `--log`, so `enable_diag()` never
+  fired on a real flight and the whole SLAM-choke table had to be reconstructed from autopilot-side
+  plan payloads.
+  **The verdict, from the first flight with it armed:** of 2 010 s spent in the loop, `backend_ms` is
+  **1 113 s (55 %)** and `track_ms` 602 s (30 %), while `integrate_ms` is **39 s (1.9 %)** and
+  `plan_ms` 29 s (1.4 %). On keyframe frames the median solve is 9 818 ms, of which the backend is
+  8 082 ms (82 %) and integrate 339 ms (3 %) — twenty-four to one. The proposed refactor targets ~3 %
+  of the flight; `_run_backend()` on the frame-critical path is the choke, which is the cost of this
+  repo deliberately collapsing upstream MASt3R-SLAM's separate backend *process* into one process.
+  Two surprises worth keeping: `map_pub_ms`, not `integrate_ms`, is the CPU cost that actually scales
+  with map size (4 → 1 238 ms as voxels reached 386 k — `topdown_summary` is O(map) and runs at ≥2 Hz),
+  and `track_ms` rose 8× then partially *fell* while the keyframe graph kept growing, so it is not a
+  simple function of graph size either. Stage A (backend off the critical path, 55 %), Stage B
+  (decouple `TOPIC_PLAN` from the SLAM cadence) and Stage C (the original proposal) are parked with
+  their designs intact in `plans/session62-spec.md`.
+  Built through `sonnet_runner.py` in five chunks. Chunk 1 tripped a red gate that turned out to be
+  pre-existing and not the chunk's doing: two self-tests asserted on the operator's LIVE `config.yaml`
+  (`use_visual_backoff_trigger`, `diag.ply_sequence`) rather than on code, so flipping an
+  operator-tunable flag for a flight reported itself as a code defect — and `perception_worker`'s had
+  been red since the commit that enabled `ply_sequence`, which is why "all 9 green" had quietly aged
+  out. Both rewritten to drive their own synthetic configs, verified green under both values of each
+  flag.
+  **The flight ended in a hardware crash** (suspected Intel Graphics; the operator has since disabled
+  the card). Salvage recovered essentially everything — one torn timeline line out of 75 077, one
+  damaged macroblock out of 17 641 video frames — but its first video repair produced an unwatchable
+  file. `salvage_flight.repair_mp4` kept its own longhand copy of the dashboard-width formula, which
+  went stale when session 60 added the leftmost LKG column (908 → 1336 px); it therefore rejected the
+  three correct same-generation donors as "wrong size" and borrowed a 908-wide VOL header for a
+  1336-wide stream, wrapping every macroblock row 428 px early. Its guard couldn't catch that, because
+  it validated the output against the very assumption that chose the header. Fixed by defining
+  `CANVAS_W`/`CANVAS_H` exactly once in `visualizer.py` (the expression had been written out longhand
+  in four places, three of which session 60 updated) and by replacing the tautological guard with an
+  actual decode of the first 300 frames — wrong header 146 errors, right header 0.
+- **Operator config decision (2026-09-05): `use_visual_backoff_trigger` → `false`.** Flight
+  `20260905_011112` exposed the tradeoff cleanly: with the camera-requested back-off ON, PLAN never
+  went stale — but goals were blacklisted as unreachable (justifiably so) and the reconstruction came
+  out worse, because the drone never dug into the corner areas. Turning it OFF cost two PLAN-STALE
+  events on the next flight and produced a better reconstruction. Staying off for now, with the
+  FALLBACK reordering (back off + dwell for SIFT *before* sweeping) expected to cover the stale-plan
+  cost it gives up.
+
 - **61** — The LKG debug panel, not the F_LKG plumbing underneath it, was lying. It published only at
   SIFT-match instants, so during a 7-minute flight with just 16 matches it sat ~50s and 8 SLAM solves
   stale while the map arrow and telemetry stayed live — the operator caught this from a screenshot at

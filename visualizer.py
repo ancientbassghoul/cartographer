@@ -63,6 +63,15 @@ PANEL_W, PANEL_H = 416, 234   # the two 16:9 left-column panels (input + telemet
 GAP = 12
 MAP_SIZE = PANEL_H * 2 + GAP  # square map, same height as the stacked left column
 STATUS_H = 48                 # two lines: SLAM state + target estimate
+# Session 62: the composed dashboard's exact pixel size, defined ONCE. This expression used to be
+# written out longhand in _open_video_writer, in two self-tests AND in salvage_flight.repair_mp4 --
+# and when session 60 added the leftmost LKG column (+PANEL_W+GAP, 908->1336 wide) only the first
+# three were updated. salvage_flight then "repaired" the crashed flight 20260905_113346 by
+# prepending a 908-wide VOL header to a 1336-wide elementary stream: every row wrapped 428px early
+# and the file decoded into garbage. One definition, so a layout change can never again leave a
+# stale copy behind.
+CANVAS_W = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE   # LKG | input over telemetry | top-down map
+CANVAS_H = STATUS_H + MAP_SIZE
 RELOC_FLASH_S = 2.0           # keep the RELOC banner up this long after the event
 
 LKG_CANVAS_STALE_S = 300.0  # session 61, revised same day: the operator found the grey swap-out
@@ -645,8 +654,7 @@ def _open_video_writer(fps):
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(out_dir, f"{ts}_visualizer.mp4")
-    width = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE   # session 60 (C9): + the new leftmost LKG column
-    height = STATUS_H + MAP_SIZE
+    width, height = CANVAS_W, CANVAS_H   # session 60 (C9) added the leftmost LKG column; see CANVAS_W
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
     if not writer.isOpened():
@@ -783,7 +791,7 @@ def run_self_test():
     # published; the composed width always follows the new 4-panel formula in EITHER state. -----------
     dash60 = Dashboard()
     img_no_canvas = dash60.render()
-    expected_w = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE
+    expected_w = CANVAS_W
     case(f"(60-1) no canvas yet -> composes without raising, width == PANEL_W+GAP+PANEL_W+GAP+MAP_SIZE "
          f"(got {img_no_canvas.shape[1]}, want {expected_w})",
          img_no_canvas.shape[1] == expected_w)
@@ -855,7 +863,7 @@ def run_self_test():
          f"(shape={panel_none61.shape})",
          panel_none61.shape == (MAP_SIZE, PANEL_W, 3))
 
-    expected_w61 = PANEL_W + GAP + PANEL_W + GAP + MAP_SIZE
+    expected_w61 = CANVAS_W
     expected_h61 = STATUS_H + MAP_SIZE
     dash61 = Dashboard()
     img_no_canvas61 = dash61.render()

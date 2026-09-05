@@ -42,7 +42,7 @@ DEFAULT_PLAN = "test_plan.md"
 # silently break.
 DEFAULT_SUITES = ["autopilot.py", "frontier_planner.py", "visual_recovery.py", "flight_replay.py",
                   "ground_grid.py", "map_store.py", "salvage_flight.py", "perception_worker.py",
-                  "visualizer.py"]
+                  "visualizer.py", "perception_timing_report.py"]
 
 # The suites run under the PROJECT VENV, not under whatever interpreter launched this runner.
 # `perception_worker.py` imports torch/MASt3R, which exist only in the venv -- running it with a bare

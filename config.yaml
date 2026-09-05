@@ -465,7 +465,7 @@ autonomy:
     # now published directly by perception_worker (the exact frame its TRACKING solve was computed from)
     # and consumed straight off the bus, so the reconstruct-from-frame_id ring -- and the age-out it could
     # suffer when SLAM solve latency outran the ring's depth -- no longer exist. See MISSION CONTEXT.
-    use_visual_backoff_trigger: true   # session 59: let the CAMERA request a back-off, not merely veto one
+    use_visual_backoff_trigger: false   # session 59: let the CAMERA request a back-off, not merely veto one
     visual_backoff_min_window_s: 3.0   # confident-evidence window that must elapse before it may fire
     visual_backoff_live_ratio: 0.66    # LIVE / (LIVE + EQUAL + LKG) needed to call it "closing"
     visual_backoff_min_samples: 5      # confident verdicts required (UNKNOWN never counts)
