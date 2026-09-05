@@ -71,11 +71,21 @@ class SlamResult:
     backend_ms: float = 0.0        # _run_backend(): retrieval update + add_factors + solve_GN_*
     pose_ms: float = 0.0           # pose recovery (Act3 basis -> numpy pose_mat + center)
     kf_download_ms: float = 0.0    # new-keyframe GPU->CPU pull (X_canon, pW, conf, uimg) + ray field
+    # Session 63 — the split INSIDE track_ms. Once the backend leaves the frame path (phase 2),
+    # this is the whole budget; measure it before optimising it, not after.
+    frame_ms: float = 0.0      # self._create_frame(...) — runs on EVERY frame
+    infer_ms: float = 0.0      # _mast3r_inference_mono — INIT and RELOC branches only
+    tracker_ms: float = 0.0    # self.tracker.track(frame) — TRACKING branch only
 
 
 # Session 62: the phase names in SlamResult, in pipeline order. Single source of truth shared by
 # perception_worker's CSV schema and the timing report — never re-type this list anywhere.
 SLAM_PHASE_FIELDS: tuple[str, ...] = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms")
+
+# Session 63: the sub-split INSIDE track_ms, in pipeline order. Kept SEPARATE from
+# SLAM_PHASE_FIELDS because those four close against slam_ms and these three close against
+# track_ms — two different invariants, and merging them would break both.
+SLAM_TRACK_PHASE_FIELDS: tuple[str, ...] = ("frame_ms", "infer_ms", "tracker_ms")
 
 
 class SlamEngine:
@@ -236,13 +246,20 @@ class SlamEngine:
         mode = states_mode = self.states.get_mode()
         T_WC = (lietorch.Sim3.Identity(1, device=self.device)
                 if i == 0 else self.states.get_frame().T_WC)
+        _t_frame0 = time.perf_counter()
         frame = self._create_frame(i, rgb_float01, T_WC, img_size=512, device=self.device)
+        _t_frame1 = time.perf_counter()
+        frame_ms = (_t_frame1 - _t_frame0) * 1000.0
 
         new_kf = False
         reloc_event = False
         ran_init = False
+        infer_ms = 0.0
+        tracker_ms = 0.0
         if mode == Mode.INIT:
+            _t_infer0 = time.perf_counter()
             X, C = self._mast3r_inference_mono(self.model, frame)
+            infer_ms = (time.perf_counter() - _t_infer0) * 1000.0
             frame.update_pointmap(X, C)
             self.keyframes.append(frame)
             self.states.queue_global_optimization(len(self.keyframes) - 1)
@@ -251,7 +268,9 @@ class SlamEngine:
             new_kf = True
             ran_init = True
         elif mode == Mode.TRACKING:
+            _t_tracker0 = time.perf_counter()
             add_new_kf, _, try_reloc = self.tracker.track(frame)
+            tracker_ms = (time.perf_counter() - _t_tracker0) * 1000.0
             if try_reloc:
                 self.states.set_mode(Mode.RELOC)
                 reloc_event = True
@@ -262,7 +281,9 @@ class SlamEngine:
                 self.states.queue_global_optimization(len(self.keyframes) - 1)
                 new_kf = True
         elif mode == Mode.RELOC:
+            _t_infer0 = time.perf_counter()
             X, C = self._mast3r_inference_mono(self.model, frame)
+            infer_ms = (time.perf_counter() - _t_infer0) * 1000.0
             frame.update_pointmap(X, C)
             self.states.set_frame(frame)
             self.states.queue_reloc()
@@ -317,4 +338,5 @@ class SlamEngine:
             new_keyframe=new_kf, reloc_event=reloc_event, pose=pose_mat,
             kf_points=kf_points, kf_colors=kf_colors,
             track_ms=track_ms, backend_ms=backend_ms, pose_ms=pose_ms,
-            kf_download_ms=kf_download_ms)
+            kf_download_ms=kf_download_ms,
+            frame_ms=frame_ms, infer_ms=infer_ms, tracker_ms=tracker_ms)

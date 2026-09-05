@@ -50,7 +50,11 @@ class MapStore:
 
         # voxel index (ix,iy,iz) tuple -> row in the parallel arrays below
         self._row_of: dict[tuple, int] = {}
-        self._keys: list[tuple] = []          # row -> (ix,iy,iz)
+        # Session 63: preallocated (cap,3) array, not a Python list -- readout paths used to pay
+        # np.asarray(list-of-tuples) on every call (O(map) each time); self._n is the live row
+        # count since len(self._keys) is now the allocated CAPACITY, not the occupancy.
+        self._keys = np.zeros((0, 3), np.int64)  # row -> (ix,iy,iz), preallocated to self._cap
+        self._n = 0                            # live rows (<= self._cap == len(self._keys))
         self._count = np.zeros(0, np.int64)    # row -> observation count
         self._color_sum = np.zeros((0, 3), np.float64)  # row -> summed RGB
         self._cap = 0                          # allocated capacity of the arrays
@@ -58,10 +62,18 @@ class MapStore:
         self.trajectory: list[np.ndarray] = []  # camera centers in world coords
         self.n_points_seen = 0                   # raw points integrated (pre-voxelization)
 
+        # Session 63: topdown_summary() was recomputing an identical raster at >=2Hz even though
+        # occupied cells only change inside integrate() (keyframes only, ~1 frame in 6). Cache the
+        # cell raster + its projection frame; _td_dirty is the ONLY invalidation signal (no timer --
+        # a stale raster after the map changed is a silent wrong answer, per CLAUDE.md).
+        self._td_cache: dict | None = None    # cached cell raster + bounds from the last recompute
+        self._td_key: tuple | None = None     # (grid, pad, min_count) the cache was built for
+        self._td_dirty: bool = True           # set True by ANY mutation of counts/colors/keys
+
     # ------------------------------------------------------------------ ingest
     def _grow(self, extra: int):
         """Ensure capacity for `extra` more voxels (amortized doubling)."""
-        need = len(self._keys) + extra
+        need = self._n + extra
         if need <= self._cap:
             return
         new_cap = max(need, max(self._cap * 2, 1024))
@@ -69,6 +81,9 @@ class MapStore:
         c[: self._cap] = self._count
         cs = np.zeros((new_cap, 3), np.float64)
         cs[: self._cap] = self._color_sum
+        k = np.zeros((new_cap, 3), np.int64)
+        k[: self._cap] = self._keys
+        self._keys = k
         self._count, self._color_sum, self._cap = c, cs, new_cap
 
     def integrate(self, points_world: np.ndarray, colors: np.ndarray | None = None):
@@ -109,28 +124,32 @@ class MapStore:
             key = (int(uniq[i, 0]), int(uniq[i, 1]), int(uniq[i, 2]))
             row = self._row_of.get(key)
             if row is None:
-                row = len(self._keys)
+                row = self._n
                 self._row_of[key] = row
-                self._keys.append(key)
+                self._keys[row] = uniq[i]
+                self._n += 1
             self._count[row] += batch_count[i]
             self._color_sum[row] += batch_color[i]
+        self._td_dirty = True  # Session 63: this path just mutated counts/colors/keys
         return len(uniq)
 
     def add_pose(self, camera_center_world):
         """Append a camera center (world coords, shape (3,)) to the trajectory."""
         c = np.asarray(camera_center_world, dtype=np.float32).reshape(3)
         self.trajectory.append(c)
+        # Session 63: deliberately does NOT set _td_dirty -- the cell raster is unaffected by a new
+        # pose, and topdown_summary() recomputes traj_u/traj_v on every call regardless of the cache.
 
     # ------------------------------------------------------------------ readout
     def __len__(self):
-        return len(self._keys)
+        return self._n
 
     def occupied(self, min_count: int = 1):
         """Return (centers Mx3 float32, colors Mx3 uint8) for voxels seen >= min_count."""
-        n = len(self._keys)
+        n = self._n
         if n == 0:
             return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8)
-        keys = np.asarray(self._keys, dtype=np.int64)
+        keys = self._keys[:n]
         count = self._count[:n]
         keep = count >= min_count
         keys, count = keys[keep], count[keep]
@@ -229,7 +248,7 @@ class MapStore:
 
     def stats(self, min_count: int = 1):
         centers, _ = self.occupied(min_count)
-        n = len(self._keys)
+        n = self._n
         counts = self._count[:n]
         return {
             "tracking_mode": self.tracking_mode,
@@ -256,8 +275,16 @@ class MapStore:
         Transport-agnostic: numpy out; the caller serializes for the bus. Each summary is a
         self-contained snapshot of the whole map, so a late-joining subscriber catches up
         fully on the next publish (no incremental state to miss).
+
+        Session 63: the cell raster (cells_u/v/rgb, bounds, span_world, n_voxels_kept, and the
+        x0/z0/scale projection frame) is cached and reused while `_td_dirty` is False and the
+        (grid, pad, min_count) key matches -- occupied cells only change inside integrate()
+        (keyframes only), so most publish-timer ticks would otherwise recompute an identical
+        answer. traj_u/traj_v are recomputed on EVERY call (cached or not): the trajectory grows
+        every frame even when the cells don't, so caching it would freeze the drawn path.
         """
         grid = int(grid)
+        key = (grid, pad, min_count)
         out = {
             "grid": grid, "tracking_mode": self.tracking_mode,
             "voxel_size": self.voxel_size, "n_voxels_kept": 0,
@@ -266,49 +293,72 @@ class MapStore:
             "cells_rgb": np.zeros((0, 3), np.uint8),
             "traj_u": np.zeros(0, np.int32), "traj_v": np.zeros(0, np.int32),
         }
-        n = len(self._keys)
-        if n == 0:
-            return out
-        keys = np.asarray(self._keys, dtype=np.int64)
-        count = self._count[:n]
-        keep = count >= min_count
-        if not keep.any():
-            return out
-        keys, count = keys[keep], count[keep]
-        csum = self._color_sum[:n][keep]
-        centers = (keys + 0.5) * self.voxel_size
-        color = (csum / count[:, None]).clip(0, 255)  # count-weighted mean RGB (float)
 
-        X, Z = centers[:, 0], centers[:, 2]
-        xlo, xhi = np.percentile(X, 1), np.percentile(X, 99)
-        zlo, zhi = np.percentile(Z, 1), np.percentile(Z, 99)
-        span = max(xhi - xlo, zhi - zlo, 1e-6)
-        cx, cz = (xlo + xhi) / 2, (zlo + zhi) / 2
-        half = span * (0.5 + pad)
-        x0, z0 = cx - half, cz - half
-        scale = (grid - 1) / (2 * half)
-
-        def to_cell(x, z):
+        def to_cell(x, z, x0, z0, scale):
             u = np.clip((x - x0) * scale, 0, grid - 1).astype(np.int64)
             vraw = np.clip((z - z0) * scale, 0, grid - 1).astype(np.int64)
             return u, (grid - 1) - vraw  # flip so +Z reads "up", matching render_topdown
 
-        u, v = to_cell(X, Z)
-        lin = v * grid + u
-        uniq, invix = np.unique(lin, return_inverse=True)
-        cell_cnt = np.bincount(invix, weights=count, minlength=len(uniq))
-        cell_rgb = np.stack(
-            [np.bincount(invix, weights=color[:, c] * count, minlength=len(uniq))
-             for c in range(3)],
-            axis=1,
-        ) / cell_cnt[:, None]
+        if self._td_dirty or self._td_key != key:
+            n = self._n
+            if n == 0:
+                self._td_cache = None
+                self._td_key = key
+                self._td_dirty = False
+                return out
+            keys = self._keys[:n]
+            count = self._count[:n]
+            keep = count >= min_count
+            if not keep.any():
+                self._td_cache = None
+                self._td_key = key
+                self._td_dirty = False
+                return out
+            keys, count = keys[keep], count[keep]
+            csum = self._color_sum[:n][keep]
+            centers = (keys + 0.5) * self.voxel_size
+            color = (csum / count[:, None]).clip(0, 255)  # count-weighted mean RGB (float)
 
-        out["cells_v"] = (uniq // grid).astype(np.int32)
-        out["cells_u"] = (uniq % grid).astype(np.int32)
-        out["cells_rgb"] = cell_rgb.clip(0, 255).astype(np.uint8)
-        out["n_voxels_kept"] = int(len(centers))
-        out["bounds"] = [float(x0), float(x0 + 2 * half), float(z0), float(z0 + 2 * half)]
-        out["span_world"] = float(2 * half)
+            X, Z = centers[:, 0], centers[:, 2]
+            xlo, xhi = np.percentile(X, 1), np.percentile(X, 99)
+            zlo, zhi = np.percentile(Z, 1), np.percentile(Z, 99)
+            span = max(xhi - xlo, zhi - zlo, 1e-6)
+            cx, cz = (xlo + xhi) / 2, (zlo + zhi) / 2
+            half = span * (0.5 + pad)
+            x0, z0 = cx - half, cz - half
+            scale = (grid - 1) / (2 * half)
+
+            u, v = to_cell(X, Z, x0, z0, scale)
+            lin = v * grid + u
+            uniq, invix = np.unique(lin, return_inverse=True)
+            cell_cnt = np.bincount(invix, weights=count, minlength=len(uniq))
+            cell_rgb = np.stack(
+                [np.bincount(invix, weights=color[:, c] * count, minlength=len(uniq))
+                 for c in range(3)],
+                axis=1,
+            ) / cell_cnt[:, None]
+
+            self._td_cache = {
+                "cells_v": (uniq // grid).astype(np.int32),
+                "cells_u": (uniq % grid).astype(np.int32),
+                "cells_rgb": cell_rgb.clip(0, 255).astype(np.uint8),
+                "n_voxels_kept": int(len(centers)),
+                "bounds": [float(x0), float(x0 + 2 * half), float(z0), float(z0 + 2 * half)],
+                "span_world": float(2 * half),
+                "x0": x0, "z0": z0, "scale": scale,
+            }
+            self._td_key = key
+            self._td_dirty = False
+
+        cache = self._td_cache
+        if cache is None:
+            return out
+        out["cells_v"] = cache["cells_v"].copy()
+        out["cells_u"] = cache["cells_u"].copy()
+        out["cells_rgb"] = cache["cells_rgb"].copy()
+        out["n_voxels_kept"] = cache["n_voxels_kept"]
+        out["bounds"] = list(cache["bounds"])
+        out["span_world"] = cache["span_world"]
 
         traj = self.trajectory_array()
         if len(traj):
@@ -317,7 +367,7 @@ class MapStore:
             TRAJ_MAX = 1500
             if len(traj) > TRAJ_MAX:
                 traj = traj[np.linspace(0, len(traj) - 1, TRAJ_MAX).astype(int)]
-            tu, tv = to_cell(traj[:, 0], traj[:, 2])
+            tu, tv = to_cell(traj[:, 0], traj[:, 2], cache["x0"], cache["z0"], cache["scale"])
             out["traj_u"], out["traj_v"] = tu.astype(np.int32), tv.astype(np.int32)
         return out
 
@@ -615,6 +665,170 @@ def run_self_test():
         markers_none_is_noop = p_none.read_bytes() == p_empty.read_bytes()
         check("(l) markers_none_is_noop -- markers=None byte-identical to markers=[]",
               markers_none_is_noop)
+
+    # --------------------------------------------------------------------
+    # SESSION-63 KEYS-AS-ARRAY: `_keys` moved from a Python list of tuples to a preallocated
+    # (cap,3) int64 array with an explicit live-row counter `_n`, to stop every readout path
+    # (occupied/stats/topdown_summary) paying a full-map np.asarray(list) conversion on every
+    # call. These tests prove the storage change is behavior-neutral.
+    # --------------------------------------------------------------------
+
+    # (m) invariant: after several integrate() calls, _n == len(_row_of) <= _cap, and _keys is
+    # shaped (_cap, 3) -- i.e. _keys is capacity, not occupancy.
+    si = MapStore(voxel_size=1.0)
+    si.integrate(np.array([[0.5, 0.5, 0.5], [3.5, 0.5, 0.5]], np.float64))
+    si.integrate(np.array([[0.5, 0.5, 0.5], [7.5, 0.5, 0.5]], np.float64))
+    invariant_ok = (si._n == len(si._row_of) <= si._cap
+                    and si._keys.shape == (si._cap, 3))
+    check(f"(m) invariant -- _n={si._n} == len(_row_of)={len(si._row_of)} <= _cap={si._cap}, "
+          f"_keys.shape={si._keys.shape}", invariant_ok)
+
+    # (n) growth: crossing the doubling boundary more than once must leave every PREVIOUSLY
+    # stored key byte-identical -- a `_grow` reallocation is a copy, never a reinterpretation.
+    sg = MapStore(voxel_size=1.0)
+    n_crossings = 0
+    growth_preserves_keys = True
+    for start in range(0, 2500, 300):
+        idx = np.arange(start, start + 300, dtype=np.float64)
+        pts = np.stack([idx, np.zeros(300), np.zeros(300)], axis=1)  # each row -> distinct voxel
+        cap_before, n_before = sg._cap, sg._n
+        keys_before = sg._keys[:n_before].copy()
+        sg.integrate(pts)
+        if sg._cap != cap_before:
+            n_crossings += 1
+            if not np.array_equal(sg._keys[:n_before], keys_before):
+                growth_preserves_keys = False
+    check(f"(n) growth crosses the doubling boundary {n_crossings} times "
+          f"(>1) and preserves prior keys byte-identical", n_crossings > 1 and growth_preserves_keys)
+
+    # (o) equivalence, load-bearing: a fixed seeded point cloud against hard-coded expectations.
+    # Points -> voxel keys (voxel_size=1.0): (0.5,0.5,0.5)x2 -> key (0,0,0) [row 0, count 2];
+    # (1.5,0.5,0.5) -> key (1,0,0) [row 1, count 1]; (2.5,0.5,1.5) -> key (2,0,1) [row 2, count 1].
+    so = MapStore(voxel_size=1.0)
+    so.integrate(np.array([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 1.5]],
+                          np.float64))
+    len_eq_n = len(so) == so._n == 3
+    centers, _ = so.occupied(min_count=1)
+    expected_centers = np.array([[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 1.5]], np.float32)
+    occupied_row_order = np.allclose(centers, expected_centers)
+    stats_n_voxels = so.stats()["n_voxels"] == so._n == 3
+    td = so.topdown_summary()
+    topdown_ok = td["n_voxels_kept"] == 3 and len(td["cells_u"]) > 0
+    equivalence_ok = len_eq_n and occupied_row_order and stats_n_voxels and topdown_ok
+    check(f"(o) equivalence -- len==_n==3 ({len_eq_n}), occupied() in row order "
+          f"({occupied_row_order}), stats()['n_voxels']==_n ({stats_n_voxels}), "
+          f"topdown_summary() n_voxels_kept==3 ({topdown_ok})", equivalence_ok)
+
+    # (p) empty store: nothing raises, and every readout is the well-formed zero/empty shape.
+    se2 = MapStore(voxel_size=0.1)
+    empty_len = len(se2) == 0
+    ec, ecol = se2.occupied()
+    empty_occupied = ec.shape == (0, 3) and ecol.shape == (0, 3)
+    etd = se2.topdown_summary()
+    empty_topdown = (etd["n_voxels_kept"] == 0 and etd["bounds"] is None
+                      and etd["span_world"] == 0.0 and len(etd["cells_u"]) == 0
+                      and len(etd["cells_v"]) == 0 and len(etd["cells_rgb"]) == 0
+                      and len(etd["traj_u"]) == 0 and len(etd["traj_v"]) == 0)
+    check(f"(p) empty store -- len==0 ({empty_len}), occupied() (0,3)/(0,3) ({empty_occupied}), "
+          f"topdown_summary() zero-filled ({empty_topdown})",
+          empty_len and empty_occupied and empty_topdown)
+
+    # --------------------------------------------------------------------
+    # SESSION-63 TOPDOWN CACHE: topdown_summary() caches the cell raster (cells_u/v/rgb, bounds,
+    # span_world, n_voxels_kept, x0/z0/scale) keyed by (grid, pad, min_count), invalidated only by
+    # _td_dirty (set at the end of integrate(), never by add_pose). traj_u/traj_v are recomputed on
+    # every call regardless of the cache, since the trajectory grows every frame.
+    # --------------------------------------------------------------------
+
+    # (q) identical output: an uncached call and the following cached call return identical
+    # content, key for key, dtypes included.
+    sq = MapStore(voxel_size=0.5)
+    rng = np.random.default_rng(0)
+    pts_q = rng.uniform(-5, 5, size=(500, 3))
+    sq.integrate(pts_q, colors=rng.uniform(0, 255, size=(500, 3)).astype(np.uint8))
+    sq.add_pose([0.0, 0.0, 0.0])
+    sq.add_pose([1.0, 0.0, 1.0])
+    td_uncached = sq.topdown_summary()
+    td_cached = sq.topdown_summary()
+    identical_output = (
+        np.array_equal(td_uncached["cells_u"], td_cached["cells_u"])
+        and np.array_equal(td_uncached["cells_v"], td_cached["cells_v"])
+        and np.array_equal(td_uncached["cells_rgb"], td_cached["cells_rgb"])
+        and np.array_equal(td_uncached["traj_u"], td_cached["traj_u"])
+        and np.array_equal(td_uncached["traj_v"], td_cached["traj_v"])
+        and td_uncached["cells_u"].dtype == td_cached["cells_u"].dtype == np.int32
+        and td_uncached["cells_rgb"].dtype == td_cached["cells_rgb"].dtype == np.uint8
+        and td_uncached["bounds"] == td_cached["bounds"]
+        and td_uncached["span_world"] == td_cached["span_world"]
+        and td_uncached["n_voxels_kept"] == td_cached["n_voxels_kept"]
+    )
+    check("(q) identical_output -- cached call matches preceding uncached call, key for key",
+          identical_output)
+
+    # (r) invalidation is real (the no-silent-fallback case): integrate() new points that add
+    # voxels must change the next summary, and _td_dirty must be True immediately after.
+    td_before = sq.topdown_summary()
+    sq.integrate(np.array([[50.0, 0.0, 50.0]], np.float64))
+    dirty_after_integrate = sq._td_dirty is True
+    td_after = sq.topdown_summary()
+    invalidation_real = (dirty_after_integrate
+                         and td_after["n_voxels_kept"] != td_before["n_voxels_kept"]
+                         and not np.array_equal(td_after["cells_u"], td_before["cells_u"]))
+    check(f"(r) invalidation_real -- integrate() sets _td_dirty and changes the next summary "
+          f"(dirty={dirty_after_integrate}, n_before={td_before['n_voxels_kept']}, "
+          f"n_after={td_after['n_voxels_kept']})", invalidation_real)
+
+    # (s) trajectory is never cached: cells stay byte-identical across add_pose() calls while
+    # traj_u grows, and _td_dirty stays False -- add_pose must not dirty the cache.
+    td1 = sq.topdown_summary()
+    sq.add_pose([2.0, 0.0, 2.0])
+    sq.add_pose([3.0, 0.0, 3.0])
+    sq.add_pose([4.0, 0.0, 4.0])
+    dirty_after_pose = sq._td_dirty
+    td2 = sq.topdown_summary()
+    traj_not_cached = (len(td2["traj_u"]) > len(td1["traj_u"])
+                       and np.array_equal(td1["cells_u"], td2["cells_u"])
+                       and dirty_after_pose is False)
+    check(f"(s) traj_not_cached -- traj_u grows ({len(td1['traj_u'])}->{len(td2['traj_u'])}) "
+          f"while cells_u is byte-identical and _td_dirty stays False", traj_not_cached)
+
+    # (t) cache key covers the parameters: grid=100 then grid=200 must each recompute their own
+    # raster, not reuse the first one twice.
+    td_g100 = sq.topdown_summary(grid=100)
+    key_after_100 = sq._td_key
+    td_g200 = sq.topdown_summary(grid=200)
+    key_after_200 = sq._td_key
+    cache_key_covers_params = (key_after_100 == (100, 0.06, 1) and key_after_200 == (200, 0.06, 1)
+                                and td_g100["cells_u"].max(initial=0) < 100
+                                and td_g200["cells_u"].max(initial=0) < 200)
+    check(f"(t) cache_key_covers_params -- grid=100 then grid=200 each get their own raster "
+          f"(keys {key_after_100} -> {key_after_200})", cache_key_covers_params)
+
+    # (u) returned arrays are copies: mutating a returned array must not corrupt the cache.
+    td3 = sq.topdown_summary(grid=100)
+    if len(td3["cells_u"]):
+        td3["cells_u"][0] = -1
+    td4 = sq.topdown_summary(grid=100)
+    returned_are_copies = (len(td4["cells_u"]) == 0) or (td4["cells_u"][0] != -1)
+    check("(u) returned_are_copies -- mutating a returned cells_u does not corrupt the cache",
+          returned_are_copies)
+
+    # (v) it is actually faster: ~200k voxels, mean of 10 cached calls >= 5x faster than the one
+    # uncached call that had to recompute the raster.
+    sv = MapStore(voxel_size=0.05)
+    rng2 = np.random.default_rng(1)
+    pts_v = rng2.uniform(-5, 5, size=(200_000, 3))
+    sv.integrate(pts_v)
+    t0 = time.perf_counter()
+    sv.topdown_summary()
+    uncached_dt = time.perf_counter() - t0
+    t1 = time.perf_counter()
+    for _ in range(10):
+        sv.topdown_summary()
+    cached_dt = (time.perf_counter() - t1) / 10
+    speedup = uncached_dt / max(cached_dt, 1e-9)
+    check(f"(v) cache_is_faster -- uncached={uncached_dt*1000:.2f}ms "
+          f"cached_mean={cached_dt*1000:.2f}ms speedup={speedup:.1f}x (need >=5x)", speedup >= 5.0)
 
     print(f"\n[map_store][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

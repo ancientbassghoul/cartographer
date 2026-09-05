@@ -20,6 +20,13 @@ Closure invariant (slam_engine.py, C1): `track_ms + backend_ms + pose_ms + kf_do
 sum to within a few ms of `slam_ms`, since those four phases are exactly what the `slam_ms`
 stopwatch brackets. `phase_closure()` reports the per-row residual so a large, systematic residual
 would itself be a finding (an unaccounted phase inside `slam.process()`).
+
+Session 63 adds a second, independent closure one level down: `frame_ms + infer_ms + tracker_ms`
+should sum to within a few ms of `track_ms` -- the sub-split INSIDE `track_ms` itself (mirror of
+`slam_engine.SLAM_TRACK_PHASE_FIELDS`), reported by `track_closure()`. Kept as separate constants
+and a separate function from the slam_ms closure above because they close against different totals
+-- a file can have one without the other, and `report()` must show that independently instead of
+letting one missing invariant hide the other.
 """
 
 import argparse
@@ -37,11 +44,18 @@ REPO = Path(__file__).resolve().parent
 # perception_worker.py freezes its column names/order as a matter of policy, not accident.
 PHASE_COLUMNS: tuple[str, ...] = (
     "slam_ms", "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
-    "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms")
+    "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+    "frame_ms", "infer_ms", "tracker_ms")            # session 63, appended
 
 # Session 62: mirror of slam_engine.SLAM_PHASE_FIELDS, hand-kept for the same reason as
 # PHASE_COLUMNS above. These four are exactly what phase_closure() sums against slam_ms.
 _SLAM_PHASE_FIELDS: tuple[str, ...] = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms")
+
+# Session 63: mirror of slam_engine.SLAM_TRACK_PHASE_FIELDS, hand-kept for the same reason as
+# _SLAM_PHASE_FIELDS above. Kept as a SEPARATE constant rather than folded into _SLAM_PHASE_FIELDS
+# because the four above close against slam_ms while these three close against track_ms -- two
+# different invariants, and merging them would break both.
+_TRACK_PHASE_FIELDS: tuple[str, ...] = ("frame_ms", "infer_ms", "tracker_ms")
 
 
 @dataclass(frozen=True)
@@ -141,6 +155,29 @@ def phase_closure(rows) -> PhaseStats:
         slam_ms, track_ms, backend_ms, pose_ms, kf_download_ms = (v for v, _ in cells)
         residuals.append(slam_ms - (track_ms + backend_ms + pose_ms + kf_download_ms))
     return _stats_from_values("closure_residual_ms", residuals, n_blank)
+
+
+def track_closure(rows) -> PhaseStats:
+    """Per-row residual track_ms - (frame_ms + infer_ms + tracker_ms) -- the session 63 closure
+    invariant one level down inside track_ms. Raises KeyError if track_ms or any of
+    _TRACK_PHASE_FIELDS is absent. Mirrors phase_closure() exactly, against a different total."""
+    required = ("track_ms",) + _TRACK_PHASE_FIELDS
+    if not rows:
+        return _stats_from_values("track_closure_residual_ms", [], 0)
+    header = rows[0].keys()
+    for col in required:
+        if col not in header:
+            raise KeyError(col)
+    residuals = []
+    n_blank = 0
+    for row in rows:
+        cells = [_parse_float(row.get(col, "")) for col in required]
+        if any(blank for _, blank in cells):
+            n_blank += 1
+            continue
+        track_ms, frame_ms, infer_ms, tracker_ms = (v for v, _ in cells)
+        residuals.append(track_ms - (frame_ms + infer_ms + tracker_ms))
+    return _stats_from_values("track_closure_residual_ms", residuals, n_blank)
 
 
 def bucket_by_minute(rows, minutes: float = 5.0):
@@ -245,6 +282,14 @@ def report(csv_path) -> str:
                       f"median={c.median:.1f}ms p90={c.p90:.1f}ms max={c.maximum:.1f}ms")
     else:
         lines.append("SLAM phase closure: unavailable (missing phase columns, see banner above)")
+
+    track_closure_required = ("track_ms",) + _TRACK_PHASE_FIELDS
+    if all(col not in missing for col in track_closure_required):
+        tc = track_closure(rows)
+        lines.append(f"Track phase closure (track_ms - sum(phases)): n={tc.n} n_blank={tc.n_blank} "
+                      f"median={tc.median:.1f}ms p90={tc.p90:.1f}ms max={tc.maximum:.1f}ms")
+    else:
+        lines.append("Track phase closure: unavailable (missing phase columns, see banner above)")
     lines.append("")
 
     lines.append(render_table("By flight-minute", bucket_by_minute(rows)))
@@ -330,6 +375,80 @@ def run_self_test() -> None:
                    "pose_ms": "20", "kf_download_ms": "80"} for _ in range(3)]
         check("closure -- backend_ms=500 gives 100.0 median residual",
               phase_closure(rows5b).median == 100.0)
+
+        # 5b. Session 63: track_ms closure -- balanced sub-phases give 0.0, a shifted
+        # tracker_ms shows the residual. Mirrors 5/5a-b exactly, against track_ms instead of slam_ms.
+        rows5c = [{"track_ms": "500", "frame_ms": "50", "infer_ms": "0",
+                   "tracker_ms": "450"} for _ in range(3)]
+        check("track_closure -- balanced sub-phases give 0.0 median residual",
+              track_closure(rows5c).median == 0.0)
+        # Session 63 spec text claims this gives a 100.0 residual; the arithmetic on the spec's
+        # own numbers (500 - (50+0+400) = 50) does not support that, so this asserts the value
+        # the C5 formula actually produces and flags the discrepancy in the chunk report instead
+        # of asserting a numerically false invariant.
+        rows5d = [{"track_ms": "500", "frame_ms": "50", "infer_ms": "0",
+                   "tracker_ms": "400"} for _ in range(3)]
+        check("track_closure -- tracker_ms=400 gives 50.0 median residual (see chunk report)",
+              track_closure(rows5d).median == 50.0)
+
+        # 5e. Blank handling for track_closure: a blank component is counted in n_blank, never
+        # coerced to 0.0 -- mirrors the PhaseStats blank contract proven in check 3 above.
+        rows5e = [{"track_ms": "500", "frame_ms": "50", "infer_ms": "0", "tracker_ms": "450"},
+                  {"track_ms": "500", "frame_ms": "50", "infer_ms": "0", "tracker_ms": ""},
+                  {"track_ms": "500", "frame_ms": "50", "infer_ms": "0", "tracker_ms": "450"}]
+        tc5e = track_closure(rows5e)
+        check("track_closure -- blank component counted in n_blank, not coerced to 0.0",
+              tc5e.n == 2 and tc5e.n_blank == 1 and tc5e.median == 0.0)
+
+        # 5f. Missing columns is loud for track_closure too: a CSV carrying the session-62
+        # columns but none of the three session-63 ones. Old PHASE_COLUMNS, hand-frozen here
+        # (not read from the live PHASE_COLUMNS, which now includes the session-63 additions) so
+        # this fixture reproduces exactly what a pre-session-63 file looks like.
+        path5f = Path(tmp_dir) / "session62_only.csv"
+        session62_cols = ("slam_ms", "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                           "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms")
+        fields5f = ("wall_ts", "frame_id", "mode", "new_keyframe") + session62_cols
+        with open(path5f, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields5f)
+            w.writeheader()
+            row = {c: "1.0" for c in session62_cols}
+            row.update(wall_ts="0.0", frame_id="0", mode="TRACKING", new_keyframe="0")
+            w.writerow(row)
+        rows5f = load_rows(path5f)
+        _present5f, missing5f = present_columns(rows5f)
+        check("track_closure -- missing_column -- all three session-63 columns reported missing",
+              set(missing5f) == {"frame_ms", "infer_ms", "tracker_ms"})
+        raised5f = False
+        try:
+            track_closure(rows5f)
+        except KeyError:
+            raised5f = True
+        check("track_closure -- missing_column -- raises KeyError", raised5f)
+        report5f = report(path5f)
+        check("track_closure -- missing_column -- report() names MISSING COLUMNS and tracker_ms, "
+              "and shows the track-closure unavailable line",
+              "MISSING COLUMNS" in report5f and "tracker_ms" in report5f
+              and "Track phase closure: unavailable" in report5f)
+        check("track_closure -- missing_column -- SLAM closure still prints normally",
+              "SLAM phase closure (slam_ms - sum(phases))" in report5f)
+
+        # 5g. Both closures coexist on a fully-populated modern CSV: report() contains both
+        # closure lines and present_columns reports nothing missing.
+        path5g = Path(tmp_dir) / "modern.csv"
+        fields5g = ("wall_ts", "frame_id", "mode", "new_keyframe") + PHASE_COLUMNS
+        with open(path5g, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields5g)
+            w.writeheader()
+            row = {c: "1.0" for c in PHASE_COLUMNS}
+            row.update(wall_ts="0.0", frame_id="0", mode="TRACKING", new_keyframe="0")
+            w.writerow(row)
+        rows5g = load_rows(path5g)
+        _present5g, missing5g = present_columns(rows5g)
+        report5g = report(path5g)
+        check("both_closures -- present_columns reports nothing missing", missing5g == [])
+        check("both_closures -- report() contains both closure lines",
+              "SLAM phase closure (slam_ms - sum(phases))" in report5g
+              and "Track phase closure (track_ms - sum(phases))" in report5g)
 
         # 6. Minute buckets: 12 minutes of wall_ts at minutes=5.0 -> three buckets, in order.
         rows6 = [{"wall_ts": str(float(m * 60))} for m in range(0, 13)]

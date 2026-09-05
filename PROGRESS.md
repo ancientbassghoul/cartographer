@@ -12,6 +12,26 @@ for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **63 (Phase 1) — the cheap half of "make SLAM fast again".** Session 62's attribution said the
+  choke is `backend_ms` (83% of a 23.8s median solve by flight-minute 20-25), with `track_ms` next at
+  30% and `map_pub_ms` the only CPU cost that actually scales with map size (4 -> 1 238ms as voxels
+  reached 386k). Operator's call: do the safe half first and fly it, so a bad flight has one suspect
+  rather than two. Two things landed. **(1)** `MapStore` stopped rebuilding the world twice a second:
+  `_keys` was a Python list of tuples converted with `np.asarray` on every `topdown_summary` call, and
+  the whole raster was recomputed at >=2 Hz even though occupied cells only change inside `integrate`
+  (keyframes only, ~1 frame in 6). Keys are now a preallocated numpy array with an explicit row
+  counter, and the raster is cached behind a dirty flag that only `integrate` sets -- the trajectory
+  is still recomputed every call, because caching that would freeze the flight path on screen.
+  Measured at 694k voxels (nearly 2x the flight's): cold path **126ms** (was ~1 238ms at 386k),
+  cached calls effectively free. **(2)** `track_ms` was split into `frame_ms` / `infer_ms` /
+  `tracker_ms` with its own closure invariant, because once the backend leaves the frame path it
+  becomes the entire budget and there is no point guessing at it twice. Built via `sonnet_runner.py`
+  in five chunks, all ten suites green. **Phase 2 -- moving `_run_backend()` into a thread, the 55-83%
+  -- is deliberately NOT built yet**: fly this first, and a concurrency bug on shared CUDA structures
+  is exactly what a self-test suite does not catch. The groundwork is recorded in
+  `plans/session63-spec.md`: `_run_backend` is already a queue consumer, every `SharedStates` accessor
+  is already lock-guarded, and upstream's `main.py:74 run_backend` is the reference to port.
+
 - **62c — parallax push measurement (watch-only), then parked.** `traveled` was computed at the
   push-done gate and discarded, so "did that push achieve anything?" could only be answered by
   reconstructing `pos` out of the timeline. It is now logged (event line + timeline row + telemetry

@@ -56,6 +56,8 @@ DIAG_PERF_FIELDS: tuple[str, ...] = (
     "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
     # --- post-SLAM phases, measured in Pipeline.step ---
     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+    # --- Session 63: the sub-split inside track_ms (slam_engine.SLAM_TRACK_PHASE_FIELDS) ---
+    "frame_ms", "infer_ms", "tracker_ms",
 )
 
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
@@ -201,6 +203,7 @@ class Pipeline:
         self._last_phase_ms: dict[str, float] = {
             "track": 0.0, "backend": 0.0, "pose": 0.0, "kf_download": 0.0,
             "integrate": 0.0, "map_pub": 0.0, "plan": 0.0, "publish": 0.0,
+            "frame": 0.0, "infer": 0.0, "tracker": 0.0,
         }
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
@@ -336,6 +339,11 @@ class Pipeline:
         self._last_phase_ms["track"] = res.track_ms
         self._last_phase_ms["backend"] = res.backend_ms
         self._last_phase_ms["pose"] = res.pose_ms
+        self._last_phase_ms["frame"] = res.frame_ms
+        if res.infer_ms > 0.0:
+            self._last_phase_ms["infer"] = res.infer_ms
+        if res.tracker_ms > 0.0:
+            self._last_phase_ms["tracker"] = res.tracker_ms
         if res.new_keyframe:
             self._last_phase_ms["kf_download"] = res.kf_download_ms
         if map_updated:
@@ -358,6 +366,7 @@ class Pipeline:
             print(f"[perception] SLAM {res.mode:<8} kf {res.n_keyframes:3d} | "
                   f"vox {len(self.mapstore):6d} | slam {slam_ms:5.1f} ms | "
                   f"[trk {p['track']:.0f} bk {p['backend']:.0f} dl {p['kf_download']:.0f}] | "
+                  f"(frm {p['frame']:.0f} inf {p['infer']:.0f} trk2 {p['tracker']:.0f}) | "
                   f"intg {p['integrate']:.0f} plan {p['plan']:.0f} map {p['map_pub']:.0f} ms | "
                   f"ray_clear {rc} | y {py} | ring f/b {rfb} | "
                   f"trigger {c.get('trigger')} yaw {c.get('yaw')}")
@@ -375,7 +384,9 @@ class Pipeline:
             track_ms=round(res.track_ms, 1), backend_ms=round(res.backend_ms, 1),
             pose_ms=round(res.pose_ms, 1), kf_download_ms=round(res.kf_download_ms, 1),
             integrate_ms=round(integrate_ms, 1), map_pub_ms=round(map_pub_ms, 1),
-            plan_ms=round(plan_ms, 1), publish_ms=round(publish_ms, 1))
+            plan_ms=round(plan_ms, 1), publish_ms=round(publish_ms, 1),
+            frame_ms=round(res.frame_ms, 1), infer_ms=round(res.infer_ms, 1),
+            tracker_ms=round(res.tracker_ms, 1))
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -1183,6 +1194,10 @@ def run_self_test(cfg):
     print(f"[perception][self-test] {'PASS' if ok_phases else 'FAIL'}  SESSION-62 SLAM PHASE FIELDS")
     assert ok_phases
 
+    ok_track_phases = _self_test_slam_track_phase_fields()
+    print(f"[perception][self-test] {'PASS' if ok_track_phases else 'FAIL'}  SESSION-63 SLAM TRACK PHASE FIELDS")
+    assert ok_track_phases
+
     ok_timing = _self_test_phase_timing(cfg)
     print(f"[perception][self-test] {'PASS' if ok_timing else 'FAIL'}  SESSION-62 PHASE TIMING SCHEMA")
     assert ok_timing
@@ -1474,6 +1489,45 @@ def _self_test_slam_phase_fields():
     return ok
 
 
+def _self_test_slam_track_phase_fields():
+    """SESSION-63 SLAM TRACK PHASE FIELDS: `SlamResult` gained three fields
+    (`slam_engine.SLAM_TRACK_PHASE_FIELDS`) that split the INSIDE of `track_ms` -- frame
+    construction, MASt3R inference (INIT/RELOC only), and the tracker (TRACKING only). They must
+    default to 0.0 (never None, per CLAUDE.md's no-silent-fallback rule), stay disjoint from the
+    session-62 `SLAM_PHASE_FIELDS`, and round-trip real values. No GPU/SLAM needed: SlamResult is
+    a plain dataclass."""
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("track_phase_fields_tuple -- SLAM_TRACK_PHASE_FIELDS is the frozen three, in order",
+          slam_engine.SLAM_TRACK_PHASE_FIELDS == ("frame_ms", "infer_ms", "tracker_ms"))
+    check("phase_fields_unchanged -- session-62 SLAM_PHASE_FIELDS is still the frozen four",
+          slam_engine.SLAM_PHASE_FIELDS == ("track_ms", "backend_ms", "pose_ms", "kf_download_ms"))
+    check("fields_disjoint -- SLAM_PHASE_FIELDS and SLAM_TRACK_PHASE_FIELDS share no names",
+          set(slam_engine.SLAM_PHASE_FIELDS) & set(slam_engine.SLAM_TRACK_PHASE_FIELDS) == set())
+
+    r = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False)
+    check("defaults_present_and_zero -- all three track-phase fields default to 0.0",
+          all(getattr(r, f) == 0.0 for f in slam_engine.SLAM_TRACK_PHASE_FIELDS))
+    check("defaults_are_float -- each track-phase field is a float",
+          all(isinstance(getattr(r, f), float) for f in slam_engine.SLAM_TRACK_PHASE_FIELDS))
+
+    r2 = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False,
+        frame_ms=3.5, infer_ms=210.0, tracker_ms=48.25)
+    check("roundtrip -- explicit track-phase values come back unchanged",
+          (r2.frame_ms, r2.infer_ms, r2.tracker_ms) == (3.5, 210.0, 48.25))
+
+    return ok
+
+
 def _self_test_phase_timing(cfg):
     """SESSION-62 PHASE TIMING SCHEMA: DIAG_PERF_FIELDS must keep its frozen 9-column prefix (so
     pre-2026-09-05 files stay readable by name), carry every SlamResult phase field plus the four
@@ -1500,6 +1554,16 @@ def _self_test_phase_timing(cfg):
           all(f in DIAG_PERF_FIELDS for f in ("integrate_ms", "map_pub_ms", "plan_ms", "publish_ms")))
     check("no_duplicate_columns -- DIAG_PERF_FIELDS has no repeated name",
           len(set(DIAG_PERF_FIELDS)) == len(DIAG_PERF_FIELDS))
+    # Session 63: the frozen-seventeen guarantee -- every flight written before this session has
+    # exactly these seventeen names in this order, and the report reads by column NAME, so the new
+    # frame_ms/infer_ms/tracker_ms columns must land strictly AFTER them, never inside.
+    check("frozen_prefix17 -- first seventeen DIAG_PERF_FIELDS names/order unchanged since before session 63",
+          DIAG_PERF_FIELDS[:17] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+                                     "n_keyframes", "n_voxels", "reloc",
+                                     "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                                     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms"))
+    check("track_phase_fields_present -- every slam_engine.SLAM_TRACK_PHASE_FIELDS name is a DIAG_PERF_FIELDS column",
+          all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_TRACK_PHASE_FIELDS))
 
     tmp_dir = tempfile.mkdtemp(prefix="phase_timing_selftest_")
     try:
@@ -1519,7 +1583,8 @@ def _self_test_phase_timing(cfg):
 
         first_row_ok = all(str(rows[0][f]) == str(full_row[f]) for f in DIAG_PERF_FIELDS)
         omitted_phase_fields = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms",
-                                 "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms")
+                                 "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+                                 "frame_ms", "infer_ms", "tracker_ms")
         blanks_ok = all(rows[1][f] == "" for f in omitted_phase_fields)
 
         check("csv_header_matches -- DictReader header equals list(DIAG_PERF_FIELDS)", header_ok)
@@ -1537,10 +1602,12 @@ def _self_test_phase_timing(cfg):
     fresh_phase_ms = {
         "track": 0.0, "backend": 0.0, "pose": 0.0, "kf_download": 0.0,
         "integrate": 0.0, "map_pub": 0.0, "plan": 0.0, "publish": 0.0,
+        "frame": 0.0, "infer": 0.0, "tracker": 0.0,
     }
-    check("phase_ms_fresh -- a fresh _last_phase_ms dict has all eight keys, every value 0.0",
+    check("phase_ms_fresh -- a fresh _last_phase_ms dict has all eleven keys, every value 0.0",
           set(fresh_phase_ms) == {"track", "backend", "pose", "kf_download",
-                                   "integrate", "map_pub", "plan", "publish"}
+                                   "integrate", "map_pub", "plan", "publish",
+                                   "frame", "infer", "tracker"}
           and all(v == 0.0 for v in fresh_phase_ms.values()))
 
     pipe = types.SimpleNamespace(_last_phase_ms=dict(fresh_phase_ms))
@@ -1551,20 +1618,31 @@ def _self_test_phase_timing(cfg):
     check("sticky_integrate_unchanged -- map_updated=False leaves a previously-set integrate value",
           pipe._last_phase_ms["integrate"] == 42.0)
 
+    # Session 63: "infer" (and "tracker") follow the same sticky rule as "integrate" -- write only
+    # when the phase actually ran (res.infer_ms > 0.0), else keep the last real value.
+    pipe._last_phase_ms["infer"] = 55.0
+    res_infer_ms = 0.0                # INIT/RELOC did not run this frame
+    if res_infer_ms > 0.0:
+        pipe._last_phase_ms["infer"] = res_infer_ms
+    check("sticky_infer_unchanged -- res.infer_ms==0.0 leaves a previously-set infer value",
+          pipe._last_phase_ms["infer"] == 55.0)
+
     def _render(p):
         return (f"[trk {p['track']:.0f} bk {p['backend']:.0f} dl {p['kf_download']:.0f}] | "
+                f"(frm {p['frame']:.0f} inf {p['infer']:.0f} trk2 {p['tracker']:.0f}) | "
                 f"intg {p['integrate']:.0f} plan {p['plan']:.0f} map {p['map_pub']:.0f} ms | ")
 
-    labels = ("trk ", "bk ", "dl ", "intg ", "plan ", "map ")
+    labels = ("trk ", "bk ", "dl ", "frm ", "inf ", "trk2 ", "intg ", "plan ", "map ")
     try:
         seg_zero = _render(fresh_phase_ms)
         seg_full = _render({"track": 12.0, "backend": 900.0, "pose": 1.5, "kf_download": 70.0,
-                             "integrate": 3.0, "map_pub": 4.0, "plan": 5.0, "publish": 6.0})
+                             "integrate": 3.0, "map_pub": 4.0, "plan": 5.0, "publish": 6.0,
+                             "frame": 8.0, "infer": 210.0, "tracker": 48.0})
         render_ok = all(tok in seg_zero for tok in labels) and all(tok in seg_full for tok in labels)
     except Exception as e:
         render_ok = False
         print(f"[perception][self-test] phase segment render raised: {e}")
-    check("phase_segment_renders -- console segment formats without raising, all six labels present",
+    check("phase_segment_renders -- console segment formats without raising, all nine labels present",
           render_ok)
 
     return ok
