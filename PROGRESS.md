@@ -5,12 +5,94 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-05**, branch `all-bets-are-off`, session 61: **built and gated, not yet
-flown**. Session 60 flew clean the same day — the F_LKG rework held up — but its own debug panel
-turned out to be lying to the operator; session 61 fixes the panel, not the plumbing. See `STATE.md`
-for the watch list on the next flight._
+_Last updated **2026-09-06**, branch `all-bets-are-off`, session 65 (Chunks 1-7): the bounded
+global-optimisation window is **built and gated, config-gated OFF by default — not yet benched or
+flown**. See `STATE.md` for what's next._
 
 ## Session Log (newest first)
+
+- **66 — flew the window; found that offline replay had never reproduced live flight; made it
+  frame-exact; and caught the window's real cost.** We flew `ON W=30` and it felt ordinary — SLAM
+  still slow (2.74 s/frame, backend 64%). Comparing that flight against the previous `OFF` flight was
+  worthless: 57% RELOC vs 12%, 52 vs 61 keyframes, different trajectories entirely. So we tried to
+  bench it offline on the June recordings instead, and every attempt undershot absurdly — 3 keyframes
+  in 200 frames, then 15, then 33, never near the 40-49 knee. **It was not the footage.** Live SLAM
+  is so slow that `io_bridge` hands it the newest frame and drops the backlog: the measured gap
+  between consecutively PROCESSED frames is a median of **112** NDI frames (p90 624), so live sees
+  snapshots ~1.9 s apart, while `--stride 3` replay sees them 17 ms apart, the match fraction never
+  falls, and no keyframes form. Every offline replay this project has ever run was in a different
+  regime from flight. Fixed properly rather than tuned around: `rec_frame` (which already rode
+  `TOPIC_POSE` but never reached disk) is now a CSV column, and `--frame-list` replays the EXACT
+  frames a flight's SLAM consumed. With that, the first honest A/B — same 319 frames, both runs 64 kf
+  and 38 RELOC — said `ON` was **10.3% slower**, even though its curve was flat (~3-4 s) where `OFF`
+  climbed 742 -> 5222 ms. The tell: `ON` cost ~1.8 s more per solve *below* the window, where the cut
+  is a provable no-op. The selection was asking CUDA four separate questions per solve (`ii.max()`, a
+  boolean-indexed `anchor_idx`, its `.numel()`, and `mask.all()`), each a device->host sync draining
+  the queue. Pulling the (tiny, ~1.3 KB) edge lists to the host once killed all four: 0-9 kf went
+  **2517 -> 749 ms** against `OFF`'s 742 — identical, as it must be. Re-running then showed `ON` 21.7%
+  faster — but also exposed a **large run-order confound**: identical `OFF` code ran 409.2 s in
+  position 1 and 496.8 s in position 2 (4.5x slower at low kf), which is the same signature we had
+  first blamed on syncs. The sync cost was real (proved at fixed position); the original "+10.3%" was
+  partly position. An ABBA set (ON,OFF,OFF,ON) cancelled the drift and settled it: **`ON` 10.3% faster on loop, 12.0% on backend**, and per bucket **identical below the window** (0-19 kf, where it is a no-op), ~17% worse at the 20-29 boundary, and **42-55% better above 30 keyframes** — the same ordering in all four individual runs, not just the averages. `ON W=30` is now the default. Note the win is diluted by this flight spending most of its time under 30 kf; a longer survey sits longer in the region where it wins ~50%. Also confirmed on real data: the
+  **anchor leak** is not theoretical — `solve_kf` max 42 = W30 + **12 anchors**, `anchors>1` on 25 of
+  102 solves, drift to 0.489, and `anchored` discards that motion, so it is computed and thrown away.
+  That is the deferred CUDA `num_fix` trigger, now firing. Config left at `OFF` pending the ABBA
+  verdict. **Then the finding that reframes all of it.** The operator called it: something adds up while flying, and everything else is yak-shaving. The frame-exact replay is what proves it — `tracker_ms` is flat at ~250-400 ms replaying the exact frames of a flight where it ran 2000-6000 ms, and every live flight steps up 7-17x within two minutes of leaving the ground and never recovers. A confirming flight with the window OFF (pre-speed-work config) showed the identical collapse — 382 ms on the ground, 4549 ms two minutes in — so none of sessions 63-66 caused it. Config was set back to `OFF`/`0` at the operator's request. Details and tables: `plans/session66-frame-exact-replay-and-window-syncs.md`; the full shareable write-up, now led by the accumulator rather than the backend, is `plans/slam_report.html`.
+
+- **65 (Chunks 1-7) — bound the global-optimisation window; config-gated, defaulting OFF, not yet
+  flown or benched.** Session 64's report (`plans/slam_report.html`) ranked this the highest-value
+  remaining lever because it changes the growth curve, not a constant factor: `FactorGraph` is
+  append-only and re-optimises every keyframe ever seen on every solve, so median `backend_ms`
+  climbed 1502ms (kf 0-9) -> 14597ms (kf 50-59). Two findings de-risked it: the CUDA kernel already
+  remaps a non-contiguous keyframe set via `searchsorted`, so dropping edges needs no index surgery;
+  and `num_fix=1` always pins the lowest-indexed keyframe in the solve, which for a suffix window is
+  always an anchor, so a windowed solve auto-anchors to the existing global estimate. Built as a
+  `FactorGraph` subclass (`slam_window.py`, factory-cached, never touching `third_party/`) with a
+  tri-state mode (OFF/SHADOW/ON) and three write-back policies (anchored/free/strict); RELOC is
+  exempt (`force_full=True`) because a successful reloc matches candidates that are usually far out
+  of window. Chunk 4 wired the three config keys (`backend_window_mode/kf/policy`, all defaulting to
+  today's unbounded behaviour) through `Pipeline.__init__` into `SlamEngine`, appended the seven
+  `SLAM_WINDOW_FIELDS` to the flight CSV (`DIAG_PERF_FIELDS`, after the frozen prefix) and four of
+  them into the `TOPIC_MAP` payload. **Found and fixed in passing:** `slam_window.py`'s own
+  `run_self_test()` had 6 failing assertions left over from Chunk 1 that assumed a plain keyframe
+  chain has zero anchors at the window boundary -- the module's own docstring and its
+  `WindowedFactorGraph`-level tests already document that a chain's boundary edge always pulls in
+  one anchor (`window_lo - 1`); the top-level self-test just never got updated to match. Fixed the
+  six expected values, not the design. **Chunk 5** added `window_summary()` to
+  `perception_timing_report.py` (pure stdlib, no `slam_engine`/`perception_worker` import, runs on
+  the bare system interpreter with no torch) so a flight's window behaviour reads straight off the
+  CSV: distinct `backend_window_mode` counts, distinct `backend_window_kf` values, median/max of
+  `solve_kf`/`solve_edges`/`graph_edges`/`anchors`, max `anchor_drift` -- plus two conditional lines
+  that exist because silently omitting them would be misleading, not just incomplete: a `SHADOW`-rows
+  caveat (those counts are WOULD-BE, the full graph actually solved) and an `anchors>1` trigger line
+  pointing at the deferred CUDA `num_fix` work. All suites green on both interpreters
+  (`slam_window.py --self-test`, `perception_worker.py --self-test`,
+  `perception_timing_report.py --self-test` under both `venv\Scripts\python.exe` and the bare system
+  python). **Chunk 6** surfaced the state in the cockpit itself, per CLAUDE.md's visible-alerts rule:
+  `backend_status_text` (already the session-64 backend-thread indicator) gained a window suffix
+  appended after the clobber count -- `OFF`/absent appends nothing (byte-identical to session 64
+  until the operator opts in), `ON` shows `w{W}k{solve_kf}` plus `a{anchors}` only when a loop edge
+  actually pulled one in, `SHADOW` shows `w?{W}` (the `?` marking priced-not-applied). No new colour
+  and no panel added -- a non-`OFF` window is an operator-chosen state, not an alarm, matching how
+  session 64 treated pose clobbers. **Chunk 7** built the "trajectory consistency holds" half of the
+  report's own question as a standalone tool, `backend_window_bench.py` (numpy + stdlib only, no
+  torch/project import): it diffs two `*_livemap.npz` exports for trajectory RMSE/max-deviation and
+  voxel-occupancy IoU, **deliberately with no Sim3 alignment** -- two runs of the same video at the
+  same stride/max-frames share the same frame count AND the same pinned oldest-keyframe anchor
+  (`num_fix=1`, both windowed and unwindowed), so there is no independent gauge freedom left for an
+  alignment to remove. All suites green, including a full existing-gate rerun with zero regressions.
+  **Also recorded as a named deferred candidate (not built, by explicit request):** multi-anchor
+  pinning via `num_fix` in `gn_kernels.cu` -- today only the single oldest anchor is pinned per solve,
+  so extra loop-closure anchors are free to drift before the `anchored` policy discards their motion
+  at write-back. The fix is unusually clean (anchors already sort to the lowest indices, so "fix the
+  first k" needs no permutation buffer) but requires a CUDA/pybind rebuild through a toolchain that
+  has fought back before (`lietorch_windows_const_fix.patch`). Trigger to build it: a bench or flight
+  where `backend_anchors > 1` regularly AND `backend_anchor_drift` is non-trivial against the
+  window's own motion scale -- `window_summary()`'s anchors>1 line (Chunk 5) exists to make this
+  visible from a report alone. Full spec (all 7 chunks + this deferred design + the operator's
+  post-run bench procedure): `plans/session65-spec.md`. **Still open:** the offline bench itself (run
+  by the operator, not built by this session) and any live flight -- both per the session-64
+  precedent of not flying an unbenched change.
 
 - **64 — the backend thread: built, flown, and switched OFF on the evidence.** Session 62's
   attribution said `_run_backend()` was 64.4% of the loop, and upstream MASt3R-SLAM runs exactly that

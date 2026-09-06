@@ -651,7 +651,15 @@ def backend_status_text(map_payload):
     Session 64 (no "backend_mode" key), so an older flight/replay renders exactly as it always did.
     FAILED is the operator-visible signal that global optimization has stopped (CLAUDE.md rule 3);
     a nonzero clobber count is reported but is NOT an alarm (see render_status: expected + self-
-    correcting, colouring it red would train the operator to ignore red)."""
+    correcting, colouring it red would train the operator to ignore red).
+
+    Session 65: appends the bounded global-optimisation window's state after the clobber suffix.
+    OFF (the default, and any payload predating session 65) appends nothing, so this renders
+    byte-identical to session 64's output until the operator opts in. ON shows the configured
+    window size and how many keyframes the last solve actually touched (`w{W}k{solve_kf}`), plus
+    `a{anchors}` only when a loop edge dragged an out-of-window keyframe in. SHADOW shows only `W`,
+    marked with a `?` -- it is priced but NOT applied, so a solve_kf number here would describe a
+    cut that never happened to the graph this frame."""
     if not map_payload or "backend_mode" not in map_payload:
         return ""
     mode = map_payload.get("backend_mode")
@@ -661,6 +669,14 @@ def backend_status_text(map_payload):
     clobbers = map_payload.get("backend_pose_clobbers", 0)
     if clobbers:
         txt += f" clob{clobbers}"
+    win_mode = map_payload.get("backend_window_mode", "OFF")
+    if win_mode == "ON":
+        txt += f" w{map_payload.get('backend_window_kf', 0)}k{map_payload.get('backend_solve_kf', 0)}"
+        anchors = map_payload.get("backend_anchors", 0)
+        if anchors:
+            txt += f"a{anchors}"
+    elif win_mode == "SHADOW":
+        txt += f" w?{map_payload.get('backend_window_kf', 0)}"
     return txt
 
 
@@ -1159,6 +1175,52 @@ def run_self_test():
     case(f"(64-6) ASYNC+clobbers status strip has NO red (has_red="
          f"{has_bgr(_strip_async_clob, (0, 0, 255))})",
          not has_bgr(_strip_async_clob, (0, 0, 255)))
+
+    # ---- SESSION-65 WINDOW STATUS: appended after the clob suffix; absent/"OFF" renders BYTE-
+    # IDENTICAL to session 64's output (older flights + the still-default OFF mode); ON shows
+    # W/solve_kf + anchors-if-any; SHADOW marks its W with "?" (measured, not applied); FAILED still
+    # short-circuits first even when window keys are present. -------------------------------------
+    case(f"(65-1) no backend_window_mode -> byte-identical to session 64 output (got {_bk_async!r})",
+         _bk_async == "bk=ASYNC q2")
+    _bk_off = backend_status_text({"backend_mode": "ASYNC", "backend_queue_depth": 2,
+                                    "backend_pose_clobbers": 0, "backend_window_mode": "OFF"})
+    case(f"(65-2) backend_window_mode=OFF -> byte-identical to session 64 output (got {_bk_off!r})",
+         _bk_off == "bk=ASYNC q2")
+
+    _bk_on = backend_status_text({"backend_mode": "ASYNC", "backend_queue_depth": 2,
+                                   "backend_pose_clobbers": 0, "backend_window_mode": "ON",
+                                   "backend_window_kf": 10, "backend_solve_kf": 12,
+                                   "backend_anchors": 0})
+    case(f"(65-3) ON W=10 solve_kf=12 anchors=0 -> ends with w10k12, no anchor suffix "
+         f"(got {_bk_on!r})", _bk_on.endswith("w10k12"))
+
+    _bk_on_anchors = backend_status_text({"backend_mode": "ASYNC", "backend_queue_depth": 2,
+                                           "backend_pose_clobbers": 0, "backend_window_mode": "ON",
+                                           "backend_window_kf": 10, "backend_solve_kf": 12,
+                                           "backend_anchors": 2})
+    case(f"(65-4) ON anchors=2 -> contains a2 (got {_bk_on_anchors!r})", "a2" in _bk_on_anchors)
+
+    _bk_shadow = backend_status_text({"backend_mode": "ASYNC", "backend_queue_depth": 0,
+                                       "backend_pose_clobbers": 0, "backend_window_mode": "SHADOW",
+                                       "backend_window_kf": 10, "backend_solve_kf": 12})
+    case(f"(65-5) SHADOW W=10 -> contains w?10, not w10k (got {_bk_shadow!r})",
+         "w?10" in _bk_shadow and "w10k" not in _bk_shadow)
+
+    _bk_failed_win = backend_status_text({"backend_mode": "FAILED", "backend_queue_depth": 5,
+                                           "backend_pose_clobbers": 0, "backend_window_mode": "ON",
+                                           "backend_window_kf": 10, "backend_solve_kf": 12,
+                                           "backend_anchors": 3})
+    case(f"(65-6) FAILED short-circuits even with window keys present (got {_bk_failed_win!r})",
+         _bk_failed_win == "bk=FAILED")
+
+    dash65 = Dashboard()
+    dash65.pose = _pose64
+    dash65.map = {"backend_mode": "ASYNC", "backend_queue_depth": 2, "backend_pose_clobbers": 0,
+                  "backend_window_mode": "ON", "backend_window_kf": 10, "backend_solve_kf": 12,
+                  "backend_anchors": 2}
+    _strip_on = dash65.render()[:STATUS_H, :]
+    case(f"(65-7) ON status strip has NO red (has_red={has_bgr(_strip_on, (0, 0, 255))})",
+         not has_bgr(_strip_on, (0, 0, 255)))
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

@@ -23,6 +23,7 @@ any failure raises. There is no CPU fallback.
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -35,6 +36,7 @@ import yaml
 
 import frame_bus
 import slam_engine
+import slam_window
 from map_store import MapStore
 from ground_grid import GroundGrid, explore_cfg
 from frontier_planner import FrontierPlanner
@@ -65,12 +67,52 @@ DIAG_PERF_FIELDS: tuple[str, ...] = (
     # fly.py opens with CREATE_NEW_CONSOLE and never captures, so it dies with the window --
     # backend_mode=FAILED alone says THAT it failed, not why. Blank while healthy.
     "backend_error",
+    # Session 65: the bounded global-optimisation window's state (slam_engine.SLAM_WINDOW_FIELDS).
+    # Appended LAST, after backend_error, so the frozen nine-column prefix and every column before
+    # this stays exactly where earlier flights' reports expect it by name.
+    "backend_window_mode", "backend_window_kf", "backend_solve_kf", "backend_solve_edges",
+    "backend_graph_edges", "backend_anchors", "backend_anchor_drift",
+    # Session 66: the recording-relative frame index this row's frame was captured at, forwarded
+    # from io_bridge meta (it already rode TOPIC_POSE but never reached this CSV). io_bridge writes
+    # EVERY NDI video frame to flight_<ts>.mp4, so this IS the frame number in that file -- which
+    # makes a flight exactly replayable offline with no frame_id->video offset arithmetic and no
+    # assumption about when the operator pressed 'r'. BLANK (not 0) when not recording: 0 is a real
+    # frame index -- the first recorded frame -- so coercing None to 0 would invent data.
+    "rec_frame",
 )
 
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
 # frame of the PLY sequence (Pipeline._record_ply_marker / _write_frame_ply) so a Blender viewer can
 # always tell which anchor is which without reading markers.json.
 PLY_MARKER_COLORS = [(255, 0, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255), (255, 128, 0)]
+
+
+def load_frame_list(csv_path):
+    """Session 66: read the `rec_frame` column of a flight's perception CSV into the sorted, de-duped
+    source-frame indices that flight's SLAM actually consumed. Used by `--frame-list` to replay a
+    recording through the EXACT frame sequence of a live flight rather than a fixed stride (a live
+    solve is too slow to keep up, so io_bridge drops the backlog and the real gaps are wildly
+    uneven). NO SILENT FALLBACK: a CSV with no rec_frame column, or one written while not recording
+    (every cell blank), raises instead of quietly degrading to stride behaviour."""
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows or "rec_frame" not in rows[0]:
+        raise ValueError(f"{csv_path}: no 'rec_frame' column -- flight predates session 66, "
+                         f"so its frame sequence cannot be reconstructed")
+    idx = sorted({int(r["rec_frame"]) for r in rows if (r.get("rec_frame") or "").strip() != ""})
+    if not idx:
+        raise ValueError(f"{csv_path}: every rec_frame cell is blank -- that flight was flown "
+                         f"without recording ('r' in the io_bridge window), so there is no video "
+                         f"to replay against")
+    return idx
+
+
+def _rec_frame_cell(rec_frame):
+    """Session 66: render io_bridge's rec_frame for one CSV cell -- "" when not recording, the int
+    otherwise. Deliberately NOT `int(rec_frame or 0)`: rec_frame 0 is the FIRST recorded frame, so a
+    falsy-coalesce would silently relabel it as "not recording" (CLAUDE.md -- a missing value must be
+    visibly missing, never an invented one)."""
+    return "" if rec_frame is None else int(rec_frame)
 
 
 def load_config(path=None):
@@ -123,7 +165,15 @@ class Pipeline:
         # Session 64: global optimization moves off the frame path onto its own thread by default
         # (perception.backend_async, config.yaml) -- see slam_engine.SlamEngine for the full rationale.
         backend_async = bool(cfg["perception"].get("backend_async", True))
-        self.slam = slam_engine.SlamEngine(conf_thresh=conf_thresh, backend_async=backend_async)
+        # Session 65: the bounded global-optimisation window -- see config.yaml's perception:
+        # block for the full rationale. No second print here: SlamEngine.__init__ already prints
+        # the startup line for this.
+        window_mode = cfg["perception"].get("backend_window_mode", "OFF")
+        window_kf = cfg["perception"].get("backend_window_kf", 0)
+        window_policy = cfg["perception"].get("backend_window_policy", "anchored")
+        self.slam = slam_engine.SlamEngine(
+            conf_thresh=conf_thresh, backend_async=backend_async,
+            window_mode=window_mode, window_kf=window_kf, window_policy=window_policy)
         started = self.slam.start_backend()
         print(f"[perception] SLAM backend: "
               f"{'ASYNC (own thread)' if started else 'SYNC (inline, backend_async=false)'}")
@@ -410,7 +460,12 @@ class Pipeline:
             backend_mode=res.backend_mode, backend_queue_depth=res.backend_queue_depth,
             backend_thread_ms=round(res.backend_thread_ms, 1),
             backend_pose_clobbers=res.backend_pose_clobbers,
-            backend_error=res.backend_error)
+            backend_error=res.backend_error,
+            backend_window_mode=res.backend_window_mode, backend_window_kf=res.backend_window_kf,
+            backend_solve_kf=res.backend_solve_kf, backend_solve_edges=res.backend_solve_edges,
+            backend_graph_edges=res.backend_graph_edges, backend_anchors=res.backend_anchors,
+            backend_anchor_drift=round(res.backend_anchor_drift, 4),
+            rec_frame=_rec_frame_cell(meta.get("rec_frame")))
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -436,6 +491,10 @@ class Pipeline:
             "backend_mode": res.backend_mode, "backend_queue_depth": res.backend_queue_depth,
             "backend_pose_clobbers": res.backend_pose_clobbers,
             "backend_error": res.backend_error,
+            # Session 65: only 4 of the 7 window fields -- backend_solve_edges, backend_graph_edges
+            # and backend_anchor_drift are CSV-only because nothing in the visualizer renders them.
+            "backend_window_mode": res.backend_window_mode, "backend_window_kf": res.backend_window_kf,
+            "backend_solve_kf": res.backend_solve_kf, "backend_anchors": res.backend_anchors,
         }
 
     # ------------------------------------------------------------- map mode planner
@@ -1040,20 +1099,39 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
                 pass
 
 
-def _video_frames(path, stride, max_frames, proc_w, proc_h, object_frame_h=720):
+def _video_frames(path, stride, max_frames, proc_w, proc_h, object_frame_h=720,
+                  frame_list=None):
     """Yield (small_512x288, hires, meta) from an mp4, sub-sampled — mirrors io_bridge's two
     streams. `hires` is the native frame downscaled to `object_frame_h` (no upscale), for the
-    object detector; perception uses the 512x288 `small`."""
+    object detector; perception uses the 512x288 `small`.
+
+    Session 66: `frame_list` (sorted, de-duped source indices) REPLACES `stride` when given. A live
+    flight never sees evenly-spaced frames -- SLAM is slow, so io_bridge hands it whatever arrived
+    last and the backlog is dropped (measured: a 112-frame median gap, p90 310). Replaying at any
+    fixed stride therefore puts SLAM in a regime the drone never flies in. Feeding back the
+    `rec_frame` column of that flight's own perception CSV reproduces the exact frame sequence the
+    live solve consumed. Frames are still read sequentially -- no seeking, which OpenCV does not do
+    reliably on a long mp4 -- and non-selected frames are decoded and discarded."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"could not open recording: {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    wanted = list(frame_list) if frame_list is not None else None
+    w_ptr = 0
     src_idx = yielded = 0
     while True:
         ret, bgr = cap.read()
         if not ret:
             break
-        if src_idx % stride == 0:
+        if wanted is not None:
+            take = w_ptr < len(wanted) and src_idx == wanted[w_ptr]
+            if take:
+                w_ptr += 1
+            elif w_ptr >= len(wanted):
+                break
+        else:
+            take = (src_idx % stride == 0)
+        if take:
             small = cv2.resize(bgr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
             sh, sw = bgr.shape[:2]
             if sh > object_frame_h:
@@ -1062,7 +1140,10 @@ def _video_frames(path, stride, max_frames, proc_w, proc_h, object_frame_h=720):
             else:
                 hires = bgr
             meta = {"frame_id": yielded, "mono_ts": time.monotonic(),
-                    "sim_time": round(src_idx / fps, 3), "controls": {}}
+                    "sim_time": round(src_idx / fps, 3), "controls": {},
+                    # session 66: the source index IS the recorded video's frame number, so a
+                    # replay CSV carries the same rec_frame correspondence as the live flight.
+                    "rec_frame": src_idx}
             yield small, hires, meta
             yielded += 1
             if max_frames and yielded >= max_frames:
@@ -1073,7 +1154,8 @@ def _video_frames(path, stride, max_frames, proc_w, proc_h, object_frame_h=720):
 
 def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
                       out_dir=None, conf_thresh=1.5, publish=False,
-                      detect=False, detect_every=5, debug_lift=False, log=False):
+                      detect=False, detect_every=5, debug_lift=False, log=False,
+                      frame_list=None):
     """M4 offline verification: drive the full SLAM+map pipeline from a recorded mp4, export the map.
 
     With `publish=True` it ALSO publishes TOPIC_POSE/MAP/PLAN on the perception state bus,
@@ -1122,7 +1204,7 @@ def run_offline_video(cfg, video, show=False, stride=3, max_frames=0,
     t0 = time.time()
     try:
         for frame, hires, meta in _video_frames(video, stride, max_frames, proc_w, proc_h,
-                                                object_frame_h):
+                                                object_frame_h, frame_list=frame_list):
             _, _, panel, map_updated = pipe.step(frame, meta, state_pub, show)
             n += 1
             if obj_pipe is not None and (n % detect_every == 0):
@@ -1235,6 +1317,14 @@ def run_self_test(cfg):
     ok_backend = _self_test_backend_thread()
     print(f"[perception][self-test] {'PASS' if ok_backend else 'FAIL'}  SESSION-64 BACKEND THREAD")
     assert ok_backend
+
+    ok_window = _self_test_slam_window_fields()
+    print(f"[perception][self-test] {'PASS' if ok_window else 'FAIL'}  SESSION-65 SLAM WINDOW FIELDS")
+    assert ok_window
+
+    ok_window_diag = _self_test_diag_window_fields()
+    print(f"[perception][self-test] {'PASS' if ok_window_diag else 'FAIL'}  SESSION-65 CHUNK 4 DIAG/MAP WINDOW FIELDS")
+    assert ok_window_diag
 
     print("[perception][self-test] PASS")
 
@@ -1822,6 +1912,198 @@ def _self_test_backend_thread():
     return ok
 
 
+def _self_test_slam_window_fields():
+    """SESSION-65 SLAM WINDOW FIELDS: `SlamResult` gained seven fields (`slam_engine.SLAM_WINDOW_FIELDS`)
+    carrying the bounded global-optimisation window's STATE (mode/W/policy and what the most recent
+    solve actually touched) -- not durations, so, like SLAM_BACKEND_FIELDS, they must stay disjoint
+    from the two phase-timing tuples and from SLAM_BACKEND_FIELDS itself, default correctly typed on
+    a pre-session-65-style construction, and `slam_window.validate_window_config` must fail fast on a
+    bad mode/policy and normalise a negative window_kf to 0. No GPU/SLAM needed: SlamResult is a plain
+    dataclass and slam_window is cold-importable."""
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("window_fields_tuple -- SLAM_WINDOW_FIELDS is the frozen seven, in order",
+          slam_engine.SLAM_WINDOW_FIELDS == ("backend_window_mode", "backend_window_kf",
+                                             "backend_solve_kf", "backend_solve_edges",
+                                             "backend_graph_edges", "backend_anchors",
+                                             "backend_anchor_drift"))
+    check("window_fields_disjoint_from_phase_fields -- shares no names with SLAM_PHASE_FIELDS",
+          set(slam_engine.SLAM_WINDOW_FIELDS) & set(slam_engine.SLAM_PHASE_FIELDS) == set())
+    check("window_fields_disjoint_from_track_phase_fields -- shares no names with SLAM_TRACK_PHASE_FIELDS",
+          set(slam_engine.SLAM_WINDOW_FIELDS) & set(slam_engine.SLAM_TRACK_PHASE_FIELDS) == set())
+    check("window_fields_disjoint_from_backend_fields -- shares no names with SLAM_BACKEND_FIELDS",
+          set(slam_engine.SLAM_WINDOW_FIELDS) & set(slam_engine.SLAM_BACKEND_FIELDS) == set())
+
+    _r_default = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False)
+    check("slam_result_window_defaults -- OFF/0/0/0/0/0/0.0, correctly typed",
+          _r_default.backend_window_mode == "OFF" and isinstance(_r_default.backend_window_mode, str)
+          and _r_default.backend_window_kf == 0 and isinstance(_r_default.backend_window_kf, int)
+          and _r_default.backend_solve_kf == 0 and isinstance(_r_default.backend_solve_kf, int)
+          and _r_default.backend_solve_edges == 0 and isinstance(_r_default.backend_solve_edges, int)
+          and _r_default.backend_graph_edges == 0 and isinstance(_r_default.backend_graph_edges, int)
+          and _r_default.backend_anchors == 0 and isinstance(_r_default.backend_anchors, int)
+          and _r_default.backend_anchor_drift == 0.0
+          and isinstance(_r_default.backend_anchor_drift, float))
+
+    for bad_mode in ("on", "Shadow", "off"):
+        try:
+            slam_window.validate_window_config(bad_mode, 10, "anchored")
+            check(f"validate_window_config rejects mode={bad_mode!r}", False)
+        except ValueError:
+            check(f"validate_window_config rejects mode={bad_mode!r}", True)
+
+    for bad_policy in ("ANCHORED", "maybe"):
+        try:
+            slam_window.validate_window_config("OFF", 10, bad_policy)
+            check(f"validate_window_config rejects policy={bad_policy!r}", False)
+        except ValueError:
+            check(f"validate_window_config rejects policy={bad_policy!r}", True)
+
+    _, normalised_w, _ = slam_window.validate_window_config("ON", -1, "strict")
+    check("validate_window_config normalises -1 -> 0", normalised_w == 0)
+
+    return ok
+
+
+def _self_test_diag_window_fields():
+    """SESSION-65 CHUNK 4: the seven `slam_engine.SLAM_WINDOW_FIELDS` land in the flight CSV
+    (`DIAG_PERF_FIELDS`, appended last, after the frozen nine-column prefix) and four of them land
+    in the `TOPIC_MAP` payload. No GPU/SLAM needed: DiagLog is pure stdlib CSV and MapStore is pure
+    numpy, so an empty real MapStore stands in for `self.mapstore` rather than a fake double."""
+    import csv
+    import shutil
+    import tempfile
+    import types
+
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("frozen_prefix9 -- first nine DIAG_PERF_FIELDS names/order unchanged",
+          DIAG_PERF_FIELDS[:9] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+                                    "n_keyframes", "n_voxels", "reloc"))
+    check("window_fields_present_exactly_once -- every SLAM_WINDOW_FIELDS name is a DIAG_PERF_FIELDS "
+          "column, exactly once",
+          all(DIAG_PERF_FIELDS.count(f) == 1 for f in slam_engine.SLAM_WINDOW_FIELDS))
+    check("no_duplicate_columns -- DIAG_PERF_FIELDS has no repeated name",
+          len(set(DIAG_PERF_FIELDS)) == len(DIAG_PERF_FIELDS))
+
+    # --- SESSION 66: rec_frame, the video-correlation column ---------------------------------
+    # io_bridge writes EVERY NDI video frame to flight_<ts>.mp4 and stamps that frame's index into
+    # meta, so logging it here makes a flight exactly replayable with no frame_id->video offset.
+    # The load-bearing case is rec_frame 0: it is the FIRST recorded frame, NOT "absent".
+    check("rec_frame_column -- rec_frame is a DIAG_PERF_FIELDS column",
+          "rec_frame" in DIAG_PERF_FIELDS)
+    check("rec_frame_frozen_prefix -- the frozen nine are still first and in order",
+          DIAG_PERF_FIELDS[:9] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode",
+                                   "new_keyframe", "n_keyframes", "n_voxels", "reloc"))
+    check("rec_frame_not_a_phase -- rec_frame joins no closure/phase tuple",
+          "rec_frame" not in slam_engine.SLAM_PHASE_FIELDS
+          and "rec_frame" not in slam_engine.SLAM_TRACK_PHASE_FIELDS
+          and "rec_frame" not in slam_engine.SLAM_BACKEND_FIELDS
+          and "rec_frame" not in slam_engine.SLAM_WINDOW_FIELDS)
+    check("rec_frame_none_is_blank -- not recording renders \"\", never 0",
+          _rec_frame_cell(None) == "")
+    check("rec_frame_zero_is_zero -- frame 0 is the FIRST recorded frame, not absent",
+          _rec_frame_cell(0) == 0 and _rec_frame_cell(0) != "")
+    check("rec_frame_int_passthrough -- a real index survives as an int",
+          _rec_frame_cell(1234) == 1234 and isinstance(_rec_frame_cell(1234), int))
+
+    tmp_dir = tempfile.mkdtemp(prefix="recframe_selftest_")
+    try:
+        rf_log = DiagLog("perception", list(DIAG_PERF_FIELDS), out_dir=tmp_dir,
+                         ts="20260101_000001")
+        rf_log.row(wall_ts=1.0, frame_id=7, rec_frame=_rec_frame_cell(0))
+        rf_log.row(wall_ts=2.0, frame_id=8, rec_frame=_rec_frame_cell(None))
+        rf_log.row(wall_ts=3.0, frame_id=9, rec_frame=_rec_frame_cell(41))
+        rf_log.close()
+        with open(rf_log.path, newline="", encoding="utf-8") as fh:
+            rr = list(csv.DictReader(fh))
+        check("rec_frame_roundtrip -- 0 writes \"0\", None writes \"\", 41 writes \"41\"",
+              [r["rec_frame"] for r in rr] == ["0", "", "41"])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="window_fields_selftest_")
+    try:
+        log = DiagLog("perception", list(DIAG_PERF_FIELDS), out_dir=tmp_dir, ts="20260101_000000")
+
+        # -- a fully-populated row: the seven window columns round-trip their real values --
+        window_values = {
+            "backend_window_mode": "ON", "backend_window_kf": 30, "backend_solve_kf": 12,
+            "backend_solve_edges": 40, "backend_graph_edges": 500, "backend_anchors": 3,
+            "backend_anchor_drift": 0.125,
+        }
+        full_row = {f: (1 if f in ("frame_id", "new_keyframe", "n_keyframes", "n_voxels", "reloc",
+                                    "backend_queue_depth", "backend_pose_clobbers")
+                        else ("TRACKING" if f == "mode"
+                              else ("ASYNC" if f == "backend_mode" else 1.0)))
+                    for f in DIAG_PERF_FIELDS}
+        full_row.update(window_values)
+        log.row(**full_row)
+
+        # -- a default-SlamResult row: exactly the seven kwargs the real diag row construction
+        # passes, everything else omitted (must come back blank, never an invented value) --
+        res_default = slam_engine.SlamResult(
+            tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+            camera_center=None, new_keyframe=False, reloc_event=False)
+        log.row(wall_ts=2.0, frame_id=2, loop_dt=0.1, slam_ms=5.0, mode="TRACKING",
+                new_keyframe=0, n_keyframes=1, n_voxels=10, reloc=0,
+                backend_window_mode=res_default.backend_window_mode,
+                backend_window_kf=res_default.backend_window_kf,
+                backend_solve_kf=res_default.backend_solve_kf,
+                backend_solve_edges=res_default.backend_solve_edges,
+                backend_graph_edges=res_default.backend_graph_edges,
+                backend_anchors=res_default.backend_anchors,
+                backend_anchor_drift=round(res_default.backend_anchor_drift, 4))
+        log.close()
+
+        with open(log.path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        full_row_ok = all(str(rows[0][f]) == str(window_values[f]) for f in window_values)
+        check("csv_full_row_window_fields_roundtrip -- all seven come back with the right values",
+              full_row_ok)
+
+        default_ok = (rows[1]["backend_window_mode"] == "OFF" and rows[1]["backend_window_kf"] == "0"
+                      and rows[1]["backend_solve_kf"] == "0" and rows[1]["backend_solve_edges"] == "0"
+                      and rows[1]["backend_graph_edges"] == "0" and rows[1]["backend_anchors"] == "0"
+                      and rows[1]["backend_anchor_drift"] == "0.0")
+        check("csv_default_slamresult_writes_literal_zeros -- 0/0.0/OFF, never a blank cell",
+              default_ok)
+
+        other_omitted = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms")
+        check("csv_other_omitted_phases_still_blank -- unrelated omitted phase columns stay blank",
+              all(rows[1][f] == "" for f in other_omitted))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -- _map_payload: an empty real MapStore (pure numpy, no GPU) stands in for self.mapstore --
+    pipe = types.SimpleNamespace(mapstore=MapStore(0.1, tracking_mode="MASt3R"))
+    payload = Pipeline._map_payload(pipe, res_default, {"frame_id": 2, "sim_time": 1.0})
+    check("map_payload_has_four_window_keys",
+          all(k in payload for k in ("backend_window_mode", "backend_window_kf",
+                                      "backend_solve_kf", "backend_anchors")))
+    check("map_payload_omits_the_other_three -- solve_edges/graph_edges/anchor_drift are CSV-only",
+          not any(k in payload for k in ("backend_solve_edges", "backend_graph_edges",
+                                          "backend_anchor_drift")))
+    check("map_payload_window_values_match_default",
+          payload["backend_window_mode"] == "OFF" and payload["backend_window_kf"] == 0
+          and payload["backend_solve_kf"] == 0 and payload["backend_anchors"] == 0)
+
+    return ok
+
+
 def _self_test_phase_timing(cfg):
     """SESSION-62 PHASE TIMING SCHEMA: DIAG_PERF_FIELDS must keep its frozen 9-column prefix (so
     pre-2026-09-05 files stay readable by name), carry every SlamResult phase field plus the four
@@ -1990,6 +2272,9 @@ def main():
     parser.add_argument("--video", default=None,
                         help="OFFLINE: drive the full SLAM+map pipeline from this mp4, export the map")
     parser.add_argument("--stride", type=int, default=3, help="offline: process every Nth source frame")
+    parser.add_argument("--frame-list", default=None,
+                        help="offline: a flight's perception CSV; replay the EXACT frames that "
+                             "flight's SLAM consumed (its rec_frame column) instead of --stride")
     parser.add_argument("--max-frames", type=int, default=0, help="offline: cap processed frames (0=all)")
     parser.add_argument("--conf-thresh", type=float, default=1.5,
                         help="per-point confidence cutoff for pointmaps fed into the map")
@@ -2022,7 +2307,8 @@ def main():
                           max_frames=args.max_frames, out_dir=args.out,
                           conf_thresh=args.conf_thresh, publish=args.publish,
                           detect=args.detect, detect_every=args.detect_every,
-                          debug_lift=args.debug_lift, log=args.log)
+                          debug_lift=args.debug_lift, log=args.log,
+                          frame_list=(load_frame_list(args.frame_list) if args.frame_list else None))
     else:
         # A stale sentinel from a crashed prior run would stop us instantly -- clear it before we start.
         if args.stop_file and os.path.exists(args.stop_file):

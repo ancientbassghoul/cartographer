@@ -31,6 +31,8 @@ import numpy as np
 import torch
 import lietorch
 
+import slam_window
+
 CARTO = Path(__file__).resolve().parent
 SLAM_REPO = CARTO / "third_party" / "MASt3R-SLAM"
 
@@ -88,6 +90,18 @@ class SlamResult:
     # failed; this carries the reason, so a flight stays diagnosable from artifacts alone with
     # nobody having had to be watching. Empty string whenever the backend is healthy.
     backend_error: str = ""
+    # Session 65 — the bounded global-optimisation window's STATE, not a duration (see
+    # slam_window.py): which mode is active, the configured W, and what the most recent solve
+    # actually touched. These belong to no closure invariant -- exactly how session 64 handled
+    # backend_mode -- so they are kept out of SLAM_PHASE_FIELDS/SLAM_TRACK_PHASE_FIELDS/
+    # SLAM_BACKEND_FIELDS, whose members close against slam_ms/track_ms/nothing respectively.
+    backend_window_mode: str = "OFF"      # "OFF" | "SHADOW" | "ON"
+    backend_window_kf: int = 0            # configured W; 0 = unbounded
+    backend_solve_kf: int = 0             # keyframes the most recent solve actually touched
+    backend_solve_edges: int = 0          # edges the most recent solve actually touched
+    backend_graph_edges: int = 0          # total edges in the graph at that solve
+    backend_anchors: int = 0              # out-of-window keyframes dragged in by loop edges
+    backend_anchor_drift: float = 0.0     # max anchor pose displacement from that solve
 
 
 # Session 62: the phase names in SlamResult, in pipeline order. Single source of truth shared by
@@ -105,6 +119,14 @@ SLAM_TRACK_PHASE_FIELDS: tuple[str, ...] = ("frame_ms", "infer_ms", "tracker_ms"
 SLAM_BACKEND_FIELDS: tuple[str, ...] = ("backend_mode", "backend_queue_depth",
                                         "backend_thread_ms", "backend_pose_clobbers",
                                         "backend_error")
+
+# Session 65: the bounded global-optimisation window's state, carried on every SlamResult. Like
+# SLAM_BACKEND_FIELDS these are STATE, not durations -- two are not even numbers you'd time -- so
+# they are deliberately kept out of SLAM_PHASE_FIELDS, SLAM_TRACK_PHASE_FIELDS and
+# SLAM_BACKEND_FIELDS, and belong to no closure invariant.
+SLAM_WINDOW_FIELDS: tuple[str, ...] = ("backend_window_mode", "backend_window_kf", "backend_solve_kf",
+                                       "backend_solve_edges", "backend_graph_edges", "backend_anchors",
+                                       "backend_anchor_drift")
 
 # Session 64: how much of a backend exception text rides the CSV. Long enough for an exception type
 # plus a useful message, short enough that a per-frame column stays readable in a spreadsheet; the
@@ -138,11 +160,22 @@ BACKEND_IDLE_SLEEP_S: float = 0.05
 
 class SlamEngine:
     def __init__(self, device="cuda:0", config_path="config/base.yaml", conf_thresh=1.5,
-                 backend_async: bool = True):
+                 backend_async: bool = True, window_mode: str = "OFF", window_kf: int = 0,
+                 window_policy: str = "anchored"):
         assert torch.cuda.is_available(), "CUDA required for SLAM (NO SILENT FALLBACKS)."
         self.device = device
         self.conf_thresh = conf_thresh
         self.tracking_mode = "MASt3R"
+
+        # Session 65: fail fast at CONSTRUCTION, not at the first solve -- a bad
+        # backend_window_mode/policy in config.yaml should never get to fly before it's caught.
+        self.window_mode, self.window_kf, self.window_policy = slam_window.validate_window_config(
+            window_mode, window_kf, window_policy)
+        if self.window_mode == "OFF":
+            print("[slam] global-opt window: mode=OFF (unbounded, upstream behaviour)")
+        else:
+            print(f"[slam] global-opt window: mode={self.window_mode} W={self.window_kf} "
+                  f"policy={self.window_policy}")
 
         # Session 64: global optimization moves off the frame path onto its own thread (upstream
         # runs this in a separate PROCESS; Windows mp.Manager() deadlocks here, so a thread is the
@@ -186,6 +219,7 @@ class SlamEngine:
         )
         from mast3r_slam.tracker import FrameTracker
         from mast3r_slam.global_opt import FactorGraph
+        import mast3r_slam_backends
 
         self._Mode = Mode
         self._create_frame = create_frame
@@ -193,7 +227,10 @@ class SlamEngine:
         self._SharedKeyframes = SharedKeyframes
         self._SharedStates = SharedStates
         self._FrameTracker = FrameTracker
-        self._FactorGraph = FactorGraph
+        # Session 65: FactorGraph is subclassed (not monkeypatched) so the window logic lives in
+        # slam_window.py, never in third_party/ (CLAUDE.md: the vendored repo stays pristine).
+        self._FactorGraph = slam_window.make_windowed_factor_graph(
+            FactorGraph, mast3r_slam_backends.gauss_newton_rays)
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_grad_enabled(False)
@@ -232,7 +269,10 @@ class SlamEngine:
         self.keyframes = self._SharedKeyframes(mgr, self.h, self.w)
         self.states = self._SharedStates(mgr, self.h, self.w)
         self.tracker = self._FrameTracker(self.model, self.keyframes, self.device)
-        self.factor_graph = self._FactorGraph(self.model, self.keyframes, None, self.device)
+        self.factor_graph = self._FactorGraph(
+            self.model, self.keyframes, None, self.device,
+            window_mode=self.window_mode, window_kf=self.window_kf,
+            window_policy=self.window_policy)
         self._initialized = True
 
     # ------------------------------------------------------------- backend
@@ -263,7 +303,10 @@ class SlamEngine:
                 if cfg["use_calib"]:
                     factor_graph.solve_GN_calib()
                 else:
-                    factor_graph.solve_GN_rays()
+                    # Session 65: RELOC is exempt from windowing. A successful reloc matches
+                    # against candidates that are usually far out of window -- windowing the one
+                    # solve that recovers tracking, to save time on a rare event, is a bad trade.
+                    factor_graph.solve_GN_rays(force_full=True)
             return success
 
     def _run_backend(self):
@@ -577,6 +620,13 @@ class SlamEngine:
         with self._backend_meta_lock:
             backend_thread_ms = self._backend_thread_ms
             backend_pose_clobbers = self._backend_pose_clobbers
+        # Session 65: last_window_stats is a frozen dataclass the backend (thread or inline) REPLACES
+        # by whole-object attribute rebind, never mutates -- so reading it once into a local needs no
+        # lock, exactly the same argument as backend_thread_ms/backend_pose_clobbers above. Session 64
+        # measured 787s of a flight lost to taking a lock just to read numbers; this avoids repeating
+        # that mistake for a value that updates far more often (every backend pass, not once a solve).
+        window_stats = (self.factor_graph.last_window_stats if self._initialized
+                         else slam_window.WindowStats(mode=self.window_mode, window_kf=self.window_kf))
         return SlamResult(
             tracking_mode=self.tracking_mode, mode=cur_mode,
             n_keyframes=kf_count, frame_idx=i, camera_center=center,
@@ -587,4 +637,8 @@ class SlamEngine:
             frame_ms=frame_ms, infer_ms=infer_ms, tracker_ms=tracker_ms,
             backend_mode=backend_mode, backend_queue_depth=backend_queue_depth,
             backend_error=backend_error,
-            backend_thread_ms=backend_thread_ms, backend_pose_clobbers=backend_pose_clobbers)
+            backend_thread_ms=backend_thread_ms, backend_pose_clobbers=backend_pose_clobbers,
+            backend_window_mode=window_stats.mode, backend_window_kf=window_stats.window_kf,
+            backend_solve_kf=window_stats.solve_kf, backend_solve_edges=window_stats.solve_edges,
+            backend_graph_edges=window_stats.graph_edges, backend_anchors=window_stats.anchors,
+            backend_anchor_drift=window_stats.anchor_drift)

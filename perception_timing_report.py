@@ -68,6 +68,16 @@ _TRACK_PHASE_FIELDS: tuple[str, ...] = ("frame_ms", "infer_ms", "tracker_ms")
 _BACKEND_STATE_COLUMNS: tuple[str, ...] = (
     "backend_mode", "backend_queue_depth", "backend_pose_clobbers")
 
+# Session 65 (C5): mirror of slam_engine.SLAM_WINDOW_FIELDS. Deliberately excluded from
+# PHASE_COLUMNS/render_table for the same reason as _BACKEND_STATE_COLUMNS above: backend_window_mode
+# is a string, backend_window_kf/backend_solve_kf/backend_solve_edges/backend_graph_edges/
+# backend_anchors are counts (not durations), and backend_anchor_drift is a pose-magnitude gauge, not
+# a millisecond figure -- render_table's "median/p90 of milliseconds" would misrepresent all seven.
+# They get their own summary line, window_summary() below.
+_WINDOW_STATE_COLUMNS: tuple[str, ...] = (
+    "backend_window_mode", "backend_window_kf", "backend_solve_kf", "backend_solve_edges",
+    "backend_graph_edges", "backend_anchors", "backend_anchor_drift")
+
 
 @dataclass(frozen=True)
 class PhaseStats:
@@ -235,6 +245,85 @@ def backend_summary(rows) -> str:
     return line
 
 
+def window_summary(rows) -> str:
+    """One-line summary of the session-65 bounded global-optimisation window (C5): distinct
+    backend_window_mode values with their row counts, the distinct backend_window_kf values seen,
+    and median/max of backend_solve_kf/backend_solve_edges/backend_graph_edges/backend_anchors plus
+    max backend_anchor_drift. Returns the exact string
+    "window state: unavailable (file predates session 65)" when any of _WINDOW_STATE_COLUMNS is
+    absent (including an empty `rows`, which carries no header at all -- same reasoning as
+    backend_summary() above). Blank/unparseable cells are counted and named via PhaseStats.n_blank,
+    never coerced to 0.
+
+    Two extra lines are appended when the data calls for them, because both silently reading past
+    them would be actively misleading, not just incomplete: a SHADOW row means solve_kf/solve_edges/
+    anchors are WOULD-BE numbers (the full graph actually solved), and an anchors>1 row means more
+    than the oldest anchor was pulled in even though only the oldest gets pinned (num_fix=1) -- the
+    trigger condition for the deferred CUDA num_fix work, so it must be findable from a report alone.
+    """
+    if not rows or any(c not in rows[0].keys() for c in _WINDOW_STATE_COLUMNS):
+        return "window state: unavailable (file predates session 65)"
+
+    mode_counts: dict = {}
+    n_blank_mode = 0
+    for row in rows:
+        mode = row.get("backend_window_mode", "")
+        if mode == "":
+            n_blank_mode += 1
+            continue
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    mode_parts = [f"{m}={n}" for m, n in sorted(mode_counts.items())]
+    if n_blank_mode:
+        mode_parts.append(f"blank={n_blank_mode}")
+    modes_str = ", ".join(mode_parts)
+
+    def _kf_sort_key(v):
+        try:
+            return (0, int(v))
+        except ValueError:
+            return (1, v)
+
+    kf_raw = [row.get("backend_window_kf", "") for row in rows]
+    n_blank_kf = sum(1 for v in kf_raw if v == "")
+    kf_distinct = sorted({v for v in kf_raw if v != ""}, key=_kf_sort_key)
+    kf_str = "window_kf=[" + ",".join(kf_distinct) + "]"
+    if n_blank_kf:
+        kf_str += f" (blank={n_blank_kf})"
+
+    solve_kf = phase_stats(rows, "backend_solve_kf")
+    solve_edges = phase_stats(rows, "backend_solve_edges")
+    graph_edges = phase_stats(rows, "backend_graph_edges")
+    anchors = phase_stats(rows, "backend_anchors")
+    drift = phase_stats(rows, "backend_anchor_drift")
+
+    line = (f"window state: mode=[{modes_str}] {kf_str} "
+            f"solve_kf median={solve_kf.median:.0f} max={solve_kf.maximum:.0f} "
+            f"(n={solve_kf.n} n_blank={solve_kf.n_blank}) "
+            f"solve_edges median={solve_edges.median:.0f} max={solve_edges.maximum:.0f} "
+            f"(n={solve_edges.n} n_blank={solve_edges.n_blank}) "
+            f"graph_edges median={graph_edges.median:.0f} max={graph_edges.maximum:.0f} "
+            f"(n={graph_edges.n} n_blank={graph_edges.n_blank}) "
+            f"anchors median={anchors.median:.0f} max={anchors.maximum:.0f} "
+            f"(n={anchors.n} n_blank={anchors.n_blank}) "
+            f"anchor_drift max={drift.maximum:.4f} (n={drift.n} n_blank={drift.n_blank})")
+
+    if any(row.get("backend_window_mode", "") == "SHADOW" for row in rows):
+        line += ("\n  (SHADOW rows: solve_kf/solve_edges/anchors are WOULD-BE counts; the full "
+                 "graph was solved)")
+
+    n_anchors_gt1 = 0
+    for row in rows:
+        v, blank = _parse_float(row.get("backend_anchors", ""))
+        if not blank and v > 1:
+            n_anchors_gt1 += 1
+    if n_anchors_gt1:
+        line += (f"\n  *** anchors>1 on {n_anchors_gt1} row(s) (max {anchors.maximum:.0f}): only "
+                  "the OLDEST is pinned (num_fix=1) -- see the deferred CUDA num_fix work in "
+                  "plans/session65-spec.md ***")
+
+    return line
+
+
 def bucket_by_minute(rows, minutes: float = 5.0):
     """Bucket rows by wall_ts relative to the first row's wall_ts, in `minutes`-wide windows.
     A row with a blank/unparseable wall_ts goes to its own "unparseable wall_ts" bucket — reported,
@@ -346,6 +435,7 @@ def report(csv_path) -> str:
     else:
         lines.append("Track phase closure: unavailable (missing phase columns, see banner above)")
     lines.append(backend_summary(rows))
+    lines.append(window_summary(rows))
     lines.append("")
 
     lines.append(render_table("By flight-minute", bucket_by_minute(rows)))
@@ -648,6 +738,77 @@ def run_self_test() -> None:
         sum10b = backend_summary(load_rows(p10b))
         check("session64 -- a first-build CSV (no backend_error column) still reports normally",
               "unavailable" not in sum10b and "ASYNC=1" in sum10b and "BACKEND FAILED" not in sum10b)
+
+        # 11. Session 65 (C5): window_summary(rows) on in-memory row dicts.
+        def _win_row(mode="OFF", kf="0", solve_kf="0", solve_edges="0", graph_edges="0",
+                     anchors="0", drift="0.0"):
+            return {"backend_window_mode": mode, "backend_window_kf": kf,
+                    "backend_solve_kf": solve_kf, "backend_solve_edges": solve_edges,
+                    "backend_graph_edges": graph_edges, "backend_anchors": anchors,
+                    "backend_anchor_drift": drift}
+
+        rows11_mixed = [_win_row(mode="OFF"), _win_row(mode="OFF"), _win_row(mode="ON"),
+                        _win_row(mode="SHADOW")]
+        summary11_mixed = window_summary(rows11_mixed)
+        check("window_summary -- names each mode with its count",
+              "OFF=2" in summary11_mixed and "ON=1" in summary11_mixed
+              and "SHADOW=1" in summary11_mixed)
+        check("window_summary -- a SHADOW row emits the would-be caveat line",
+              "WOULD-BE counts" in summary11_mixed)
+
+        rows11_all_on = [_win_row(mode="ON"), _win_row(mode="ON")]
+        check("window_summary -- an all-ON CSV emits no SHADOW caveat",
+              "WOULD-BE counts" not in window_summary(rows11_all_on))
+
+        check("window_summary -- missing columns -> exact unavailable string",
+              window_summary([{"slam_ms": "1.0"}])
+              == "window state: unavailable (file predates session 65)")
+        check("window_summary -- empty rows -> exact unavailable string",
+              window_summary([]) == "window state: unavailable (file predates session 65)")
+
+        rows11_blank = [_win_row(anchors="0"), _win_row(anchors=""), _win_row(anchors="2")]
+        summary11_blank = window_summary(rows11_blank)
+        check("window_summary -- blank backend_anchors counted via n_blank, not coerced to 0",
+              "anchors median=1 max=2 (n=2 n_blank=1)" in summary11_blank)
+
+        rows11_gt1 = [_win_row(anchors="0"), _win_row(anchors="1"), _win_row(anchors="3")]
+        check("window_summary -- anchors>1 line names the row count and max",
+              "anchors>1 on 1 row(s) (max 3)" in window_summary(rows11_gt1))
+        rows11_not_gt1 = [_win_row(anchors="0"), _win_row(anchors="1"), _win_row(anchors="1")]
+        check("window_summary -- no anchors>1 line when the max is exactly 1",
+              "anchors>1" not in window_summary(rows11_not_gt1))
+
+        check("PHASE_COLUMNS -- contains none of _WINDOW_STATE_COLUMNS",
+              not any(c in PHASE_COLUMNS for c in _WINDOW_STATE_COLUMNS))
+
+        # 11b. report()-level: a pre-session-65 CSV (path5k, session 64) still prints both closure
+        # lines and backend_summary normally alongside the window-unavailable line -- one missing
+        # feature must not suppress another (mirrors check 5j's backend_summary precedent).
+        report5k_again = report(path5k)
+        check("window_summary -- report() on pre-session-65 CSV shows unavailable alongside "
+              "closures + backend summary",
+              "window state: unavailable (file predates session 65)" in report5k_again
+              and "SLAM phase closure" in report5k_again
+              and "Track phase closure" in report5k_again
+              and "backend state: mode=[ASYNC=2, SYNC=1]" in report5k_again)
+
+        # 11c. A fully modern session-65 CSV: report() renders a populated window_summary line.
+        path11m = Path(tmp_dir) / "session65.csv"
+        fields11m = (("wall_ts", "frame_id", "mode", "new_keyframe") + PHASE_COLUMNS
+                     + _BACKEND_STATE_COLUMNS + _WINDOW_STATE_COLUMNS)
+        with open(path11m, "w", newline="", encoding="utf-8") as fh11m:
+            w11m = csv.DictWriter(fh11m, fieldnames=fields11m)
+            w11m.writeheader()
+            row11m = {c: "1.0" for c in PHASE_COLUMNS}
+            row11m.update(wall_ts="0.0", frame_id="0", mode="TRACKING", new_keyframe="0",
+                          backend_mode="ASYNC", backend_queue_depth="0", backend_pose_clobbers="0",
+                          backend_window_mode="ON", backend_window_kf="30", backend_solve_kf="12",
+                          backend_solve_edges="40", backend_graph_edges="500", backend_anchors="2",
+                          backend_anchor_drift="0.05")
+            w11m.writerow(row11m)
+        report11m = report(path11m)
+        check("window_summary -- report() on a modern session-65 CSV shows a populated line",
+              "window state: mode=[ON=1]" in report11m)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

@@ -18,28 +18,98 @@ technical facts (control mechanic, build quirks, world-frame convention): `PROGR
 `## Architecture`, `## What's built`, and `## Reference — don't re-derive` sections.
 
 ## Current status
-Branch **`all-bets-are-off`**. **Session 62 is BUILT, GATED and FLOWN** — all **10** self-test suites
-green at HEAD (`perception_timing_report.py` joined the gate), spec archived at
-`plans/session62-spec.md`. Session 61 is flown too (three flights on 2026-09-05); its panel watch
-list below has NOT been formally reviewed against those logs yet.
 
-Session 62 was measurement only: it instrumented where `slam_ms` actually goes, and answered the
-question below. It also fixed `fly.py`, which had never passed `--log` to `perception_worker.py`, so
-**every flight from here on writes `OUTPUT/diag/<ts>_perception.csv`** with the full phase split.
-Read one with `venv\Scripts\python.exe perception_timing_report.py` (no argument = newest flight).
+### >>> THE PROBLEM IS AN IN-FLIGHT ACCUMULATOR. EVERYTHING ELSE IS SECONDARY. <<<
+Operator's conclusion, 2026-09-06, and the data supports it. `tracker_ms` is **flat at ~250-400 ms**
+across a deterministic replay of the EXACT frames a flight consumed, and **2000-6000 ms** on the live
+flight those same frames came from. Every live flight starts at ~370 ms with the drone on the ground,
+then steps up **7-17x within two minutes of takeoff** and never returns:
 
-**Live config note (operator, 2026-09-05): `use_visual_backoff_trigger` is `false` on purpose.**
-Flight `20260905_011112` showed the tradeoff: with it ON, PLAN never went stale, but goals got
-blacklisted as unreachable (justifiably) and the reconstruction was worse because the drone never dug
-into the corner areas. OFF costs ~2 PLAN-STALE events per flight and reconstructs better. Leaving it
-off, on the expectation that the FALLBACK reordering (next item) recovers the stale-plan cost.
+| run | start | -> | -> | -> | end |
+|---|---|---|---|---|---|
+| replay, window ON | 253 | 236 | 814 | 268 | 267 |
+| replay, window OFF | 254 | 269 | 353 | 360 | 394 |
+| **live, window ON** | 363 | **6240** | 5035 | 2722 | 2668 |
+| **live, window OFF** | 382 | **4549** | 2530 | 3127 | 3127 |
 
-The 2026-09-05 11:33 flight ended in a **hardware crash** (suspected Intel Graphics; the operator has
-since disabled that card). It was salvaged with essentially no loss — see `PROGRESS.md` session 62 for
-the VOL-header bug that made the FIRST salvage attempt produce an unwatchable video, now fixed.
+**Ruled out:** the frames (replay uses the identical sequence); any of the session 63-66 speed work
+(the step change is identical with the window ON and OFF, backend inline or threaded); and plain
+GPU contention with Unity (real — replays run 1.0-1.4 s/frame vs 2.4-7.3 live — but constant across
+every flight, so it cannot explain a step change at takeoff or a 2x gap between two same-config
+flights). **Something changes state once the vehicle is airborne, in a process whose inputs are
+provably identical.** Cheapest next measurement: log the Gauss-Newton iteration count + convergence
+reason per `tracker.track()` call and correlate against `tracker_ms`. Full write-up with every table:
+`plans/slam_report.html`.
 
-`main` is unaffected and sits at session 43 (confirmed tolerable live-fly on 2026-09-01), with one
-open problem: height.
+**Do not resume the constant-factor optimisation work before this is understood.** Sessions 63-66
+produced real, measured improvements that do not touch this, and chasing more of them is yak-shaving.
+
+Branch **`all-bets-are-off`**. **Session 65 (bounded global-opt window) is BUILT, GATED, FLOWN and
+BENCHED. Session 66 made offline replay frame-exact and fixed the window's real cost.**
+`config.yaml` currently ships **`backend_window_mode: "OFF"`, `backend_window_kf: 0`** — set back
+to OFF at the operator's request so a flight runs exactly as it did before the speed work
+(`backend_async` was already `false`). The window is a real ~10% improvement on replay (evidence
+below) and can be re-enabled with `"ON"` / `30`, but it is NOT the fix for the accumulator above. Session 65's design/mechanics: `plans/session65-spec.md`.
+Session 66's measurements and replay mechanics: `plans/session66-frame-exact-replay-and-window-syncs.md`.
+
+**>>> THE BIGGEST THING LEARNED THIS SESSION — offline replay had NEVER reproduced live flight. <<<**
+SLAM runs at ~0.2 Hz, so `io_bridge` hands it the newest frame and DROPS the backlog. Measured on
+flight `20260906_144839`: the gap between consecutively PROCESSED frames is a median of **112** NDI
+frames (p90 624, max 1735) at ~58 fps capture — live sees snapshots ~1.9 s apart. Replaying a
+recording at the default `--stride 3` puts frames 17 ms apart, so the match fraction never falls
+below `match_frac_thresh: 0.333` and almost no keyframes form (measured: **3 keyframes in 200
+frames**). No fixed stride reproduces live, because the real gaps are wildly uneven (median 76, p90
+543, max 1510 on the session-66 flight). **Any bench, and `plans/slam_report.html`'s claim that
+resolution work is "a bench experiment, not a flight", must account for this.**
+
+The fix, and the tool to use from now on:
+- `rec_frame` is now a flight-CSV column (it already rode `TOPIC_POSE` but never reached disk).
+  `io_bridge` writes EVERY NDI frame to `flight_<ts>.mp4`, so it IS that file's frame number.
+- **Press `r` in the io_bridge window on every flight.** Then replay it exactly:
+  `venv\Scripts\python.exe perception_worker.py --video OUTPUTlight_<ts>.mp4 --frame-list
+  OUTPUT\diag\<ts>_perception.csv --no-display --log --out <dir>`
+  This is a **controlled A/B** — same frames, same order — which no pair of live flights can be.
+
+**Window verdict — SETTLED, `ON W=30` ships.** Frame-exact A/B on `flight_20260906_165141` (319
+frames; every run 64 kf / 38 RELOC, so genuinely matched), run as an **ABBA set** (ON,OFF,OFF,ON) to
+cancel the run-order drift described below. Drift-cancelled: loop **364.3 s vs 405.9 s (ON 10.3%
+faster)**, backend **233.2 s vs 265.1 s (12.0%)**. Median `backend_ms` on global solves:
+
+| total kf | ON | OFF | |
+|---|---|---|---|
+| 0-9 | 1704 | 1697 | identical — the window is a no-op below `W` |
+| 10-19 | 2241 | 2231 | identical |
+| 20-29 | 2571 | 2196 | 17% worse (boundary: anchors appear, little cut yet) |
+| 30-39 | 2201 | 3816 | **42% better** |
+| 40-49 | 1931 | 4018 | **52% better** |
+| 50-59 | 2316 | 4651 | **50% better** |
+| 60-69 | 1896 | 4168 | **55% better** |
+
+`ON` is flat (~1700-2600 ms) where `OFF` climbs 1697 -> 4651; the ordering holds in each of the four
+individual runs, not just the means. **The whole-flight number is diluted** — this flight spends most
+of its frames under 30 kf where the window does nothing — so the gain GROWS with flight length. Getting
+here required a session-66 fix: the selection was asking CUDA four questions per solve (`ii.max()`, a
+boolean-indexed `anchor_idx`, its `.numel()`, `mask.all()`), each a device->host sync draining the
+queue and costing ~1.8 s per solve even below the window. The edge lists are ~1.3 KB, so they are now
+pulled to the host once and every decision made there (0-9 kf: 2517 -> 749 ms).
+
+**CAVEAT — measurement order is a large confound here.** Identical `OFF` code ran 409.2 s in run
+position 1 and 496.8 s in position 2 (up to 4.5x slower at low keyframe counts). That is the same
+signature originally mis-attributed to the window itself. **Never compare two sequential runs on this
+machine without controlling order** — use ABBA (A,B,B,A) so a linear drift cancels. An ABBA set was
+run to settle the verdict; see IMMEDIATE NEXT #0.
+
+**The anchor leak is CONFIRMED on real data and is the deferred CUDA `num_fix` trigger.** At W=30:
+`solve_kf` max **42** (= 30 window + **12 anchors**), `anchors>1` on **25 of 102** solve frames,
+`anchor_drift` up to **0.489**. The `anchored` policy discards that motion at write-back, so those
+anchors are optimised and the answer thrown away — a 43% overshoot of the bound, paid for and unused.
+Fix design (make `num_fix` a kernel parameter; anchors are always the lowest sorted indices, so "fix
+the first k" is exactly "fix all anchors", no reordering) is in `plans/session65-spec.md`'s deferred
+section. Requires rebuilding the CUDA extension.
+
+**Still true and unaddressed:** SLAM is slow. The flown `ON W=30` flight ran 2.74 s/frame with backend
+at 64% of the loop, and `tracker_ms` grew 330 -> ~1800 ms within the flight again (third occurrence,
+still unexplained — see `plans/slam_report.html` section 07).
 
 ## THE SLAM CHOKE — MEASURED (session 62). Stop guessing; the numbers are in.
 `OUTPUT/diag/20260905_113348_perception.csv`, 446 frames, 35 min, voxels 3 220 → 386 558, keyframes
@@ -110,6 +180,24 @@ Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
 
 ## >>> IMMEDIATE NEXT <<<
 
+0. **>>> DECIDE the bounded window's default, then fly it. <<<** Session 66 already did the bench
+   the old item-0 described, and did it better: the **frame-exact replay** (`--frame-list`) is a
+   controlled A/B that the old fixed-`--stride` procedure could not be — see the status section for
+   why any fixed stride misrepresents live. What remains:
+   (a) **DONE — the ABBA set settled it and `ON W=30` is now the shipped default** (see the verdict
+   table in the status section). What remains is to **fly it**: every number above is replay, and a
+   replay cannot show how a cheaper backend changes where the autopilot decides to go.
+   (b) **Then decide the `num_fix` CUDA work** on the anchor-leak evidence in the status section
+   (25 of 102 solves with `anchors>1`, max 12, a 43% overshoot of the bound). It is the difference
+   between a window that truly bounds the solve and one that leaks — design in
+   `plans/session65-spec.md`'s deferred section; needs a CUDA extension rebuild
+   (`build_mast3r_slam.bat`), which is the risk.
+   (c) `SHADOW` mode and `free`/`strict` policies are built and gated but still **never exercised** —
+   worth one frame-exact run each if the window ships ON.
+   (d) **Always press `r` when the io_bridge window opens.** Without the recording a flight cannot be
+   replayed, and every future SLAM-speed lever (bf16, attention, resolution, RELOC throttling) needs
+   frame-exact replay to be testable at all.
+
 1. **>>> SLAM SPEED: the target is now `tracker_ms` + `infer_ms` (~72% of the loop). <<<**
    Session 64 settled the backend question and it is CLOSED: threading it works mechanically
    (`backend_ms` on the frame path 1634s -> 0s, no failures, no clobbers) but on a single GPU it does
@@ -130,7 +218,7 @@ Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
    flight** with nothing in the tracker changing. Candidate causes, none tested: the warm-start
    `idx_f2k` degrading as tracking gets worse (more solver iterations), VRAM pressure (peak 7.35 GB of
    16 GB), thermal, or the retrieval DB. Attack plan in `plans/session64-spec.md`'s closing section
-   and the shareable report at `OUTPUT/slam_report.html`.
+   and the shareable report at `plans/slam_report.html`.
 2. **Parallax-push measurement: BUILT (watch-only) and PARKED at step 3.** Steps 1-2 are in:
    `traveled`, net cycle drift, distinct-pose count and a three-state verdict (moved / stuck /
    **unknown**) now ride the push-done event, the timeline row and the telemetry panel. Threshold is a

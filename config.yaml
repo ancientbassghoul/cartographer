@@ -45,6 +45,21 @@ perception:
                          # upstream runs this in a separate process (main.py run_backend()), a
                          # thread is the Windows-safe equivalent (mp.Manager() deadlocks here).
                          # false restores today's inline behaviour exactly.
+  # SESSION 65 -- FactorGraph is append-only (add_factors only ever torch.cat's) and solve_GN_rays
+  #   re-optimises EVERY keyframe ever seen in any edge, on every solve -- median backend_ms climbed
+  #   1502ms (kf 0-9) -> 14597ms (kf 50-59) on the diagnosing flight (plans/slam_report.html). These
+  #   three keys bound that growth to a suffix of recent keyframes instead of the whole graph.
+  #   backend_window_mode: OFF (unbounded, today's behaviour) / SHADOW (compute + report the would-be
+  #     cut, but still solve the full graph -- prices a W with zero trajectory risk) / ON (apply it).
+  #   backend_window_kf: W, the window size in keyframes; <= 0 means unbounded regardless of mode.
+  #   backend_window_policy: anchored (keep loop-closure edges, write back only in-window keyframes so
+  #     out-of-window anchors' stored poses are never touched) / free (upstream-faithful -- anchors
+  #     move and are written back too, pricing the difference against anchored) / strict (drop every
+  #     edge with an out-of-window endpoint -- pure sliding window, no loop closure, the pessimistic
+  #     bound). OFF is the default pending a bench + a flight, exactly as backend_async is.
+  backend_window_mode: "OFF"
+  backend_window_kf: 0
+  backend_window_policy: "anchored"
 
 models:
   # (depth_anything REMOVED 2026-07-07 — DA-V2 depth inference disabled; the wall stand-off uses the SLAM raycast.)

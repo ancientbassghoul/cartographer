@@ -1,0 +1,432 @@
+<title>Something Accumulates In Flight</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+  :root{
+    --ground:#F1F4F4; --surface:#FFFFFF; --sunk:#E7ECEC;
+    --ink:#12181A; --ink-2:#33403F; --muted:#5C6B6D; --rule:#CBD6D5;
+    --accent:#0E6E75; --accent-soft:#D6E8E7;
+    --warn:#A85B12; --warn-soft:#F4E4D2;
+    --crit:#8E2B24; --crit-soft:#F2DEDB;
+    --good:#2F6B3F;
+    --display:"IBM Plex Sans Condensed",system-ui,sans-serif;
+    --body:"IBM Plex Serif",Georgia,serif;
+    --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+    --measure:68ch;
+  }
+  :root:not([data-theme="light"]){ }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --ground:#0D1315; --surface:#141C1E; --sunk:#101718;
+      --ink:#E4ECED; --ink-2:#BCC9C9; --muted:#8A9A9A; --rule:#2A3739;
+      --accent:#45A8A2; --accent-soft:#16302F;
+      --warn:#D08A3E; --warn-soft:#332616;
+      --crit:#C4675E; --crit-soft:#331E1C;
+      --good:#6FAE7C;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0D1315; --surface:#141C1E; --sunk:#101718;
+    --ink:#E4ECED; --ink-2:#BCC9C9; --muted:#8A9A9A; --rule:#2A3739;
+    --accent:#45A8A2; --accent-soft:#16302F;
+    --warn:#D08A3E; --warn-soft:#332616;
+    --crit:#C4675E; --crit-soft:#331E1C;
+    --good:#6FAE7C;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground); color:var(--ink);
+    font-family:var(--body); font-size:17px; line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:0 28px 96px}
+  .col{max-width:var(--measure)}
+  p{margin:0 0 1.05em}
+  a{color:var(--accent)}
+  h1,h2,h3{font-family:var(--display); text-wrap:balance; margin:0}
+  h1{font-size:clamp(2.4rem,5.4vw,3.9rem); font-weight:700; letter-spacing:-.022em; line-height:1.02}
+  h2{font-size:1.72rem; font-weight:600; letter-spacing:-.012em}
+  h3{font-size:1.12rem; font-weight:600; letter-spacing:-.004em}
+  .mono{font-family:var(--mono); font-variant-numeric:tabular-nums}
+  code{font-family:var(--mono); font-size:.86em; background:var(--sunk);
+       padding:.1em .34em; border-radius:3px}
+
+  /* ---------- masthead ---------- */
+  header.mast{padding:56px 0 34px; border-bottom:2px solid var(--ink)}
+  .eyebrow{font-family:var(--mono); font-size:.7rem; font-weight:500;
+           letter-spacing:.17em; text-transform:uppercase; color:var(--accent); margin:0 0 18px}
+  .dek{font-size:1.16rem; color:var(--ink-2); max-width:60ch; margin:20px 0 0}
+  .facts{display:flex; flex-wrap:wrap; gap:0; margin:30px 0 0;
+         border-top:1px solid var(--rule)}
+  .fact{flex:1 1 190px; padding:14px 20px 14px 0; border-right:1px solid var(--rule)}
+  .fact:last-child{border-right:0}
+  .fact dt{font-family:var(--mono); font-size:.66rem; letter-spacing:.13em;
+           text-transform:uppercase; color:var(--muted); margin:0 0 5px}
+  .fact dd{margin:0; font-family:var(--display); font-weight:600; font-size:.98rem}
+
+  /* ---------- sections ---------- */
+  section{padding:52px 0 0}
+  .sec-head{display:flex; align-items:baseline; gap:14px; margin:0 0 22px;
+            border-bottom:1px solid var(--rule); padding-bottom:10px}
+  .sec-num{font-family:var(--mono); font-size:.74rem; color:var(--accent); font-weight:600}
+
+  /* ---------- verdict cards ---------- */
+  .verdicts{display:grid; grid-template-columns:repeat(auto-fit,minmax(268px,1fr)); gap:0;
+            border:1px solid var(--rule); background:var(--surface)}
+  .v{padding:22px 24px; border-right:1px solid var(--rule)}
+  .v:last-child{border-right:0}
+  .v .grade{font-family:var(--mono); font-size:.64rem; letter-spacing:.14em;
+            text-transform:uppercase; font-weight:600; display:inline-block;
+            padding:3px 8px; border-radius:2px; margin:0 0 12px}
+  .g-settled{background:var(--accent-soft); color:var(--accent)}
+  .g-neg{background:var(--crit-soft); color:var(--crit)}
+  .g-open{background:var(--warn-soft); color:var(--warn)}
+  .v h3{margin:0 0 8px}
+  .v p{font-size:.93rem; color:var(--ink-2); margin:0}
+
+  /* ---------- data ---------- */
+  .scroll{overflow-x:auto; margin:0 0 6px}
+  table{border-collapse:collapse; width:100%; font-size:.9rem; min-width:520px}
+  caption{caption-side:bottom; text-align:left; font-size:.8rem; color:var(--muted);
+          padding:9px 0 0; font-family:var(--display)}
+  th,td{text-align:right; padding:9px 14px; border-bottom:1px solid var(--rule)}
+  th:first-child,td:first-child{text-align:left}
+  thead th{font-family:var(--mono); font-size:.68rem; letter-spacing:.1em;
+           text-transform:uppercase; color:var(--muted); font-weight:500;
+           border-bottom:1.5px solid var(--ink)}
+  tbody td{font-family:var(--mono); font-variant-numeric:tabular-nums}
+  tbody td:first-child{font-family:var(--body)}
+  tr.hi td{background:var(--accent-soft); font-weight:600}
+  .worse{color:var(--crit); font-weight:600}
+  .better{color:var(--good); font-weight:600}
+
+  /* ---------- proportion bar ---------- */
+  .bar{display:flex; height:46px; border:1px solid var(--ink); overflow:hidden; margin:0 0 12px}
+  .bar span{display:flex; align-items:center; justify-content:center;
+            font-family:var(--mono); font-size:.7rem; font-weight:600; color:var(--surface);
+            white-space:nowrap; overflow:hidden}
+  .legend{display:flex; flex-wrap:wrap; gap:8px 22px; font-family:var(--display);
+          font-size:.84rem; color:var(--ink-2)}
+  .legend i{display:inline-block; width:11px; height:11px; margin-right:7px;
+            vertical-align:-1px; border-radius:2px}
+
+  /* ---------- chronology ---------- */
+  ol.chron{list-style:none; margin:0; padding:0; counter-reset:step}
+  ol.chron > li{position:relative; padding:0 0 26px 62px; counter-increment:step}
+  ol.chron > li::before{
+    content:counter(step,decimal-leading-zero);
+    position:absolute; left:0; top:1px; font-family:var(--mono); font-size:.78rem;
+    font-weight:600; color:var(--accent); border:1px solid var(--rule);
+    background:var(--surface); width:42px; text-align:center; padding:3px 0; border-radius:2px}
+  ol.chron > li::after{content:""; position:absolute; left:21px; top:30px; bottom:0;
+                       width:1px; background:var(--rule)}
+  ol.chron > li:last-child::after{display:none}
+  ol.chron h3{margin:0 0 5px}
+  ol.chron p{font-size:.95rem; margin:0 0 .6em}
+  .stamp{font-family:var(--mono); font-size:.68rem; letter-spacing:.09em;
+         text-transform:uppercase; color:var(--muted); display:block; margin:0 0 6px}
+
+  /* ---------- levers ---------- */
+  .lever{border-left:3px solid var(--accent); background:var(--surface);
+         padding:18px 22px; margin:0 0 14px}
+  .lever.risky{border-left-color:var(--warn)}
+  .lever.blocked{border-left-color:var(--crit)}
+  .lever h3{display:flex; flex-wrap:wrap; align-items:baseline; gap:10px; margin:0 0 8px}
+  .tag{font-family:var(--mono); font-size:.62rem; letter-spacing:.12em; text-transform:uppercase;
+       font-weight:600; padding:2px 7px; border-radius:2px; background:var(--sunk); color:var(--muted)}
+  .tag.hi{background:var(--accent-soft); color:var(--accent)}
+  .tag.md{background:var(--warn-soft); color:var(--warn)}
+  .lever p{font-size:.93rem; margin:0 0 .55em}
+  .lever p:last-child{margin-bottom:0}
+  .lever .how{color:var(--muted); font-size:.87rem}
+  .lever .how b{font-family:var(--display); color:var(--ink-2); font-weight:600}
+
+  .callout{border:1px solid var(--rule); border-left:3px solid var(--crit);
+           background:var(--surface); padding:20px 24px; margin:0 0 20px}
+  .callout h3{margin:0 0 8px; color:var(--crit)}
+  .callout p{font-size:.95rem; margin:0 0 .6em}
+  .callout p:last-child{margin:0}
+
+  ul.qs{list-style:none; margin:0; padding:0}
+  ul.qs li{padding:14px 0; border-bottom:1px solid var(--rule)}
+  ul.qs li:last-child{border-bottom:0}
+  ul.qs b{font-family:var(--display); font-size:1.02rem; display:block; margin:0 0 4px}
+  ul.qs p{font-size:.93rem; color:var(--ink-2); margin:0}
+
+  footer{margin:70px 0 0; padding:22px 0 0; border-top:2px solid var(--ink);
+         font-family:var(--display); font-size:.85rem; color:var(--muted);
+         display:flex; flex-wrap:wrap; gap:8px 26px}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+
+<div class="wrap">
+
+<header class="mast">
+  <p class="eyebrow">Performance investigation &middot; monocular drone mapping</p>
+  <h1>Something accumulates in flight</h1>
+  <p class="dek">Four sessions of instrumenting a MASt3R-SLAM pipeline on a single laptop GPU. Two
+     architectural changes measured honestly &mdash; one rejected, one shipped &mdash; and then the
+     finding that reframes both: the pipeline is not slow because of its algorithms. It is slow
+     because something degrades <em>while flying</em>, and the same frames replayed offline do not
+     degrade at all.</p>
+  <dl class="facts">
+    <div class="fact"><dt>Stack</dt><dd>MASt3R-SLAM &rarr; voxel map &rarr; autopilot, 5 processes on ZMQ</dd></div>
+    <div class="fact"><dt>Hardware</dt><dd>RTX 3080 Laptop, 16&nbsp;GB &middot; shared with the Unity sim</dd></div>
+    <div class="fact"><dt>Input</dt><dd>Single monocular feed &middot; no depth, IMU or pose</dd></div>
+    <div class="fact"><dt>Evidence</dt><dd>12 instrumented flights + 14 frame-exact replays</dd></div>
+  </dl>
+</header>
+
+<section>
+  <div class="sec-head"><span class="sec-num">01</span><h2>Verdict</h2></div>
+  <div class="verdicts">
+    <div class="v">
+      <span class="grade g-open">The open problem</span>
+      <h3>It degrades only in flight</h3>
+      <p><code>tracker_ms</code> is <b>flat at ~250&ndash;400&nbsp;ms</b> across a deterministic replay
+         of the exact frames a flight consumed &mdash; and <b>2&nbsp;000&ndash;6&nbsp;000&nbsp;ms</b> on
+         the live flight those frames came from. Same code, same frames, same order.</p>
+    </div>
+    <div class="v">
+      <span class="grade g-settled">Shipped</span>
+      <h3>Bounding the graph works</h3>
+      <p>The append-only factor graph now solves a suffix window. <b>42&ndash;55&nbsp;% cheaper</b>
+         above 30 keyframes, identical below it. Real, measured under an ABBA design &mdash; and
+         <em>not</em> the fix for the above.</p>
+    </div>
+    <div class="v">
+      <span class="grade g-neg">Negative result</span>
+      <h3>Threading the backend does not help</h3>
+      <p>Works by every internal measure, makes real flights worse. One GPU, so the tracker competes
+         with it. Shipped disabled.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">02</span><h2>The measurement that changed the question</h2></div>
+  <div class="col">
+    <p>For three sessions every conclusion came from live flights, and live flights are not
+       repeatable &mdash; different trajectory, different tracking luck, different keyframe count. The
+       fourth session made replay <b>frame-exact</b>, and that is what exposed the real problem.</p>
+    <p>The enabling discovery is unglamorous. SLAM runs at ~0.2&nbsp;Hz, so the capture process hands
+       it the newest frame and <em>drops the backlog</em>. Measured on one flight:</p>
+  </div>
+  <div class="scroll">
+    <table style="min-width:0">
+      <thead><tr><th>Gap between consecutively PROCESSED frames</th><th>value</th></tr></thead>
+      <tbody>
+        <tr><td>median</td><td>112 frames</td></tr>
+        <tr><td>p90</td><td>624</td></tr>
+        <tr><td>max</td><td>1&nbsp;735</td></tr>
+        <tr><td>capture rate</td><td>~58 fps</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col" style="margin-top:22px">
+    <p>Live SLAM never sees video. It sees a slideshow ~1.9&nbsp;s apart, with wildly uneven gaps.
+       <b>Every offline replay this project had ever run used a fixed stride</b>, feeding frames
+       17&nbsp;ms apart &mdash; near-identical images, so the match fraction never fell below
+       threshold and keyframes barely formed: <span class="mono">3 keyframes in 200 frames</span>
+       offline against <span class="mono">52 in 395</span> live. The &ldquo;bench it offline
+       first&rdquo; advice was measuring a regime the drone never flies in.</p>
+    <p>The fix was to log which frames SLAM actually consumed (<code>rec_frame</code>, already present
+       in the message bus but never written to disk) and replay exactly those. That turns a flight
+       into a <b>controlled experiment</b>: identical input, identical order, any config.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">03</span><h2>The accumulator</h2></div>
+  <div class="col">
+    <p>With frame-exact replay available, the same 319 frames were run offline and compared against
+       the live flight they were recorded from. <code>tracker_ms</code> is
+       <code>tracker.track()</code> &mdash; a Gauss-Newton pose solve, up to
+       <code>max_iters: 50</code>, warm-started from the previous frame.</p>
+  </div>
+  <div class="scroll">
+    <table>
+      <caption>Median <code>tracker_ms</code> through each run. Replays are deterministic, single
+        process, no simulator on the GPU. Live rows are the flights themselves.</caption>
+      <thead><tr><th>Run</th><th>start</th><th>&rarr;</th><th>&rarr;</th><th>&rarr;</th><th>end</th></tr></thead>
+      <tbody>
+        <tr><td>Replay (window ON)</td><td>253</td><td>236</td><td>814</td><td>268</td><td class="better">267</td></tr>
+        <tr><td>Replay (window OFF)</td><td>254</td><td>269</td><td>353</td><td>360</td><td class="better">394</td></tr>
+        <tr class="hi"><td>Live, window ON</td><td>363</td><td>6&nbsp;240</td><td>5&nbsp;035</td><td>2&nbsp;722</td><td class="worse">2&nbsp;668</td></tr>
+        <tr class="hi"><td>Live, window OFF</td><td>382</td><td>4&nbsp;549</td><td>2&nbsp;530</td><td>3&nbsp;127</td><td class="worse">3&nbsp;127</td></tr>
+        <tr><td>Live, a better flight</td><td>384</td><td>945</td><td>1&nbsp;228</td><td>1&nbsp;620</td><td class="worse">1&nbsp;845</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col" style="margin-top:22px">
+    <p>Every live flight starts at <b>~370&nbsp;ms</b> &mdash; the drone is still on the ground &mdash;
+       and then steps up by <b>7&ndash;17&times; within two minutes of takeoff</b> and never returns.
+       The replays, fed the identical frames, stay flat.</p>
+  </div>
+  <div class="callout">
+    <h3>What this rules out</h3>
+    <p><b>It is not the frames.</b> The replay consumes exactly the images the live flight consumed,
+       in exactly the same order.</p>
+    <p><b>It is not any of the optimisation work.</b> The step-change is identical with the bounded
+       window ON and OFF, and with the backend inline or threaded.</p>
+    <p><b>It is not simply GPU contention with the simulator.</b> That is real &mdash; replays run
+       1.0&ndash;1.4&nbsp;s/frame against 2.4&ndash;7.3&nbsp;s/frame live &mdash; but it is a constant
+       across every flight, and cannot explain a <em>step change at takeoff</em> or why two flights
+       with the same config differ 2&times;.</p>
+    <p>Something accumulates or changes state once the vehicle is airborne, inside a process whose
+       inputs are provably identical. That is the whole problem. Everything below is smaller.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">04</span><h2>Where the time goes now</h2></div>
+  <div class="col"><p>Whole-flight attribution across live flights. Shares are of total loop time,
+     every frame counted &mdash; an earlier version of this report used medians over
+     <em>subsets</em> (<code>tracker_ms</code> is zero on relocalisation frames), which made flights
+     with different tracking luck incomparable and produced an apparent anti-correlation that was
+     purely a selection effect.</p></div>
+  <div class="scroll">
+    <table>
+      <caption>Live flights only. <code>backend_ms</code> is absent on the threaded-backend flight
+        because the work left the frame path, not because it stopped.</caption>
+      <thead><tr><th>Flight</th><th>s/frame</th><th>RELOC</th><th>tracker</th><th>infer</th><th>backend</th></tr></thead>
+      <tbody>
+        <tr><td>0905_221128</td><td>6.31</td><td>35 %</td><td>20.4 %</td><td>12.3 %</td><td>67.0 %</td></tr>
+        <tr><td>0906_000915 (async)</td><td>7.32</td><td>22 %</td><td class="worse">71.2 %</td><td>8.2 %</td><td>&mdash;</td></tr>
+        <tr><td>0906_144839</td><td>3.39</td><td>57 %</td><td>11.0 %</td><td>21.6 %</td><td>67.1 %</td></tr>
+        <tr><td>0906_165121</td><td>2.74</td><td>12 %</td><td>29.8 %</td><td>5.3 %</td><td>64.4 %</td></tr>
+        <tr class="hi"><td>0906_220605</td><td>4.55</td><td>0 %</td><td class="worse">43.7 %</td><td>0.2 %</td><td>55.7 %</td></tr>
+        <tr class="hi"><td>0906_225627 (pre-speed-work config)</td><td>2.42</td><td>0 %</td><td class="worse">43.5 %</td><td>0.2 %</td><td>55.5 %</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col" style="margin-top:22px">
+    <p>The backend was 64&ndash;72&nbsp;% of the loop when this investigation started and is still the
+       largest single line. But <code>tracker_ms</code> has grown from a footnote to
+       <b>~44&nbsp;%</b>, and it is the term that carries the accumulator.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">05</span><h2>Bounding the graph &mdash; built, measured, shipped</h2></div>
+  <div class="col">
+    <p>The factor graph is append-only: <code>get_unique_kf_idx()</code> returns every keyframe ever
+       seen in any edge, and <code>solve_GN_rays()</code> re-optimises all of them on every keyframe.
+       <code>local_opt.window_size</code> existed in config, was read once at
+       <code>global_opt.py:26</code>, and was never referenced again &mdash; dead code.</p>
+    <p>Two findings made this safe to cut. The CUDA kernel <b>already remaps a non-contiguous keyframe
+       set</b> via <code>searchsorted</code>, so dropping edges needs no index surgery. And
+       <code>num_fix = 1</code> pins the lowest-indexed keyframe in the solve &mdash; which, for a
+       suffix window, is always an out-of-window anchor, so a windowed solve auto-anchors to the
+       existing global estimate.</p>
+  </div>
+  <div class="scroll">
+    <table>
+      <caption>Frame-exact A/B, ABBA design (ON,OFF,OFF,ON) to cancel run-order drift. Every run
+        64 keyframes and 38 RELOC frames &mdash; genuinely matched.</caption>
+      <thead><tr><th>Total keyframes</th><th>OFF</th><th>ON (W=30)</th><th></th></tr></thead>
+      <tbody>
+        <tr><td>0&ndash;9</td><td>1&nbsp;697</td><td>1&nbsp;704</td><td>identical &mdash; a no-op below the window</td></tr>
+        <tr><td>10&ndash;19</td><td>2&nbsp;231</td><td>2&nbsp;241</td><td>identical</td></tr>
+        <tr><td>20&ndash;29</td><td>2&nbsp;196</td><td>2&nbsp;571</td><td>17 % worse at the boundary</td></tr>
+        <tr><td>30&ndash;39</td><td>3&nbsp;816</td><td class="better">2&nbsp;201</td><td>42 % better</td></tr>
+        <tr><td>40&ndash;49</td><td>4&nbsp;018</td><td class="better">1&nbsp;931</td><td>52 % better</td></tr>
+        <tr class="hi"><td>50&ndash;59</td><td>4&nbsp;651</td><td class="better">2&nbsp;316</td><td>50 % better</td></tr>
+        <tr><td>60&ndash;69</td><td>4&nbsp;168</td><td class="better">1&nbsp;896</td><td>55 % better</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col" style="margin-top:22px">
+    <p>Whole run: <span class="mono">364.3&nbsp;s vs 405.9&nbsp;s</span> loop (ON 10.3&nbsp;% faster),
+       backend 12.0&nbsp;%. ON is flat where OFF climbs &mdash; the growth curve is bent, which is what
+       the lever was chosen for, and the gain therefore <em>grows with flight length</em>. It is a
+       real improvement. <b>It is not the fix</b>, because the accumulator is untouched by it.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">06</span><h2>Two traps that cost real time</h2></div>
+  <ul class="qs">
+    <li><b>Measuring a device by asking it questions</b>
+      <p>The first frame-exact A/B said the window made things <em>10.3&nbsp;% worse</em>. The tell:
+         it cost ~1.8&nbsp;s more per solve even <em>below</em> the window, where the cut is a provable
+         no-op. The selection was asking CUDA four separate questions per solve &mdash;
+         <code>ii.max()</code>, a boolean-indexed anchor list, its <code>.numel()</code>, and
+         <code>mask.all()</code> &mdash; each a device&rarr;host sync draining the queue before the
+         solve could start. The edge lists are ~1.3&nbsp;KB; pulling them to the host <em>once</em> and
+         deciding there fixed it: <span class="mono">2&nbsp;517 &rarr; 749&nbsp;ms</span>, against the
+         unwindowed 742.</p></li>
+    <li><b>Run order, on this machine, is worth ~26&nbsp;%</b>
+      <p>Identical code, identical input, different position in a sequential batch:
+         <span class="mono">358.8&nbsp;s</span> vs <span class="mono">453.0&nbsp;s</span>. That is
+         <em>larger than the effect being measured</em>, and it is what contaminated the first
+         verdict. Every comparison here now uses an ABBA design so a linear drift cancels. Any future
+         benchmark on this hardware that compares two sequential runs is measuring the order.</p></li>
+  </ul>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">07</span><h2>Known defects, carried forward</h2></div>
+
+  <div class="lever">
+    <h3>The bounded window leaks <span class="tag md">Confirmed on flight data</span></h3>
+    <p>Loop-closure edges pull out-of-window keyframes back into the solve as anchors, and
+       <code>num_fix = 1</code> pins only the oldest. Measured at W=30: <code>solve_kf</code> reached
+       <b>42</b> (30 + <b>12 anchors</b>), <code>anchors&gt;1</code> on <b>25 of 102</b> solves,
+       anchor drift to <span class="mono">0.489</span>. Under the shipped write-back policy that drift
+       is <em>discarded</em> &mdash; those keyframes are optimised and the answer thrown away. The
+       bound overshoots by 43&nbsp;%.</p>
+    <p class="how"><b>Fix:</b> make <code>num_fix</code> a kernel parameter. Anchors are always the
+       lowest sorted indices, so &ldquo;fix the first k&rdquo; is exactly &ldquo;fix all
+       anchors&rdquo; &mdash; no reordering, no permutation buffer. Requires rebuilding the CUDA
+       extension.</p>
+  </div>
+
+  <div class="lever risky">
+    <h3>Input resolution <span class="tag">Previously parked &mdash; on a false premise</span></h3>
+    <p>This was parked as &ldquo;a bench experiment, not a flight, since raw recordings exist&rdquo;.
+       Recordings existed but <b>did not reproduce live conditions at any fixed stride</b>, so that
+       reasoning was void. With frame-exact replay it is now genuinely benchable &mdash; though it
+       remains a constant-factor trade that pushes the model off its training distribution.</p>
+  </div>
+
+  <div class="lever blocked">
+    <h3>Two GPUs, or CUDA stream priority <span class="tag">Speculative</span></h3>
+    <p>The threading negative result is specific to <em>one</em> GPU, which is also rendering the
+       simulator. The backend is genuinely parallelisable work with nowhere to go.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-num">08</span><h2>Where a second opinion would help most</h2></div>
+  <ul class="qs">
+    <li><b>What accumulates in MASt3R-SLAM once a vehicle is moving?</b>
+      <p>This is the only question that matters. <code>tracker.track()</code> costs ~250&nbsp;ms
+         replaying the exact frames of a flight where it cost 2&nbsp;000&ndash;6&nbsp;000&nbsp;ms.
+         Candidates not yet separated: Gauss-Newton iteration count rising as the warm start
+         (<code>idx_f2k</code>) degrades; the retrieval database growing; CUDA allocator
+         fragmentation across a long-lived process; contention with the simulator that worsens as the
+         map grows. <b>The cheapest next measurement is the GN iteration count and convergence reason
+         per call</b> &mdash; it confirms or kills the feedback-loop hypothesis outright.</p></li>
+    <li><b>Is a step change at takeoff a clue or a coincidence?</b>
+      <p>Every flight sits at ~370&nbsp;ms on the ground and jumps 7&ndash;17&times; within two minutes
+         of leaving it, then plateaus rather than continuing to climb. A plateau argues against
+         unbounded accumulation and for a <em>regime change</em> &mdash; the tracker meeting a harder
+         problem and staying there.</p></li>
+    <li><b>Is 0.2&nbsp;Hz simply what this model costs on this hardware?</b>
+      <p>If ~1&nbsp;s per ViT-L pass at 512&nbsp;px on a mobile 3080 sharing a GPU with the renderer is
+         near the floor, the honest answer is architectural &mdash; a lighter tracker between
+         keyframes &mdash; rather than optimisation.</p></li>
+  </ul>
+</section>
+
+<footer>
+  <span>Project Cartographer</span>
+  <span>MASt3R-SLAM &middot; PyTorch &middot; CUDA</span>
+  <span>All figures from per-frame instrumentation and frame-exact replay, 2026-09-05&thinsp;&ndash;&thinsp;06</span>
+</footer>
+
+</div>
