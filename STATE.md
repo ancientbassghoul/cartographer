@@ -110,27 +110,27 @@ Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
 
 ## >>> IMMEDIATE NEXT <<<
 
-1. **>>> MAKE SLAM FAST AGAIN <<< — Phase 1 BUILT + GATED, NOT YET FLOWN. Phase 2 is the big one.**
-   Evidence (`20260905_184034`): `slam_ms` median **425ms** at minutes 0-5 vs **23 816ms** at 20-25 —
-   56x — of which **`backend_ms` is 19 851ms (83%)**. RELOC median 7 284ms, backend 6 288 (86%).
-   FALLBACK is NOT the problem: it recovered a 6-minute plan-stale and, on a 10.5-minute one, handed
-   SLAM good viewpoints it simply never solved.
-   **Phase 1 (done, in tree):** `MapStore` keys are a preallocated numpy array with an explicit row
-   counter, and `topdown_summary`'s raster is cached behind a dirty flag only `integrate` sets (the
-   trajectory is still recomputed every call — caching it would freeze the path on screen). Measured
-   at 694k voxels: cold **126ms** (was ~1 238ms at 386k), cached calls free. `track_ms` is now split
-   into `frame_ms`/`infer_ms`/`tracker_ms` with its own closure invariant. Spec:
-   `plans/session63-spec.md`. **Fly it once** and confirm `map_pub_ms` stays flat at high voxel
-   counts, the `track_ms` breakdown names what is growing, and `backend_ms` is unchanged.
-   **Phase 2 (NOT built — write its spec after that flight):** move `_run_backend()` off the
-   frame-critical path into a thread. Groundwork already verified: `_run_backend` is a queue consumer
-   (`states.global_optimizer_tasks`), **every `SharedStates` accessor is already `with self.lock`**
-   (`third_party/MASt3R-SLAM/mast3r_slam/frame.py:156,169,185,199-203`), and the reference to port is
-   `third_party/MASt3R-SLAM/main.py:74 run_backend`. A separate PROCESS is ruled out by
-   `slam_engine.py:38` (Windows `mp.Manager()` deadlock) — a thread is the option. Will need
-   `backend_mode`/`backend_queue_depth`/`backend_wait_ms` + a `slam.backend_async` kill switch per
-   CLAUDE.md, and accepts two consequences: keyframe points downloaded before that keyframe is
-   optimised (a widening of an existing property), and an asynchronous RELOC mode transition.
+1. **>>> SLAM SPEED: the target is now `tracker_ms` + `infer_ms` (~72% of the loop). <<<**
+   Session 64 settled the backend question and it is CLOSED: threading it works mechanically
+   (`backend_ms` on the frame path 1634s -> 0s, no failures, no clobbers) but on a single GPU it does
+   not remove the work, it lets the tracker compete with it -- `backend_thread_ms` p90 14.5s -> 26.2s
+   once contention was removed, and both flights in that state lost tracking within minutes while the
+   earlier, accidentally-serialised one flew 98 minutes clean. **`backend_async: false` is the default
+   on evidence.** Do not re-open it without a 20+ minute flight; the median frame carries no backend
+   cost in either mode (it fires on ~1 frame in 6), so short flights and medians cannot measure it.
+   **Where the time actually is** (flight `20260906_000915`, `track_ms` split, session 63):
+
+   | mode | `track_ms` | dominated by |
+   |---|---|---|
+   | TRACKING | 1109 ms | `tracker_ms` **945 ms (85%)** -- `tracker.track()` |
+   | RELOC | 1783 ms | `infer_ms` **1762 ms (99%)** -- `_mast3r_inference_mono` |
+
+   `frame_ms` is 5-8 ms; frame construction is nothing. Both hot paths are MASt3R ViT-Large forward
+   passes at `img_size=512`. **Unexplained and high-value: `tracker_ms` grew 405 -> 5177 ms over one
+   flight** with nothing in the tracker changing. Candidate causes, none tested: the warm-start
+   `idx_f2k` degrading as tracking gets worse (more solver iterations), VRAM pressure (peak 7.35 GB of
+   16 GB), thermal, or the retrieval DB. Attack plan in `plans/session64-spec.md`'s closing section
+   and the shareable report at `OUTPUT/slam_report.html`.
 2. **Parallax-push measurement: BUILT (watch-only) and PARKED at step 3.** Steps 1-2 are in:
    `traveled`, net cycle drift, distinct-pose count and a three-state verdict (moved / stuck /
    **unknown**) now ride the push-done event, the timeline row and the telemetry panel. Threshold is a

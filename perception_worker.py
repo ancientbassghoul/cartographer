@@ -58,6 +58,13 @@ DIAG_PERF_FIELDS: tuple[str, ...] = (
     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
     # --- Session 63: the sub-split inside track_ms (slam_engine.SLAM_TRACK_PHASE_FIELDS) ---
     "frame_ms", "infer_ms", "tracker_ms",
+    # --- Session 64: backend-thread state (NOT part of any closure; backend_ms stays the
+    #     frame-path number and is 0.0 in ASYNC) ---
+    "backend_mode", "backend_queue_depth", "backend_thread_ms", "backend_pose_clobbers",
+    # Session 64: WHY the backend died. The CRITICAL line naming the reason goes to a console
+    # fly.py opens with CREATE_NEW_CONSOLE and never captures, so it dies with the window --
+    # backend_mode=FAILED alone says THAT it failed, not why. Blank while healthy.
+    "backend_error",
 )
 
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
@@ -113,7 +120,13 @@ class Pipeline:
         self.proc_h = int(cfg["perception"]["processing_height"])
 
         # SLAM chdir's into its repo on load; it owns the GPU alone now (depth removed).
-        self.slam = slam_engine.SlamEngine(conf_thresh=conf_thresh)
+        # Session 64: global optimization moves off the frame path onto its own thread by default
+        # (perception.backend_async, config.yaml) -- see slam_engine.SlamEngine for the full rationale.
+        backend_async = bool(cfg["perception"].get("backend_async", True))
+        self.slam = slam_engine.SlamEngine(conf_thresh=conf_thresh, backend_async=backend_async)
+        started = self.slam.start_backend()
+        print(f"[perception] SLAM backend: "
+              f"{'ASYNC (own thread)' if started else 'SYNC (inline, backend_async=false)'}")
         self.mapstore = MapStore(self.voxel_size, tracking_mode=self.slam.tracking_mode)
 
         self.last_report = time.monotonic()
@@ -250,6 +263,11 @@ class Pipeline:
         self.diag_perf.close()
         self.diag_lift.close()
 
+    def close_slam(self):
+        """Stop + join the backend thread (Session 64). Safe to call unconditionally on shutdown --
+        SlamEngine.close() is itself safe when the thread was never started or already stopped."""
+        self.slam.close()
+
     def step(self, frame_bgr, meta, state_pub=None, show=True):
         # --- SLAM every frame ---
         self._slam_seq += 1   # one actual SLAM invocation, unconditionally -- see __init__ for why
@@ -367,6 +385,8 @@ class Pipeline:
                   f"vox {len(self.mapstore):6d} | slam {slam_ms:5.1f} ms | "
                   f"[trk {p['track']:.0f} bk {p['backend']:.0f} dl {p['kf_download']:.0f}] | "
                   f"(frm {p['frame']:.0f} inf {p['infer']:.0f} trk2 {p['tracker']:.0f}) | "
+                  f"bk[{res.backend_mode} q{res.backend_queue_depth} {res.backend_thread_ms:.0f}ms"
+                  f"{f' clob{res.backend_pose_clobbers}' if res.backend_pose_clobbers else ''}] | "
                   f"intg {p['integrate']:.0f} plan {p['plan']:.0f} map {p['map_pub']:.0f} ms | "
                   f"ray_clear {rc} | y {py} | ring f/b {rfb} | "
                   f"trigger {c.get('trigger')} yaw {c.get('yaw')}")
@@ -386,7 +406,11 @@ class Pipeline:
             integrate_ms=round(integrate_ms, 1), map_pub_ms=round(map_pub_ms, 1),
             plan_ms=round(plan_ms, 1), publish_ms=round(publish_ms, 1),
             frame_ms=round(res.frame_ms, 1), infer_ms=round(res.infer_ms, 1),
-            tracker_ms=round(res.tracker_ms, 1))
+            tracker_ms=round(res.tracker_ms, 1),
+            backend_mode=res.backend_mode, backend_queue_depth=res.backend_queue_depth,
+            backend_thread_ms=round(res.backend_thread_ms, 1),
+            backend_pose_clobbers=res.backend_pose_clobbers,
+            backend_error=res.backend_error)
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -407,6 +431,11 @@ class Pipeline:
             "cells_rgb": packed.tolist(),
             "traj_u": s["traj_u"].tolist(), "traj_v": s["traj_v"].tolist(),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
+            # Session 64: backend-thread state, so the visualizer can surface a degraded/async
+            # backend to the operator (CLAUDE.md rule 3) instead of it being invisible off-CSV.
+            "backend_mode": res.backend_mode, "backend_queue_depth": res.backend_queue_depth,
+            "backend_pose_clobbers": res.backend_pose_clobbers,
+            "backend_error": res.backend_error,
         }
 
     # ------------------------------------------------------------- map mode planner
@@ -997,6 +1026,7 @@ def run_live(cfg, show=True, conf_thresh=1.5, debug_lift=False, log=False, stop_
             _write_markers_sidecar(pipe, seq_dir)
             print(f"[perception] PLY sequence ({ply_frame_idx} frame(s)"
                   f"{', DEGRADED -- see CRITICAL lines above' if pipe.ply_seq_degraded else ''}) -> {seq_dir}")
+        pipe.close_slam()
         pipe.close_diag()
         frame_sub.close()
         state_pub.close()
@@ -1201,6 +1231,10 @@ def run_self_test(cfg):
     ok_timing = _self_test_phase_timing(cfg)
     print(f"[perception][self-test] {'PASS' if ok_timing else 'FAIL'}  SESSION-62 PHASE TIMING SCHEMA")
     assert ok_timing
+
+    ok_backend = _self_test_backend_thread()
+    print(f"[perception][self-test] {'PASS' if ok_backend else 'FAIL'}  SESSION-64 BACKEND THREAD")
+    assert ok_backend
 
     print("[perception][self-test] PASS")
 
@@ -1528,6 +1562,266 @@ def _self_test_slam_track_phase_fields():
     return ok
 
 
+class _FakeBackendStates:
+    """Session 64: stands in for mast3r_slam.frame.SharedStates -- just enough surface for
+    SlamEngine._backend_loop / _queue_depth to drive against, with a REAL lock (the whole point
+    of this session is that InProcessManager.RLock() is a real threading.RLock now)."""
+
+    def __init__(self):
+        import threading
+        self.lock = threading.RLock()
+        self.global_optimizer_tasks = []
+        self._mode = "TRACKING"
+
+    def get_mode(self):
+        with self.lock:
+            return self._mode
+
+    def is_paused(self):
+        with self.lock:
+            return False
+
+
+class _FakeBackendKeyframes:
+    """Session 64 (chunk 2): stands in for mast3r_slam.frame.SharedKeyframes -- just enough surface
+    (lock/__len__/T_WC) for the C4 clobber-recording path in _backend_loop/process() to drive
+    against. A REAL lock and a small CPU tensor buffer; no CUDA/no real keyframes needed since the
+    fake queue in _FakeBackendStates never actually grows this buffer."""
+
+    def __init__(self, buffer=4):
+        import threading
+        self.lock = threading.RLock()
+        self.T_WC = torch.zeros(buffer, 1, 8)
+        self._n = 0
+
+    def __len__(self):
+        with self.lock:
+            return self._n
+
+
+def _self_test_backend_thread():
+    """SESSION-64 BACKEND THREAD (chunk 1) + BACKEND TELEMETRY/CLOBBER COUNTER (chunk 2):
+    `_run_backend()` moves off the frame path onto its own thread, gated by `backend_async` and
+    stoppable via `close()`. No CUDA/no real SlamEngine: the engine is built with `object.__new__`
+    and only the attributes the thread body touches are set, against a fake states double exposing
+    lock/global_optimizer_tasks/get_mode()/is_paused() -- per CLAUDE.md's no-silent-fallback rule, a
+    dead backend thread must set a visible `backend_failed` flag and STAY dead rather than reverting
+    to synchronous or retrying. Chunk 2 adds: `SLAM_BACKEND_FIELDS`/`SlamResult` defaults,
+    `_backend_mode()` resolution (FAILED beats ASYNC beats SYNC), and `_check_backend_clobber()`
+    accounting against plain CPU tensors -- the one race session 64 counts instead of prevents."""
+    import threading
+    import types
+
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("idle_sleep_bounded -- BACKEND_IDLE_SLEEP_S is a positive float under 0.05",
+          isinstance(slam_engine.BACKEND_IDLE_SLEEP_S, float)
+          and 0.0 < slam_engine.BACKEND_IDLE_SLEEP_S <= 0.1)   # session 64: widened from <0.05 when the
+          #   gap moved 5ms -> 50ms to cut states.lock contention (see BACKEND_IDLE_SLEEP_S)
+
+    def make_engine(backend_async, run_backend):
+        eng = object.__new__(slam_engine.SlamEngine)
+        eng._initialized = True        # session 64: states/keyframes exist only after _lazy_state();
+                                       #   the double stands in for an already-initialised engine
+        eng.device = "cuda:0"          # session 64: a real engine always has this, and the thread
+                                       #   body pins its own (thread-local) CUDA device from it
+        eng.backend_async = backend_async
+        eng.backend_failed = None
+        eng._backend_thread = None
+        eng._backend_stop = threading.Event()
+        eng._backend_meta_lock = threading.Lock()
+        eng._backend_thread_ms = 0.0
+        eng._backend_solves = 0
+        eng._backend_pose_clobbers = 0
+        eng._backend_last_written = {}
+        eng.states = _FakeBackendStates()
+        eng.keyframes = _FakeBackendKeyframes()
+        eng._Mode = types.SimpleNamespace(RELOC="RELOC")
+        eng._run_backend = run_backend
+        return eng
+
+    # -- kill switch: backend_async=False starts nothing --
+    eng_off = make_engine(False, lambda: None)
+    started_off = eng_off.start_backend()
+    check("start_backend_off -- returns False and starts no thread when backend_async is False",
+          started_off is False and eng_off._backend_thread is None)
+
+    # -- on: starts a live daemon thread; a second call is an idempotent no-op --
+    eng_on = make_engine(True, lambda: None)
+    started1 = eng_on.start_backend()
+    thread1 = eng_on._backend_thread
+    alive_and_daemon = thread1 is not None and thread1.is_alive() and thread1.daemon
+    started2 = eng_on.start_backend()
+    check("start_backend_on -- returns True, thread alive, is a daemon",
+          started1 is True and alive_and_daemon)
+    check("start_backend_idempotent -- second call no-ops, still True, same thread object",
+          started2 is True and eng_on._backend_thread is thread1)
+    eng_on.close()
+    check("close_stops_thread -- is_alive() False after close()", not thread1.is_alive())
+
+    # -- drains a queue of tasks and keeps polling once it is empty --
+    calls_drain = []
+
+    def run_backend_drain():
+        calls_drain.append(1)
+        with eng_drain.states.lock:
+            if eng_drain.states.global_optimizer_tasks:
+                eng_drain.states.global_optimizer_tasks.pop(0)
+
+    eng_drain = make_engine(True, run_backend_drain)
+    eng_drain.states.global_optimizer_tasks.extend([0, 1, 2])
+    eng_drain.start_backend()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and len(calls_drain) < 3:
+        time.sleep(0.01)
+    check("drains_queue -- fake _run_backend called >=3x for 3 queued tasks within a bounded wait",
+          len(calls_drain) >= 3)
+    count_after_drain = len(calls_drain)
+    # Session 64: derive the wait from the poll gap itself rather than hardcoding it -- this case
+    # broke when BACKEND_IDLE_SLEEP_S moved 5ms -> 50ms to cut states.lock contention, even though
+    # the behaviour under test (the loop keeps polling instead of exiting) was completely unchanged.
+    time.sleep(slam_engine.BACKEND_IDLE_SLEEP_S * 4 + 0.05)
+    check("polls_after_empty -- loop keeps calling _run_backend once the queue is empty (no exit)",
+          eng_drain._backend_thread.is_alive() and len(calls_drain) > count_after_drain)
+    eng_drain.close()
+
+    # -- close() is safe when never started, and safe to call twice --
+    eng_never = make_engine(True, lambda: None)
+    try:
+        eng_never.close()
+        eng_never.close()
+        close_safety_ok = True
+    except BaseException:
+        close_safety_ok = False
+    check("close_never_started_and_twice -- no-op both times, never raises", close_safety_ok)
+
+    # -- an exception in _run_backend sets backend_failed and the thread does not re-enter it --
+    calls_fail = []
+
+    def run_backend_raises():
+        calls_fail.append(1)
+        raise RuntimeError("boom")
+
+    eng_fail = make_engine(True, run_backend_raises)
+    eng_fail.start_backend()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and eng_fail.backend_failed is None:
+        time.sleep(0.01)
+    failed_str_ok = isinstance(eng_fail.backend_failed, str) and len(eng_fail.backend_failed) > 0
+    time.sleep(0.05)
+    check("failure_sets_backend_failed_and_stops -- non-empty string, thread dead, called exactly once",
+          failed_str_ok and not eng_fail._backend_thread.is_alive() and len(calls_fail) == 1)
+
+    # -- C2: SLAM_BACKEND_FIELDS is exactly the four names, disjoint from the two phase tuples --
+    check("backend_fields_tuple -- SLAM_BACKEND_FIELDS is the frozen four, in order",
+          slam_engine.SLAM_BACKEND_FIELDS == ("backend_mode", "backend_queue_depth",
+                                               "backend_thread_ms", "backend_pose_clobbers",
+                                               "backend_error"))   # session 64: + the failure reason
+    check("backend_fields_disjoint_from_phase_fields -- shares no names with SLAM_PHASE_FIELDS",
+          set(slam_engine.SLAM_BACKEND_FIELDS) & set(slam_engine.SLAM_PHASE_FIELDS) == set())
+    check("backend_fields_disjoint_from_track_phase_fields -- shares no names with SLAM_TRACK_PHASE_FIELDS",
+          set(slam_engine.SLAM_BACKEND_FIELDS) & set(slam_engine.SLAM_TRACK_PHASE_FIELDS) == set())
+
+    # -- C2: a SlamResult built with only pre-session-64 arguments gets SYNC/0/0.0/0 defaults --
+    _r_default = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False)
+    check("slam_result_backend_defaults -- SYNC/0/0.0/0, correctly typed",
+          _r_default.backend_mode == "SYNC" and isinstance(_r_default.backend_mode, str)
+          and _r_default.backend_queue_depth == 0 and isinstance(_r_default.backend_queue_depth, int)
+          and _r_default.backend_thread_ms == 0.0 and isinstance(_r_default.backend_thread_ms, float)
+          and _r_default.backend_pose_clobbers == 0 and isinstance(_r_default.backend_pose_clobbers, int))
+
+    # -- C2: backend_mode -- SYNC (no thread), ASYNC (live thread), FAILED beats both --
+    eng_sync = make_engine(True, lambda: None)
+    check("backend_mode_sync -- no thread started yet -> SYNC", eng_sync._backend_mode() == "SYNC")
+
+    eng_async = make_engine(True, lambda: None)
+    eng_async.start_backend()
+    check("backend_mode_async -- live thread, no failure -> ASYNC", eng_async._backend_mode() == "ASYNC")
+    eng_async.backend_failed = "RuntimeError: injected"
+    check("backend_mode_failed_beats_async -- backend_failed set while thread still alive -> FAILED",
+          eng_async._backend_mode() == "FAILED")
+    eng_async.backend_failed = None
+    eng_async.close()
+
+    check("backend_mode_failed_with_dead_thread_object -- thread object still present but dead -> FAILED",
+          eng_fail._backend_mode() == "FAILED")
+    eng_fail.close()
+
+    # -- C4: clobber accounting against fake CPU tensors (no CUDA/no real keyframes needed) --
+    eng_cl = make_engine(True, lambda: None)
+    t_old = torch.zeros(1, 8)
+    t_new = torch.ones(1, 8)
+
+    eng_cl._backend_last_written = {3: t_old.clone()}
+    eng_cl._check_backend_clobber(3, t_new)
+    check("clobber_changed_counts_once_and_clears_record",
+          eng_cl._backend_pose_clobbers == 1 and 3 not in eng_cl._backend_last_written)
+    eng_cl._check_backend_clobber(3, t_new)
+    check("clobber_second_check_after_clear_does_not_double_count", eng_cl._backend_pose_clobbers == 1)
+
+    eng_cl._backend_pose_clobbers = 0
+    eng_cl._backend_last_written = {5: t_old.clone()}
+    eng_cl._check_backend_clobber(5, t_old.clone())
+    check("clobber_unchanged_counts_zero", eng_cl._backend_pose_clobbers == 0)
+
+    eng_cl._backend_pose_clobbers = 0
+    eng_cl._backend_last_written = {}
+    eng_cl._check_backend_clobber(9, t_new)
+    check("clobber_no_record_for_index_counts_zero", eng_cl._backend_pose_clobbers == 0)
+
+    # Session 64, regression guard for the bug the FIRST BENCH RUN found -- and which nothing above
+    # could have caught, because none of these cases actually crossed a thread boundary into real
+    # torch. Grad mode is THREAD-LOCAL: the engine disables autograd on the MAIN thread
+    # (slam_engine.py:153) and upstream inherits the same setting from its backend PROCESS's own
+    # __main__, so the new thread started with autograd ON and died on its first solve. Every
+    # lietorch/MASt3R op inside _run_backend assumes inference mode. Assert the loop body turns it
+    # off for ITSELF, from a thread that genuinely starts with it on.
+    grad_seen = {}
+
+    def _probe_grad():
+        grad_seen["in_thread"] = torch.is_grad_enabled()
+        eng_g._backend_stop.set()          # one pass is all we need
+
+    eng_g = make_engine(True, _probe_grad)
+    torch.set_grad_enabled(True)           # what a FRESH thread actually inherits here
+    try:
+        th_g = threading.Thread(target=eng_g._backend_loop, daemon=True)
+        th_g.start()
+        th_g.join(timeout=5.0)
+    finally:
+        torch.set_grad_enabled(False)      # restore the engine-wide inference mode
+    check(f"thread_disables_autograd -- backend thread runs with grad OFF "
+          f"(saw {grad_seen.get('in_thread')}, exited={not th_g.is_alive()})",
+          grad_seen.get("in_thread") is False and not th_g.is_alive()
+          and eng_g.backend_failed is None)
+
+    # Session 64, second regression guard from the bench: the thread is started at Pipeline
+    # construction, but `states`/`keyframes` are not built until `_lazy_state()` runs on the FIRST
+    # FRAME -- so an eager loop raised AttributeError and killed itself before a single frame was
+    # seen. It must idle harmlessly instead, and then pick up once the engine initialises.
+    eng_lazy = make_engine(True, lambda: calls_lazy.append(1))
+    calls_lazy = []
+    eng_lazy._initialized = False
+    del eng_lazy.states                       # exactly the pre-first-frame shape
+    th_lazy = threading.Thread(target=eng_lazy._backend_loop, daemon=True)
+    th_lazy.start()
+    time.sleep(0.05)                          # several idle passes
+    survived = th_lazy.is_alive() and eng_lazy.backend_failed is None and not calls_lazy
+    eng_lazy._backend_stop.set()
+    th_lazy.join(timeout=5.0)
+    check(f"waits_for_lazy_state -- backend idles (no crash, no work) until _lazy_state() has run "
+          f"(alive={survived}, failed={eng_lazy.backend_failed})", survived)
+
+    return ok
+
+
 def _self_test_phase_timing(cfg):
     """SESSION-62 PHASE TIMING SCHEMA: DIAG_PERF_FIELDS must keep its frozen 9-column prefix (so
     pre-2026-09-05 files stay readable by name), carry every SlamResult phase field plus the four
@@ -1564,12 +1858,24 @@ def _self_test_phase_timing(cfg):
                                      "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms"))
     check("track_phase_fields_present -- every slam_engine.SLAM_TRACK_PHASE_FIELDS name is a DIAG_PERF_FIELDS column",
           all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_TRACK_PHASE_FIELDS))
+    # Session 64: the frozen-twenty guarantee -- every flight written before this session has exactly
+    # these twenty names in this order; the four backend-thread columns land strictly AFTER them.
+    check("frozen_prefix20 -- first twenty DIAG_PERF_FIELDS names/order unchanged since before session 64",
+          DIAG_PERF_FIELDS[:20] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+                                     "n_keyframes", "n_voxels", "reloc",
+                                     "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                                     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+                                     "frame_ms", "infer_ms", "tracker_ms"))
+    check("backend_fields_present -- every slam_engine.SLAM_BACKEND_FIELDS name is a DIAG_PERF_FIELDS column",
+          all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_BACKEND_FIELDS))
 
     tmp_dir = tempfile.mkdtemp(prefix="phase_timing_selftest_")
     try:
         log = DiagLog("perception", list(DIAG_PERF_FIELDS), out_dir=tmp_dir, ts="20260101_000000")
-        full_row = {f: (1 if f in ("frame_id", "new_keyframe", "n_keyframes", "n_voxels", "reloc")
-                        else ("TRACKING" if f == "mode" else 1.0))
+        full_row = {f: (1 if f in ("frame_id", "new_keyframe", "n_keyframes", "n_voxels", "reloc",
+                                    "backend_queue_depth", "backend_pose_clobbers")
+                        else ("TRACKING" if f == "mode"
+                              else ("ASYNC" if f == "backend_mode" else 1.0)))
                     for f in DIAG_PERF_FIELDS}
         log.row(**full_row)
         log.row(wall_ts=2.0, frame_id=2, loop_dt=0.1, slam_ms=5.0, mode="TRACKING",
@@ -1582,14 +1888,19 @@ def _self_test_phase_timing(cfg):
             rows = list(reader)
 
         first_row_ok = all(str(rows[0][f]) == str(full_row[f]) for f in DIAG_PERF_FIELDS)
+        backend_mode_roundtrip_ok = rows[0]["backend_mode"] == "ASYNC"
         omitted_phase_fields = ("track_ms", "backend_ms", "pose_ms", "kf_download_ms",
                                  "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
-                                 "frame_ms", "infer_ms", "tracker_ms")
+                                 "frame_ms", "infer_ms", "tracker_ms",
+                                 "backend_mode", "backend_queue_depth", "backend_thread_ms",
+                                 "backend_pose_clobbers")
         blanks_ok = all(rows[1][f] == "" for f in omitted_phase_fields)
 
         check("csv_header_matches -- DictReader header equals list(DIAG_PERF_FIELDS)", header_ok)
         check("csv_full_row_roundtrips -- fully-populated row's values come back unchanged", first_row_ok)
-        check("csv_omitted_phases_are_blank -- missing phase kwargs write '' not '0.0'", blanks_ok)
+        check("csv_backend_mode_roundtrips_as_string -- 'ASYNC' comes back as the string, not a number",
+              backend_mode_roundtrip_ok)
+        check("csv_omitted_phases_are_blank -- missing phase kwargs write '' not '0.0'/'SYNC'/'0'", blanks_ok)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1644,6 +1955,28 @@ def _self_test_phase_timing(cfg):
         print(f"[perception][self-test] phase segment render raised: {e}")
     check("phase_segment_renders -- console segment formats without raising, all nine labels present",
           render_ok)
+
+    # Session 64: the bk[...] console segment reads straight off `res` (per-frame truth), not the
+    # sticky dict -- a SimpleNamespace stand-in exercises both FAILED and ASYNC without a real engine.
+    def _render_bk(r):
+        return (f"bk[{r.backend_mode} q{r.backend_queue_depth} {r.backend_thread_ms:.0f}ms"
+                f"{f' clob{r.backend_pose_clobbers}' if r.backend_pose_clobbers else ''}] | ")
+
+    try:
+        res_async = types.SimpleNamespace(backend_mode="ASYNC", backend_queue_depth=3,
+                                          backend_thread_ms=120.4, backend_pose_clobbers=0)
+        res_failed = types.SimpleNamespace(backend_mode="FAILED", backend_queue_depth=0,
+                                           backend_thread_ms=0.0, backend_pose_clobbers=2)
+        seg_async, seg_failed = _render_bk(res_async), _render_bk(res_failed)
+        bk_render_ok = True
+    except Exception as e:
+        seg_async = seg_failed = ""
+        bk_render_ok = False
+        print(f"[perception][self-test] backend console segment render raised: {e}")
+    check("backend_console_segment_renders -- ASYNC and FAILED both render without raising, contain 'bk['",
+          bk_render_ok and "bk[" in seg_async and "bk[" in seg_failed)
+    check("backend_console_clob_only_when_nonzero -- 'clob' shown only when backend_pose_clobbers != 0",
+          "clob" not in seg_async and "clob2" in seg_failed)
 
     return ok
 

@@ -12,6 +12,45 @@ for the watch list on the next flight._
 
 ## Session Log (newest first)
 
+- **64 — the backend thread: built, flown, and switched OFF on the evidence.** Session 62's
+  attribution said `_run_backend()` was 64.4% of the loop, and upstream MASt3R-SLAM runs exactly that
+  function in a separate PROCESS, so the design was a restoration rather than an invention -- the task
+  queue, `states.lock` and `keyframes.lock` were all already there and unused. A separate process is
+  ruled out on Windows (`slam_engine.py:38`, `mp.Manager()` deadlock), so it became a thread.
+  **Mechanically it worked perfectly**: `backend_ms` on the frame path 1634s -> 0s, solves of 14s
+  median / 153s max running off-thread, zero thread deaths, zero pose clobbers across a 98-minute
+  flight. Two bugs surfaced in the bench and only in the bench, both of the same family -- something
+  true on the main thread that is not true on another: torch's grad mode is THREAD-LOCAL (the engine
+  disables autograd in `__init__` on the main thread; upstream inherits it from its backend process's
+  own `__main__`), and `states`/`keyframes` are built lazily on the FIRST FRAME while the thread starts
+  at Pipeline construction. The loud `bk[FAILED]` state made each a five-minute diagnosis; without it
+  both would have looked like "no improvement".
+  **Then the measurement bit back.** Making the backend visible cost more than the backend: reading
+  the queue depth for the console took `states.lock` every frame while the backend held it, and the
+  clobber check took `keyframes.lock` twice more -- 787s, 13.4% of a flight, spent waiting to read
+  numbers. The session-62 closure invariants localised it immediately (residual p90 jumped ~0 ->
+  2839ms because the wait falls OUTSIDE every phase stamp). Fixed by publishing those values from
+  whoever already holds the lock, moving the clobber check onto the backend thread, and widening the
+  idle poll 5ms -> 50ms (an idle pass took `states.lock` twice, ~400x/second, purely to contend).
+  Closure residual came back to p90 1ms.
+  **And that fix is what made flights worse.** The lock contention had been accidentally SERIALISING
+  tracker and backend. Removing it let them genuinely share one GPU: `backend_thread_ms` p90 rose
+  14.5s -> 26.2s, and both flights in that configuration lost tracking within minutes, where the
+  earlier contended one flew 98 minutes clean. The operator spotted the pattern from flight
+  behaviour before the data did. **Verdict: `backend_async: false` by default.** On a single GPU,
+  threading the backend does not remove the work -- it makes the tracker compete with it, and a
+  degraded tracker loses tracking, which costs far more than the stalls it saves.
+  Kept regardless, all independent of the flag: the `track_ms` split (`frame_ms`/`infer_ms`/
+  `tracker_ms`), which is what redirected the whole effort -- **`tracker_ms` is 85% of TRACKING's
+  track_ms and `infer_ms` is 99% of RELOC's, together ~72% of the loop**; the `map_pub_ms` fix
+  (191ms -> 9ms per publish); and the backend instrumentation including `backend_error`, so a dead
+  thread is diagnosable from artifacts alone. Full write-up: `plans/session64-spec.md`.
+  **Methodology note worth keeping:** three of this session's hypotheses were overturned by matched
+  comparisons -- flight length (98 min vs 42 min) flattered one conclusion, the median cannot move at
+  all (the backend fires on ~1 frame in 6, so the median frame carries no backend cost in either
+  mode), and a RELOC blamed on threading turned out to be a wall with a grey camera view. Compare
+  matched windows, compare tails not medians, and trust the operator's live observation.
+
 - **63 (Phase 1) — the cheap half of "make SLAM fast again".** Session 62's attribution said the
   choke is `backend_ms` (83% of a 23.8s median solve by flight-minute 20-25), with `track_ms` next at
   30% and `map_pub_ms` the only CPU cost that actually scales with map size (4 -> 1 238ms as voxels

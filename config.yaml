@@ -30,6 +30,21 @@ perception:
   object_frame_height: 720               # hi-res frame height for Qwen grounding (width keeps aspect; no upscale beyond source)
   capture_key: "space"                   # io_bridge: grab the current FULL-RES drone frame -> capture_dir (benchmark frames)
   capture_dir: "test_assets/captures"    # where 'space' snapshots are written (full-res PNG; sort into Nasrallah/Rifle/None)
+  # SESSION 64 VERDICT -- DEFAULT false ON EVIDENCE, not caution. Threading the backend works
+  #   mechanically (backend_ms on the frame path 1634s -> 0s, no failures, no pose clobbers)
+  #   but on a SINGLE GPU it does not remove the work, it just lets the tracker COMPETE with
+  #   it: backend_thread_ms p90 rose 14.5s -> 26.2s once frame-path lock contention was
+  #   removed, and both flights in that configuration lost tracking within minutes, while the
+  #   one flight that still had the contention (which was accidentally SERIALISING the two)
+  #   ran 98 minutes cleanly. A degraded tracker loses tracking, and that costs far more than
+  #   the stalls it saves. Set true only to re-open that experiment, and only for a 20+ minute
+  #   flight -- the median frame carries no backend cost in either mode (it fires on ~1 frame
+  #   in 6), so short flights and medians cannot measure this at all.
+  backend_async: false   # session 64: run MASt3R-SLAM's global optimization on its own thread --
+                         # backend_ms was 64.4% of the loop (flight 20260905_221128, 386 frames);
+                         # upstream runs this in a separate process (main.py run_backend()), a
+                         # thread is the Windows-safe equivalent (mp.Manager() deadlocks here).
+                         # false restores today's inline behaviour exactly.
 
 models:
   # (depth_anything REMOVED 2026-07-07 — DA-V2 depth inference disabled; the wall stand-off uses the SLAM raycast.)
@@ -344,6 +359,17 @@ autonomy:
     #     continuous latch hold to catch a clean FLOOR. FLOOR detection is NEW/unvalidated -> dock_max_s caps it. ---
     home_reach_dist: 0.5             # "reached the origin" test (SLAM units) — tightened 1.0->0.5 so the drone actually
                                      #   flies home at altitude before docking (a general tolerance, NOT a room answer)
+    # Session 63 (operator): the survey's DELIVERABLE is the map, and it is complete the moment no
+    #   reachable frontier remains -- everything after that is the drone flying itself home to park,
+    #   which adds flight minutes, more SLAM load and more chances to lose tracking, for nothing the
+    #   assessment looks at. With this true the postlude is SKIPPED: the mission is declared complete
+    #   at the point RETURN_TO_ORIGIN would have begun, the drone holds a neutral hover exactly where
+    #   it is, and perception + visualizer are asked to finalize their artifacts (map/.ply/.npz, the
+    #   CSVs, the recording) right then. The stack is NOT killed -- fly.py's own teardown still runs
+    #   when the operator presses ENTER, so the flight report still compiles.
+    #   false = the original RETURN_TO_ORIGIN -> ORIENT_HOME -> HOME_REFINE -> DOCK_FLOOR ->
+    #   LOW_STANDOFF -> DONE postlude, unchanged.
+    end_at_postlude: true             # skip the fly-home postlude; finish where the survey finished
     home_max_s: 300.0                 # SAFETY: cap the homing; then dock HERE (logged, NO SILENT FALLBACK)
     # ORIENT_HOME: converge on the take-off heading using the REAL bearing error each turn (clamped to one
     # turn_step_deg per turn, but no longer forced to a multiple of it — that quantization could ping-pong

@@ -116,7 +116,15 @@ def main():
         # from autopilot-side plan payloads. Matches how autopilot.py is launched on the next line.
         perception = subprocess.Popen([python_exe, "perception_worker.py", "--no-display", "--log", "--stop-file", perception_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         # The autopilot writes the flight report; give it the stop-file so it can flush its map + timeline on exit.
-        autopilot = subprocess.Popen([python_exe, "autopilot.py", "--explore", "--log", "--stop-file", stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
+        # Session 63: --finish-stops lets the autopilot end the data-collection half of the flight the
+        # moment the survey is complete (config `end_at_postlude`), by touching the SAME two graceful-stop
+        # sentinels this file's teardown uses. Perception flushes its map/.npz/.ply + CSVs and visualizer
+        # releases the MP4 right then; the autopilot itself keeps holding a neutral hover, and everything
+        # below still runs normally when the operator presses ENTER.
+        autopilot = subprocess.Popen([python_exe, "autopilot.py", "--explore", "--log",
+                                      "--stop-file", stop_file,
+                                      "--finish-stops", f"{perception_stop_file},{visualizer_stop_file}"],
+                                     cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         visualizer = subprocess.Popen([python_exe, "visualizer.py", "--record", "--stop-file", visualizer_stop_file], cwd=cartographer_dir, creationflags=NEW_CONSOLE)
         processes.append(subprocess.Popen([python_exe, "io_bridge.py"], cwd=cartographer_dir, creationflags=NEW_CONSOLE))
 

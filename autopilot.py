@@ -1271,6 +1271,9 @@ class ExploreController:
         # params (durations / stand-off scale) — NO room answer (origin is the SLAM-frame [0,0]; the floor is
         # detected LIVE by the flow FLOOR collapse). A continuous hold-down is FORBIDDEN (see DOCK_FLOOR).
         self.home_reach_dist = float(e.get("home_reach_dist", self.goal_reach_dist))  # "reached origin" test
+        # Session 63: skip the fly-home postlude entirely and finish where the survey finished
+        # (see config.yaml for the operator's reasoning). Read here beside the postlude's own knobs.
+        self.end_at_postlude = bool(e.get("end_at_postlude", True))
         self.home_max_s = float(e.get("home_max_s", 30.0))          # SAFETY cap on homing (then dock here; logged)
         # ORIENT_HOME: converge on the take-off heading to within a real tolerance (NOT "quantized turn rounds
         # to 0", which knife-edges into a side-to-side ping-pong whenever the residual sits near half a turn
@@ -4250,6 +4253,17 @@ class ExploreController:
                     self._enter("STUCK", now)
                     event = ("mission ABANDONED: at least one corner was never reached (far-corner give-up "
                              "cap hit) -> drone likely physically stuck -> STUCK (hold in place; logging paused)")
+                elif self.end_at_postlude:
+                    # Session 63 (operator): the map is the deliverable and it is finished HERE. Flying
+                    # home to park buys nothing the assessment inspects and costs flight minutes, SLAM
+                    # load and tracking risk. Go straight to DONE -- the same terminal state the postlude
+                    # would have reached -- which holds a neutral hover in place. run_explore's existing
+                    # DONE edge does the rest (per-step logging off, and the finish-stops handshake that
+                    # lets perception + visualizer flush their artifacts). NOT a silent skip: the state
+                    # is DONE, the event says why, and `end_at_postlude: false` restores the postlude.
+                    self._enter("DONE", now)
+                    event = ("mission complete — no reachable frontier remains -> DONE "
+                             "(end_at_postlude: fly-home postlude SKIPPED; holding here)")
                 else:
                     self._home_phase = None               # lazy-init the homing sub-loop on entry
                     self._enter("RETURN_TO_ORIGIN", now)
@@ -5410,7 +5424,39 @@ def _visrec_debug_sink(ctrl, diag, canvas, save, stamp, saved_count):
     return rel
 
 
-def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
+def _signal_finish_stops(paths, prefix=""):
+    """Session 63: touch each graceful-stop sentinel in `paths` and return the lines to log.
+
+    These are the SAME sentinels fly.py's teardown writes, so the processes watching them
+    (perception_worker, visualizer) run their existing, proven shutdown -- perception's
+    `_checkpoint_livemap` map/.npz/.ply plus its CSV close, visualizer's `VideoWriter.release`
+    without which the MP4 carries no index and is unplayable. Reusing that route rather than
+    inventing a second one is why ending a flight early costs a few lines.
+
+    Returns a list of log lines rather than printing, so the caller owns both the console and the
+    diag sink (and so this is unit-testable at all -- it used to be inline in run_explore's ZMQ
+    loop). A failure to touch one is annunciated as CRITICAL and the others are still attempted:
+    the flight is over either way, but the operator must know an artifact was NOT flushed early and
+    that the launcher's teardown is now the only thing that will do it (CLAUDE.md: no silent
+    fallbacks). Returns [] for an empty/None `paths`, so the no-op case logs nothing."""
+    paths = tuple(p for p in (paths or ()) if p)
+    if not paths:
+        return []
+    out, failed = [], 0
+    for fs in paths:
+        try:
+            open(fs, "w").close()
+        except OSError as exc:
+            failed += 1
+            out.append(f"*** CRITICAL: could not signal {fs} to finalize ({exc}) -> that process "
+                       f"keeps running until the launcher's teardown stops it ***")
+    out.append(f"{prefix} [autopilot][explore] finish-stops signalled "
+               f"({len(paths) - failed}/{len(paths)}): perception + visualizer finalizing now; this "
+               f"process holds a neutral hover until you stop the stack")
+    return out
+
+
+def run_explore(cfg, stop_event=None, log=False, no_takeoff=False, finish_stops=()):
     """Bus wrapper around ExploreController: SUB frames (:frame_bus_port, flow WALL detector) + the
     explore plan (TOPIC_PLAN on :perception_state_port); PUB TOPIC_CONTROL. Enable on io_bridge with
     'm' (any manual flight key aborts to manual). Arms + takes off automatically (the prelude) unless
@@ -5992,6 +6038,19 @@ def run_explore(cfg, stop_event=None, log=False, no_takeoff=False):
                          f"{_stuck_summary(stuck_intervals)} -> per-step logging OFF (map backdrop still emitted at exit)")
                 print(mline, flush=True); diag.line(mline)
                 logging_off = True
+                # Session 63: ask perception + visualizer to finalize NOW, by touching the very same
+                # graceful-stop sentinels fly.py would touch at teardown -- so they run their existing,
+                # proven shutdown (perception's _checkpoint_livemap map/.npz/.ply + CSV close;
+                # visualizer's VideoWriter.release, without which the MP4 has no index and is
+                # unplayable). Reusing those paths rather than inventing a second shutdown route is the
+                # whole reason this is a few lines. THIS process deliberately stays alive: DONE holds a
+                # neutral hover, so the drone parks where it is instead of drifting, and fly.py's own
+                # teardown still compiles the report when the operator presses ENTER.
+                # A failure here is annunciated, never swallowed (CLAUDE.md: no silent fallbacks) --
+                # the flight is over either way, but the operator must know the artifacts were not
+                # flushed early and that the teardown is now the only thing that will do it.
+                for _line in _signal_finish_stops(finish_stops, _rec_prefix(last_rec_frame)):
+                    print(_line, flush=True); diag.line(_line)
             # Suppress the per-step timeline record while PARKED in STUCK (after its entry record) or after the
             # mission-end DONE — the two states that otherwise emit an identical record every tick forever.
             suppress_step = logging_off or (state == "STUCK" and not stuck_entry)
@@ -6237,6 +6296,7 @@ def run_self_test(cfg):
 
     # ---- Map mode: ExploreController full leg (ORIENT[open-loop turn]->ADVANCE->BACKOFF->SETTLE->REPLAN->DONE) ----
     ctrl = ExploreController(cfg, no_takeoff=True)   # skip the prelude; this test covers the frontier loop
+    ctrl.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     ctrl.reverse_probe_on_wall = False               # this test covers the default back_off wall path
     goal = [3.0, 0.0]                                 # beyond goal_reach_dist so the WALL path (not goal-reached) runs
     order = []
@@ -6274,6 +6334,7 @@ def run_self_test(cfg):
     # gentle DOWN micro-pulses (joy_vertical=+1) until the descent gain flattens -> a LATCH hold where
     # floor_contact latches -> LOW_STANDOFF nudges UP (joy_vertical=-1) -> DONE.
     cpost = ExploreController(cfg, no_takeoff=True)
+    cpost.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     plan_done = {"plan_valid": True, "done": True, "goal": None, "pos": [0.0, 0.0], "heading_deg": 0.0,
                  "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 5.0}
     porder, prev_p = [], None
@@ -6296,6 +6357,7 @@ def run_self_test(cfg):
     # home_refine_max_s=0 too: HOME_REFINE has its own bounded give-up (same idiom) and would otherwise keep
     # pushing forever at this same far-from-origin pose (no takeoff heading -> ORIENT_HOME is skipped).
     chome = ExploreController(cfg, no_takeoff=True)
+    chome.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     chome.home_max_s = 0.0
     chome.home_refine_max_s = 0.0
     far_done = dict(plan_done, pos=[9.0, 9.0])
@@ -6303,6 +6365,7 @@ def run_self_test(cfg):
     home_cap_ok = _is_subsequence(["RETURN_TO_ORIGIN", "HOME_REFINE", "DOCK_FLOOR"], sthome)
     # dock_max_s cap: the floor never latches (floor_contact False) -> still proceed to LOW_STANDOFF.
     cdock = ExploreController(cfg, no_takeoff=True)
+    cdock.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     cdock.dock_max_s = 0.0
     _, _, _, stdock = _drive(cdock, plan_done, False, 0.5, 0.0, floor=False)
     dock_cap_ok = _is_subsequence(["RETURN_TO_ORIGIN", "DOCK_FLOOR", "LOW_STANDOFF"], stdock)
@@ -6312,6 +6375,7 @@ def run_self_test(cfg):
     # DOCK_FLOOR, emitted a forward push, AND visibly SETTLED between homing actions. Inject a live frame stream
     # (like _drive) so the settles resolve.
     chomeloop = ExploreController(cfg, no_takeoff=True)
+    chomeloop.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     chomeloop.rest_between_s = 0.1; chomeloop.settle_fresh_frames = 2
     chomeloop.home_refine_max_s = 0.1  # this test only simulates position closing DURING RETURN_TO_ORIGIN's
                                         # own forward push, not HOME_REFINE's -- give it up fast so the test
@@ -6344,6 +6408,7 @@ def run_self_test(cfg):
     #     toward the take-off heading (driving the bearing-wrap math), then dock. heading_deg=170, takeoff=-170:
     #     the short way is +20 (wrap), NOT -340.
     corient = ExploreController(cfg, no_takeoff=True)
+    corient.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     corient.rest_between_s = 0.1; corient.settle_fresh_frames = 2
     corient._takeoff_heading = -170.0
     saw_orient_turn = reached_dock2 = False
@@ -6373,6 +6438,7 @@ def run_self_test(cfg):
     # (b) DOCK survives a SLAM loss: reach DOCK_FLOOR healthy, then inject PLAN-LOST -> the DEDICATED
     #     POSTLUDE_LOST_HOLD (NOT HOLD_LOST / FALLBACK); then recover (OK + fast frames) -> resume DOCK_FLOOR.
     cdl = ExploreController(cfg, no_takeoff=True)
+    cdl.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     dplan = {"plan_valid": True, "done": True, "goal": None, "pos": [0.0, 0.0], "heading_deg": 0.0,
              "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 5.0}
     _drive(cdl, dplan, False, 0.6, 0.0, floor=False)             # settle into DOCK_FLOOR
@@ -6396,6 +6462,7 @@ def run_self_test(cfg):
     #     (a floor-level drone would otherwise be shoved back up). Drive DOCK with a floor-level pose; assert the
     #     lock target stays None and no UP (joy_vertical=-1) is ever emitted in the descent.
     cri = ExploreController(cfg, no_takeoff=True)
+    cri.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     _drive(cri, dict(dplan, pos_y=0.02), False, 0.6, 0.0, floor=False)
     no_reinflate = cri.target_altitude_y is None
     tri, fidri = 5.0, 8000
@@ -6420,6 +6487,7 @@ def run_self_test(cfg):
     #      DONE. Fix: DONE added to POSTLUDE_STATES -> a loss diverts to the existing POSTLUDE_LOST_HOLD and
     #      resumes DONE directly (no new resume-phase branch needed; DONE has no sub-phase).
     cdone = ExploreController(cfg, no_takeoff=True)
+    cdone.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     dplan2 = {"plan_valid": True, "done": True, "goal": None, "pos": [0.0, 0.0], "heading_deg": 0.0,
               "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 5.0}
     _drive(cdone, dplan2, False, 40.0, 0.0, floor=True)          # happy path all the way to DONE
@@ -6450,6 +6518,7 @@ def run_self_test(cfg):
     #      exploration's own ADVANCE can; that stage keeps its own BACKOFF untouched). _home_phase must never
     #      become "BACKOFF" during RETURN_TO_ORIGIN, no matter how tight the reported forward clearance is.
     cnb = ExploreController(cfg, no_takeoff=True)
+    cnb.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     cnb.leg_max_s = 1000.0    # keep ADVANCE running the whole test window (isolates the clearance reaction)
     blocked_plan = {"plan_valid": True, "done": True, "goal": None, "pos": [5.0, 5.0], "heading_deg": 0.0,
                     "bearing_err": None, "pos_y": 0.0, "forward_clearance_dist": 0.1}   # << inside stop_clearance_dist
@@ -6474,6 +6543,7 @@ def run_self_test(cfg):
     #     The fix (turn by the real, clamped-not-quantized angle) must still converge within a bounded number
     #     of turn+settle cycles instead of oscillating indefinitely.
     coh = ExploreController(cfg, no_takeoff=True)
+    coh.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     coh.rest_between_s = 0.1; coh.settle_fresh_frames = 2
     coh._takeoff_heading = 0.0
     OVERSHOOT = 1.4
@@ -6500,6 +6570,7 @@ def run_self_test(cfg):
     orient_converge_ok = saw_oh_turn and converged_oh and turns_taken <= 6
     # (b) orient_home_max_s cap: pose stays invalid forever (never converges) -> proceed anyway (VISIBLE).
     coc = ExploreController(cfg, no_takeoff=True)
+    coc.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     coc._takeoff_heading = 90.0
     coc.orient_home_max_s = 0.0
     coc.home_refine_max_s = 0.0
@@ -7704,6 +7775,7 @@ def run_self_test(cfg):
             break
     stuck_stays_ok = still_stuck
     cend = ExploreController(cfg, no_takeoff=True); cend._enter("REPLAN", 0.0)
+    cend.end_at_postlude = False   # session 63: this case tests the POSTLUDE, so pin the flag off
     _a, s_end, _ = cend.step(0.0, {"done": True, "goal": None, "pos": [0.0, 0.0]}, False)
     graceful_end_ok = (s_end == "RETURN_TO_ORIGIN" and cend._corner_giveup_stuck is False)
     # the ORDINARY (non-giveup) use of STUCK (e.g. FALLBACK exhaustion) still auto-resumes once SLAM/planning
@@ -10398,6 +10470,81 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if s62d_ok else 'FAIL'}  SESSION-62 PARALLAX PUSH MEASUREMENT overall")
     assert s62d_ok, "session-62 parallax push measurement"
 
+    # ---- SESSION-63 END AT POSTLUDE ------------------------------------------------------------------
+    # Operator: the map is the deliverable and it is finished the moment no reachable frontier remains.
+    # Flying home to park buys nothing the assessment inspects and costs flight minutes, SLAM load and
+    # tracking risk. With `end_at_postlude` true the survey ends AT the point RETURN_TO_ORIGIN would
+    # have begun: DONE (a neutral hover, held in place), and the finish-stop sentinels let perception +
+    # visualizer flush their artifacts immediately. These cases pin BOTH branches from synthetic configs
+    # -- the postlude cases above are pinned off precisely because they would otherwise inherit
+    # whatever the operator has in config.yaml, the failure class that bit sessions 62 and 62b.
+    _done_plan63 = {"plan_valid": True, "done": True, "goal": None, "pos": [5.0, 5.0],
+                    "heading_deg": 0.0, "bearing_err": None, "pos_y": 0.0,
+                    "forward_clearance_dist": 5.0}
+
+    def _c63(end_at_postlude):
+        _cfg = copy.deepcopy(cfg)
+        _cfg.setdefault("autonomy", {}).setdefault("explore", {})["end_at_postlude"] = end_at_postlude
+        c = ExploreController(_cfg, no_takeoff=True)
+        c._enter("REPLAN", 0.0)
+        return c
+
+    c63on, c63off = _c63(True), _c63(False)
+    cfg63_ok = (c63on.end_at_postlude is True and c63off.end_at_postlude is False)
+    _a_on, s63on, _e_on = c63on.step(0.05, _done_plan63, False)
+    _a_off, s63off, _e_off = c63off.step(0.05, _done_plan63, False)
+    branch_ok = (s63on == "DONE" and s63off == "RETURN_TO_ORIGIN")
+    print(f"[self-test] {'PASS' if cfg63_ok and branch_ok else 'FAIL'}  SESSION-63 end_at_postlude routes "
+          f"mission-complete (on -> {s63on}, off -> {s63off})")
+
+    # (63-2) DONE must HOLD -- a neutral vector, so the drone parks where it is instead of drifting.
+    _held, t63 = True, 0.10
+    for _ in range(40):
+        a63, s63, _ = c63on.step(t63, _done_plan63, False)
+        if s63 != "DONE" or any(abs(float(v or 0.0)) > 0.0
+                                for k, v in a63.items() if isinstance(v, (int, float))):
+            _held = False
+        t63 += 0.05
+    print(f"[self-test] {'PASS' if _held else 'FAIL'}  SESSION-63 DONE holds a neutral hover in place "
+          f"(state={c63on.state})")
+
+    # (63-3) the corner-give-up escalation still wins over the early finish: a drone that never reached a
+    #        corner is probably physically stuck, and must STUCK-hold rather than declare success.
+    c63g = _c63(True)
+    c63g._corner_giveup_stuck = False
+    _a, s63g, _ = c63g.step(0.05, dict(_done_plan63, corner_giveup_stuck=True), False)
+    giveup_wins = s63g == "STUCK"
+    print(f"[self-test] {'PASS' if giveup_wins else 'FAIL'}  SESSION-63 corner give-up still outranks the "
+          f"early finish (-> {s63g})")
+
+    # (63-4) _signal_finish_stops: touches every path, returns a summary line, and ANNUNCIATES a failure
+    #        instead of swallowing it -- the operator must know an artifact was not flushed early.
+    import shutil as _sh63, tempfile as _tf63   # local: autopilot.py has no module-level need
+    _td63 = _tf63.mkdtemp()
+    try:
+        _p1 = os.path.join(_td63, "stop_a")
+        _p2 = os.path.join(_td63, "stop_b")
+        _lines_ok = _signal_finish_stops((_p1, _p2), "PFX")
+        touched_ok = (os.path.exists(_p1) and os.path.exists(_p2)
+                      and len(_lines_ok) == 1 and "2/2" in _lines_ok[0] and "PFX" in _lines_ok[0])
+        # A path inside a file (not a directory) cannot be opened -> OSError on that one only.
+        _bad = os.path.join(_p1, "nope", "stop_c")
+        _p3 = os.path.join(_td63, "stop_d")
+        _lines_bad = _signal_finish_stops((_bad, _p3), "PFX")
+        loud_ok = (any("CRITICAL" in ln for ln in _lines_bad)
+                   and os.path.exists(_p3)                 # the others are still attempted
+                   and any("1/2" in ln for ln in _lines_bad))
+        empty_ok = (_signal_finish_stops(None) == [] and _signal_finish_stops(()) == []
+                    and _signal_finish_stops(("",)) == [])
+    finally:
+        _sh63.rmtree(_td63, ignore_errors=True)
+    print(f"[self-test] {'PASS' if touched_ok and loud_ok and empty_ok else 'FAIL'}  SESSION-63 "
+          f"_signal_finish_stops (touched={touched_ok}, failure_is_loud={loud_ok}, no_op={empty_ok})")
+
+    s63_ok = (cfg63_ok and branch_ok and _held and giveup_wins and touched_ok and loud_ok and empty_ok)
+    print(f"[self-test] {'PASS' if s63_ok else 'FAIL'}  SESSION-63 END AT POSTLUDE overall")
+    assert s63_ok, "session-63 end at postlude"
+
     # ---- SESSION-58 DEAD-GOAL BUMP GUARD -----------------------------------------------------------
     # 22:40:24.170 BLACKLIST PERMANENT retired goal=[3.9,-3.6] -> 22:40:25.165 bump pulse #2 fired against
     # that SAME dead goal and backed off, because neither _register_bump nor the SLAM_HOLD settle-resume
@@ -12176,6 +12323,11 @@ def main():
                         help="override the mission's SAFETY timeout for until-contact steps (seconds)")
     parser.add_argument("--log", action="store_true",
                         help="write the verdict log (rec_frame-prefixed) + a CSV to OUTPUT/diag/")
+    parser.add_argument("--finish-stops", default=None,
+                        help="--explore: comma-separated sentinel paths to touch once the mission "
+                             "reaches DONE, so those processes (perception, visualizer) finalize "
+                             "their artifacts immediately instead of waiting for the launcher's "
+                             "teardown. This process stays alive holding a neutral hover.")
     parser.add_argument("--stop-file", default=None,
                         help="--explore: path to a sentinel file; when it appears, exit the loop CLEANLY "
                              "(runs the shutdown that emits the replay map backdrop + closes diag). Lets a "
@@ -12195,7 +12347,9 @@ def main():
             except OSError:
                 pass
         stop_event = _FileStopEvent(args.stop_file) if args.stop_file else None
-        run_explore(cfg, stop_event=stop_event, log=args.log, no_takeoff=args.no_takeoff)
+        _finish_stops = tuple(p for p in (args.finish_stops or "").split(",") if p.strip())
+        run_explore(cfg, stop_event=stop_event, log=args.log, no_takeoff=args.no_takeoff,
+                    finish_stops=_finish_stops)
     else:
         run_mission(cfg, mission_path=args.mission, max_contact_s=args.max_contact_s, log=args.log)
 

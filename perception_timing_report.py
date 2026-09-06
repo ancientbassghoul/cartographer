@@ -45,7 +45,10 @@ REPO = Path(__file__).resolve().parent
 PHASE_COLUMNS: tuple[str, ...] = (
     "slam_ms", "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
-    "frame_ms", "infer_ms", "tracker_ms")            # session 63, appended
+    "frame_ms", "infer_ms", "tracker_ms",            # session 63, appended
+    "backend_thread_ms")                             # session 64: the one true duration among the
+                                                       # four backend-state columns (C3) -- the other
+                                                       # three live in _BACKEND_STATE_COLUMNS instead
 
 # Session 62: mirror of slam_engine.SLAM_PHASE_FIELDS, hand-kept for the same reason as
 # PHASE_COLUMNS above. These four are exactly what phase_closure() sums against slam_ms.
@@ -56,6 +59,14 @@ _SLAM_PHASE_FIELDS: tuple[str, ...] = ("track_ms", "backend_ms", "pose_ms", "kf_
 # because the four above close against slam_ms while these three close against track_ms -- two
 # different invariants, and merging them would break both.
 _TRACK_PHASE_FIELDS: tuple[str, ...] = ("frame_ms", "infer_ms", "tracker_ms")
+
+# Session 64 (C3): mirror of the three non-duration backend-state columns from
+# perception_worker.DIAG_PERF_FIELDS. Deliberately excluded from PHASE_COLUMNS/render_table:
+# backend_mode is a string (SYNC/ASYNC/FAILED), backend_queue_depth is a live queue length, and
+# backend_pose_clobbers is a cumulative counter -- render_table's "median/p90 of milliseconds"
+# treatment would misrepresent all three. They get their own summary line, backend_summary() below.
+_BACKEND_STATE_COLUMNS: tuple[str, ...] = (
+    "backend_mode", "backend_queue_depth", "backend_pose_clobbers")
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,50 @@ def track_closure(rows) -> PhaseStats:
     return _stats_from_values("track_closure_residual_ms", residuals, n_blank)
 
 
+def backend_summary(rows) -> str:
+    """One-line summary of the session-64 backend-thread state (C3/C4): distinct backend_mode
+    values with their row counts, median/max backend_queue_depth, and the final (maximum)
+    backend_pose_clobbers -- it is cumulative, so a mean/median would be meaningless. Returns the
+    exact string "backend state: unavailable (file predates session 64)" when any of
+    _BACKEND_STATE_COLUMNS is absent (including an empty `rows`, which carries no header at all --
+    same reasoning as present_columns([]) above). Blank/unparseable cells are counted and named via
+    PhaseStats.n_blank, never coerced to 0."""
+    if not rows or any(c not in rows[0].keys() for c in _BACKEND_STATE_COLUMNS):
+        return "backend state: unavailable (file predates session 64)"
+
+    mode_counts: dict = {}
+    n_blank_mode = 0
+    for row in rows:
+        mode = row.get("backend_mode", "")
+        if mode == "":
+            n_blank_mode += 1
+            continue
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    mode_parts = [f"{m}={n}" for m, n in sorted(mode_counts.items())]
+    if n_blank_mode:
+        mode_parts.append(f"blank={n_blank_mode}")
+    modes_str = ", ".join(mode_parts)
+
+    depth = phase_stats(rows, "backend_queue_depth")
+    clobbers = phase_stats(rows, "backend_pose_clobbers")
+
+    line = (f"backend state: mode=[{modes_str}] "
+            f"queue_depth median={depth.median:.0f} max={depth.maximum:.0f} "
+            f"(n={depth.n} n_blank={depth.n_blank}) "
+            f"pose_clobbers={clobbers.maximum:.0f} (n={clobbers.n} n_blank={clobbers.n_blank})")
+
+    # Session 64: if the thread died, the REASON is the most useful line in this whole report -- the
+    # CRITICAL message carrying it goes to a console fly.py opens with CREATE_NEW_CONSOLE and never
+    # captures, so this column is its only surviving copy. Read with .get() rather than adding it to
+    # _BACKEND_STATE_COLUMNS on purpose: CSVs written by the FIRST session-64 build carry the other
+    # four but not this one, and gating on it would report those files as predating session 64
+    # entirely. The value is latched once set, so the first non-blank cell is the reason.
+    first_error = next((e for e in (r.get("backend_error", "").strip() for r in rows) if e), "")
+    if first_error:
+        line += "\n*** BACKEND FAILED: " + first_error + " ***"
+    return line
+
+
 def bucket_by_minute(rows, minutes: float = 5.0):
     """Bucket rows by wall_ts relative to the first row's wall_ts, in `minutes`-wide windows.
     A row with a blank/unparseable wall_ts goes to its own "unparseable wall_ts" bucket — reported,
@@ -290,6 +345,7 @@ def report(csv_path) -> str:
                       f"median={tc.median:.1f}ms p90={tc.p90:.1f}ms max={tc.maximum:.1f}ms")
     else:
         lines.append("Track phase closure: unavailable (missing phase columns, see banner above)")
+    lines.append(backend_summary(rows))
     lines.append("")
 
     lines.append(render_table("By flight-minute", bucket_by_minute(rows)))
@@ -416,8 +472,12 @@ def run_self_test() -> None:
             w.writerow(row)
         rows5f = load_rows(path5f)
         _present5f, missing5f = present_columns(rows5f)
-        check("track_closure -- missing_column -- all three session-63 columns reported missing",
-              set(missing5f) == {"frame_ms", "infer_ms", "tracker_ms"})
+        # This fixture predates session 63 AND session 64 (PHASE_COLUMNS now also carries
+        # backend_thread_ms, appended in C3), so present_columns() names all four as missing --
+        # computed against the live PHASE_COLUMNS rather than hand-listed, so this stays correct
+        # across future appends the same way check 4's assertion already does.
+        check("track_closure -- missing_column -- session-63 + session-64 columns reported missing",
+              set(missing5f) == set(PHASE_COLUMNS) - set(session62_cols))
         raised5f = False
         try:
             track_closure(rows5f)
@@ -449,6 +509,63 @@ def run_self_test() -> None:
         check("both_closures -- report() contains both closure lines",
               "SLAM phase closure (slam_ms - sum(phases))" in report5g
               and "Track phase closure (track_ms - sum(phases))" in report5g)
+
+        # 5h. Session 64: backend_summary on a mixed-mode CSV -- distinct backend_mode values with
+        # their counts, queue_depth median/max over parseable rows only (one blank), and
+        # backend_pose_clobbers as the final/maximum value.
+        rows5h = [
+            {"backend_mode": "SYNC", "backend_queue_depth": "0", "backend_pose_clobbers": "0"},
+            {"backend_mode": "ASYNC", "backend_queue_depth": "2", "backend_pose_clobbers": "0"},
+            {"backend_mode": "ASYNC", "backend_queue_depth": "", "backend_pose_clobbers": "1"},
+            {"backend_mode": "ASYNC", "backend_queue_depth": "4", "backend_pose_clobbers": "3"},
+            {"backend_mode": "FAILED", "backend_queue_depth": "4", "backend_pose_clobbers": "3"},
+        ]
+        summary5h = backend_summary(rows5h)
+        check("backend_summary -- names each mode with its row count",
+              "SYNC=1" in summary5h and "ASYNC=3" in summary5h and "FAILED=1" in summary5h)
+        check("backend_summary -- queue_depth median/max over parseable rows, blank counted",
+              "queue_depth median=3 max=4 (n=4 n_blank=1)" in summary5h)
+        check("backend_summary -- pose_clobbers reported as final/max value, not mean/median",
+              "pose_clobbers=3 (n=5 n_blank=0)" in summary5h)
+
+        # 5i. Session 64: absent backend-state columns (pre-session-64 file, including an empty
+        # `rows`) yield the exact unavailable string -- never a KeyError, never zero-filled.
+        check("backend_summary -- missing columns -> exact unavailable string",
+              backend_summary([{"slam_ms": "1.0"}])
+              == "backend state: unavailable (file predates session 64)")
+        check("backend_summary -- empty rows -> exact unavailable string",
+              backend_summary([]) == "backend state: unavailable (file predates session 64)")
+
+        # 5j. report() on the pre-session-64 fixture (path4 from check 4) still prints both closure
+        # lines normally AND the backend-unavailable line -- one missing feature must not suppress
+        # another.
+        report4_again = report(path4)
+        check("backend_summary -- report() on legacy CSV shows unavailable line alongside closures",
+              "backend state: unavailable (file predates session 64)" in report4_again
+              and "SLAM phase closure" in report4_again
+              and "Track phase closure" in report4_again)
+
+        # 5k. A fully modern session-64 CSV: report() renders a populated backend_summary line.
+        path5k = Path(tmp_dir) / "session64.csv"
+        fields5k = (("wall_ts", "frame_id", "mode", "new_keyframe") + PHASE_COLUMNS
+                    + _BACKEND_STATE_COLUMNS)
+        with open(path5k, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields5k)
+            w.writeheader()
+            for i, m in enumerate(("SYNC", "ASYNC", "ASYNC")):
+                row = {c: "1.0" for c in PHASE_COLUMNS}
+                row.update(wall_ts=str(float(i)), frame_id=str(i), mode="TRACKING",
+                           new_keyframe="0", backend_mode=m, backend_queue_depth=str(i),
+                           backend_pose_clobbers=str(i))
+                w.writerow(row)
+        report5k = report(path5k)
+        check("backend_summary -- report() on a modern session-64 CSV shows a populated line",
+              "backend state: mode=[ASYNC=2, SYNC=1]" in report5k)
+
+        # 5l. PHASE_COLUMNS carries backend_thread_ms (a real duration) but not the three
+        # state columns -- those belong to _BACKEND_STATE_COLUMNS instead (C3).
+        check("PHASE_COLUMNS -- contains backend_thread_ms, not backend_mode",
+              "backend_thread_ms" in PHASE_COLUMNS and "backend_mode" not in PHASE_COLUMNS)
 
         # 6. Minute buckets: 12 minutes of wall_ts at minutes=5.0 -> three buckets, in order.
         rows6 = [{"wall_ts": str(float(m * 60))} for m in range(0, 13)]
@@ -489,6 +606,48 @@ def run_self_test() -> None:
                                 columns=("slam_ms", "backend_ms"))
         check("render -- missing column renders '--' and is named in caption",
               "--" in table9b and "backend_ms" in table9b)
+
+        # 10. Session 64 (operator ask): a dead backend thread must stay diagnosable from ARTIFACTS
+        #     ALONE. The CRITICAL line naming the reason is printed to a console fly.py opens with
+        #     CREATE_NEW_CONSOLE and never captures, so it dies with the window -- backend_mode=FAILED
+        #     records only THAT it failed. Pin that the reason reaches the report, and that a CSV from
+        #     the FIRST session-64 build (four backend columns, no backend_error) still reports
+        #     normally rather than being dismissed as predating the session.
+        cols10 = list(PHASE_COLUMNS) + ["wall_ts", "mode", "new_keyframe", "backend_mode",
+                                        "backend_queue_depth", "backend_pose_clobbers",
+                                        "backend_error"]
+        p10 = Path(tmp_dir) / "failed_perception.csv"
+        with open(p10, "w", newline="", encoding="utf-8") as fh10:
+            w10 = csv.DictWriter(fh10, fieldnames=cols10)
+            w10.writeheader()
+            for k10 in range(4):
+                r10 = {c: "0" for c in cols10}
+                r10.update(wall_ts=str(1000.0 + k10), mode="TRACKING", new_keyframe="0",
+                           backend_mode="FAILED", backend_queue_depth=str(k10),
+                           backend_pose_clobbers="0",
+                           backend_error=("" if k10 == 0 else
+                                          "RuntimeError: CUDA error: an illegal memory access"))
+                w10.writerow(r10)
+        rows10 = load_rows(p10)
+        sum10 = backend_summary(rows10)
+        check("session64 -- backend_error reaches the report",
+              "BACKEND FAILED" in sum10 and "illegal memory access" in sum10 and "FAILED=4" in sum10)
+        check("session64 -- no failure banner while healthy",
+              "BACKEND FAILED" not in backend_summary(
+                  [dict(r, backend_mode="ASYNC", backend_error="") for r in rows10]))
+
+        cols10b = [c for c in cols10 if c != "backend_error"]
+        p10b = Path(tmp_dir) / "first_build_perception.csv"
+        with open(p10b, "w", newline="", encoding="utf-8") as fh10b:
+            w10b = csv.DictWriter(fh10b, fieldnames=cols10b)
+            w10b.writeheader()
+            r10b = {c: "0" for c in cols10b}
+            r10b.update(wall_ts="1000.0", mode="TRACKING", new_keyframe="0",
+                        backend_mode="ASYNC", backend_queue_depth="0", backend_pose_clobbers="0")
+            w10b.writerow(r10b)
+        sum10b = backend_summary(load_rows(p10b))
+        check("session64 -- a first-build CSV (no backend_error column) still reports normally",
+              "unavailable" not in sum10b and "ASYNC=1" in sum10b and "BACKEND FAILED" not in sum10b)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

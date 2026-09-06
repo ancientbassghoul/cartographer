@@ -646,7 +646,25 @@ def render_lkg_panel(canvas, info=None, age_s=None, w=PANEL_W, h=MAP_SIZE):
     return panel
 
 
-def render_status(pose, width, reloc_active, target=None):
+def backend_status_text(map_payload):
+    """Session 64: compact backend-thread status for the top strip -- "" when the payload predates
+    Session 64 (no "backend_mode" key), so an older flight/replay renders exactly as it always did.
+    FAILED is the operator-visible signal that global optimization has stopped (CLAUDE.md rule 3);
+    a nonzero clobber count is reported but is NOT an alarm (see render_status: expected + self-
+    correcting, colouring it red would train the operator to ignore red)."""
+    if not map_payload or "backend_mode" not in map_payload:
+        return ""
+    mode = map_payload.get("backend_mode")
+    if mode == "FAILED":
+        return "bk=FAILED"
+    txt = f"bk={mode} q{map_payload.get('backend_queue_depth', 0)}"
+    clobbers = map_payload.get("backend_pose_clobbers", 0)
+    if clobbers:
+        txt += f" clob{clobbers}"
+    return txt
+
+
+def render_status(pose, width, reloc_active, target=None, map_payload=None):
     # Two-line strip: SLAM state on top, the target estimate below.
     strip = np.full((STATUS_H, width, 3), 45, np.uint8)
     if pose is None:
@@ -659,6 +677,11 @@ def render_status(pose, width, reloc_active, target=None):
     # Default tracking mode = green; anything else = orange (a fallback must never be silent).
     col = (0, 255, 0) if tm == "MASt3R" else (0, 165, 255)
     cv2.putText(strip, txt, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+    bk_txt = backend_status_text(map_payload)
+    if bk_txt:
+        (txt_w, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        bk_col = (0, 0, 255) if bk_txt == "bk=FAILED" else col
+        cv2.putText(strip, bk_txt, (8 + txt_w + 16, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, bk_col, 1)
     if reloc_active:
         cv2.putText(strip, "RELOC!", (width - 95, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
@@ -752,7 +775,7 @@ class Dashboard:
         body = np.hstack([lkg_p, row_gap, left, row_gap, map_p])  # (MAP_SIZE, width)
 
         reloc_active = (time.monotonic() - self._last_reloc) < RELOC_FLASH_S
-        status = render_status(self.pose, body.shape[1], reloc_active, self.target)
+        status = render_status(self.pose, body.shape[1], reloc_active, self.target, self.map)
         return np.vstack([status, body])
 
 
@@ -1101,6 +1124,41 @@ def run_self_test():
     case("(62-13) `unknown` does NOT borrow the stuck alarm colour (absence of evidence is not alarm)",
          not has_bgr(render_telemetry_panel({"state": "SETTLE", "recovery": None, "push": _punk},
                                             {})[200:, :], (0, 200, 255)))
+
+    # ---- SESSION-64 BACKEND STATUS: "" for pre-session-64 payloads (older flight/replay renders
+    # unchanged); ASYNC/FAILED surfaced in the top strip; FAILED reads red, a nonzero clobber count
+    # (expected + self-correcting, see C4) does NOT -- colouring it red would train the operator to
+    # ignore red. ------------------------------------------------------------------------------------
+    case("(64-1) backend_status_text({}) == \"\" and backend_status_text(None) == \"\" (older flight)",
+         backend_status_text({}) == "" and backend_status_text(None) == "")
+
+    _bk_async = backend_status_text({"backend_mode": "ASYNC", "backend_queue_depth": 2,
+                                      "backend_pose_clobbers": 0})
+    case(f"(64-2) ASYNC q2, no clobbers -> contains ASYNC and q2, no clob (got {_bk_async!r})",
+         "ASYNC" in _bk_async and "q2" in _bk_async and "clob" not in _bk_async)
+
+    _bk_clob = backend_status_text({"backend_mode": "ASYNC", "backend_queue_depth": 2,
+                                     "backend_pose_clobbers": 7})
+    case(f"(64-3) nonzero clobbers -> adds clob (got {_bk_clob!r})", "clob" in _bk_clob)
+
+    _bk_failed = backend_status_text({"backend_mode": "FAILED", "backend_queue_depth": 5,
+                                       "backend_pose_clobbers": 0})
+    case(f"(64-4) FAILED -> contains FAILED (got {_bk_failed!r})", "FAILED" in _bk_failed)
+
+    _pose64 = {"tracking_mode": "MASt3R", "mode": "TRACKING", "n_keyframes": 5, "n_voxels": 100,
+               "slam_ms": 50.0}
+    dash64 = Dashboard()
+    dash64.pose = _pose64
+    dash64.map = {"backend_mode": "FAILED", "backend_queue_depth": 5, "backend_pose_clobbers": 0}
+    _strip_failed = dash64.render()[:STATUS_H, :]
+    case(f"(64-5) FAILED status strip is red (has_red={has_bgr(_strip_failed, (0, 0, 255))})",
+         has_bgr(_strip_failed, (0, 0, 255)))
+
+    dash64.map = {"backend_mode": "ASYNC", "backend_queue_depth": 2, "backend_pose_clobbers": 7}
+    _strip_async_clob = dash64.render()[:STATUS_H, :]
+    case(f"(64-6) ASYNC+clobbers status strip has NO red (has_red="
+         f"{has_bgr(_strip_async_clob, (0, 0, 255))})",
+         not has_bgr(_strip_async_clob, (0, 0, 255)))
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
