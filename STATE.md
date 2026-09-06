@@ -37,9 +37,20 @@ then steps up **7-17x within two minutes of takeoff** and never returns:
 GPU contention with Unity (real — replays run 1.0-1.4 s/frame vs 2.4-7.3 live — but constant across
 every flight, so it cannot explain a step change at takeoff or a 2x gap between two same-config
 flights). **Something changes state once the vehicle is airborne, in a process whose inputs are
-provably identical.** Cheapest next measurement: log the Gauss-Newton iteration count + convergence
-reason per `tracker.track()` call and correlate against `tracker_ms`. Full write-up with every table:
-`plans/slam_report.html`.
+provably identical.**
+
+**NEXT STEP — instrument `tracker.track()` and fly once.** Log three numbers per call: the GN
+**iteration count**, the **convergence reason** (`rel_error` / `delta_norm` / hit the `max_iters: 50`
+ceiling), and the **match/inlier count** the solve started from. No behavioural change, and the
+frame-exact replay of that flight is a matched control. Decisive either way:
+- **Iterations climb at takeoff** -> the accumulator is the warm-start feedback loop (worse tracking
+  -> worse `idx_f2k` seed -> more iterations -> slower -> worse tracking). Real knobs: `max_iters`,
+  `rel_error`, or reseeding `idx_f2k` from retrieval instead of the previous frame.
+- **Iterations flat while `tracker_ms` rises** -> the cost is not in the solver; it is process-level
+  state a replay never accumulates (CUDA allocator fragmentation, retrieval-DB growth, sim
+  contention scaling with map size). The same log eliminates the solver and redirects the hunt.
+
+Full write-up with every table, and this plan in section 03: `plans/slam_report.html`.
 
 **Do not resume the constant-factor optimisation work before this is understood.** Sessions 63-66
 produced real, measured improvements that do not touch this, and chasing more of them is yak-shaving.

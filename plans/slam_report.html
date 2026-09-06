@@ -279,6 +279,30 @@
     <p>Something accumulates or changes state once the vehicle is airborne, inside a process whose
        inputs are provably identical. That is the whole problem. Everything below is smaller.</p>
   </div>
+
+  <div class="lever">
+    <h3>The next step <span class="tag hi">Do this first</span> <span class="tag">One flight</span></h3>
+    <p><b>Instrument <code>tracker.track()</code> and fly once.</b> Log three numbers per call: the
+       Gauss-Newton <b>iteration count</b>, the <b>convergence reason</b> (converged on
+       <code>rel_error</code>, on <code>delta_norm</code>, or hit the <code>max_iters: 50</code>
+       ceiling), and the <b>match / inlier count</b> the solve started from. No behavioural change, no
+       new dependency, and the frame-exact replay of that same flight is a matched control.</p>
+    <p>The measurement is decisive either way, which is why it comes before any further optimisation:</p>
+    <p class="how"><b>If iterations climb at takeoff</b> &rarr; the accumulator is the warm-start
+       feedback loop: degrading tracking quality produces a worse seed
+       (<code>idx_f2k</code> comes from the previous frame), which needs more iterations, which is
+       slower, which degrades tracking further. That is a closed loop with real knobs &mdash;
+       <code>max_iters</code>, <code>rel_error</code>, or reseeding <code>idx_f2k</code> from
+       retrieval rather than from the previous frame.</p>
+    <p class="how"><b>If iterations stay flat while <code>tracker_ms</code> rises</b> &rarr; the cost
+       is not in the solver at all, and the cause is process-level state that a replay never
+       accumulates: CUDA allocator fragmentation across a long-lived process, retrieval-database
+       growth, or contention with the simulator that worsens as the map grows. The same log
+       eliminates the solver and points the next measurement at memory rather than mathematics.</p>
+    <p class="how"><b>Do not resume constant-factor optimisation before this runs.</b> The window,
+       the map-publish cache and the backend thread are all real, measured work that leaves this
+       untouched.</p>
+  </div>
 </section>
 
 <section>
@@ -409,8 +433,9 @@
          Candidates not yet separated: Gauss-Newton iteration count rising as the warm start
          (<code>idx_f2k</code>) degrades; the retrieval database growing; CUDA allocator
          fragmentation across a long-lived process; contention with the simulator that worsens as the
-         map grows. <b>The cheapest next measurement is the GN iteration count and convergence reason
-         per call</b> &mdash; it confirms or kills the feedback-loop hypothesis outright.</p></li>
+         map grows. The planned measurement is in section&nbsp;03 &mdash; <b>are there known failure
+         modes in this tracker where convergence degrades as the keyframe graph or scale drift
+         grows?</b></p></li>
     <li><b>Is a step change at takeoff a clue or a coincidence?</b>
       <p>Every flight sits at ~370&nbsp;ms on the ground and jumps 7&ndash;17&times; within two minutes
          of leaving it, then plateaus rather than continuing to climb. A plateau argues against
