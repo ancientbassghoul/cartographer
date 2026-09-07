@@ -680,6 +680,25 @@ def backend_status_text(map_payload):
     return txt
 
 
+TRACKER_GN_MAX_ITERS = 50   # Session 67 (CHUNK 5): mirrors third_party/MASt3R-SLAM/config/base.yaml's
+                            # tracker.max_iters. Display-only -- that config lives in the SLAM process
+                            # and is never published on the bus, so this is NOT read live; if the
+                            # vendored config's ceiling is ever retuned, this constant must follow it.
+
+
+def tracker_status_text(map_payload):
+    """Session 67 (CHUNK 5): compact GN-solver status for the top strip -- "" when the payload
+    predates session 67 (no "trk_gn_exit" key), so an older flight/replay renders exactly as it
+    always did, and also "" when trk_gn_exit == "" (track() did not run this frame: INIT/RELOC),
+    since there is nothing to report. Otherwise a compact gn=<iters>/<ceiling>, e.g. "gn=12/50".
+    """
+    if not map_payload or "trk_gn_exit" not in map_payload:
+        return ""
+    if map_payload.get("trk_gn_exit") == "":
+        return ""
+    return f"gn={map_payload.get('trk_gn_iters', 0)}/{TRACKER_GN_MAX_ITERS}"
+
+
 def render_status(pose, width, reloc_active, target=None, map_payload=None):
     # Two-line strip: SLAM state on top, the target estimate below.
     strip = np.full((STATUS_H, width, 3), 45, np.uint8)
@@ -693,11 +712,21 @@ def render_status(pose, width, reloc_active, target=None, map_payload=None):
     # Default tracking mode = green; anything else = orange (a fallback must never be silent).
     col = (0, 255, 0) if tm == "MASt3R" else (0, 165, 255)
     cv2.putText(strip, txt, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+    (txt_w, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    cursor_x = 8 + txt_w + 16
     bk_txt = backend_status_text(map_payload)
     if bk_txt:
-        (txt_w, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         bk_col = (0, 0, 255) if bk_txt == "bk=FAILED" else col
-        cv2.putText(strip, bk_txt, (8 + txt_w + 16, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, bk_col, 1)
+        cv2.putText(strip, bk_txt, (cursor_x, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, bk_col, 1)
+        (bk_w, _), _ = cv2.getTextSize(bk_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cursor_x += bk_w + 16
+    # Session 67 (CHUNK 5): the GN-solver segment, next to the session-64 backend segment. max_iters
+    # is the only exit that reads red -- hitting the ceiling is the degraded state (CLAUDE.md rule 3),
+    # converging via rel_error/delta_norm is not.
+    tk_txt = tracker_status_text(map_payload)
+    if tk_txt:
+        tk_col = (0, 0, 255) if (map_payload or {}).get("trk_gn_exit") == "max_iters" else col
+        cv2.putText(strip, tk_txt, (cursor_x, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, tk_col, 1)
     if reloc_active:
         cv2.putText(strip, "RELOC!", (width - 95, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
@@ -1221,6 +1250,33 @@ def run_self_test():
     _strip_on = dash65.render()[:STATUS_H, :]
     case(f"(65-7) ON status strip has NO red (has_red={has_bgr(_strip_on, (0, 0, 255))})",
          not has_bgr(_strip_on, (0, 0, 255)))
+
+    # ---- SESSION-67 TRACKER STATUS (CHUNK 5): "" for pre-session-67 payloads (no "trk_gn_exit" key)
+    # and for trk_gn_exit == "" (INIT/RELOC never ran a solve); otherwise a compact gn=<iters>/<ceiling>.
+    # max_iters is the ONLY exit that reads red -- hitting the ceiling is the degraded state (CLAUDE.md
+    # rule 3), converging via rel_error/delta_norm is not. ---------------------------------------------
+    case("(67-1) tracker_status_text({}) == \"\" and tracker_status_text(None) == \"\" (older flight)",
+         tracker_status_text({}) == "" and tracker_status_text(None) == "")
+
+    case("(67-2) trk_gn_exit == \"\" (INIT/RELOC) -> \"\"",
+         tracker_status_text({"trk_gn_exit": "", "trk_gn_iters": 0}) == "")
+
+    _tk_rel = tracker_status_text({"trk_gn_exit": "rel_error", "trk_gn_iters": 12})
+    case(f"(67-3) rel_error at 12 iters -> contains gn=12 (got {_tk_rel!r})", "gn=12" in _tk_rel)
+
+    dash67 = Dashboard()
+    dash67.pose = _pose64
+    dash67.map = {"backend_mode": "SYNC", "backend_queue_depth": 0, "backend_pose_clobbers": 0,
+                  "trk_gn_exit": "max_iters", "trk_gn_iters": 50}
+    _strip_maxiters = dash67.render()[:STATUS_H, :]
+    case(f"(67-4) max_iters status strip is red (has_red={has_bgr(_strip_maxiters, (0, 0, 255))})",
+         has_bgr(_strip_maxiters, (0, 0, 255)))
+
+    dash67.map = {"backend_mode": "SYNC", "backend_queue_depth": 0, "backend_pose_clobbers": 0,
+                  "trk_gn_exit": "rel_error", "trk_gn_iters": 12}
+    _strip_relerror = dash67.render()[:STATUS_H, :]
+    case(f"(67-5) rel_error status strip has NO red (has_red={has_bgr(_strip_relerror, (0, 0, 255))})",
+         not has_bgr(_strip_relerror, (0, 0, 255)))
 
     print(f"\n[self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok

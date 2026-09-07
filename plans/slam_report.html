@@ -184,11 +184,14 @@
   <div class="sec-head"><span class="sec-num">01</span><h2>Verdict</h2></div>
   <div class="verdicts">
     <div class="v">
-      <span class="grade g-open">The open problem</span>
+      <span class="grade g-settled">Solved &mdash; session 68</span>
       <h3>It degrades only in flight</h3>
       <p><code>tracker_ms</code> is <b>flat at ~250&ndash;400&nbsp;ms</b> across a deterministic replay
          of the exact frames a flight consumed &mdash; and <b>2&nbsp;000&ndash;6&nbsp;000&nbsp;ms</b> on
          the live flight those frames came from. Same code, same frames, same order.</p>
+      <p><b>The cause is not in this codebase.</b> The GPU thermally throttles to
+         <b>210&nbsp;MHz of a 2&nbsp;100&nbsp;MHz ceiling</b> within two minutes of sustained load.
+         See section&nbsp;03.</p>
     </div>
     <div class="v">
       <span class="grade g-settled">Shipped</span>
@@ -281,27 +284,102 @@
   </div>
 
   <div class="lever">
-    <h3>The next step <span class="tag hi">Do this first</span> <span class="tag">One flight</span></h3>
-    <p><b>Instrument <code>tracker.track()</code> and fly once.</b> Log three numbers per call: the
-       Gauss-Newton <b>iteration count</b>, the <b>convergence reason</b> (converged on
-       <code>rel_error</code>, on <code>delta_norm</code>, or hit the <code>max_iters: 50</code>
-       ceiling), and the <b>match / inlier count</b> the solve started from. No behavioural change, no
-       new dependency, and the frame-exact replay of that same flight is a matched control.</p>
-    <p>The measurement is decisive either way, which is why it comes before any further optimisation:</p>
-    <p class="how"><b>If iterations climb at takeoff</b> &rarr; the accumulator is the warm-start
-       feedback loop: degrading tracking quality produces a worse seed
-       (<code>idx_f2k</code> comes from the previous frame), which needs more iterations, which is
-       slower, which degrades tracking further. That is a closed loop with real knobs &mdash;
-       <code>max_iters</code>, <code>rel_error</code>, or reseeding <code>idx_f2k</code> from
-       retrieval rather than from the previous frame.</p>
-    <p class="how"><b>If iterations stay flat while <code>tracker_ms</code> rises</b> &rarr; the cost
-       is not in the solver at all, and the cause is process-level state that a replay never
-       accumulates: CUDA allocator fragmentation across a long-lived process, retrieval-database
-       growth, or contention with the simulator that worsens as the map grows. The same log
-       eliminates the solver and points the next measurement at memory rather than mathematics.</p>
-    <p class="how"><b>Do not resume constant-factor optimisation before this runs.</b> The window,
-       the map-publish cache and the backend thread are all real, measured work that leaves this
-       untouched.</p>
+    <h3>What the instrumentation said <span class="tag hi">Flown</span> <span class="tag">Hypothesis rejected</span></h3>
+    <p><b>Session 67 wrapped <code>tracker.track()</code></b> (not copied &mdash;
+       <code>third_party/</code> stays pristine) to log, per call: the Gauss-Newton
+       <b>iteration count</b>, the <b>convergence reason</b>, the <b>match&nbsp;/&nbsp;inlier count</b>
+       the solve started from, and a fixed-work&nbsp;/&nbsp;solve-work split
+       (<code>trk_pre_ms</code>&nbsp;/&nbsp;<code>trk_solve_ms</code>). It flew on 2026-09-07, and it
+       killed the hypothesis it was built to test.</p>
+    <p class="how"><b>Gauss-Newton iterations are flat.</b> Median 4&ndash;7 for the entire flight,
+       no trend. There is exactly one step &mdash; 1&nbsp;&rarr;&nbsp;6 at t&nbsp;=&nbsp;22&nbsp;s,
+       when the drone first <em>moves</em>, because a stationary camera converges in a single step.
+       <b>The warm-start <code>idx_f2k</code> feedback loop is dead as an explanation.</b></p>
+    <p class="how"><b>What grew instead grew everywhere, by the same factor.</b>
+       <code>trk_pre_ms</code> 341&nbsp;&rarr;&nbsp;3&nbsp;024&nbsp;ms; solver cost normalised per
+       iteration per 100&nbsp;k correspondences 13.1&nbsp;&rarr;&nbsp;138.7 (10.6&times;). A
+       ViT-Large forward pass and a 7-DOF Gauss-Newton step share no code, no kernels and no data,
+       yet they move in lockstep (r&nbsp;=&nbsp;+0.878) and <em>recover together</em>. CPU work
+       (<code>frame_ms</code>) stayed 4.8&nbsp;&rarr;&nbsp;6&ndash;9&nbsp;ms throughout.</p>
+    <p class="how"><b>The one weak claim, tested rather than asserted.</b> An earlier draft called
+       <code>trk_pre_ms</code> &ldquo;fixed work&rdquo;. It is not &mdash; <code>iter_proj</code> and
+       <code>refine_matches</code> are genuinely data-dependent. Measured: within the first five
+       minutes, worst-half match quality gave <code>trk_pre_ms</code> <b>344&nbsp;ms</b> and
+       best-half <b>343&nbsp;ms</b>. That channel is ~0.</p>
+  </div>
+
+  <div class="callout">
+    <h3>The answer: the GPU was running at one tenth of its clock</h3>
+    <p>Nothing in the stack logged the GPU, so session 68 added <code>gpu_probe.py</code> &mdash;
+       standalone, pure stdlib, no project imports and no GPU work of its own. Global state from
+       <code>nvidia-smi</code> (clocks, temperature, power, and the <b>throttle reason bits</b>);
+       per-process VRAM and 3D/Compute engine share from Windows performance counters, because
+       <code>nvidia-smi --query-compute-apps</code> reports per-process memory as
+       <code>[N/A]</code> under WDDM.</p>
+    <p>It flew behind a deliberately controlled manual profile &mdash; <b>park 2&nbsp;min, fly 4,
+       park 2, fly 4</b> &mdash; because a leak cannot un-leak while parked, so recoveries
+       discriminate causes that a monotone autonomous trend never could.</p>
+  </div>
+
+  <div class="scroll">
+    <table>
+      <caption><code>SwThermalSlowdown</code> was active in <b>235 of 247 samples</b>. Median clock
+        for the flight: <b>210&nbsp;MHz against a 2&nbsp;100&nbsp;MHz ceiling</b>. Peak 96&nbsp;&deg;C.</caption>
+      <thead><tr><th>t</th><th>SM clock</th><th>Temperature</th><th>Throttle reason</th></tr></thead>
+      <tbody>
+        <tr><td>17&nbsp;s</td><td class="better">1&nbsp;725&nbsp;MHz</td><td>73&nbsp;&deg;C</td><td>none</td></tr>
+        <tr><td>54&nbsp;s</td><td>780&nbsp;MHz</td><td>79&nbsp;&deg;C</td><td><b>SwThermalSlowdown</b></td></tr>
+        <tr><td>123&nbsp;s</td><td>450&nbsp;MHz</td><td>89&nbsp;&deg;C</td><td>SwThermalSlowdown</td></tr>
+        <tr class="hi"><td>146&nbsp;s &rarr; end</td><td class="worse">210&nbsp;MHz</td><td>88&ndash;96&nbsp;&deg;C</td><td>SwThermalSlowdown</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="col" style="margin-top:22px">
+    <p><b>So the headline of this report was wrong, and wrong in an instructive way.</b>
+       &ldquo;Steps up 7&ndash;17&times; within two minutes of takeoff, on every flight&rdquo; was
+       never about takeoff. It is <b>the GPU's thermal time constant</b> &mdash; throttling engages
+       at 54&nbsp;s and bottoms out at 146&nbsp;s whatever the drone is doing. The operator's own
+       flight proves it: during the first parked phase, with the aircraft stationary,
+       <code>slam_ms</code> still went 350&nbsp;&rarr;&nbsp;2&nbsp;000&nbsp;ms. Motion was never
+       involved. Every ruled-out item in the panel above was ruled out correctly; the hypothesis
+       they left standing was simply the wrong shape, because no measurement in this stack could
+       see below the CUDA API.</p>
+  </div>
+
+  <div class="lever risky">
+    <h3>Still unexplained <span class="tag md">~1.9&times; of the ~7&times;</span></h3>
+    <p>If the clock were the whole story, time&nbsp;&times;&nbsp;clock &mdash; the cycle count for
+       fixed work &mdash; would be constant. It is not, quite:</p>
+    <p class="how"><b>257&nbsp;M cycles</b> at 600&ndash;1&nbsp;000&nbsp;MHz &middot;
+       <b>263&nbsp;M</b> at 300&ndash;600&nbsp;MHz &middot; <b>482&nbsp;M</b> below 300&nbsp;MHz.
+       So the clock accounts for ~3.7&times; and something nearly doubles the cycle count at the
+       floor. Untested candidates: VRAM spill to system memory (rose +210&nbsp;MB; peak
+       10.2&nbsp;/&nbsp;16.4&nbsp;GB), the simulator's rising share, sub-300&nbsp;MHz scheduling
+       cliffs.</p>
+    <p class="how"><b>The simulator's share is real but confounded.</b> <code>Xlab_util_3d</code>
+       correlates <b>+0.955</b> with <code>trk_pre_ms</code> &mdash; the strongest number in the
+       dataset, and consistent with the operator's long-held observation that facing the east wall
+       (windows, an opening into another room) is measurably slower. But an 8&times;-slower GPU
+       raises <em>everyone's</em> busy fraction, so this data cannot separate &ldquo;Unity demanded
+       more&rdquo; from &ldquo;everything got slower&rdquo;.</p>
+  </div>
+
+  <div class="lever">
+    <h3>The next step <span class="tag hi">Do this first</span> <span class="tag">Ten minutes</span></h3>
+    <p>The GPU <b>idles at 64&ndash;65&nbsp;&deg;C</b> with nothing running (35&ndash;45&nbsp;&deg;C
+       would be normal) and draws only <b>~50&nbsp;W at 96&nbsp;&deg;C</b>, on a part that sustains
+       80&ndash;150&nbsp;W. The cooling system is not removing 50&nbsp;watts. That is dust, thermal
+       paste, a blocked intake, a soft surface or a fan curve &mdash; not a workload problem, and not
+       a software problem.</p>
+    <p class="how"><b>Raise or actively cool the machine, then re-run only the two-minute park</b>
+       with <code>gpu_probe.py</code> and watch where <code>SwThermalSlowdown</code> engages and
+       what the clock floor becomes. Nothing else needs to change to know whether it worked.</p>
+    <p class="how"><b>Everything measured before this was measured at ~10&nbsp;% clock.</b> The
+       bounded window, the map-publish cache and the backend-threading negative result are all real
+       and were all benched on a pathological baseline &mdash; they are worth re-measuring, not
+       re-doing. The relationship is also self-reinforcing in our favour: less GPU work &rarr; less
+       heat &rarr; higher clock.</p>
   </div>
 </section>
 
@@ -395,6 +473,18 @@
 <section>
   <div class="sec-head"><span class="sec-num">07</span><h2>Known defects, carried forward</h2></div>
 
+  <div class="lever blocked">
+    <h3>The machine thermally throttles to 10&nbsp;% clock <span class="tag md">Root cause &middot; not a code defect</span></h3>
+    <p>Carried at the top of this list because it dominates every other entry. The GPU idles at
+       64&ndash;65&nbsp;&deg;C and reaches 96&nbsp;&deg;C at only ~50&nbsp;W, on a part rated for
+       80&ndash;150&nbsp;W; <code>SwThermalSlowdown</code> holds the core at 210&nbsp;MHz of a
+       2&nbsp;100&nbsp;MHz ceiling for 95&nbsp;% of a flight. See section&nbsp;03.</p>
+    <p class="how"><b>Consequence for everything below:</b> every constant-factor result in this
+       report was measured on a GPU running at roughly a tenth of its clock. The findings stand as
+       relative comparisons &mdash; they were ABBA-controlled &mdash; but their absolute magnitudes
+       are not the magnitudes this stack would show on healthy hardware.</p>
+  </div>
+
   <div class="lever">
     <h3>The bounded window leaks <span class="tag md">Confirmed on flight data</span></h3>
     <p>Loop-closure edges pull out-of-window keyframes back into the solve as anchors, and
@@ -427,31 +517,39 @@
 <section>
   <div class="sec-head"><span class="sec-num">08</span><h2>Where a second opinion would help most</h2></div>
   <ul class="qs">
-    <li><b>What accumulates in MASt3R-SLAM once a vehicle is moving?</b>
-      <p>This is the only question that matters. <code>tracker.track()</code> costs ~250&nbsp;ms
-         replaying the exact frames of a flight where it cost 2&nbsp;000&ndash;6&nbsp;000&nbsp;ms.
-         Candidates not yet separated: Gauss-Newton iteration count rising as the warm start
-         (<code>idx_f2k</code>) degrades; the retrieval database growing; CUDA allocator
-         fragmentation across a long-lived process; contention with the simulator that worsens as the
-         map grows. The planned measurement is in section&nbsp;03 &mdash; <b>are there known failure
-         modes in this tracker where convergence degrades as the keyframe graph or scale drift
-         grows?</b></p></li>
-    <li><b>Is a step change at takeoff a clue or a coincidence?</b>
-      <p>Every flight sits at ~370&nbsp;ms on the ground and jumps 7&ndash;17&times; within two minutes
-         of leaving it, then plateaus rather than continuing to climb. A plateau argues against
-         unbounded accumulation and for a <em>regime change</em> &mdash; the tracker meeting a harder
-         problem and staying there.</p></li>
+    <li><b>What explains the ~1.9&times; that the clock does not?</b>
+      <p>Cycle counts for fixed work should be flat across clock bands. They are &mdash; 257&nbsp;M at
+         600&ndash;1&nbsp;000&nbsp;MHz, 263&nbsp;M at 300&ndash;600&nbsp;MHz &mdash; and then jump to
+         <b>482&nbsp;M below 300&nbsp;MHz</b>. Something nearly doubles the work per cycle at the
+         floor. VRAM spill to system memory rose +210&nbsp;MB over the flight (peak
+         10.2&nbsp;/&nbsp;16.4&nbsp;GB); the simulator's engine share rose; sub-300&nbsp;MHz may
+         simply have its own scheduling cliff. <b>Which of those is worth chasing first?</b></p></li>
+    <li><b>How much of the GPU is the simulator actually taking?</b>
+      <p><code>Xlab_util_3d</code> correlates <b>+0.955</b> with tracker cost, and looking at one
+         particular wall &mdash; windows, an opening into a second room &mdash; is reproducibly the
+         slowest thing the drone can do. But utilisation percentages are busy-fractions, so an
+         8&times;-slower GPU inflates every process's share at once. <b>What measurement separates
+         &ldquo;the renderer demanded more work&rdquo; from &ldquo;everything got slower&rdquo;
+         on a single shared GPU?</b></p></li>
     <li><b>Is 0.2&nbsp;Hz simply what this model costs on this hardware?</b>
-      <p>If ~1&nbsp;s per ViT-L pass at 512&nbsp;px on a mobile 3080 sharing a GPU with the renderer is
-         near the floor, the honest answer is architectural &mdash; a lighter tracker between
-         keyframes &mdash; rather than optimisation.</p></li>
+      <p>Still open, and now askable honestly for the first time. If ~1&nbsp;s per ViT-L pass at
+         512&nbsp;px on a mobile 3080 sharing a GPU with the renderer is near the floor <em>at full
+         clock</em>, the answer is architectural &mdash; a lighter tracker between keyframes &mdash;
+         rather than optimisation. Every previous attempt to answer this was measuring a throttled
+         machine.</p></li>
+    <li><b>What should we have measured first?</b>
+      <p>Offered as the transferable lesson rather than a question. Five sessions of increasingly
+         careful software instrumentation correctly ruled out the frames, the solver, the backend,
+         the map and the warm start &mdash; and could not see the cause, because nothing in the
+         stack could see below the CUDA API. <b>A hardware counter would have cost ten minutes on
+         day one.</b></p></li>
   </ul>
 </section>
 
 <footer>
   <span>Project Cartographer</span>
   <span>MASt3R-SLAM &middot; PyTorch &middot; CUDA</span>
-  <span>All figures from per-frame instrumentation and frame-exact replay, 2026-09-05&thinsp;&ndash;&thinsp;06</span>
+  <span>Figures from per-frame instrumentation, frame-exact replay and GPU counters, 2026-09-05&thinsp;&ndash;&thinsp;07</span>
 </footer>
 
 </div>

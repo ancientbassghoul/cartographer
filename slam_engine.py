@@ -32,6 +32,7 @@ import torch
 import lietorch
 
 import slam_window
+import slam_track_stats
 
 CARTO = Path(__file__).resolve().parent
 SLAM_REPO = CARTO / "third_party" / "MASt3R-SLAM"
@@ -78,6 +79,17 @@ class SlamResult:
     frame_ms: float = 0.0      # self._create_frame(...) — runs on EVERY frame
     infer_ms: float = 0.0      # _mast3r_inference_mono — INIT and RELOC branches only
     tracker_ms: float = 0.0    # self.tracker.track(frame) — TRACKING branch only
+    # Session 67 — the split INSIDE tracker_ms itself: fixed match-forward/pointmap work vs the
+    # data-dependent GN solve, plus the solve's exit reason and correspondence counts (slam_track_
+    # stats.TrackStats). Defaults match TRACK_STATS_ABSENT — "did not run this frame" stays
+    # distinguishable from a genuine zero (CLAUDE.md no-silent-fallback rule, applied to measurement).
+    trk_pre_ms: float = 0.0
+    trk_solve_ms: float = 0.0
+    trk_gn_iters: int = 0
+    trk_gn_exit: str = ""
+    trk_valid_opt: int = 0
+    trk_match_frac: float = 0.0
+    trk_seeded: int = 0
     # Session 64 — the backend is no longer on the frame path, so its state must be reported
     # explicitly rather than inferred from a timing column that is now always 0.0 (CLAUDE.md 2+3).
     backend_mode: str = "SYNC"          # "SYNC" | "ASYNC" | "FAILED"
@@ -127,6 +139,12 @@ SLAM_BACKEND_FIELDS: tuple[str, ...] = ("backend_mode", "backend_queue_depth",
 SLAM_WINDOW_FIELDS: tuple[str, ...] = ("backend_window_mode", "backend_window_kf", "backend_solve_kf",
                                        "backend_solve_edges", "backend_graph_edges", "backend_anchors",
                                        "backend_anchor_drift")
+
+# Session 67: the split inside tracker_ms, and the GN solve's state. A THIRD closure invariant,
+# distinct from the four SLAM_PHASE_FIELDS close against slam_ms and the three SLAM_TRACK_PHASE_
+# FIELDS close against track_ms -- these close against tracker_ms alone.
+SLAM_TRACKER_PHASE_FIELDS: tuple[str, ...] = slam_track_stats.TRACKER_PHASE_FIELDS
+SLAM_TRACKER_STATE_FIELDS: tuple[str, ...] = slam_track_stats.TRACKER_STATE_FIELDS
 
 # Session 64: how much of a backend exception text rides the CSV. Long enough for an exception type
 # plus a useful message, short enough that a per-frame column stays readable in a spreadsheet; the
@@ -226,7 +244,12 @@ class SlamEngine:
         self._mast3r_inference_mono = mast3r_inference_mono
         self._SharedKeyframes = SharedKeyframes
         self._SharedStates = SharedStates
-        self._FrameTracker = FrameTracker
+        # Session 67: FrameTracker is subclassed (not monkeypatched) so the per-track() instrumentation
+        # lives in slam_track_stats.py, never in third_party/ (CLAUDE.md: the vendored repo stays
+        # pristine) -- exactly the same factory-over-injected-base pattern as _FactorGraph below.
+        self._FrameTracker = slam_track_stats.make_instrumented_frame_tracker(FrameTracker)
+        print("[slam] tracker instrumentation: FrameTracker -> InstrumentedFrameTracker "
+              "(slam_track_stats, session 67)")
         # Session 65: FactorGraph is subclassed (not monkeypatched) so the window logic lives in
         # slam_window.py, never in third_party/ (CLAUDE.md: the vendored repo stays pristine).
         self._FactorGraph = slam_window.make_windowed_factor_graph(
@@ -269,6 +292,12 @@ class SlamEngine:
         self.keyframes = self._SharedKeyframes(mgr, self.h, self.w)
         self.states = self._SharedStates(mgr, self.h, self.w)
         self.tracker = self._FrameTracker(self.model, self.keyframes, self.device)
+        # Session 67 fail-fast guard: a missing last_track_stats means the instrumentation wrapper
+        # (slam_track_stats.make_instrumented_frame_tracker) silently didn't apply -- crash here,
+        # never fly blind with blank tracker columns nobody can diagnose after (CLAUDE.md).
+        assert hasattr(self.tracker, "last_track_stats"), (
+            "self.tracker has no last_track_stats -- slam_track_stats.make_instrumented_frame_tracker "
+            "did not wrap FrameTracker as expected")
         self.factor_graph = self._FactorGraph(
             self.model, self.keyframes, None, self.device,
             window_mode=self.window_mode, window_kf=self.window_kf,
@@ -520,6 +549,7 @@ class SlamEngine:
         ran_init = False
         infer_ms = 0.0
         tracker_ms = 0.0
+        track_stats = slam_track_stats.TRACK_STATS_ABSENT
         if mode == Mode.INIT:
             _t_infer0 = time.perf_counter()
             X, C = self._mast3r_inference_mono(self.model, frame)
@@ -535,6 +565,9 @@ class SlamEngine:
             _t_tracker0 = time.perf_counter()
             add_new_kf, _, try_reloc = self.tracker.track(frame)
             tracker_ms = (time.perf_counter() - _t_tracker0) * 1000.0
+            # Session 67: whole-object read, no lock -- last_track_stats is frozen and REPLACED by
+            # attribute rebind, never mutated, same argument as window_stats/backend_thread_ms below.
+            track_stats = self.tracker.last_track_stats
             # C4 clobber accounting deliberately does NOT happen here any more -- see
             # _poll_backend_clobber(). Taking keyframes.lock on the frame path cost 1.7% of flight
             # 20260906_000915 while the backend held it, and the backend thread can observe the
@@ -635,6 +668,10 @@ class SlamEngine:
             track_ms=track_ms, backend_ms=backend_ms, pose_ms=pose_ms,
             kf_download_ms=kf_download_ms,
             frame_ms=frame_ms, infer_ms=infer_ms, tracker_ms=tracker_ms,
+            trk_pre_ms=track_stats.trk_pre_ms, trk_solve_ms=track_stats.trk_solve_ms,
+            trk_gn_iters=track_stats.trk_gn_iters, trk_gn_exit=track_stats.trk_gn_exit,
+            trk_valid_opt=track_stats.trk_valid_opt, trk_match_frac=track_stats.trk_match_frac,
+            trk_seeded=track_stats.trk_seeded,
             backend_mode=backend_mode, backend_queue_depth=backend_queue_depth,
             backend_error=backend_error,
             backend_thread_ms=backend_thread_ms, backend_pose_clobbers=backend_pose_clobbers,

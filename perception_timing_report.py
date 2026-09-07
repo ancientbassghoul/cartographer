@@ -46,9 +46,14 @@ PHASE_COLUMNS: tuple[str, ...] = (
     "slam_ms", "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
     "frame_ms", "infer_ms", "tracker_ms",            # session 63, appended
-    "backend_thread_ms")                             # session 64: the one true duration among the
+    "backend_thread_ms",                             # session 64: the one true duration among the
                                                        # four backend-state columns (C3) -- the other
                                                        # three live in _BACKEND_STATE_COLUMNS instead
+    "trk_pre_ms", "trk_solve_ms")                     # session 67: the two true durations inside
+                                                       # tracker_ms itself (C1) -- the five state
+                                                       # columns beside them live in
+                                                       # _TRACKER_STATE_COLUMNS instead, same reasoning
+                                                       # as _BACKEND_STATE_COLUMNS below
 
 # Session 62: mirror of slam_engine.SLAM_PHASE_FIELDS, hand-kept for the same reason as
 # PHASE_COLUMNS above. These four are exactly what phase_closure() sums against slam_ms.
@@ -77,6 +82,17 @@ _BACKEND_STATE_COLUMNS: tuple[str, ...] = (
 _WINDOW_STATE_COLUMNS: tuple[str, ...] = (
     "backend_window_mode", "backend_window_kf", "backend_solve_kf", "backend_solve_edges",
     "backend_graph_edges", "backend_anchors", "backend_anchor_drift")
+
+# Session 67 (C1/C5): mirror of slam_track_stats.TRACKER_PHASE_FIELDS / TRACKER_STATE_FIELDS,
+# hand-kept for the same reason as every other mirror in this module. The two phase fields are true
+# durations and belong in PHASE_COLUMNS (render_table's median/p90 treatment is correct for them);
+# the five state columns do NOT -- trk_gn_iters/trk_valid_opt are counts, trk_gn_exit is a string,
+# trk_match_frac is a fraction, and trk_seeded is a 0/1 flag, so "median/p90 of milliseconds" would
+# misrepresent all five. They get their own artifact, tracker_trend() below, the same way
+# _BACKEND_STATE_COLUMNS/_WINDOW_STATE_COLUMNS get backend_summary()/window_summary().
+_TRACKER_PHASE_FIELDS: tuple[str, ...] = ("trk_pre_ms", "trk_solve_ms")
+_TRACKER_STATE_COLUMNS: tuple[str, ...] = ("trk_gn_iters", "trk_gn_exit", "trk_valid_opt",
+                                           "trk_match_frac", "trk_seeded")
 
 
 @dataclass(frozen=True)
@@ -199,6 +215,43 @@ def track_closure(rows) -> PhaseStats:
         track_ms, frame_ms, infer_ms, tracker_ms = (v for v, _ in cells)
         residuals.append(track_ms - (frame_ms + infer_ms + tracker_ms))
     return _stats_from_values("track_closure_residual_ms", residuals, n_blank)
+
+
+def tracker_closure(rows) -> str:
+    """Session 67 (C1): a THIRD closure line, one level down inside tracker_ms itself -- mirrors
+    phase_closure()/track_closure() exactly (same residual math, same median/p90/max/n/n_blank
+    reporting) but returns a formatted string rather than a PhaseStats, per the C5 contract, since
+    it is printed directly rather than fed to render_table.
+
+    Per-row residual tracker_ms - (trk_pre_ms + trk_solve_ms), computed over TRACKING rows only
+    (trk_gn_exit not in ("", "skipped", "error")): the "" rows never entered track() this frame and
+    the "skipped"/"error" rows never entered the solve, so trk_pre_ms there is defined as the WHOLE
+    track() call (module docstring) rather than pre-solve work -- including them would measure a
+    different invariant, not a violation of this one.
+
+    Returns the exact string "tracker closure: unavailable (file predates session 67)" when
+    tracker_ms, trk_pre_ms, trk_solve_ms or trk_gn_exit is absent from the header (including an
+    empty `rows`, which carries no header at all -- same reasoning as backend_summary() above).
+    """
+    required = ("tracker_ms",) + _TRACKER_PHASE_FIELDS + ("trk_gn_exit",)
+    if not rows or any(c not in rows[0].keys() for c in required):
+        return "tracker closure: unavailable (file predates session 67)"
+
+    residuals = []
+    n_blank = 0
+    for row in rows:
+        if row.get("trk_gn_exit", "") in ("", "skipped", "error"):
+            continue
+        cells = [_parse_float(row.get(col, "")) for col in ("tracker_ms",) + _TRACKER_PHASE_FIELDS]
+        if any(blank for _, blank in cells):
+            n_blank += 1
+            continue
+        tracker_ms, trk_pre_ms, trk_solve_ms = (v for v, _ in cells)
+        residuals.append(tracker_ms - (trk_pre_ms + trk_solve_ms))
+    s = _stats_from_values("tracker_closure_residual_ms", residuals, n_blank)
+    return (f"Tracker closure (tracker_ms - sum(trk_pre_ms+trk_solve_ms)): "
+            f"n={s.n} n_blank={s.n_blank} "
+            f"median={s.median:.1f}ms p90={s.p90:.1f}ms max={s.maximum:.1f}ms")
 
 
 def backend_summary(rows) -> str:
@@ -324,6 +377,113 @@ def window_summary(rows) -> str:
     return line
 
 
+def _mean_pct_blank(rows, column):
+    """Mean of a 0/1 column as a percentage, plus (n, n_blank) -- PhaseStats has no mean, so
+    trk_seeded (a flag, not a duration) gets this small dedicated helper instead of phase_stats."""
+    values = []
+    n_blank = 0
+    for row in rows:
+        v, blank = _parse_float(row.get(column, ""))
+        if blank:
+            n_blank += 1
+        else:
+            values.append(v)
+    mean_pct = statistics.mean(values) * 100.0 if values else 0.0
+    return mean_pct, len(values), n_blank
+
+
+def _exits_mix(rows) -> str:
+    """Compact `name:count` mix of trk_gn_exit values in a bucket, ordered by descending count
+    (ties broken alphabetically for a deterministic rendering)."""
+    counts: dict = {}
+    for row in rows:
+        exit_reason = row.get("trk_gn_exit", "")
+        counts[exit_reason] = counts.get(exit_reason, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{name}:{count}" for name, count in ordered)
+
+
+def tracker_trend(rows) -> str:
+    """Session 67 (C1) -- the decisive artifact: does trk_gn_iters climb across a flight while
+    tracker_ms rises too (the warm-start `idx_f2k` feedback loop is the accumulator), or does
+    tracker_ms rise while iterations stay flat (the accumulator is process-level state, not the
+    solver)? Splits every row with a non-empty trk_gn_exit -- INIT/RELOC rows (`""`) never entered
+    track() this frame and are excluded, but "skipped"/"error" rows ARE included here (unlike
+    tracker_closure() above, which needs a completed solve to close a residual against) -- into
+    five equal-count buckets ordered by wall_ts, and reports medians per bucket plus the
+    seeded-warm-start percentage and the exit-reason mix.
+
+    Returns the exact string "tracker stats: unavailable (file predates session 67)" when
+    wall_ts, tracker_ms, trk_gn_exit, or any _TRACKER_PHASE_FIELDS/_TRACKER_STATE_COLUMNS name is
+    absent from the header (including an empty `rows`). Blank/unparseable cells are counted and
+    named per bucket (`(blank=N)`), never coerced to 0 (CLAUDE.md).
+    """
+    required = (("wall_ts", "tracker_ms", "trk_gn_exit") + _TRACKER_PHASE_FIELDS
+                + _TRACKER_STATE_COLUMNS)
+    if not rows or any(c not in rows[0].keys() for c in required):
+        return "tracker stats: unavailable (file predates session 67)"
+
+    tracked = [row for row in rows if row.get("trk_gn_exit", "") != ""]
+    if not tracked:
+        return "tracker stats: no TRACKING rows (trk_gn_exit was blank on every row)"
+
+    timed = []
+    n_unparseable_ts = 0
+    for row in tracked:
+        ts, blank = _parse_float(row.get("wall_ts", ""))
+        if blank:
+            n_unparseable_ts += 1
+        else:
+            timed.append((ts, row))
+    timed.sort(key=lambda pair: pair[0])
+    ordered_rows = [row for _, row in timed]
+
+    n = len(ordered_rows)
+    header = ["bucket", "n", "tracker_ms", "trk_pre_ms", "trk_solve_ms", "trk_gn_iters",
+              "trk_valid_opt", "trk_match_frac", "seeded%", "exits"]
+    lines = ["Tracker trend (5 equal-count buckets by wall_ts, non-empty trk_gn_exit rows only)"]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join("---" for _ in header) + " |")
+
+    def _cell(stats: PhaseStats, fmt: str) -> str:
+        cell = fmt.format(stats.median)
+        if stats.n_blank:
+            cell += f" (blank={stats.n_blank})"
+        return cell
+
+    base, rem = divmod(n, 5)
+    start = 0
+    for i in range(5):
+        size = base + (1 if i < rem else 0)
+        bucket = ordered_rows[start:start + size]
+        start += size
+        label = f"{i + 1}/5"
+        if not bucket:
+            lines.append("| " + " | ".join([label, "0", "--", "--", "--", "--", "--", "--", "--",
+                                             "--"]) + " |")
+            continue
+        seeded_pct, _seeded_n, seeded_blank = _mean_pct_blank(bucket, "trk_seeded")
+        seeded_cell = f"{seeded_pct:.1f}%"
+        if seeded_blank:
+            seeded_cell += f" (blank={seeded_blank})"
+        cells = [
+            label, str(len(bucket)),
+            _cell(phase_stats(bucket, "tracker_ms"), "{:.1f}"),
+            _cell(phase_stats(bucket, "trk_pre_ms"), "{:.1f}"),
+            _cell(phase_stats(bucket, "trk_solve_ms"), "{:.1f}"),
+            _cell(phase_stats(bucket, "trk_gn_iters"), "{:.1f}"),
+            _cell(phase_stats(bucket, "trk_valid_opt"), "{:.1f}"),
+            _cell(phase_stats(bucket, "trk_match_frac"), "{:.4f}"),
+            seeded_cell,
+            _exits_mix(bucket),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    if n_unparseable_ts:
+        lines.append(f"({n_unparseable_ts} TRACKING row(s) excluded: unparseable wall_ts)")
+    return "\n".join(lines)
+
+
 def bucket_by_minute(rows, minutes: float = 5.0):
     """Bucket rows by wall_ts relative to the first row's wall_ts, in `minutes`-wide windows.
     A row with a blank/unparseable wall_ts goes to its own "unparseable wall_ts" bucket — reported,
@@ -434,8 +594,10 @@ def report(csv_path) -> str:
                       f"median={tc.median:.1f}ms p90={tc.p90:.1f}ms max={tc.maximum:.1f}ms")
     else:
         lines.append("Track phase closure: unavailable (missing phase columns, see banner above)")
+    lines.append(tracker_closure(rows))
     lines.append(backend_summary(rows))
     lines.append(window_summary(rows))
+    lines.append(tracker_trend(rows))
     lines.append("")
 
     lines.append(render_table("By flight-minute", bucket_by_minute(rows)))
@@ -809,6 +971,124 @@ def run_self_test() -> None:
         report11m = report(path11m)
         check("window_summary -- report() on a modern session-65 CSV shows a populated line",
               "window state: mode=[ON=1]" in report11m)
+
+        # 12. Session 67 (C1/C5): tracker_closure()/tracker_trend() -- the report that answers
+        #     whether iterations climb (warm-start feedback loop) or tracker_ms rises while
+        #     iterations stay flat (process-level state a replay never touches).
+        def _trk_row(wall_ts, tracker_ms="500.0", trk_pre_ms="100.0", trk_solve_ms="50.0",
+                     trk_gn_iters="10", trk_gn_exit="rel_error", trk_valid_opt="200",
+                     trk_match_frac="0.5", trk_seeded="1"):
+            return {"wall_ts": str(wall_ts), "tracker_ms": tracker_ms, "trk_pre_ms": trk_pre_ms,
+                    "trk_solve_ms": trk_solve_ms, "trk_gn_iters": trk_gn_iters,
+                    "trk_gn_exit": trk_gn_exit, "trk_valid_opt": trk_valid_opt,
+                    "trk_match_frac": trk_match_frac, "trk_seeded": trk_seeded}
+
+        def _parse_trend_cells(text, column_name):
+            lines = text.splitlines()
+            header_idx = next(i for i, ln in enumerate(lines) if ln.startswith("| bucket"))
+            header_cells = [c.strip() for c in lines[header_idx].strip("|").split("|")]
+            col_idx = header_cells.index(column_name)
+            values = []
+            for ln in lines[header_idx + 2:]:
+                if not ln.startswith("|"):
+                    break
+                cells = [c.strip() for c in ln.strip("|").split("|")]
+                cell = cells[col_idx]
+                values.append(None if cell == "--" else float(cell.split(" ")[0]))
+            return values
+
+        # 12a. PHASE_COLUMNS carries the two true durations, not the five state columns (C5).
+        check("PHASE_COLUMNS -- contains trk_pre_ms/trk_solve_ms, not trk_gn_exit",
+              "trk_pre_ms" in PHASE_COLUMNS and "trk_solve_ms" in PHASE_COLUMNS
+              and "trk_gn_exit" not in PHASE_COLUMNS)
+
+        # 12b. trk_gn_iters rising 4 -> 45 across 50 rows yields monotonically rising bucket medians.
+        rows12b = [_trk_row(wall_ts=float(i),
+                             trk_gn_iters=str(round(4 + i * (45 - 4) / 49.0)))
+                   for i in range(50)]
+        trend12b = tracker_trend(rows12b)
+        iters12b = _parse_trend_cells(trend12b, "trk_gn_iters")
+        check("tracker_trend -- five buckets, all populated (n=50 over 5 buckets)",
+              len(iters12b) == 5 and all(v is not None for v in iters12b))
+        check("tracker_trend -- trk_gn_iters bucket medians rise monotonically",
+              iters12b == sorted(iters12b) and iters12b[0] < iters12b[-1])
+
+        # 12c. Rows with trk_gn_exit == "" (INIT/RELOC) are excluded from every median and from n.
+        rows12c = ([_trk_row(wall_ts=float(i), trk_gn_exit="") for i in range(5)]
+                   + [_trk_row(wall_ts=float(i + 10), trk_gn_exit="rel_error") for i in range(5)])
+        trend12c = tracker_trend(rows12c)
+        n12c = _parse_trend_cells(trend12c, "n")
+        check("tracker_trend -- blank trk_gn_exit rows excluded from n (5 tracked, not 10)",
+              sum(v or 0 for v in n12c) == 5)
+
+        # 12d. Blank/unparseable cells are counted and named, never coerced to 0.
+        rows12d = [_trk_row(wall_ts=0.0, trk_valid_opt="200"),
+                   _trk_row(wall_ts=1.0, trk_valid_opt=""),
+                   _trk_row(wall_ts=2.0, trk_valid_opt="200")]
+        trend12d = tracker_trend(rows12d)
+        check("tracker_trend -- a blank cell is named '(blank=1)', not rendered as 0",
+              "(blank=1)" in trend12d)
+
+        # 12e. trk_match_frac renders with enough precision to distinguish 0.0412 from 0.0489.
+        rows12e = ([_trk_row(wall_ts=float(i), trk_match_frac="0.0412") for i in range(5)]
+                   + [_trk_row(wall_ts=float(i + 5), trk_match_frac="0.0489") for i in range(5)])
+        trend12e = tracker_trend(rows12e)
+        check("tracker_trend -- trk_match_frac distinguishes 0.0412 from 0.0489",
+              "0.0412" in trend12e and "0.0489" in trend12e)
+
+        # 12f. The exits mix reports each distinct value with its count, descending by count.
+        rows12f = ([{"trk_gn_exit": "rel_error"}] * 5 + [{"trk_gn_exit": "delta_norm"}] * 3
+                   + [{"trk_gn_exit": "max_iters"}] * 1)
+        check("_exits_mix -- distinct values with counts, ordered by descending count",
+              _exits_mix(rows12f) == "rel_error:5, delta_norm:3, max_iters:1")
+
+        # 12g. tracker_closure: near-zero residual for a consistent CSV, large when
+        #      trk_pre_ms + trk_solve_ms exceeds tracker_ms. Mirrors check 5/5a-b's precedent.
+        rows12g_ok = [{"tracker_ms": "500.0", "trk_pre_ms": "300.0", "trk_solve_ms": "200.0",
+                       "trk_gn_exit": "rel_error"} for _ in range(3)]
+        closure12g_ok = tracker_closure(rows12g_ok)
+        check("tracker_closure -- balanced pre+solve gives a near-zero (0.0ms) median residual",
+              "n=3" in closure12g_ok and "median=0.0ms" in closure12g_ok)
+
+        rows12g_bad = [{"tracker_ms": "500.0", "trk_pre_ms": "300.0", "trk_solve_ms": "400.0",
+                        "trk_gn_exit": "rel_error"} for _ in range(3)]
+        closure12g_bad = tracker_closure(rows12g_bad)
+        check("tracker_closure -- pre+solve (700) exceeding tracker_ms (500) shows a large residual",
+              "median=-200.0ms" in closure12g_bad)
+
+        # 12h. tracker_closure excludes "skipped"/"error" rows (they never entered the solve).
+        rows12h_skip = [{"tracker_ms": "500.0", "trk_pre_ms": "500.0", "trk_solve_ms": "0.0",
+                         "trk_gn_exit": "skipped"}]
+        check("tracker_closure -- 'skipped' rows excluded from the closure (n=0)",
+              "n=0" in tracker_closure(rows12h_skip))
+
+        # 12i. A pre-session-67 CSV yields BOTH exact unavailable strings, and report() still
+        #      prints the SLAM/track closures normally -- one missing feature must not suppress
+        #      another (mirrors checks 5j/11b's precedent). Hand-frozen pre-67 PHASE_COLUMNS (the
+        #      12 names this module carried before session 67 appended trk_pre_ms/trk_solve_ms).
+        pre67_phase_cols = ("slam_ms", "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                            "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+                            "frame_ms", "infer_ms", "tracker_ms", "backend_thread_ms")
+        path12i = Path(tmp_dir) / "pre_session67.csv"
+        fields12i = ("wall_ts", "frame_id", "mode", "new_keyframe") + pre67_phase_cols
+        with open(path12i, "w", newline="", encoding="utf-8") as fh12i:
+            w12i = csv.DictWriter(fh12i, fieldnames=fields12i)
+            w12i.writeheader()
+            row12i = {c: "1.0" for c in pre67_phase_cols}
+            row12i.update(wall_ts="0.0", frame_id="0", mode="TRACKING", new_keyframe="0")
+            w12i.writerow(row12i)
+        rows12i = load_rows(path12i)
+        check("tracker_closure -- pre-session-67 CSV -> exact unavailable string",
+              tracker_closure(rows12i) == "tracker closure: unavailable (file predates session 67)")
+        check("tracker_trend -- pre-session-67 CSV -> exact unavailable string",
+              tracker_trend(rows12i) == "tracker stats: unavailable (file predates session 67)")
+        report12i = report(path12i)
+        check("tracker stats -- report() on pre-session-67 CSV shows both unavailable lines "
+              "alongside the SLAM/track closures printing normally",
+              "tracker closure: unavailable (file predates session 67)" in report12i
+              and "tracker stats: unavailable (file predates session 67)" in report12i
+              and "SLAM phase closure (slam_ms - sum(phases))" in report12i
+              and "Track phase closure (track_ms - sum(phases))" in report12i)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

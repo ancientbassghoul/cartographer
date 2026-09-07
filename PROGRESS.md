@@ -5,11 +5,72 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-06**, branch `all-bets-are-off`, session 65 (Chunks 1-7): the bounded
-global-optimisation window is **built and gated, config-gated OFF by default — not yet benched or
-flown**. See `STATE.md` for what's next._
+_Last updated **2026-09-07**, branch `all-bets-are-off`, session 67 (Chunks 1-5): `tracker.track()`
+is now instrumented end-to-end (CSV, console, visualizer) — **built and self-tested, not yet flown**.
+See `STATE.md` for what's next._
 
 ## Session Log (newest first)
+
+- **68 — THE ACCUMULATOR IS A THERMALLY THROTTLED GPU. Not an accumulator, and not in our code.**
+  We flew session 67's instrumentation and read `tracker_trend`. The hypothesis it was built to test
+  died immediately: **GN iterations are FLAT** all flight (median 4-7, no trend), with exactly one
+  step — 1 -> 6 at t=22 s, when the drone first *moves*, because a stationary camera converges in one
+  step. The warm-start `idx_f2k` feedback loop is dead. What grew instead was everything else, and
+  by the same factor: `trk_pre_ms` (fixed-shape ViT-L forward) 341 -> 3024 ms, and solver cost
+  normalised per iteration per 100k points 13.1 -> 138.7 (10.6x). Two workloads sharing no code, no
+  kernels and no data, moving in lockstep (r = +0.878) and **recovering together**, while CPU
+  `frame_ms` stayed 4.8 -> 6-9 ms. Non-monotonic recovery killed fragmentation, retrieval-DB growth
+  and map size; our own GPU duty cycle was pinned at 0.85-1.05 from minute 0, so load didn't explain
+  it either. The operator challenged the one weak claim ("fixed work can't slow down") and was right
+  — `iter_proj`/`refine_matches` genuinely are data-dependent — so we measured that channel instead
+  of asserting it away: within the first 5 min, worst-half match quality gave `trk_pre_ms` 344 ms and
+  best-half 343 ms. Identical. The data channel is ~0.
+  **Nothing in the stack logged the GPU, so we built `gpu_probe.py`** — a standalone probe that reads
+  the hardware's own counters from outside the flight (what it does and why, in `STATE.md`). Then the
+  operator flew a deliberately controlled manual profile —
+  park 2 min, fly 4, park 2, fly 4 — which is what made it decisive, since a leak cannot un-leak
+  while parked.
+  **Verdict, from the GPU's own reason bits: `SwThermalSlowdown` in 235 of 247 samples.** Clock
+  1725 MHz at t=17 s -> throttle engages at t=54 s / 79 C -> 780 -> 450 -> **210 MHz from t=146 s to
+  the end, against a 2100 MHz ceiling.** 67 C -> 96 C peak. So STATE.md's long-standing "steps up
+  7-17x within two minutes of takeoff, on every flight" was never about takeoff at all: **it is the
+  GPU's thermal time constant**, and the operator's parked first phase (350 -> 2000 ms without
+  moving) proves motion was never involved. Cycle-count test (time x clock, i.e. cycles for fixed
+  work): 257M at 600-1000 MHz, 263M at 300-600, 482M below 300 — so the clock explains ~3.7x of the
+  ~7x and **~1.9x is still unexplained** (VRAM spill rose +210 MB, peak 10.2/16.4 GB; Unity's share
+  rose; sub-300 MHz has its own cliff). The operator's never-mentioned hunch that the east wall
+  (windows, opening into another room) was slow is confirmed as real but second-order:
+  `Xlab_util_3d` correlates +0.955 with `trk_pre_ms`, though that is confounded — an 8x-slower GPU
+  raises everyone's busy fraction, so cause and effect cannot be separated from this data.
+  **The finding that reframes the project: the GPU idles at 64-65 C with nothing running** (should be
+  35-45 C) **and draws only ~50 W at 96 C** (that chip sustains 80-150 W). The cooling is not removing
+  50 watts — dust, paste, intake, or fan curve. Sessions 63-66 optimised a GPU running at one tenth of
+  its clock; those gains are real but the baseline was pathological. It is also self-reinforcing in
+  our favour: less GPU work -> less heat -> higher clock. Next step is a 10-minute thermal experiment
+  (raise/cool the laptop, re-run the 2-min park, watch where throttle engages) with an up-to-8x payoff
+  — more than every optimisation session combined.
+
+- **67 (Chunks 1-5) — instrumented `tracker.track()` so the accumulator hunt has numbers, not just a
+  step-change.** We wanted the GN iteration count, the convergence reason, the match fraction and a
+  fixed-work/solve-work time split per call, without touching `third_party/` or any behaviour. Built
+  `slam_track_stats.py`: a frozen `TrackStats` dataclass, a `classify_convergence()` mirror of
+  `nonlinear_optimizer.check_convergence()`'s bare bool (step 0's `old_cost = inf` means it can only
+  ever converge via `delta_norm`, reproduced exactly, `or`'s tie-break included), and
+  `make_instrumented_frame_tracker()` — a factory-cached `FrameTracker` subclass, same pattern as
+  `slam_window.make_windowed_factor_graph`, that wraps `track()` rather than reproducing its body and
+  only re-implements `opt_pose_ray_dist_sim3` (the one live GN path; `opt_pose_calib_sim3` raises
+  `NotImplementedError` naming `use_calib=False` rather than silently going uninstrumented). Wired the
+  seven fields through `perception_worker.py`'s CSV (40 columns now, frozen prefixes untouched) and
+  console line, and two of them (`trk_gn_iters`, `trk_gn_exit`) into the `TOPIC_MAP` payload — the other
+  five are CSV-only, same precedent as session 65's window fields. **Chunk 5** surfaced it in the
+  cockpit: `visualizer.py` gained `tracker_status_text()`, rendered next to the session-64 backend
+  segment in the top strip as `gn=<iters>/50`, red only on `max_iters` (hitting the ceiling is the
+  degraded state; converging via `rel_error`/`delta_norm` is not). `TRACKER_GN_MAX_ITERS = 50` is a
+  necessary display-only constant — the real config lives in the SLAM process and the one-argument
+  `tracker_status_text(map_payload)` signature has no path to read it live. All suites green:
+  `slam_track_stats.py`, `perception_worker.py`, `perception_timing_report.py`, `visualizer.py`
+  (5 new self-test cases, 67-1..67-5). Flown in session 68, which is where the verdict lives.
+  Full spec: `plans/session67-spec.md`.
 
 - **66 — flew the window; found that offline replay had never reproduced live flight; made it
   frame-exact; and caught the window's real cost.** We flew `ON W=30` and it felt ordinary — SLAM
@@ -669,12 +730,191 @@ text recoverable from git history of this file if ever needed._
 
 ## Next (resume after a context clear)
 
-**Moved to `STATE.md`** — read that file first; it has the live watch list for session 56's
-pending live-fly and the `main`-branch HEIGHT-issue pointer, kept current instead of duplicated here.
+**Read `STATE.md` first** — it holds the ONE live item and nothing else. Everything open lives in
+`## Future (backlog)` below; the numbers behind it live in `## Reference — don't re-derive`.
+Session 68 moved the watch lists here so the resume file stays cheap to reload after a context clear.
 
 ---
 
 ## Future (backlog)
+
+### >>> TRIAGE TABLE — DECISION PENDING (operator, 2026-09-07) <<<
+The operator has **not yet decided** what to do with the items below; this table survives a context
+clear so the decision can be picked up cold. One row per group in this backlog. "Read" is the
+assistant's recommendation, not a decision.
+
+| | Item | Read |
+|---|---|---|
+| **A1** | Fly the bounded window `ON W=30` (config still ships OFF) | Cheap, but re-bench after thermals — the 10% gain was measured at 10% clock |
+| **A2** | `num_fix` CUDA work (anchor leak, 43% overshoot, confirmed on real data) | Real defect, needs a CUDA rebuild. Defer until thermals settle |
+| **A3** | `SHADOW` / `free` / `strict` policies built but never exercised | One replay each. Low value |
+| **B1** | Parallax-push step 3 (act on the stuck verdict) | Parked deliberately by the operator. Still parked? |
+| **B2** | FALLBACK reordering — flown, never reviewed | Free: just read a log |
+| **B3** | SERVO phase never observed working since session 60 | Same log, same pass as B2 |
+| **B4** | Bump-pulse latency (10-18 s), 3 designs, none built | Scales with SLAM latency → **may evaporate at full clock** |
+| **B5** | Staleness UI | Operator wanted to discuss before building |
+| **B6** | Adaptive back-off strength | Operator's idea, never built |
+| **B7** | Session 47's dead `_backoff_resolve_since` gate | Dead code. Delete or wire |
+| **B8** | No bounded-survey mechanism — flights end by manual stop | **Scope-relevant.** Phase 2 arguably needs it |
+| **C** | Session 61 panel watch list, 7 items, flown never reviewed | One log-reading pass |
+| **D** | Session 56/57 watch list + sessions 49-55 unconfirmed | Large. Much may be throttle symptoms |
+| **E** | Three July orphan flights tripping the launch prompt | 30 seconds, reversible |
+| **F** | Standing habits (timing report, press `r`, run `gpu_probe`) | Not tasks |
+| **G** | Goal-management rewrite decision rule | Conditional — only if goal problems recur |
+| **H** | `main` branch HEIGHT issue, never diagnosed | Different branch |
+| **I** | Three parked choke cures (Stage A superseded, B live, C large) | Re-rank after thermals |
+
+**Suggested order if no other steer:** **E** now (free) → **B2+B3+C** as one log-reading pass (free,
+and it retires three stale watch lists) → **B8**, the only item the assessment task itself needs →
+everything else after the thermal experiment establishes the real performance baseline.
+
+
+### Open items moved out of `STATE.md` (session 68 housekeeping)
+`STATE.md` now carries only the live item. Everything below was accumulating there; it is open, but
+none of it is what we are doing right now. **All of it predates session 68's thermal finding** — some
+may be symptoms of the throttle rather than bugs, so re-check against a healthy-hardware flight before
+building anything here.
+
+**A. Bounded window — decisions left open (sessions 65-66).** Numbers: `Measured numbers` above.
+- **Fly `ON W=30`.** Every window number is replay; a replay cannot show how a cheaper backend changes
+  where the autopilot decides to go. `config.yaml` currently ships `backend_window_mode: "OFF"`,
+  `backend_window_kf: 0` — set back to OFF at the operator's request so a flight runs exactly as it
+  did before the speed work (`backend_async` was already `false`).
+- **The anchor leak / `num_fix` CUDA work.** Confirmed on real data: at W=30, `solve_kf` max **42**
+  (30 window + **12 anchors**), `anchors>1` on **25 of 102** solve frames, `anchor_drift` to 0.489.
+  The `anchored` policy discards that motion at write-back — a 43 % overshoot of the bound, paid for
+  and thrown away. Design in `plans/session65-spec.md`'s deferred section; needs a CUDA extension
+  rebuild (`build_mast3r_slam.bat`), which is the risk.
+- **`SHADOW` mode and the `free`/`strict` policies are built and gated but never exercised** — worth
+  one frame-exact run each if the window ships ON.
+
+**B. Autopilot — built and flown, never reviewed.**
+- **Parallax-push measurement: BUILT (watch-only), PARKED at step 3.** `traveled`, net cycle drift,
+  distinct-pose count and a three-state verdict (moved / stuck / unknown) ride the push-done event,
+  the timeline row and the telemetry panel. Threshold is a fraction of `parallax_push_dist`
+  (`push_stuck_drift_frac: 0.4`), never an absolute, since SLAM units have no metric scale.
+  **Nothing acts on the verdict.** Validated: the operator's corner trap replays to three consecutive
+  `stuck` verdicts on exactly the looping cycles; flight `20260905_184034` was a clean negative
+  control (13 moved, 7 unknown, zero stuck). Caveat: one `drift 6.245u` reading, almost certainly a
+  RELOC pose jump — step 3 must be robust to that. Step 3 (trigger the guarded forward escape
+  `reposition_fwd`) is deliberately NOT built; operator's call, slow SLAM outranked it.
+- **FALLBACK reordering: BUILT + FLOWN 2026-09-05, unreviewed.** Ladder is
+  `INITIAL_WAIT → BACKOFF → BACKOFF_WAIT → TURN → PUSH → WAIT_POST → TURN → …`, once per episode,
+  aborting on `backwall_contact`. Watch for `FALLBACK SERVO: held EQUAL for N solved frames` — the
+  intended give-up path, which fired for the first time ever on `20260905_155834`. If it becomes
+  common, revisit whether `servo_hold_frames: 3` (~38 s at that flight's `slam_ms`) is too patient.
+- **FALLBACK's `SERVO` phase has still never been observed working on a flight** (built session 60).
+- **Bump-pulse latency** — a blacklisted goal takes 10-18 s to become visible to the autopilot (rides
+  the next published plan; scales with SLAM latency). Three designs sketched, none built:
+  `plans/session58-lkg-window-discipline-and-dead-goal-guard.md`, "Session-59 design sketch".
+- **Staleness UI** — operator wants to discuss before it is built. Case on record: the status strip
+  showed `SLAM=TRACKING kf=27 slam=2921.5ms` from 15 s earlier while perception was mid-solve on
+  frame #153 (`slam_ms=15472.2`). Session 62's Stage B (explicit `pose_age_s`/`pose_frame_id` on the
+  plan) is the plumbing this would render.
+- **Adaptive back-off strength** (operator's idea, 2026-09-04) — scale the back-off to the measured
+  clearance DEFICIT instead of a fixed `backoff_hold_s`. One duration cannot serve the observed
+  trigger range 0.25 … 1.20 (sizing for the worst overshoots the mildest ~6×), which is why
+  back-to-back back-offs persist. Caveat: post-back-off clearance readings are heavily contaminated
+  by SLAM re-localisation (timeline shows `0.25 → 7.30` and `7.88 → 0.25`), so a closed loop must NOT
+  naively trust the next `forward_clearance_dist`.
+- **Close session 47's dead re-solve gate.** `_backoff_resolve_since` (budget
+  `backoff_resolve_budget_s: 12.0`) is armed by `_step_backoff` on completion but only ever *checked*
+  inside `_maybe_loss_snapshot_backoff`; session 57 moved the PLAN-LOST path onto
+  `_step_lost_recovery`, which never checks it. Dead on that path since session 57.
+- **Flights still end by manual stop** — no bounded-survey mechanism exists.
+
+**C. Session 61 panel watch list (BUILT + FLOWN 2026-09-05, never reviewed).**
+1. The LIVE half of the LKG panel moves continuously; the F_LKG half changes whenever telemetry's
+   `src=slam:<id>` changes — no more ~50 s/8-solve freeze.
+2. Telemetry's `LKG=<src> age=<n>s` should RESET to ~0 every time SLAM solves a fresh frame.
+3. Green inlier lines on the panel, steady ~2 Hz once a loss episode matures past the 12 s
+   `loss_backoff_grace_s` window; DURING that grace, `lines=none (loss grace N/12.0s)` — never blank.
+4. Info block COMPLETE: `closer`, `scale`, `size`, `src`, `age` legible, nothing clipped; yellow
+   "F_LKG (reference)"/"LIVE" labels visible.
+5. The panel must never grey out during `PLAN-LOST`/`PLAN-STALE` (`LKG_CANVAS_STALE_S` is 5 minutes,
+   so this should be near-impossible; the guard is a dead-publisher backstop).
+6. Kill switches unchanged: `visrec_debug_window: false` kills compose + publish + PNG saving outright;
+   `use_visual_matching: false` leaves an EXPLAINED idle panel, not a silent grey one.
+7. **`diag.ply_sequence` is ON** and `OUTPUT/diag/20260905_113348_plyseq/` did fill — the
+   marker-stability check (first five markers at identical world coords in an early and a late frame)
+   was never run. ~1.2 GB/flight, capped at `ply_sequence_max=2000`.
+
+**D. Session 56/57 watch list — still current, still unconfirmed.** Full design/replay arithmetic in
+`plans/session56-settle-gate-currency-and-lkg-freeze.md` and
+`plans/session57-planlost-recovery-and-direction-aware-lkg.md`.
+- A `[VISREC]` line reading `closer=LKG` while a back-off was pending → the hold should fire and **no**
+  BACKOFF should follow (the operator-reported 08:51 symptom). Never yet seen maturing on a flight.
+- `size=` vs `scale=` on the same lines — does the spread ratio hold steady where `scale` swung
+  `0.27 → 1.85` within one second?
+- `LOST_VISUAL_HOLD` notices should appear and NOT repeat every tick.
+- No two back-offs inside one loss episode closer together than `loss_backoff_grace_s`.
+- Corner-tour goals draw **blue** on the map panel; frontier goals stay yellow.
+- `SLAM_HOLD_FORCED_HOP`/`SETTLE_DEADBAND` should become **rare**, not the normal exit (~3.5 s median
+  / 5 s p75 resolution expected instead of the 15 s dead-band escape).
+- No 3.5 s `ADVANCE`↔`SLAM_HOLD` limit cycle — if it appears, the release-grace stamp isn't landing
+  (check it is stamped AFTER `_enter`, not before).
+- `[VISREC]` bursts gone: a held-still loss should log a handful of matches, not hundreds/minute, and
+  zero `scale=1.00 inliers=7xx contained=True` self-matches anywhere.
+- `TRIM` fires while parked in `SLAM_HOLD`, not just from `SETTLE`/`ADVANCE`; `TRIM enter (DOWN)`
+  fires at all (every flight so far only showed sag/UP); `TRIM` exits within ~3 s of its pulse even at
+  1500-2700 ms SLAM latency (`FORCED after N.Ns` = the backstop fired, not a bug, but the primary fix
+  isn't landing).
+- `SLAM_HOLD`↔`HOLD_LOST` limit cycle still can't persist past ~18 s (regression check only).
+- Sessions 49-55 are all still themselves unconfirmed (their flights kept getting cut short by the
+  bugs sessions 53-56 fixed): session 55 crash-survivability (periodic livemap checkpoints, multiple
+  `"map"` timeline records, and the crash-recovery prompt + `salvage_flight.py` actually working if
+  you kill perception/visualizer mid-flight); session 50's `SETTLE gate blocked … → forcing REPLAN`
+  in place of a 91.6 s park (if it fires OFTEN that is an honest signal SLAM is chronically slow, not
+  a bug); session 51 pure waste removal (expect **zero** decision changes); no back-off suppressed
+  notice unless one was genuinely about to fire; no goal committed inside a permanently blacklisted
+  region.
+
+**E. Housekeeping, offered and never done.** Three July orphan flights (`20260720_133111`, `_135245`,
+`_135307`) trip `fly.py`'s crash-recovery prompt at every launch. Moving them to
+`OUTPUT/diag/_orphans_2026-07/` silences it permanently and reversibly — the detector globs that
+directory non-recursively.
+
+**F. Standing habits, not tasks.**
+- Read the timing report after every flight: `venv\Scripts\python.exe perception_timing_report.py`
+  (no argument = newest). `fly.py` passes `--log`, so the CSV always exists.
+- Press `r` in the io_bridge window on every flight (see the replay trap above).
+- Run `gpu_probe.py` in a second terminal on every flight (session 68).
+
+**G. Operator's decision rule (2026-09-04), unchanged.** If flights are clean from here, stop and ship
+the Blender/PLY presentation work. If goal problems recur, **rebuild goal management from scratch**
+against a written behaviour spec — the operator's own judgement is that it is over-complicated, and
+the evidence agrees: two independent death registries (`_blacklist` with soft/permanent/active, and
+`_swept_corners`, which deliberately ignores the first), four mechanisms writing the first (2-bump,
+stall, loop, stagnation), a third `_goal_db` disc structure, plus `corner_no_blacklist_dist` /
+`corner_giveup_limit` / clearance-inset carve-outs. Sessions 52, 58 and 59 each patched a *different*
+hole in the same invariant and one broke another. Before any rewrite, build the carve-out inventory
+("this exemption exists because flight X did Y") so nothing hard-won is dropped by accident.
+
+**H. `main` branch — diagnose the HEIGHT issue.** A 2026-09-01 live flight confirmed sessions 20-43
+fly *tolerably* (operator's own call). Height is still off, not yet diagnosed. Start by opening the
+flight replay debugger and comparing `pos_y` vs `target_altitude_y` across the flight; check whether
+`trim_pulse_s` (currently `0.01`, much shorter than the `0.16` session 40 tuned) is correcting
+meaningfully at all, before assuming it is TRIM.
+
+**I. The three parked choke cures** (full designs in `plans/session62-spec.md`), ranked by the
+measured share in `Measured numbers` above. **Re-rank these after the thermal fix** — they were
+ranked against a throttled baseline.
+- **Stage A — move `_run_backend()` off the frame-critical path.** Targets 55 %. *Superseded in
+  practice by session 64's negative result: threading works mechanically but makes real flights
+  worse on one GPU. `backend_async: false` is the default on evidence; do not re-open without a
+  20+ minute flight, since the median frame carries no backend cost either way (~1 frame in 6).*
+- **Stage B — decouple `TOPIC_PLAN` publishing from the SLAM cadence.** Today a plan can only be
+  published from inside `step()`, so `PLAN_PUB_INTERVAL = 0.5 s` is a lie: during a 12 s solve the
+  autopilot gets no plan and no forward clearance at all. Must carry explicit `pose_age_s` /
+  `pose_frame_id`. **Still live and unaddressed.**
+- **Stage C — the tracking/mapping thread split.** Targets 3.3 %. If ever built: `MapStore._grow`
+  *reallocates* `_count`/`_color_sum`, so a concurrent raycast is a **torn** read, not a stale one
+  (needs copy-on-write snapshot swap, not a "lightweight" lock); `clearance` and `planner.select`
+  must stay on one side of the fence or a single `_plan_payload` mixes two map snapshots; and
+  `flight_replay.py` / `salvage_flight.py` / the timeline all assume plan-frame correspondence.
+- **`_map_payload`/`topdown_summary`** at 4.6 % and growing (4 → 1 238 ms across voxel buckets to
+  386 k) — pure CPU, no CUDA sharing, cheap to fix, worth more than `integrate` + `plan` combined.
+
 - **Session 57 backlog — two diagnosed-but-unbuilt findings from the 20260903_083329 flight, neither
   built this session.** Both carry this warning:
 
@@ -841,7 +1081,9 @@ pending live-fly and the `main`-branch HEIGHT-issue pointer, kept current instea
 Assessment task: from the black-box **XLAB** Unity sim's single monocular drone feed, autonomously
 map the room and report the 3D location of a target object (+ uncertainty). Phases: 1 Human Recon →
 2 Autonomous Survey → 3 Localize & Report → GUI. Grading = internal consistency (metric scale and
-compute efficiency NOT graded). Local on an RTX 3080 Laptop (16 GB).
+compute efficiency NOT graded). Local on an RTX 3080 Laptop (16 GB), **sharing that GPU with the
+Unity sim** — session 68 found that sharing, and the machine's thermals, dominate every performance
+number in this file.
 
 ## Architecture (processes over a ZMQ bus)
 - **P1 `io_bridge.py`** — NDI capture + 60 Hz TCP control to Unity + keyboard. Publishes 512×288
@@ -896,6 +1138,98 @@ section is current-state only, not a second retelling.)*
 ---
 
 ## Reference — don't re-derive
+
+### Measured numbers — don't re-measure
+Moved out of `STATE.md` (session 68) so the resume file stays cheap. These are the tables the session
+log refers to but deliberately does not repeat. **Every number here was taken on a GPU that session 68
+later found running at ~10% of its clock** (see the session-68 log entry) — the relative comparisons
+were order-controlled and stand, but the absolute magnitudes are not what healthy hardware would show.
+
+**Session 68's clock/temperature table lives in `STATE.md`'s current status** while the thermal
+experiment is the live item. Move it here when it stops being current — do not copy it.
+
+**The SLAM choke, attributed (session 62).** `OUTPUT/diag/20260905_113348_perception.csv`, 446 frames,
+35 min, voxels 3 220 → 386 558, keyframes 1 → 82. Phase closure residual median 0.1 ms, so the split
+is trustworthy. Of **2 010 s** in the loop:
+
+| phase | total | share | what it is |
+|---|---|---|---|
+| **`backend_ms`** | **1 113 s** | **55.4 %** | `_run_backend()`: retrieval update + `add_factors` + `solve_GN_rays()` |
+| `track_ms` | 602 s | 29.9 % | frame construction + the INIT/TRACKING/RELOC branch |
+| `map_pub_ms` | 93 s | 4.6 % | `_map_payload` + publish (`topdown_summary` is O(map)) |
+| `integrate_ms` | 39 s | 1.9 % | `mapstore.add_pose` + `mapstore.integrate` + `ground.integrate` |
+| `plan_ms` | 29 s | 1.4 % | `_plan_payload` (13 raycasts, frontiers, `planner.select`) + publish |
+| `pose_ms` + `kf_download_ms` + `publish_ms` | 2.9 s | 0.1 % | — |
+
+Net throughput **0.22 Hz**. On keyframe frames (77 of 446): median `slam_ms` 9 818 ms = `backend_ms`
+8 082 (**82 %**) + `integrate_ms` 339 (3 %); ordinary frames 1 652 ms with `backend_ms` 0.
+**Ruled out by this measurement:** CPU-side map integration as the choke driver (1.9 %), and with it
+the premise of the original async-refactor proposal. Ruled out earlier: autopilot loop rate
+(32-38.5 Hz), Unity focus loss, the clearance raycast.
+
+**Where `track_ms` goes (session 63)**, flight `20260906_000915`:
+
+| mode | `track_ms` | dominated by |
+|---|---|---|
+| TRACKING | 1109 ms | `tracker_ms` **945 ms (85%)** — `tracker.track()` |
+| RELOC | 1783 ms | `infer_ms` **1762 ms (99%)** — `_mast3r_inference_mono` |
+
+`frame_ms` is 5-8 ms; frame construction is nothing. Both hot paths are MASt3R ViT-Large forward
+passes at `img_size=512`.
+
+**Historical degradation** (autopilot-side `slam_ms`, 2026-09-04 flight, 30 of 47 minutes blind —
+`HOLD_LOST` 1348 s + `FALLBACK` 471 s). Kept because it shows the *time* behaviour a single-flight
+attribution cannot — and, read with session 68, it is the thermal ramp:
+
+| flight min | frames | median | p90 | max |
+|---|---|---|---|---|
+| 0–5 | 151 | 791 ms | 2 829 | 13 970 |
+| 5–10 | 72 | 1 404 | 9 960 | 16 479 |
+| 10–15 | 56 | 2 436 | 10 860 | 37 197 |
+| 15–20 | 22 | 12 682 | 22 133 | 58 061 |
+| 20–25 | 16 | 5 056 | 41 969 | **71 774** |
+| 25–30 | 86 | 1 783 | 4 402 | 37 209 |
+| 40–45 | 78 | 1 816 | 3 012 | 31 399 |
+
+Worst wait between two solved frames: **72.9 s** at flight-minute 24.6.
+
+**Bounded-window A/B (sessions 65-66), median `backend_ms` on global solves.** Frame-exact replay of
+`flight_20260906_165141` (319 frames; every run 64 kf / 38 RELOC, so genuinely matched), run as an
+**ABBA set** (ON,OFF,OFF,ON) to cancel run-order drift. Drift-cancelled: loop 364.3 s vs 405.9 s
+(**ON 10.3 % faster**), backend 233.2 s vs 265.1 s (12.0 %):
+
+| total kf | ON | OFF | |
+|---|---|---|---|
+| 0-9 | 1704 | 1697 | identical — the window is a no-op below `W` |
+| 10-19 | 2241 | 2231 | identical |
+| 20-29 | 2571 | 2196 | 17% worse (boundary: anchors appear, little cut yet) |
+| 30-39 | 2201 | 3816 | **42% better** |
+| 40-49 | 1931 | 4018 | **52% better** |
+| 50-59 | 2316 | 4651 | **50% better** |
+| 60-69 | 1896 | 4168 | **55% better** |
+
+`ON` is flat (~1700-2600 ms) where `OFF` climbs 1697 → 4651, and the ordering holds in each of the
+four individual runs. The whole-flight number is **diluted** — most frames are under 30 kf where the
+window does nothing — so the gain grows with flight length.
+
+### Two measurement traps this project paid for
+Both cost real time and both will recur if forgotten.
+
+1. **Run order on this machine is worth ~26 %.** Identical `OFF` code ran 409.2 s in run position 1
+   and 496.8 s in position 2 (up to 4.5× slower at low keyframe counts) — *larger than the effect
+   being measured*, and it originally got mis-attributed to the window itself. **Never compare two
+   sequential runs here without ABBA (A,B,B,A)** so a linear drift cancels. Session 68 explains it:
+   the GPU is hotter, and therefore slower, later in a batch.
+2. **No fixed `--stride` replay reproduces live flight.** SLAM runs at ~0.2 Hz, so `io_bridge` hands
+   it the newest frame and drops the backlog: the gap between consecutively PROCESSED frames is a
+   median of **112** NDI frames (p90 624, max 1735) at ~58 fps capture — live sees snapshots ~1.9 s
+   apart, while `--stride 3` puts them 17 ms apart, the match fraction never falls below
+   `match_frac_thresh: 0.333`, and almost no keyframes form (3 in 200 frames). The real gaps are
+   wildly uneven, so no single stride works. **Use `--frame-list` and the `rec_frame` column**, which
+   replays the exact frames a flight's SLAM consumed:
+   `perception_worker.py --video OUTPUT\flight_<ts>.mp4 --frame-list OUTPUT\diag\<ts>_perception.csv --no-display --log --out <dir>`
+   That needs the recording, so **press `r` in the io_bridge window on every flight.**
+
 
 ### Drone control mechanic
 Yaw is a **"fly toward your aim"** scheme: yaw moves an aim crosshair, forward thrust flies toward it;

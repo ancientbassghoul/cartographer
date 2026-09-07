@@ -79,6 +79,12 @@ DIAG_PERF_FIELDS: tuple[str, ...] = (
     # assumption about when the operator pressed 'r'. BLANK (not 0) when not recording: 0 is a real
     # frame index -- the first recorded frame -- so coercing None to 0 would invent data.
     "rec_frame",
+    # Session 67: the split INSIDE tracker_ms -- fixed match-forward/pointmap work vs the GN solve,
+    # plus the solve's exit reason and correspondence counts (slam_engine.SLAM_TRACKER_PHASE_FIELDS +
+    # SLAM_TRACKER_STATE_FIELDS, from slam_track_stats.TrackStats). Appended LAST, after rec_frame, so
+    # every column before this keeps the exact position earlier flights' reports expect by name.
+    "trk_pre_ms", "trk_solve_ms", "trk_gn_iters", "trk_gn_exit",
+    "trk_valid_opt", "trk_match_frac", "trk_seeded",
 )
 
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
@@ -267,6 +273,8 @@ class Pipeline:
             "track": 0.0, "backend": 0.0, "pose": 0.0, "kf_download": 0.0,
             "integrate": 0.0, "map_pub": 0.0, "plan": 0.0, "publish": 0.0,
             "frame": 0.0, "infer": 0.0, "tracker": 0.0,
+            # Session 67: the split inside tracker_ms -- same "only when it ran" stickiness.
+            "trk_pre": 0.0, "trk_solve": 0.0,
         }
         self._last_pos_y = None           # last published camera Y (altitude; +Y is DOWN)
         self._last_ring_fb = (None, None) # last (forward, backward) ring clearances (report line)
@@ -412,6 +420,10 @@ class Pipeline:
             self._last_phase_ms["infer"] = res.infer_ms
         if res.tracker_ms > 0.0:
             self._last_phase_ms["tracker"] = res.tracker_ms
+        if res.trk_pre_ms > 0.0:
+            self._last_phase_ms["trk_pre"] = res.trk_pre_ms
+        if res.trk_solve_ms > 0.0:
+            self._last_phase_ms["trk_solve"] = res.trk_solve_ms
         if res.new_keyframe:
             self._last_phase_ms["kf_download"] = res.kf_download_ms
         if map_updated:
@@ -431,12 +443,19 @@ class Pipeline:
             rf, rb = self._last_ring_fb
             rfb = (f"{rf:.2f}" if rf is not None else "--") + "/" + (f"{rb:.2f}" if rb is not None else "--")
             p = self._last_phase_ms
+            # Session 67: the GN-solve state, read from `res` directly (per-frame truth, not the
+            # sticky `p` dict -- the rule session 64 set for backend_mode). Rendered only when
+            # track() actually ran the solve this frame, so INIT/RELOC frames never print a fake gn0.
+            trk_seg = (f"trk[pre{res.trk_pre_ms:.0f} sv{res.trk_solve_ms:.0f} "
+                       f"gn{res.trk_gn_iters}/{res.trk_gn_exit} mf{res.trk_match_frac:.2f}] | "
+                       if res.trk_gn_exit else "")
             print(f"[perception] SLAM {res.mode:<8} kf {res.n_keyframes:3d} | "
                   f"vox {len(self.mapstore):6d} | slam {slam_ms:5.1f} ms | "
                   f"[trk {p['track']:.0f} bk {p['backend']:.0f} dl {p['kf_download']:.0f}] | "
                   f"(frm {p['frame']:.0f} inf {p['infer']:.0f} trk2 {p['tracker']:.0f}) | "
                   f"bk[{res.backend_mode} q{res.backend_queue_depth} {res.backend_thread_ms:.0f}ms"
                   f"{f' clob{res.backend_pose_clobbers}' if res.backend_pose_clobbers else ''}] | "
+                  f"{trk_seg}"
                   f"intg {p['integrate']:.0f} plan {p['plan']:.0f} map {p['map_pub']:.0f} ms | "
                   f"ray_clear {rc} | y {py} | ring f/b {rfb} | "
                   f"trigger {c.get('trigger')} yaw {c.get('yaw')}")
@@ -465,7 +484,11 @@ class Pipeline:
             backend_solve_kf=res.backend_solve_kf, backend_solve_edges=res.backend_solve_edges,
             backend_graph_edges=res.backend_graph_edges, backend_anchors=res.backend_anchors,
             backend_anchor_drift=round(res.backend_anchor_drift, 4),
-            rec_frame=_rec_frame_cell(meta.get("rec_frame")))
+            rec_frame=_rec_frame_cell(meta.get("rec_frame")),
+            trk_pre_ms=round(res.trk_pre_ms, 1), trk_solve_ms=round(res.trk_solve_ms, 1),
+            trk_gn_iters=res.trk_gn_iters, trk_gn_exit=res.trk_gn_exit,
+            trk_valid_opt=res.trk_valid_opt, trk_match_frac=round(res.trk_match_frac, 4),
+            trk_seeded=res.trk_seeded)
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -495,6 +518,10 @@ class Pipeline:
             # and backend_anchor_drift are CSV-only because nothing in the visualizer renders them.
             "backend_window_mode": res.backend_window_mode, "backend_window_kf": res.backend_window_kf,
             "backend_solve_kf": res.backend_solve_kf, "backend_anchors": res.backend_anchors,
+            # Session 67: GN-solve state, forwarded for CHUNK 5's visualizer overlay. The other five
+            # tracker fields (trk_pre_ms/trk_solve_ms/trk_valid_opt/trk_match_frac/trk_seeded) are
+            # CSV-only, same as session 65's solve_edges/graph_edges/anchor_drift.
+            "trk_gn_iters": res.trk_gn_iters, "trk_gn_exit": res.trk_gn_exit,
         }
 
     # ------------------------------------------------------------- map mode planner
@@ -1326,6 +1353,10 @@ def run_self_test(cfg):
     print(f"[perception][self-test] {'PASS' if ok_window_diag else 'FAIL'}  SESSION-65 CHUNK 4 DIAG/MAP WINDOW FIELDS")
     assert ok_window_diag
 
+    ok_tracker_diag = _self_test_diag_tracker_fields()
+    print(f"[perception][self-test] {'PASS' if ok_tracker_diag else 'FAIL'}  SESSION-67 CHUNK 3 DIAG/CONSOLE TRACKER FIELDS")
+    assert ok_tracker_diag
+
     print("[perception][self-test] PASS")
 
 
@@ -2104,6 +2135,106 @@ def _self_test_diag_window_fields():
     return ok
 
 
+def _self_test_diag_tracker_fields():
+    """SESSION-67 CHUNK 3: the seven tracker-instrumentation columns (slam_engine.SLAM_TRACKER_
+    PHASE_FIELDS + SLAM_TRACKER_STATE_FIELDS, sourced from slam_track_stats.TrackStats) land in the
+    flight CSV (DIAG_PERF_FIELDS, appended last, after rec_frame -- making the header 40 columns) and
+    the 1 Hz console line grows a trk[...] segment that renders only on frames track() actually ran.
+    No GPU/SLAM needed: DiagLog is pure stdlib CSV and the console segment is exercised against a
+    SimpleNamespace stand-in, exactly like session 64's backend console-segment test."""
+    import csv
+    import shutil
+    import tempfile
+    import types
+
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"[perception][self-test] {'PASS' if cond else 'FAIL'}  {name}")
+
+    check("frozen_prefix33 -- first thirty-three DIAG_PERF_FIELDS names/order unchanged",
+          DIAG_PERF_FIELDS[:33] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+                                     "n_keyframes", "n_voxels", "reloc",
+                                     "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                                     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+                                     "frame_ms", "infer_ms", "tracker_ms",
+                                     "backend_mode", "backend_queue_depth", "backend_thread_ms",
+                                     "backend_pose_clobbers", "backend_error",
+                                     "backend_window_mode", "backend_window_kf", "backend_solve_kf",
+                                     "backend_solve_edges", "backend_graph_edges", "backend_anchors",
+                                     "backend_anchor_drift", "rec_frame"))
+    tracker_fields = slam_engine.SLAM_TRACKER_PHASE_FIELDS + slam_engine.SLAM_TRACKER_STATE_FIELDS
+    check("tracker_fields_present_exactly_once -- every SLAM_TRACKER_PHASE_FIELDS/STATE_FIELDS name "
+          "is a DIAG_PERF_FIELDS column, exactly once",
+          all(DIAG_PERF_FIELDS.count(f) == 1 for f in tracker_fields))
+    check("forty_columns_no_duplicates -- DIAG_PERF_FIELDS is 40 columns, all unique",
+          len(DIAG_PERF_FIELDS) == 40 and len(set(DIAG_PERF_FIELDS)) == 40)
+
+    tmp_dir = tempfile.mkdtemp(prefix="tracker_fields_selftest_")
+    try:
+        log = DiagLog("perception", list(DIAG_PERF_FIELDS), out_dir=tmp_dir, ts="20260101_000000")
+
+        # -- a fully-populated row: the seven tracker columns round-trip their real values, including
+        # trk_gn_exit as the STRING "max_iters" (a GN_EXITS member), never a number --
+        tracker_values = {
+            "trk_pre_ms": 12.3, "trk_solve_ms": 45.6, "trk_gn_iters": 7, "trk_gn_exit": "max_iters",
+            "trk_valid_opt": 512, "trk_match_frac": 0.8321, "trk_seeded": 1,
+        }
+        full_row = {f: (1 if f in ("frame_id", "new_keyframe", "n_keyframes", "n_voxels", "reloc",
+                                    "backend_queue_depth", "backend_pose_clobbers")
+                        else ("TRACKING" if f == "mode"
+                              else ("ASYNC" if f == "backend_mode" else 1.0)))
+                    for f in DIAG_PERF_FIELDS}
+        full_row.update(tracker_values)
+        log.row(**full_row)
+
+        # -- a row with the seven tracker kwargs OMITTED: must come back blank, never "0"/"0.0" --
+        log.row(wall_ts=2.0, frame_id=2, loop_dt=0.1, slam_ms=5.0, mode="TRACKING",
+                new_keyframe=0, n_keyframes=1, n_voxels=10, reloc=0)
+        log.close()
+
+        with open(log.path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+
+        full_row_ok = all(str(rows[0][f]) == str(tracker_values[f]) for f in tracker_values)
+        check("csv_full_row_tracker_fields_roundtrip -- all seven come back with the right values",
+              full_row_ok)
+        check("csv_gn_exit_roundtrips_as_string -- 'max_iters' comes back as the string, not a number",
+              rows[0]["trk_gn_exit"] == "max_iters")
+
+        blanks_ok = all(rows[1][f] == "" for f in tracker_values)
+        check("csv_omitted_tracker_fields_are_blank -- omitted -> '', never '0'/'0.0'", blanks_ok)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -- the 1 Hz console segment: reads `res` directly (per-frame truth, not the sticky dict), and
+    # renders only when track() actually ran the solve this frame (trk_gn_exit non-empty) --
+    def _render_trk(r):
+        return (f"trk[pre{r.trk_pre_ms:.0f} sv{r.trk_solve_ms:.0f} "
+                f"gn{r.trk_gn_iters}/{r.trk_gn_exit} mf{r.trk_match_frac:.2f}] | "
+                if r.trk_gn_exit else "")
+
+    try:
+        res_ran = types.SimpleNamespace(trk_pre_ms=8.0, trk_solve_ms=32.0, trk_gn_iters=5,
+                                        trk_gn_exit="rel_error", trk_match_frac=0.91)
+        res_absent = types.SimpleNamespace(trk_pre_ms=0.0, trk_solve_ms=0.0, trk_gn_iters=0,
+                                           trk_gn_exit="", trk_match_frac=0.0)
+        seg_ran, seg_absent = _render_trk(res_ran), _render_trk(res_absent)
+        render_ok = True
+    except Exception as e:
+        seg_ran = seg_absent = ""
+        render_ok = False
+        print(f"[perception][self-test] tracker console segment render raised: {e}")
+    check("tracker_console_segment_renders -- contains 'trk[' when trk_gn_exit is set",
+          render_ok and "trk[" in seg_ran)
+    check("tracker_console_segment_absent_on_no_run -- empty when trk_gn_exit=='' (INIT/RELOC)",
+          seg_absent == "")
+
+    return ok
+
+
 def _self_test_phase_timing(cfg):
     """SESSION-62 PHASE TIMING SCHEMA: DIAG_PERF_FIELDS must keep its frozen 9-column prefix (so
     pre-2026-09-05 files stay readable by name), carry every SlamResult phase field plus the four
@@ -2150,6 +2281,25 @@ def _self_test_phase_timing(cfg):
                                      "frame_ms", "infer_ms", "tracker_ms"))
     check("backend_fields_present -- every slam_engine.SLAM_BACKEND_FIELDS name is a DIAG_PERF_FIELDS column",
           all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_BACKEND_FIELDS))
+    # Session 67: the frozen-thirty-three guarantee -- every flight written before this session has
+    # exactly these thirty-three names in this order; the seven tracker-instrumentation columns land
+    # strictly AFTER them.
+    check("frozen_prefix33 -- first thirty-three DIAG_PERF_FIELDS names/order unchanged since before "
+          "session 67",
+          DIAG_PERF_FIELDS[:33] == ("wall_ts", "frame_id", "loop_dt", "slam_ms", "mode", "new_keyframe",
+                                     "n_keyframes", "n_voxels", "reloc",
+                                     "track_ms", "backend_ms", "pose_ms", "kf_download_ms",
+                                     "integrate_ms", "map_pub_ms", "plan_ms", "publish_ms",
+                                     "frame_ms", "infer_ms", "tracker_ms",
+                                     "backend_mode", "backend_queue_depth", "backend_thread_ms",
+                                     "backend_pose_clobbers", "backend_error",
+                                     "backend_window_mode", "backend_window_kf", "backend_solve_kf",
+                                     "backend_solve_edges", "backend_graph_edges", "backend_anchors",
+                                     "backend_anchor_drift", "rec_frame"))
+    check("tracker_fields_present -- every SLAM_TRACKER_PHASE_FIELDS/SLAM_TRACKER_STATE_FIELDS name "
+          "is a DIAG_PERF_FIELDS column",
+          all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_TRACKER_PHASE_FIELDS)
+          and all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_TRACKER_STATE_FIELDS))
 
     tmp_dir = tempfile.mkdtemp(prefix="phase_timing_selftest_")
     try:
