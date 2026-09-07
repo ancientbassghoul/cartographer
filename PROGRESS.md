@@ -49,6 +49,14 @@ See `STATE.md` for what's next._
   our favour: less GPU work -> less heat -> higher clock. Next step is a 10-minute thermal experiment
   (raise/cool the laptop, re-run the 2-min park, watch where throttle engages) with an up-to-8x payoff
   — more than every optimisation session combined.
+  **Housekeeping with teeth:** `STATE.md` had reached 431 lines and its headline had been actively
+  wrong for two sessions, so it was cut to 96 (the live item only) with every watch list, backlog
+  item and measurement table moved here and zero duplicated lines between the two files. The cause
+  was structural — the workflow had an append step and no delete step — so `CLAUDE.md` gained a
+  **third mandatory closing step, PRUNE**, plus a pruning rule: every watch item must name the event
+  that closes it, that event DELETES it (confirmed / broken / not-observed are the only outcomes),
+  anything unreviewed for three sessions was never real, prune before appending, and a `STATE.md`
+  over ~120 lines or with a stale headline means the step failed.
 
 - **67 (Chunks 1-5) — instrumented `tracker.track()` so the accumulator hunt has numbers, not just a
   step-change.** We wanted the GN iteration count, the convergence reason, the match fraction and a
