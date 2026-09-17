@@ -33,6 +33,7 @@ import lietorch
 
 import slam_window
 import slam_track_stats
+import slam_reloc_stats
 
 CARTO = Path(__file__).resolve().parent
 SLAM_REPO = CARTO / "third_party" / "MASt3R-SLAM"
@@ -126,6 +127,16 @@ class SlamResult:
     cuda_reserved_mb: float = 0.0
     cuda_peak_mb: float = 0.0
     fg_edge_mb: float = 0.0
+    # Session 69 -- the relocalisation attempt this frame ran, if any (slam_reloc_stats.RelocStats).
+    # reloc_attempt == 0 means no attempt on this frame; everything else is then blank/0 by default.
+    reloc_attempt: int = 0
+    reloc_n_cand: int = 0
+    reloc_cands: str = ""
+    reloc_fracs: str = ""
+    reloc_best_frac: float = 0.0
+    reloc_vetoed: int = 0
+    reloc_ok: int = 0
+    reloc_ms: float = 0.0
 
 
 # Session 62: the phase names in SlamResult, in pipeline order. Single source of truth shared by
@@ -156,6 +167,10 @@ SLAM_WINDOW_FIELDS: tuple[str, ...] = ("backend_window_mode", "backend_window_kf
 # closure invariant -- same standing as SLAM_BACKEND_FIELDS / SLAM_WINDOW_FIELDS.
 SLAM_MEMORY_FIELDS: tuple[str, ...] = ("cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb",
                                        "fg_edge_mb")
+
+# Session 69: one relocalisation attempt's candidates and verdict (slam_reloc_stats.RELOC_FIELDS).
+# STATE, not durations (reloc_ms is the one exception and closes against nothing).
+SLAM_RELOC_FIELDS: tuple[str, ...] = slam_reloc_stats.RELOC_FIELDS
 
 # Session 67: the split inside tracker_ms, and the GN solve's state. A THIRD closure invariant,
 # distinct from the four SLAM_PHASE_FIELDS close against slam_ms and the three SLAM_TRACK_PHASE_
@@ -196,7 +211,8 @@ BACKEND_IDLE_SLEEP_S: float = 0.05
 class SlamEngine:
     def __init__(self, device="cuda:0", config_path="config/base.yaml", conf_thresh=1.5,
                  backend_async: bool = True, window_mode: str = "OFF", window_kf: int = 0,
-                 window_policy: str = "anchored"):
+                 window_policy: str = "anchored",
+                 reloc_strict: bool | None = None, reloc_min_match_frac: float | None = None):
         assert torch.cuda.is_available(), "CUDA required for SLAM (NO SILENT FALLBACKS)."
         self.device = device
         self.conf_thresh = conf_thresh
@@ -206,6 +222,8 @@ class SlamEngine:
         # backend_window_mode/policy in config.yaml should never get to fly before it's caught.
         self.window_mode, self.window_kf, self.window_policy = slam_window.validate_window_config(
             window_mode, window_kf, window_policy)
+        print("[slam] allocator: torch.cuda.empty_cache() after every backend pass (session 69, "
+              "WDDM never flushes the cache itself)")
         if self.window_mode == "OFF":
             print("[slam] global-opt window: mode=OFF (unbounded, upstream behaviour)")
         else:
@@ -271,11 +289,29 @@ class SlamEngine:
         # slam_window.py, never in third_party/ (CLAUDE.md: the vendored repo stays pristine).
         self._FactorGraph = slam_window.make_windowed_factor_graph(
             FactorGraph, mast3r_slam_backends.gauss_newton_rays)
+        # Session 69: one more level over the windowed class, recording what add_factors saw
+        # (per-candidate match fractions) so a relocalisation attempt's verdict can be explained.
+        from mast3r_slam.mast3r_utils import mast3r_match_symmetric
+        self._FactorGraph = slam_reloc_stats.make_reloc_instrumented_factor_graph(
+            self._FactorGraph, mast3r_match_symmetric)
+        print("[slam] reloc instrumentation: FactorGraph -> "
+              f"{self._FactorGraph.__name__} (slam_reloc_stats, session 69)")
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_grad_enabled(False)
         load_config(config_path)
         config["use_calib"] = False
+        # Session 69: relocalisation acceptance, overridden from config.yaml (see its comment) over
+        # upstream's base.yaml values. None = keep upstream's. Logged either way so a flight's console
+        # says which rule it flew under.
+        if reloc_strict is not None:
+            config["reloc"]["strict"] = bool(reloc_strict)
+        if reloc_min_match_frac is not None:
+            config["reloc"]["min_match_frac"] = float(reloc_min_match_frac)
+        self.reloc_min_match_frac = float(config["reloc"]["min_match_frac"])   # published on every plan
+        print(f"[slam] reloc acceptance: strict={config['reloc']['strict']} "
+              f"min_match_frac={config['reloc']['min_match_frac']} k={config['retrieval']['k']} "
+              f"({'config.yaml override' if reloc_strict is not None or reloc_min_match_frac is not None else 'upstream base.yaml'})")
         self._config = config
 
         self.model = load_mast3r(device=device)
@@ -285,6 +321,8 @@ class SlamEngine:
         self._i = 0
         self.n_keyframes = 0
         self.n_reloc = 0
+        self._reloc_attempts = 0                                   # session 69: cumulative
+        self._last_reloc_stats = slam_reloc_stats.RELOC_STATS_ABSENT
         self._origin = torch.zeros(1, 3, device=device)
         # Origin + 3 unit axes, acted on by T_WC to recover the full pose via Act3 only.
         # (T_WC.matrix() routes through Act4 on a view of the pose data, which corrupts the
@@ -325,12 +363,14 @@ class SlamEngine:
     def _relocalization(self, frame):
         cfg = self._config
         keyframes, factor_graph = self.keyframes, self.factor_graph
+        _t_reloc = time.perf_counter()                              # session 69
         with keyframes.lock:
             retrieval_inds = self.retrieval_database.update(
                 frame, add_after_query=False,
                 k=cfg["retrieval"]["k"], min_thresh=cfg["retrieval"]["min_thresh"])
             kf_idx = list(retrieval_inds)
             success = False
+            factor_graph.last_add_factors_stats = None              # session 69: this attempt only
             if kf_idx:
                 keyframes.append(frame)
                 n_kf = len(keyframes)
@@ -345,6 +385,19 @@ class SlamEngine:
                     keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
                 else:
                     keyframes.pop_last()
+            # Session 69: one RelocStats per attempt -- what retrieval proposed, how each candidate
+            # matched, and the verdict -- to the CSV (via process()) and the console. Measured
+            # BEFORE the solve below so reloc_ms is the query+match cost, the part every failed
+            # attempt pays.
+            self._reloc_attempts += 1
+            self._last_reloc_stats = slam_reloc_stats.build_reloc_stats(
+                self._reloc_attempts, kf_idx,
+                factor_graph.last_add_factors_stats if kf_idx else None,
+                float(cfg["reloc"]["min_match_frac"]),
+                (time.perf_counter() - _t_reloc) * 1000.0)
+            print(slam_reloc_stats.format_console_line(
+                self._last_reloc_stats, float(cfg["reloc"]["min_match_frac"]),
+                bool(cfg["reloc"]["strict"])))
             if success:
                 if cfg["use_calib"]:
                     factor_graph.solve_GN_calib()
@@ -401,6 +454,16 @@ class SlamEngine:
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:
                 states.global_optimizer_tasks.pop(0)
+        # Session 69: return the allocator's cached-free blocks to the driver after every pass.
+        # Each solve gathers one pointmap per edge into a working block (~2.3 MB x edges) that is
+        # a little bigger than last pass's, so the freed old block can never serve the next request
+        # and PyTorch's caching allocator keeps asking the driver for new ones -- quadratic growth
+        # (flight 20260917_154226: 8.2 GB peak live, 29.5 GB reserved, 15 GB paged to system RAM).
+        # On Linux the allocator flushes itself when cudaMalloc fails; under Windows/WDDM cudaMalloc
+        # never fails (it pages), so the flush never fires, and expandable_segments is Linux-only.
+        # Cost: the next pass re-allocates from the driver, a few ms against a multi-second solve.
+        # Visible in the CSV as cuda_reserved_mb tracking cuda_alloc_mb instead of climbing.
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------- backend thread
     def _queue_depth(self) -> int:
@@ -552,6 +615,7 @@ class SlamEngine:
             self._lazy_state(rgb_float01)
 
         _t0 = time.perf_counter()
+        _reloc_attempts_at_entry = self._reloc_attempts             # session 69
         i = self._i
         mode = states_mode = self.states.get_mode()
         T_WC = (lietorch.Sim3.Identity(1, device=self.device)
@@ -678,6 +742,10 @@ class SlamEngine:
         window_stats = (self.factor_graph.last_window_stats if self._initialized
                          else slam_window.WindowStats(mode=self.window_mode, window_kf=self.window_kf))
         mem = self._memory_stats()
+        # Session 69: attach the attempt this call ran (SYNC: _run_backend ran inline above), else
+        # the ABSENT default so reloc_attempt == 0 reads unambiguously as "no attempt this frame".
+        rl = (self._last_reloc_stats if self._reloc_attempts > _reloc_attempts_at_entry
+              else slam_reloc_stats.RELOC_STATS_ABSENT)
         return SlamResult(
             tracking_mode=self.tracking_mode, mode=cur_mode,
             n_keyframes=kf_count, frame_idx=i, camera_center=center,
@@ -697,7 +765,11 @@ class SlamEngine:
             backend_solve_kf=window_stats.solve_kf, backend_solve_edges=window_stats.solve_edges,
             backend_graph_edges=window_stats.graph_edges, backend_anchors=window_stats.anchors,
             backend_anchor_drift=window_stats.anchor_drift,
-            cuda_alloc_mb=mem[0], cuda_reserved_mb=mem[1], cuda_peak_mb=mem[2], fg_edge_mb=mem[3])
+            cuda_alloc_mb=mem[0], cuda_reserved_mb=mem[1], cuda_peak_mb=mem[2], fg_edge_mb=mem[3],
+            reloc_attempt=rl.reloc_attempt, reloc_n_cand=rl.reloc_n_cand,
+            reloc_cands=rl.reloc_cands, reloc_fracs=rl.reloc_fracs,
+            reloc_best_frac=rl.reloc_best_frac, reloc_vetoed=rl.reloc_vetoed,
+            reloc_ok=rl.reloc_ok, reloc_ms=rl.reloc_ms)
 
     _FG_EDGE_TENSORS = ("ii", "jj", "idx_ii2jj", "idx_jj2ii", "valid_match_j", "valid_match_i",
                         "Q_ii2jj", "Q_jj2ii")

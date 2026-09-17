@@ -60,6 +60,18 @@ perception:
   backend_window_mode: "OFF"
   backend_window_kf: 0
   backend_window_policy: "anchored"
+  # Session 69: relocalisation acceptance. Upstream (third_party/.../config/base.yaml, kept pristine)
+  # ships strict=True / min_match_frac=0.3: retrieval proposes its k=3 best keyframes and the
+  # attempt fails if ANY of them matches under the threshold. Two instrumented flights (perception
+  # CSV reloc_* columns, 2026-09-17) showed that rule rejecting 68 % of attempts whose best candidate
+  # was >= 0.3 -- a 0.59 match vetoed 20x in a row by a retrieval false positive at 0.000 -- and
+  # measured the two score populations: genuinely-wrong candidates (> 2.5 u away) topped out at 0.17
+  # (worst unlabelled suspect 0.27); the candidate that carried each real recovery scored 0.37-0.69.
+  # strict=False accepts on the best candidate alone (weak ones are dropped, not vetoes); 0.35 sits
+  # in the 0.27-0.37 gap. Time-to-recover on the protocol flight: 24/40/76/48 s strict -> 19/23/5/17 s.
+  # slam_engine applies these over upstream's values after load_config and logs the result.
+  reloc_strict: false
+  reloc_min_match_frac: 0.35
 
 models:
   # (depth_anything REMOVED 2026-07-07 — DA-V2 depth inference disabled; the wall stand-off uses the SLAM raycast.)
@@ -571,6 +583,33 @@ autonomy:
                               #   resumes the sweep. Mirrors servo_min_window_s deliberately: the same
                               #   evidence window in both directions. Holds still while it waits, and a
                               #   single confident verdict inside the window clears it outright.
+                              #   Session 69: additionally never abandons before at least ONE reloc
+                              #   attempt has run since SERVO began (an attempt takes ~1.7 s > 1.5 s).
+    # --- Session 69: every hold-still while lost (the 12 s LOSS-RECOVERY GRACE, fallback_initial_wait_s,
+    #   fallback_backoff_wait_s, fallback_post_push_wait_s, and SERVO's EQUAL hold) is decided by what
+    #   SLAM's relocalisation attempts are SEEING (plan fields reloc_attempt/reloc_n_cand/reloc_best_frac
+    #   -> reloc_hold.RelocHoldGate), not by the timer alone. Evidence (flights 20260917_210627 and
+    #   _213324): facing a textureless wall every attempt returns 0 retrieval candidates for as long as
+    #   the drone stays put (16, 29, 16 consecutive empties), so 32 s of hovering there never could
+    #   work; once candidates appear, `best` climbs over a few attempts and recovery follows, which is
+    #   when holding pays. Rule: fewer than reloc_hold_streak attempts seen during the hold -> the
+    #   site's own timer above still decides (unchanged behaviour when SLAM is slow-but-tracking or
+    #   perception is silent); an attempt is WEAK if it has 0 candidates OR its best match fraction is
+    #   below reloc_hold_weak_frac x SLAM's reloc_min_match_frac (flight 20260917_222822 held 20 s caps
+    #   on a candidate flat at 0.08 -- retrieval returns SOMETHING almost anywhere); the last
+    #   reloc_hold_streak attempts all weak and >= reloc_hold_min_s elapsed -> leave (change the view);
+    #   strong candidates -> keep while the best keeps IMPROVING by > reloc_hold_progress_delta over
+    #   each reloc_hold_streak attempts (every real recovery came from a climbing best; with non-strict
+    #   acceptance a good match recovers within an attempt or two, so a flat score means this pose will
+    #   not do it), up to reloc_hold_cap_s (servo_hold_cap_s for SERVO). Every early leave / extension
+    #   is logged with its reason and shown on the recovery panel. General durations, a count, a ratio
+    #   of SLAM's own threshold and a score delta -- not a room's answer.
+    reloc_hold_min_s: 3.0            # ~two attempts before a weak-run verdict may end a hold
+    reloc_hold_cap_s: 20.0           # longest any hold is extended while the best keeps improving
+    reloc_hold_streak: 3             # consecutive weak attempts that mean "this view is hopeless"
+    reloc_hold_weak_frac: 0.5        # weak = best < this x reloc_min_match_frac (0.175 at 0.35)
+    reloc_hold_progress_delta: 0.02  # improvement the best must show per streak to keep holding
+    servo_hold_cap_s: 12.0           # SERVO's EQUAL hold cap (replaces servo_hold_frames as the give-up)
     # --- SLAM frame-timing settle gate. A healthy MASt3R-SLAM solve on this GPU builds a frame in well under
     #     a second; a choke (esp. right after a turn) spikes it and the emitted pose is unreliable. While
     #     translating / just after a turn / on recovering, HOLD until the solve settles, then fly. These are

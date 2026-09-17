@@ -89,6 +89,12 @@ DIAG_PERF_FIELDS: tuple[str, ...] = (
     # gpu_probe.py sees on the process total can be named: live tensors vs allocator cache vs the
     # solve's transient peak vs the FactorGraph's per-edge tensors. Appended LAST, after trk_seeded.
     "cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb", "fg_edge_mb",
+    # Session 69: one relocalisation attempt per row that ran one (slam_engine.SLAM_RELOC_FIELDS /
+    # slam_reloc_stats.RelocStats): which keyframes retrieval proposed, each one's mutual match
+    # fraction, how many fell under reloc.min_match_frac, and the verdict. reloc_attempt == 0 means
+    # no attempt on this frame. Appended LAST, after fg_edge_mb.
+    "reloc_attempt", "reloc_n_cand", "reloc_cands", "reloc_fracs",
+    "reloc_best_frac", "reloc_vetoed", "reloc_ok", "reloc_ms",
 )
 
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
@@ -183,7 +189,10 @@ class Pipeline:
         window_policy = cfg["perception"].get("backend_window_policy", "anchored")
         self.slam = slam_engine.SlamEngine(
             conf_thresh=conf_thresh, backend_async=backend_async,
-            window_mode=window_mode, window_kf=window_kf, window_policy=window_policy)
+            window_mode=window_mode, window_kf=window_kf, window_policy=window_policy,
+            # session 69: absent keys -> None -> upstream's strict=True / 0.3 (logged by the engine)
+            reloc_strict=cfg["perception"].get("reloc_strict"),
+            reloc_min_match_frac=cfg["perception"].get("reloc_min_match_frac"))
         started = self.slam.start_backend()
         print(f"[perception] SLAM backend: "
               f"{'ASYNC (own thread)' if started else 'SYNC (inline, backend_async=false)'}")
@@ -494,7 +503,11 @@ class Pipeline:
             trk_valid_opt=res.trk_valid_opt, trk_match_frac=round(res.trk_match_frac, 4),
             trk_seeded=res.trk_seeded,
             cuda_alloc_mb=round(res.cuda_alloc_mb, 1), cuda_reserved_mb=round(res.cuda_reserved_mb, 1),
-            cuda_peak_mb=round(res.cuda_peak_mb, 1), fg_edge_mb=round(res.fg_edge_mb, 1))
+            cuda_peak_mb=round(res.cuda_peak_mb, 1), fg_edge_mb=round(res.fg_edge_mb, 1),
+            reloc_attempt=res.reloc_attempt, reloc_n_cand=res.reloc_n_cand,
+            reloc_cands=res.reloc_cands, reloc_fracs=res.reloc_fracs,
+            reloc_best_frac=res.reloc_best_frac, reloc_vetoed=res.reloc_vetoed,
+            reloc_ok=res.reloc_ok, reloc_ms=res.reloc_ms)
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -582,6 +595,15 @@ class Pipeline:
             "cap_ts": meta.get("mono_ts"),
             "frame_id": meta.get("frame_id"), "sim_time": meta.get("sim_time"),
             "ground": self.ground.summary(raster=self.GROUND_RASTER),
+            # Session 69: the relocalisation attempt this frame ran (slam_reloc_stats.RelocStats; 0 =
+            # none), so the autopilot's loss-recovery holds (reloc_hold.RelocHoldGate) can be decided by
+            # what SLAM is seeing -- 0 candidates = the view is unrecognised, move; candidates = hold --
+            # instead of by fixed timers. Rides EVERY plan, valid or not: attempts only happen while lost.
+            "reloc_attempt": res.reloc_attempt, "reloc_n_cand": res.reloc_n_cand,
+            "reloc_best_frac": res.reloc_best_frac,
+            # ... and SLAM's acceptance threshold, so the gate's "weak candidate" line is a ratio of
+            # the ONE number SLAM actually judges by (config.yaml reloc_min_match_frac), never a copy.
+            "reloc_min_match_frac": self.slam.reloc_min_match_frac,
         }
         if not valid:
             return payload
@@ -1568,6 +1590,7 @@ def _self_test_f_lkg_source(cfg):
         p = types.SimpleNamespace(
             ground=GroundGrid(cfg), planner=FrontierPlanner(cfg), mapstore=MapStore(0.1),
             _slam_seq=0, last_planner_event=[], GROUND_RASTER=160, last_plan_valid=False,
+            slam=types.SimpleNamespace(reloc_min_match_frac=0.35),   # session 69: published on every plan
             clearance_fan_deg=float(e.get("clearance_fan_deg", 15.0)),
             clearance_fan_n=int(e.get("clearance_fan_n", 3)),
             clearance_skip=float(e.get("clearance_skip", 0.25)),
@@ -1587,7 +1610,10 @@ def _self_test_f_lkg_source(cfg):
 
     def _res(mode, pos_ok, tracking_mode="MASt3R"):
         cc = np.array([1.0, 0.0, 2.0]) if pos_ok else None
-        return types.SimpleNamespace(mode=mode, tracking_mode=tracking_mode, camera_center=cc)
+        # session 69: _plan_payload now forwards the reloc fields on every plan; the stand-in carries
+        # SlamResult's defaults for them ("no attempt this frame").
+        return types.SimpleNamespace(mode=mode, tracking_mode=tracking_mode, camera_center=cc,
+                                     reloc_attempt=0, reloc_n_cand=0, reloc_best_frac=0.0)
 
     meta = {"mono_ts": 0.0, "frame_id": 1, "sim_time": 0.0}
 
@@ -2175,9 +2201,10 @@ def _self_test_diag_tracker_fields():
     check("tracker_fields_present_exactly_once -- every SLAM_TRACKER_PHASE_FIELDS/STATE_FIELDS name "
           "is a DIAG_PERF_FIELDS column, exactly once",
           all(DIAG_PERF_FIELDS.count(f) == 1 for f in tracker_fields))
-    # Session 69 appended the four SLAM_MEMORY_FIELDS after trk_seeded: 40 -> 44.
-    check("forty_four_columns_no_duplicates -- DIAG_PERF_FIELDS is 44 columns, all unique",
-          len(DIAG_PERF_FIELDS) == 44 and len(set(DIAG_PERF_FIELDS)) == 44)
+    # Session 69 appended the four SLAM_MEMORY_FIELDS after trk_seeded (40 -> 44), then the eight
+    # SLAM_RELOC_FIELDS after those (44 -> 52).
+    check("fifty_two_columns_no_duplicates -- DIAG_PERF_FIELDS is 52 columns, all unique",
+          len(DIAG_PERF_FIELDS) == 52 and len(set(DIAG_PERF_FIELDS)) == 52)
 
     tmp_dir = tempfile.mkdtemp(prefix="tracker_fields_selftest_")
     try:
@@ -2310,9 +2337,17 @@ def _self_test_phase_timing(cfg):
     # Session 69: the memory columns are the LAST four, in SLAM_MEMORY_FIELDS order, and every one
     # of them is a SlamResult field defaulting to a float 0.0 ("not measured", distinguishable from
     # a real reading only by never being exactly 0.0 on a CUDA process that has loaded a model).
-    check("memory_fields_last -- DIAG_PERF_FIELDS ends with SLAM_MEMORY_FIELDS, in order",
-          tuple(DIAG_PERF_FIELDS[-len(slam_engine.SLAM_MEMORY_FIELDS):])
-          == slam_engine.SLAM_MEMORY_FIELDS)
+    _n_mem, _n_rel = len(slam_engine.SLAM_MEMORY_FIELDS), len(slam_engine.SLAM_RELOC_FIELDS)
+    check("memory_then_reloc_fields_last -- DIAG_PERF_FIELDS ends with SLAM_MEMORY_FIELDS then "
+          "SLAM_RELOC_FIELDS, in order",
+          tuple(DIAG_PERF_FIELDS[-(_n_mem + _n_rel):-_n_rel]) == slam_engine.SLAM_MEMORY_FIELDS
+          and tuple(DIAG_PERF_FIELDS[-_n_rel:]) == slam_engine.SLAM_RELOC_FIELDS)
+    _r_rel = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False)
+    check("slam_result_reloc_defaults -- reloc_attempt 0, cands/fracs '', ok 0",
+          _r_rel.reloc_attempt == 0 and _r_rel.reloc_cands == "" and _r_rel.reloc_fracs == ""
+          and _r_rel.reloc_ok == 0 and _r_rel.reloc_best_frac == 0.0)
     _r_mem = slam_engine.SlamResult(
         tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
         camera_center=None, new_keyframe=False, reloc_event=False)

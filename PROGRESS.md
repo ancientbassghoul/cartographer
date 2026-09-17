@@ -5,9 +5,10 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-17**, branch `all-bets-are-off`, session 69: the thermal cliff is closed
-(fans), the remaining VRAM ramp is NAMED (allocator paging under WDDM), fix proposed and approved,
-not yet written. See `STATE.md` for what's next._
+_Last updated **2026-09-17**, branch `all-bets-are-off`, session 69 (two commits): thermal cliff
+closed, VRAM paging fixed and confirmed, and the loss-recovery stack rebuilt on measured
+relocalisation evidence -- non-strict acceptance at 0.35, evidence-gated holds, no TRIM on an
+unconfirmed re-lock -- flown four times. See `STATE.md` for what's next._
 
 ## Session Log (newest first)
 
@@ -49,6 +50,37 @@ not yet written. See `STATE.md` for what's next._
   cutting our own CPU load (backlog J). Also noticed: the io_bridge recordings of 2026-09-06/07 have
   no `moov` atom (writer killed before finalising) and will not open — backlog K. The operator used
   flight 2 for the demo: "flew like a dream", visual-recovery fallback seen working.
+  **Second half of the session — the recovery stack, rebuilt on evidence.** `empty_cache` went in
+  and held on every later flight (reserved 6.6 -> 7.7 GB over 9-10 min, spill flat at its ~240 MB
+  baseline, VRAM 60-66 %). A flight that went to FALLBACK and never came back (`20260917_175917`:
+  loss at 2.5 min after four fast forward hops with match fractions sliding 0.28 -> 0.19, then **466
+  relocalisation attempts in 10 min, all failed**, while the visual matcher saw known scenery 85-90 %
+  of the time) pointed at the acceptance rule, not the view: upstream `reloc.strict=True` rejects the
+  WHOLE attempt if ANY of retrieval's k=3 candidates has < 0.3 mutual matches. Instrumented it the
+  session-67 way — `slam_reloc_stats.py` subclasses FactorGraph, `add_factors` body verbatim plus one
+  recorded struct; eight `reloc_*` CSV columns and a console line per attempt — and a forced-loss
+  flight (`_210627`) showed it: 68 % of attempts had a best candidate >= 0.3 and were vetoed anyway,
+  including a **0.59 match rejected 20x in a row** by a retrieval false positive at 0.000; the only
+  spot that ever passed was where three neighbouring keyframes all overlapped the view. A protocol
+  flight (`_213324`, six forced losses, hold still until strict recovers) labelled every candidate by
+  its keyframe's distance from the recovered pose: genuinely-wrong candidates topped out at **0.17**
+  (worst unlabelled suspect 0.27), the candidate carrying each real recovery scored **0.37-0.69**.
+  Operator decision: `strict: False`, `min_match_frac: 0.35` (overridden from `config.yaml` over
+  upstream's base.yaml after `load_config`, logged at startup). Then the operator's two observations
+  — "it doesn't wait for SLAM after servo settles" and "the 20 s wait facing a blank wall is
+  wasted" — turned out to be the same finding in the data: facing a textureless wall every attempt
+  returns **0 candidates** for as long as the drone stays put (16, 29, 16 consecutive empties, ending
+  only when it moved), while every real recovery came from a best that CLIMBED over a few attempts.
+  So every hold-still while lost (grace, INITIAL_WAIT, BACKOFF_WAIT, WAIT_POST, SERVO's EQUAL hold)
+  is now decided by `reloc_hold.RelocHoldGate` from the plan's reloc fields: leave after three
+  attempts that are empty or below half the acceptance threshold, hold while the best is improving,
+  cap 20 s (12 s SERVO); the old timers remain as the limit when no attempt is observed. v1 of the
+  gate ("any candidate = hold") wasted ~80 s of one flight on a candidate flat at 0.08 — the weak
+  threshold and the stagnation rule are v2. Flight `_222822` also caught **TRIM firing 36 ms after a
+  re-lock** (pos_y at the -2.10 trigger on an unconfirmed pose) and breaking the seconds-old
+  tracking, three times out of five losses: TRIM is now blocked while `_recovering`. Last flight of
+  the day (`_225913`): 118 keyframes, three losses, three recoveries in <= 10 s each; ended in a
+  TRIM oscillation (DOWN overshoots into the UP band) and a corner-give-up STUCK — backlog L / G.
 
 - **68 — THE ACCUMULATOR IS A THERMALLY THROTTLED GPU. Not an accumulator, and not in our code.**
   We flew session 67's instrumentation and read `tracker_trend`. The hypothesis it was built to test
@@ -813,14 +845,18 @@ assistant's recommendation, not a decision.
 
 | **J** | Cut our own CPU load (session 69: CPU at TjMax, throttling 22 %; GPU waits on it 31 %) — PLY sequence ~250 MB/flight, `timeline.jsonl` ~100 MB, visualizer mp4 encode, five processes | Cheap wins likely; measure with HWiNFO's CPU rows |
 | **K** | io_bridge recordings of 2026-09-06/07 have no `moov` atom — writer killed before finalising, files unopenable. Session 66's frame-exact replay depends on these | Check how io_bridge closes its writer on `fly.py` shutdown |
+| **L** | TRIM oscillation (flight `_225913`, 23:09): DOWN pulse at pos_y −2.16 overshoots to −1.63, past the UP trigger −1.75, so it pulses UP — three trims in 9 s. The session-44 hardcoded band (−2.10..−1.75, 0.35 wide) is narrower than one pulse's travel (0.53) | Pulse magnitude vs band width; the no-leakage exception is on record for this branch |
+| **M** | Planner declared "mission complete — no reachable frontier" after 2 min / 20 keyframes with 6 of 7 goals never approached (flight `_163625`); the deciding planner lines print only to the perception console, which finish-stops closes | Make the planner's retire/done reasons ride the timeline; then **G** |
+| **N** | Visual-recovery canvas (the LKG panel) is not re-rendered while autonomy is OFF (`autopilot.py`: intake before the pause gate, canvas publish after it), so the panel freezes during manual tests while F_LKG itself keeps updating | Cosmetic; move the canvas publish above the gate or mark it stale |
 
 **Suggested order if no other steer:** **E** now (free) → **B2+B3+C** as one log-reading pass (free,
 and it retires three stale watch lists) → **B8**, the only item the assessment task itself needs →
 everything else after the thermal experiment establishes the real performance baseline.
 **Session 69 update:** the thermal baseline is now established (fans fixed the cliff; the chassis
-still thermal-limits both chips — see the session-69 log and `Measured numbers`). With the paging
-fix in, **A1 (window ON)** rises: flight 2 measured the unbounded backend going 2 -> 13.7 s over 100
-keyframes on the new baseline, and that is now the largest remaining per-frame cost.
+still thermal-limits both chips — see the session-69 log and `Measured numbers`). The paging fix is
+in and confirmed. **A1 (window ON)** is now the largest remaining per-frame cost: flight 2 measured
+the unbounded backend going 2 -> 13.7 s over 100 keyframes, and flight `_225913` reached 118
+keyframes. **L** (TRIM oscillation) is the one thing that ended the last flight badly and is small.
 
 
 ### Open items moved out of `STATE.md` (session 68 housekeeping)
@@ -1231,6 +1267,34 @@ OFF, solve touches every edge): 2.0 s at 100 edges -> 13.7 s at 256.
 HWiNFO Max column, flight 2: CPU Package 100 C, Core/Package thermal throttling Yes 22 %, power
 limit exceeded 8 %; GPU hot spot 91.3 C, thermal limiter 65 %, utilization limiter 31 %,
 reliability-voltage 4 %, power 0 %; GPU core load avg 57.8 %; GPU power max 70.9 W (limit 80/100).
+
+**`empty_cache` confirmed (flights `_175917`, `_213318`, `_222822`, `_225913`):** `cuda_reserved_mb`
+6.6 -> 7.2-7.7 GB over 9-14 min, spill flat at the ~240 MB baseline, VRAM 60-66 % — never again the
+29.5 GB / 15 GB paged of flight 2. A 10+ min flight that stays in TRACKING throughout is the last
+unflown case (every one so far lost tracking at least once).
+
+**Relocalisation acceptance (session 69, `reloc_*` columns).** One attempt = retrieval's top-k
+keyframes matched against the frame; `reloc_best_frac` = max over candidates of
+min(match_frac_j, match_frac_i). Cost: ~1.35-1.5 s with candidates, ~40 ms with none.
+- Strict rule, forced-loss flight `20260917_210627`: 112 attempts, 81 with candidates, 2 accepted;
+  55 of 81 (68 %) had best >= 0.30 and were vetoed by a weaker candidate. Recovery trios 29/31/32
+  and 38/29/31 (kf 38 = the frame reloc appended at recovery 1). 20 consecutive attempts at
+  best 0.56-0.59 vetoed by kf 12 at 0.000.
+- Labelled protocol flight `20260917_213324` (six episodes, candidates labelled by keyframe distance
+  from the strict-recovered pose): FAR (> 2.5 u) n=5, max **0.17**; MID (1-2.5 u) n=43, median 0.36,
+  max 0.62; NEAR (< 1 u) n=32, median 0.27, max 0.69. Carrying candidate at each recovery 0.37-0.69
+  (min 0.366). Time-to-recover per episode, strict vs non-strict thresholds:
+  strict 24/40/76/48/2/1 s; 0.30-0.40 -> 19/23/5/17/0/1 s; 0.50 -> 19/26/7/never/never/1 s.
+- Non-strict 0.35, flight `_222822`: 5 losses, 5 recoveries, 4 of them at `vetoed 2`. Flight
+  `_225913`: 3 losses, 3 recoveries, each <= 10 s.
+
+**Loss-recovery holds (session 69, `reloc_hold.py`).** First 20 s after each loss, attempts as
+`candidates/best`: `_210627` 21:11:28 -> 16x `0c` then `3c/0.31, 0.50`; `_213324` 21:37:24 -> 29x
+`0c` then `3c/0.12, 0.43, 0.62`; the `0c` runs ended exactly when the drone moved. Gate v2 replay of
+flight `_222822`'s holds: settle cycle 2 (`2c/0.08` x16) 20.0 s -> 3.6 s; settle cycle 3 20.0 -> 3.1;
+last-episode grace (`3c/0.02-0.07`) 20.0 -> 5.7; initial wait 20.0 -> 4.9; the two holds that ended
+in recovery are not pre-empted. Blank-wall episode in the self-test: grace ends at 3.05 s of 12,
+initial wait at 3.05 s of 20; with no attempts in the plan the legacy 12 s / 20 s hold exactly.
 
 **The SLAM choke, attributed (session 62).** `OUTPUT/diag/20260905_113348_perception.csv`, 446 frames,
 35 min, voxels 3 220 → 386 558, keyframes 1 → 82. Phase closure residual median 0.1 ms, so the split

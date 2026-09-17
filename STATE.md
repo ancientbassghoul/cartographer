@@ -17,38 +17,40 @@ Branch **`all-bets-are-off`**.
 
 ## Current status
 
-### Where the "accumulator" stands after session 69 (2026-09-17)
-The multi-session slowdown was three stacked things, all now measured (numbers: `PROGRESS.md` →
-`Measured numbers` → session 68/69 tables):
-1. **GPU thermal throttle — CLOSED.** Fans + cleaned intakes: peak 96 C -> 75-83 C, clock floor
-   210 -> 780 MHz, `trk_pre_ms` flat at ~340 ms for 7 min. The chassis still thermal-limits the GPU
-   (hot-spot limiter 65 % of a flight) and the CPU (100 C, throttling 22 %); that is hardware, and
-   the remaining levers are in backlog **J**.
-2. **VRAM paging — NAMED, fix approved, NOT YET WRITTEN.** The live item below.
-3. **Unbounded backend window** (`backend_window_mode: OFF`): `backend_ms` 2 s -> 13.7 s over 100
-   keyframes on the healthy baseline. Backlog **A1**, now the largest remaining per-frame cost.
+### Session 69 is DONE and committed (2026-09-17). Nothing is mid-flight.
+What it closed (numbers and narrative: `PROGRESS.md` session-69 log entry + `Measured numbers`):
+- GPU thermal cliff — fans; peak 96 -> 75-83 C, `trk_pre_ms` flat.
+- VRAM paging — `torch.cuda.empty_cache()` after each backend pass; **confirmed on four flights**
+  (reserved 6.6 -> 7.7 GB, spill flat). One unflown case: a 10+ min flight that never loses tracking.
+- Relocalisation — instrumented (`slam_reloc_stats.py`, `reloc_*` CSV columns, a console line per
+  attempt), measured, and the acceptance rule changed on the evidence: `reloc_strict: false`,
+  `reloc_min_match_frac: 0.35` in `config.yaml` (over upstream's strict/0.3).
+- Loss-recovery holds — every hold-still while lost is decided by reloc evidence
+  (`reloc_hold.py`); TRIM is blocked on an unconfirmed re-lock. Last flight: 118 keyframes, three
+  losses, three recoveries in <= 10 s each.
 
-### >>> LIVE ITEM: put `torch.cuda.empty_cache()` at the end of `_run_backend()`, then fly. <<<
-**What:** on Windows/WDDM, PyTorch's caching allocator never flushes (cudaMalloc never fails, it
-pages), and every global-solve pass needs a slightly bigger working block (~2.3 MB x edges) than the
-last, so `cuda_reserved_mb` grows quadratically — flight 2: 6.9 -> **29.5 GB** reserved on a 16 GB
-card, 15 GB paged, for 8.2 GB peak live. `expandable_segments` is Linux-only.
-**Fix:** one explicit `torch.cuda.empty_cache()` after each backend pass in `slam_engine.py`
-`_run_backend()`. Log it once at startup so the behaviour is visible. Not a fallback.
-**Test:** next flight with `gpu_probe.py` running, then `gpu_probe.py --report` — `t_resv` should
-track `t_alloc` + ~1 GB instead of climbing; `spill` should stay at its ~200 MB baseline. Closes
-on that flight: confirmed -> one line in `PROGRESS.md`; broken -> its own plan.
+### >>> NEXT: pick the next item from the triage table (`PROGRESS.md` -> `## Future (backlog)`). <<<
+Recommendation, in order:
+1. **L** — TRIM oscillation (ended the last flight in STUCK; DOWN pulse overshoots into the UP band).
+   Small, and the only thing that went wrong on an otherwise clean flight.
+2. **A1** — fly the bounded window `ON W=30`. The unbounded backend is now the largest per-frame
+   cost (2 -> 13.7 s over 100 keyframes; the map reached 118).
+3. **M/G** — the planner's premature "mission complete" (its reasons must first ride the timeline).
 
-### Standing habits (session 68-69)
-- **Run `venv\Scripts\python.exe gpu_probe.py` alongside every flight**, and HWiNFO64 with
-  `GPU Performance Limiters` and the CPU `DTS` section expanded (reset Min/Max before takeoff).
-  `--report` joins GPU state + torch's memory split (`t_alloc/t_resv/t_peak/fg_edge`) to `trk_pre_ms`.
-- The park 2 / fly 4 / park 2 / fly 4 manual profile for any "does X accumulate?" question.
+Standing watch (closes on the next flight): `gpu_probe.py --report` -> `t_resv` stays within ~1 GB
+of `t_alloc`; the perception console's `[slam] reloc acceptance: strict=False min_match_frac=0.35`
+line is present; FALLBACK event lines name why each hold ended.
+
+### Standing habits
+- **Run `venv\Scripts\python.exe gpu_probe.py` alongside every flight**; `--report` joins GPU
+  state + torch's memory split to `trk_pre_ms`. HWiNFO64 only if the clock leaves 780 MHz.
+- Forced-loss test: fly ~3 min, force a loss, hold still on mapped ground, watch the `RELOC attempt`
+  lines and the FALLBACK hold reasons.
 
 ## Everything else
 There is no second live item. Open work, watch lists, deferred designs and the measured numbers all
 live in `PROGRESS.md`:
-- `## Future (backlog)` — the **TRIAGE TABLE** (A-K, with session 69's update line), then every
+- `## Future (backlog)` — the **TRIAGE TABLE** (A-N, with session 69's update line), then every
   open item. **Read this before picking up anything new.**
 - `## Reference — don't re-derive` → `### Measured numbers` — the throttled-flight table, the two
   session-69 flights side by side, the torch memory split, the HWiNFO limiter readings, plus the

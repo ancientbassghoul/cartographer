@@ -100,6 +100,12 @@ _TRACKER_STATE_COLUMNS: tuple[str, ...] = ("trk_gn_iters", "trk_gn_exit", "trk_v
 _MEMORY_COLUMNS: tuple[str, ...] = ("cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb",
                                     "fg_edge_mb")
 
+# Session 69: mirror of slam_engine.SLAM_RELOC_FIELDS -- per-attempt relocalisation candidates and
+# verdict (strings/counts; reloc_ms is a duration but only on RELOC rows). Excluded from
+# PHASE_COLUMNS/render_table; read them straight from the CSV (rows with reloc_attempt > 0).
+_RELOC_COLUMNS: tuple[str, ...] = ("reloc_attempt", "reloc_n_cand", "reloc_cands", "reloc_fracs",
+                                   "reloc_best_frac", "reloc_vetoed", "reloc_ok", "reloc_ms")
+
 
 @dataclass(frozen=True)
 class PhaseStats:

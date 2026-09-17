@@ -48,6 +48,7 @@ from diag_log import DiagLog, NullLog
 from flow_contact_detector import (FlowContactDetector, detector_from_cfg, FlowVerdict,
                                     CMD_UP, CMD_FWD, CMD_BACK, CMD_DOWN)
 from flight_playbook import FlightPlaybook, RecipePlayer
+from reloc_hold import RelocHoldGate
 from visual_recovery import VisualRecoveryProbe, VisualMatch
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -971,6 +972,23 @@ class ExploreController:
         self.servo_hold_frames = int(e.get("servo_hold_frames", 3))
         # Session 62: how long a lost/UNKNOWN match must PERSIST before SERVO gives up (see config.yaml).
         self.servo_lost_grace_s = float(e.get("servo_lost_grace_s", 1.5))        # SLAM frames CAPTURED at the held EQUAL pose that must be SOLVED before giving up and resuming the sweep
+        # Session 69: every hold-still while lost (the LOSS-RECOVERY GRACE, FALLBACK's INITIAL_WAIT,
+        # BACKOFF_WAIT, WAIT_POST, and SERVO's EQUAL hold) is now decided by what SLAM's relocalisation
+        # attempts are SEEING (reloc_hold.RelocHoldGate, fed from the plan's reloc_* fields) rather than
+        # by the fixed timers above -- which remain as the LEGACY limit for a hold in which no attempt is
+        # observed at all (SLAM slow but tracking, perception silent), so that case is unchanged. See
+        # config.yaml and reloc_hold.py for the evidence and the rule.
+        self.reloc_hold_min_s = float(e.get("reloc_hold_min_s", 3.0))
+        self.reloc_hold_cap_s = float(e.get("reloc_hold_cap_s", 20.0))
+        self.reloc_hold_streak = int(e.get("reloc_hold_streak", 3))
+        self.reloc_hold_weak_frac = float(e.get("reloc_hold_weak_frac", 0.5))
+        self.reloc_hold_progress_delta = float(e.get("reloc_hold_progress_delta", 0.02))
+        self.servo_hold_cap_s = float(e.get("servo_hold_cap_s", 12.0))
+        self._reloc_gate = RelocHoldGate(self.reloc_hold_min_s, self.reloc_hold_cap_s,
+                                         self.reloc_hold_streak, self.reloc_hold_weak_frac,
+                                         self.reloc_hold_progress_delta)
+        self._servo_entry_t = None      # float | None: when SERVO was entered (attempts-since gate)
+        self._servo_equal_t0 = None     # float | None: when EQUAL was first reached this SERVO
         self._servo_tally = VisualDirectionTally()   # rolling evidence for the SERVO entry decision
         self._servo_cap_floor = None    # float | None: cap_ts floor stamped when EQUAL is first reached
         self._servo_frames_seen = 0     # int: solved frames CAPTURED at/after that floor (see _update_slam)
@@ -1857,16 +1875,24 @@ class ExploreController:
             # SERVO phase). `_loss_grace_noticed` is the SAME per-episode latch the other loss-grace sites
             # use, so this notice prints once per episode, not once per tick (Finding D: the old per-tick
             # event string printed 413 times in one flight).
-            if self._loss_episode_t0 is not None and now - self._loss_episode_t0 < self.loss_backoff_grace_s:
-                if not self._loss_grace_noticed:
-                    self._loss_grace_noticed = True
-                    waited = now - self._loss_episode_t0
-                    self.note_timeout("LOSS_GRACE", (
-                        f"LOSS-RECOVERY GRACE: holding still for {self.loss_backoff_grace_s:.0f}s "
-                        f"({waited:.1f}s elapsed) before the FALLBACK sweep (96.9% of held-still losses "
-                        "resolve inside that window)."), now)
-                self._enter("HOLD_LOST", now)
-                return {}, "HOLD_LOST", None
+            # Session 69: the grace is evidence-gated too -- it ends early when relocalisation attempts
+            # keep finding 0 candidates (the view is unrecognised; 96.9% of losses may resolve in 12 s,
+            # but none of THOSE do), and the legacy 12 s still bounds a hold with no attempts observed.
+            if self._loss_episode_t0 is not None:
+                v = self._reloc_gate.verdict(now, self._loss_episode_t0, self.loss_backoff_grace_s)
+                if not v.leave:
+                    if not self._loss_grace_noticed:
+                        self._loss_grace_noticed = True
+                        waited = now - self._loss_episode_t0
+                        self.note_timeout("LOSS_GRACE", (
+                            f"LOSS-RECOVERY GRACE: holding still up to {self.loss_backoff_grace_s:.0f}s "
+                            f"({waited:.1f}s elapsed) before the FALLBACK sweep -- ends early if reloc "
+                            "attempts keep finding no candidates."), now)
+                    self._enter("HOLD_LOST", now)
+                    return {}, "HOLD_LOST", None
+                waited = now - self._loss_episode_t0
+                return self._enter_fallback_sweep(
+                    now, f"PLAN-STALE -> FALLBACK sweep after {waited:.1f}s grace ({v.reason}) (REWIND disabled)")
             return self._enter_fallback_sweep(now, "PLAN-STALE -> FALLBACK sweep (REWIND disabled)")
         # Ghost-path guard: a re-lock that already MOVED (unconfirmed) decoupled the leftover history from the
         # true pose -> clear it and BYPASS REWIND straight to the safe FALLBACK sweep.
@@ -2148,6 +2174,8 @@ class ExploreController:
         self._servo_cap_floor = None
         self._servo_frames_seen = 0
         self._servo_lost_since = None       # session 62: and a fresh servo-EXIT window
+        self._servo_entry_t = None          # session 69: and fresh reloc-evidence stamps
+        self._servo_equal_t0 = None
 
     def wants_visual_match(self, now=None, status=None):
         """Session 51: True only when THIS tick can actually CONSUME a visual match. There are exactly
@@ -2283,7 +2311,23 @@ class ExploreController:
             "servo_lost_s": (None if self._servo_lost_since is None
                              else round(now - self._servo_lost_since, 1)),
             "servo_lost_grace_s": self.servo_lost_grace_s,
+            # Session 69: what the reloc-evidence gate makes of the CURRENT hold (None when the phase is
+            # not a hold), so a cut-short or an extended wait is visible on the panel, not just in the log.
+            "hold": self._hold_panel(now),
         }
+
+    def _hold_panel(self, now):
+        phase = self._fallback_phase
+        legacy = {"INITIAL_WAIT": self.fallback_initial_wait_s, "BACKOFF_WAIT": self.fallback_backoff_wait_s,
+                  "WAIT_POST": self.fallback_post_push_wait_s}
+        if phase in legacy and self._fallback_phase_t0 is not None:
+            v = self._reloc_gate.verdict(now, self._fallback_phase_t0, legacy[phase])
+        elif phase == "SERVO" and self._servo_equal_t0 is not None:
+            v = self._reloc_gate.verdict(now, self._servo_equal_t0, self.servo_hold_cap_s,
+                                         cap_s=self.servo_hold_cap_s)
+        else:
+            return None
+        return {"attempts": v.attempts, "weak": v.weak, "best": round(v.best, 2), "reason": v.reason}
 
     def _step_fallback_servo(self, now, plan, visual_match):
         """FALLBACK's SERVO phase (session 60, Finding C / plan C6): servos along the ONE axis a
@@ -2316,13 +2360,22 @@ class ExploreController:
             lost_for = now - self._servo_lost_since
             if lost_for < self.servo_lost_grace_s:
                 return {}, "FALLBACK", None          # hold still; the view may well come back
+            # Session 69: the 1.5 s grace is shorter than one relocalisation attempt (~1.7 s), so this
+            # used to abandon a view SLAM had not yet tried once. Hold until at least one attempt has
+            # run since SERVO began -- bounded by the servo cap so a silent SLAM cannot pin us here.
+            n_att = (self._reloc_gate.attempts_since(self._servo_entry_t)
+                     if self._servo_entry_t is not None else 0)
+            if n_att == 0 and self._servo_entry_t is not None and now - self._servo_entry_t < self.servo_hold_cap_s:
+                return {}, "FALLBACK", None
             self._player = None
             self._servo_cap_floor = None
             self._servo_frames_seen = 0
             self._servo_lost_since = None
+            self._servo_equal_t0 = None
             self._fallback_phase, self._fallback_phase_t0 = "TURN", now
             return {}, "FALLBACK", (f"FALLBACK SERVO: match lost for {lost_for:.1f}s "
-                                    f"(> {self.servo_lost_grace_s:.1f}s grace) -> resume sweep")
+                                    f"(> {self.servo_lost_grace_s:.1f}s grace, {n_att} reloc attempt(s) "
+                                    f"since entry) -> resume sweep")
         self._servo_lost_since = None                # a confident verdict clears the exit window
         self._servo_last_verdict = verdict
         if verdict == "LIVE":
@@ -2348,13 +2401,22 @@ class ExploreController:
         if self._servo_cap_floor is None:
             self._servo_cap_floor = plan.get("cap_ts")
             self._servo_frames_seen = 0
+            self._servo_equal_t0 = now
             return {}, "FALLBACK", "FALLBACK SERVO: EQUAL -> holding at F_LKG's viewpoint"
-        if self._servo_frames_seen >= self.servo_hold_frames:
+        # Session 69: hold while relocalisation attempts are seeing candidates (this IS a known view;
+        # with non-strict acceptance the first good attempt recovers), leave after a run of empties or
+        # at servo_hold_cap_s. `servo_hold_frames` used to end this after 3 solved frames regardless;
+        # `_servo_frames_seen` still counts for the panel.
+        v = self._reloc_gate.verdict(now, self._servo_equal_t0, self.servo_hold_cap_s,
+                                     cap_s=self.servo_hold_cap_s)
+        if v.leave:
+            held = now - self._servo_equal_t0
             self._servo_cap_floor = None
             self._servo_frames_seen = 0
+            self._servo_equal_t0 = None
             self._fallback_phase, self._fallback_phase_t0 = "TURN", now
-            return {}, "FALLBACK", (f"FALLBACK SERVO: held EQUAL for {self.servo_hold_frames} solved "
-                                    "frames, no recovery -> resume sweep")
+            return {}, "FALLBACK", (f"FALLBACK SERVO: held EQUAL {held:.1f}s, {v.attempts} reloc "
+                                    f"attempt(s), no recovery ({v.reason}) -> resume sweep")
         return {}, "FALLBACK", None
 
     def _step_fallback_sweep(self, now, plan, wall_contact, backwall_contact, visual_match):
@@ -2407,6 +2469,8 @@ class ExploreController:
                 self._servo_cap_floor = None
                 self._servo_frames_seen = 0
                 self._servo_lost_since = None       # session 62: enter SERVO with a clean exit window
+                self._servo_entry_t = now           # session 69: no abandon before one reloc attempt
+                self._servo_equal_t0 = None
                 self._fallback_phase, self._fallback_phase_t0 = "SERVO", now
                 return {}, "FALLBACK", f"FALLBACK: sustained visual match ({tally_summary}) -> SERVO to F_LKG"
         if self._fallback_phase == "SERVO":
@@ -2414,11 +2478,13 @@ class ExploreController:
         phase = self._fallback_phase
         elapsed = now - self._fallback_phase_t0
         if phase == "INITIAL_WAIT":
-            if elapsed < self.fallback_initial_wait_s:
+            # Session 69: evidence-gated (see reloc_hold.py); fallback_initial_wait_s is the legacy limit.
+            v = self._reloc_gate.verdict(now, self._fallback_phase_t0, self.fallback_initial_wait_s)
+            if not v.leave:
                 return {}, "FALLBACK", None
             nxt = "BACKOFF" if self.fallback_backoff_first else "TURN"
             self._fallback_phase, self._fallback_phase_t0 = nxt, now
-            return {}, "FALLBACK", (f"FALLBACK: initial {self.fallback_initial_wait_s:.0f}s wait done -> "
+            return {}, "FALLBACK", (f"FALLBACK: initial wait ended after {elapsed:.1f}s ({v.reason}) -> "
                                     f"{'back off, then look before turning' if nxt == 'BACKOFF' else 'turn'}")
         if phase == "BACKOFF":
             # Session 62: the SAME `back_off` playbook recipe FALLBACK SERVO and `_blind_contact_backoff`
@@ -2453,11 +2519,12 @@ class ExploreController:
             # The SERVO tally checked at the top of this function runs on every tick, so THIS is where a
             # match is most likely to be found -- same bearing as F_LKG, just wider. Nothing else to do
             # but hold still and let it accumulate.
-            if elapsed < self.fallback_backoff_wait_s:
+            v = self._reloc_gate.verdict(now, self._fallback_phase_t0, self.fallback_backoff_wait_s)
+            if not v.leave:
                 return {}, "FALLBACK", None
             self._fallback_phase, self._fallback_phase_t0 = "TURN", now
-            return {}, "FALLBACK", (f"FALLBACK: no sustained match in {self.fallback_backoff_wait_s:.0f}s "
-                                    f"after the back-off -> begin the sweep")
+            return {}, "FALLBACK", (f"FALLBACK: no sustained match {elapsed:.1f}s after the back-off "
+                                    f"({v.reason}) -> begin the sweep")
         if phase == "TURN":
             if self._player is None:
                 self._player = self._build_turn(self.recovery_turn_step_deg)
@@ -2491,9 +2558,15 @@ class ExploreController:
             self._player = None
             self._fallback_phase, self._fallback_phase_t0 = "WAIT_POST", now
             return {}, "FALLBACK", f"FALLBACK: push {self._fallback_push_dirn} done -> settle"
-        # WAIT_POST
-        if elapsed < self.fallback_post_push_wait_s:
+        # WAIT_POST -- session 69: evidence-gated like the other holds. A cut-short settle is logged
+        # (the old timer ended silently) so a fast sweep is legible in the log.
+        v = self._reloc_gate.verdict(now, self._fallback_phase_t0, self.fallback_post_push_wait_s)
+        if not v.leave:
             return {}, "FALLBACK", None
+        if elapsed < self.fallback_post_push_wait_s:
+            self._fallback_cum_deg = 0.0
+            self._fallback_phase, self._fallback_phase_t0 = "TURN", now
+            return {}, "FALLBACK", f"FALLBACK: settle cut short after {elapsed:.1f}s ({v.reason}) -> turn"
         # Session 60 (C6): FALLBACK never exhausts to STUCK anymore (operator: "continue forever ...
         # either it'd recover, or I'd stop it manually") -- `_fallback_cum_deg` is diagnostic-only now,
         # reset every lap so it stays legible in a long flight's logs instead of growing unbounded.
@@ -3032,9 +3105,9 @@ class ExploreController:
             if not self._loss_grace_noticed:
                 self._loss_grace_noticed = True
                 self.note_timeout("LOSS_GRACE", (
-                    f"LOSS-RECOVERY GRACE: holding still for {self.loss_backoff_grace_s:.0f}s before any "
-                    f"reaction (96.9% of held-still losses resolve inside that window). Looking at the "
-                    f"camera after that."), now)
+                    f"LOSS-RECOVERY GRACE: no visual back-off reaction in the first "
+                    f"{self.loss_backoff_grace_s:.0f}s of a loss (the FALLBACK hold itself ends on reloc "
+                    "evidence, see reloc_hold.py). Looking at the camera after that."), now)
             return None
         # step 3: the cached clearance decides whether a back-off is PENDING -- never whether we look.
         pending = (self._last_good_clearance is not None
@@ -3135,9 +3208,9 @@ class ExploreController:
                 if not self._loss_grace_noticed:
                     self._loss_grace_noticed = True
                     self.note_timeout("LOSS_GRACE", (
-                        f"LOSS-RECOVERY GRACE: too-close evidence at the loss instant, but holding still for "
-                        f"{self.loss_backoff_grace_s:.0f}s to let SLAM re-lock before reacting "
-                        f"(96.9% of held-still losses resolve inside that window). No back-off yet."), now)
+                        f"LOSS-RECOVERY GRACE: too-close evidence at the loss instant, but no visual "
+                        f"back-off reaction in the first {self.loss_backoff_grace_s:.0f}s of a loss (the "
+                        "FALLBACK hold itself ends on reloc evidence, see reloc_hold.py). No back-off yet."), now)
                 return None
         # Session 47 -- POST-BACKOFF SLAM RE-SOLVE GATE (see `_backoff_resolve_since`). A back-off that SLAM
         # never got to look at cannot have been judged, so re-firing off the SAME pre-backoff evidence is not
@@ -3413,6 +3486,7 @@ class ExploreController:
                 and plan.get("plan_valid") and plan.get("heading_deg") is not None and not self._slam_slow):
             self._takeoff_heading = float(plan["heading_deg"])
         self._update_slam(plan)   # track SLAM frame-build time for the settle gate (below + at the gate sites)
+        self._reloc_gate.note_plan(plan, now)   # session 69: reloc attempts feed the loss-recovery holds
         if plan.get("plan_valid"):
             self._ever_tracked = True   # SLAM has tracked at least once -> a later empty-history STALE is a real loss, not warmup
             # Session 34: cache the last-known-good position + forward clearance every valid tick. The map
@@ -3653,7 +3727,14 @@ class ExploreController:
         # makes SLAM_HOLD's height-trim trigger reachable exactly like SETTLE/ADVANCE already are (neither
         # has an earlier exhaustive-return handler in between). No behavior change for SETTLE/ADVANCE: this
         # is strictly before their own handlers too, both before and after the move.
+        # Session 69: never TRIM on an unconfirmed re-lock. `_recovering` is True from the first
+        # PLAN-STALE of a loss until a >=1u ADVANCE confirms the new pose -- the autopilot's own
+        # "re-locked; NOT trusted" window -- and SLAM_HOLD is exactly where a fresh re-lock sits.
+        # Flight 20260917_222822: TRIM fired 36 ms after `plan status: OK` on a re-locked pose
+        # (pos_y -2.102 vs the -2.100 trigger), the vertical pulse broke the seconds-old tracking,
+        # and the resulting episode ran 3m23s. Three of that flight's five losses re-broke this way.
         if (self.trim_enable and st in _TRIM_TRIGGER_STATES and not self._calib_active
+                and not self._recovering
                 and self._ceiling_y is not None
                 and plan.get("plan_valid") and plan.get("pos_y") is not None):
             _y = float(plan["pos_y"])
@@ -9994,11 +10075,49 @@ def run_self_test(cfg):
         t += 0.05; fid4 += 1
     still_servo_ok = c60s4._fallback_phase == "SERVO"
     cum_during_servo_ok = c60s4._fallback_cum_deg == 0.0    # (6) never advances while in SERVO
-    final_plan60 = dict(stale60, slam_ms=100.0, frame_id=fid4, cap_ts=floor4 + fid4)   # the Nth -> resume
+    # Session 69: solved frames alone no longer end the EQUAL hold -- the Nth frame used to resume the
+    # sweep; now the hold is decided by reloc evidence (reloc_hold.RelocHoldGate) and bounded by
+    # servo_hold_cap_s. (a) the Nth solved frame with NO reloc attempts observed -> still SERVO;
+    # (b) three consecutive 0-candidate attempts after reloc_hold_min_s -> resume (view unrecognised);
+    # (c) a separate controller with candidates present holds past the old count and past
+    #     min_s, and leaves exactly at servo_hold_cap_s.
+    final_plan60 = dict(stale60, slam_ms=100.0, frame_id=fid4, cap_ts=floor4 + fid4)   # the Nth frame
     c60s4.step(t, final_plan60, False, status="PLAN-STALE", visual_match=vm_equal60)
+    frames_alone_hold_ok = c60s4._fallback_phase == "SERVO"
+    t = c60s4._servo_equal_t0 + c60s4.reloc_hold_min_s + 0.1
+    for att in (1, 2, 3):
+        empty = dict(stale60, reloc_attempt=att, reloc_n_cand=0, reloc_best_frac=0.0)
+        c60s4.step(t, empty, False, status="PLAN-STALE", visual_match=vm_equal60)
+        t += 0.05
     resumed_ok = c60s4._fallback_phase != "SERVO"
+    c60s4c = ExploreController(cfg, no_takeoff=True)
+    c60s4c._ever_tracked = True
+    c60s4c.servo_min_window_s = 0.2; c60s4c.servo_min_samples = 2
+    c60s4c._enter_fallback_sweep(0.0, None)
+    t = 0.0
+    for _ in range(10):
+        c60s4c.step(t, dict(stale60, cap_ts=t), False, status="PLAN-STALE", visual_match=vm_equal60)
+        t += 0.05
+        if c60s4c._servo_cap_floor is not None:
+            break
+    eq0 = c60s4c._servo_equal_t0
+    for att in range(1, 6):    # five IMPROVING attempts (0.20 -> 0.32), spread over 8 s -> still holding
+        t = eq0 + 1.5 * att
+        c60s4c.step(t, dict(stale60, reloc_attempt=att, reloc_n_cand=3, reloc_best_frac=0.17 + 0.03 * att,
+                            reloc_min_match_frac=0.35),
+                    False, status="PLAN-STALE", visual_match=vm_equal60)
+    cands_hold_ok = c60s4c._fallback_phase == "SERVO"
+    c60s4c.step(eq0 + 9.0, dict(stale60, reloc_attempt=6, reloc_n_cand=3, reloc_best_frac=0.33,
+                                reloc_min_match_frac=0.35), False, status="PLAN-STALE", visual_match=vm_equal60)
+    c60s4c.step(eq0 + c60s4c.servo_hold_cap_s - 0.1, dict(stale60), False, status="PLAN-STALE",
+                visual_match=vm_equal60)
+    before_cap_ok = c60s4c._fallback_phase == "SERVO"
+    c60s4c.step(eq0 + c60s4c.servo_hold_cap_s + 0.1, dict(stale60), False, status="PLAN-STALE",
+                visual_match=vm_equal60)
+    cap_resumes_ok = c60s4c._fallback_phase != "SERVO"
     hold_frames_ok = (in_servo_after_entry_ok and below_floor_never_counted_ok and still_servo_ok
-                      and resumed_ok)
+                      and frames_alone_hold_ok and resumed_ok and cands_hold_ok and before_cap_ok
+                      and cap_resumes_ok)
 
     # (7) a run of UNKNOWN verdicts never enters SERVO.
     c60s7 = ExploreController(cfg, no_takeoff=True)
@@ -10072,9 +10191,10 @@ def run_self_test(cfg):
     print(f"[self-test] {'PASS' if servo_equal_ok else 'FAIL'}  SESSION-60 FALLBACK SERVO "
           f"sustained_EQUAL_holds_and_stamps_floor")
     print(f"[self-test] {'PASS' if hold_frames_ok else 'FAIL'}  SESSION-60 FALLBACK SERVO "
-          f"servo_hold_frames_resumes_sweep (in_servo={in_servo_after_entry_ok}, "
+          f"servo_equal_hold_by_reloc_evidence (in_servo={in_servo_after_entry_ok}, "
           f"below_floor_ignored={below_floor_never_counted_ok}, short_of_count_still_holds={still_servo_ok}, "
-          f"nth_frame_resumes={resumed_ok})")
+          f"frames_alone_hold={frames_alone_hold_ok}, three_empties_resume={resumed_ok}, "
+          f"candidates_hold={cands_hold_ok}, before_cap_holds={before_cap_ok}, cap_resumes={cap_resumes_ok})")
     print(f"[self-test] {'PASS' if cum_during_servo_ok else 'FAIL'}  SESSION-60 FALLBACK SERVO "
           f"cum_deg_frozen_during_servo")
     print(f"[self-test] {'PASS' if unknown_never_servo_ok else 'FAIL'}  SESSION-60 FALLBACK SERVO "
@@ -11606,16 +11726,22 @@ def run_self_test(cfg):
 
     # (2) episode_clock_and_trust_survive: a trim triggered mid-episode must NOT reset the bad-SLAM episode
     # clock or silently restore recovery trust -- only SLAM_HOLD's OWN settle-gate/trust check may do that.
+    # Session 69 REVISION of this check: it used to assert that a trim fires from SLAM_HOLD while
+    # `_recovering` is True and merely leaves the episode clock / trust flag alone. Flight
+    # 20260917_222822 showed that trim breaking the seconds-old re-lock three times out of five, so
+    # TRIM is now blocked for the whole "re-locked; NOT trusted" window: state stays SLAM_HOLD, and
+    # the episode clock and the trust flag survive untouched exactly as before. The trim fires once
+    # the re-lock is confirmed (test 1 above, `_recovering` False).
     c56t2 = _mk_trim()
     c56t2._enter_slam_hold("SETTLE", 0.0, "test setup")
     c56t2._slam_hold_episode_t0 = 100.0
     c56t2._recovering = True
     _, s_t2, _ = c56t2.step(0.0, _tplan(-1.70, cap=0.0, fid=1), False)
-    episode_clock_and_trust_survive = (s_t2 == "TRIM" and c56t2._slam_hold_episode_t0 == 100.0
+    episode_clock_and_trust_survive = (s_t2 != "TRIM" and c56t2._slam_hold_episode_t0 == 100.0
                                        and c56t2._recovering is True)
     ok = ok and episode_clock_and_trust_survive
     print(f"[self-test] {'PASS' if episode_clock_and_trust_survive else 'FAIL'}  SESSION-56 TRIM FROM "
-          f"SLAM_HOLD episode_clock_and_trust_survive (state={s_t2}, "
+          f"SLAM_HOLD no_trim_while_recovering_and_episode_clock_survives (state={s_t2}, "
           f"episode_t0={c56t2._slam_hold_episode_t0}, recovering={c56t2._recovering})")
 
     # (3) resume_target_is_honoured: Step 6.2's DECISION -- a TRIM interrupting an as-yet-unresolved
@@ -12299,6 +12425,91 @@ def run_self_test(cfg):
     canvas_publish_ok = case61p_1 and case61p_2 and case61p_3 and case61p_4
     ok = ok and canvas_publish_ok
     print(f"[self-test] {'PASS' if canvas_publish_ok else 'FAIL'}  SESSION-61 CANVAS PUBLISH overall")
+
+    # ---------------- SESSION 69: loss-recovery holds decided by reloc evidence (reloc_hold.RelocHoldGate)
+    # The blank-wall episode: PLAN-STALE, every reloc attempt returns 0 candidates. The grace (12 s) and
+    # FALLBACK's INITIAL_WAIT (20 s) must each end ~reloc_hold_min_s after three empties, not at their
+    # timers; the same controller with NO attempts in the plan must behave exactly as before (legacy).
+    stale69 = {"plan_valid": False, "goal": None, "pos": [0.0, 0.0], "clearance_ring": None}
+    def _run69(attempts_per_plan, seconds):
+        c = ExploreController(cfg, no_takeoff=True)
+        c._ever_tracked = True
+        c.command_history.clear()
+        t, att, events = 0.0, 0, []
+        while t < seconds:
+            plan = dict(stale69)
+            if attempts_per_plan and int(t / 0.6) > att:    # a new attempt every 0.6 s (empties are fast)
+                att = int(t / 0.6)
+                plan.update(reloc_attempt=att, reloc_n_cand=0, reloc_best_frac=0.0)
+            _a, st, ev = c.step(t, plan, False, status="PLAN-STALE")
+            if ev:
+                events.append((round(t, 2), st, ev))
+            t += 0.05
+        return c, events
+    c69e, ev69e = _run69(True, 12.0)
+    grace_end = next((t for t, st, ev in ev69e if "FALLBACK sweep after" in ev), None)
+    iw_end = next((t for t, st, ev in ev69e if "initial wait ended" in ev), None)
+    grace_cut_ok = grace_end is not None and c69e.reloc_hold_min_s <= grace_end < c69e.loss_backoff_grace_s
+    grace_reason_ok = grace_end is not None and any("no usable candidates" in ev for t, st, ev in ev69e if t == grace_end)
+    iw_cut_ok = (iw_end is not None and grace_end is not None
+                 and c69e.reloc_hold_min_s <= iw_end - grace_end < c69e.fallback_initial_wait_s)
+    backed_off_ok = any("backed off" in ev for t, st, ev in ev69e)
+    c69l, ev69l = _run69(False, 13.0)
+    grace_end_l = next((t for t, st, ev in ev69l if "FALLBACK sweep" in ev), None)
+    legacy_grace_ok = grace_end_l is not None and abs(grace_end_l - c69l.loss_backoff_grace_s) < 0.2
+    legacy_iw_still_waiting_ok = c69l._fallback_phase == "INITIAL_WAIT"   # 1 s in, 20 s legacy timer
+    panel69 = c69l.recovery_status(13.0)
+    panel_ok = (panel69 is not None and isinstance(panel69.get("hold"), dict)
+                and "reason" in panel69["hold"] and panel69["hold"]["attempts"] == 0)
+    # junk candidates (flight 20260917_222824: 2c/0.08 for 20 s): weak below 0.5 x 0.35 -> cut like empties
+    c69j = ExploreController(cfg, no_takeoff=True)
+    c69j._ever_tracked = True
+    c69j.command_history.clear()
+    t, att, junk_end = 0.0, 0, None
+    while t < 8.0:
+        plan = dict(stale69)
+        if int(t / 1.4) > att:
+            att = int(t / 1.4)
+            plan.update(reloc_attempt=att, reloc_n_cand=2, reloc_best_frac=0.08, reloc_min_match_frac=0.35)
+        _a, st, ev = c69j.step(t, plan, False, status="PLAN-STALE")
+        if ev and "FALLBACK sweep after" in ev:
+            junk_end = (round(t, 2), ev)
+            break
+        t += 0.05
+    junk_cut_ok = junk_end is not None and junk_end[0] < c69j.loss_backoff_grace_s and "no usable candidates" in junk_end[1]
+    # TRIM guard: an unconfirmed re-lock (_recovering) at the trigger height must NOT enter TRIM
+    c69t = ExploreController(cfg, no_takeoff=True)
+    c69t._ever_tracked = True
+    c69t.trim_enable = True
+    c69t._ceiling_y = -2.5
+    c69t.trim_high_trigger_y = -2.1
+    c69t._enter("SLAM_HOLD", 0.0)
+    c69t._recovering = True
+    ok_plan69 = {"plan_valid": True, "goal": [1.0, 1.0], "pos": [0.0, 0.0], "pos_y": -2.15,
+                 "heading_deg": 0.0, "clearance_ring": None, "slam_ms": 300.0, "frame_id": 1, "cap_ts": 0.0}
+    _a, st_rec, _ = c69t.step(0.1, ok_plan69, False, status="OK")
+    trim_blocked_ok = st_rec != "TRIM"
+    c69t._recovering = False
+    _a, st_conf, _ = c69t.step(0.2, dict(ok_plan69, frame_id=2, cap_ts=0.1), False, status="OK")
+    trim_allowed_ok = st_conf == "TRIM"
+    reloc_hold_ok = (grace_cut_ok and grace_reason_ok and iw_cut_ok and backed_off_ok and legacy_grace_ok
+                     and legacy_iw_still_waiting_ok and panel_ok and junk_cut_ok and trim_blocked_ok
+                     and trim_allowed_ok)
+    ok = ok and reloc_hold_ok
+    print(f"[self-test] {'PASS' if grace_cut_ok and grace_reason_ok else 'FAIL'}  SESSION-69 RELOC HOLD "
+          f"grace_cut_short_on_empties (ended at {grace_end}s of {c69e.loss_backoff_grace_s:.0f}s, "
+          f"reason_named={grace_reason_ok})")
+    print(f"[self-test] {'PASS' if iw_cut_ok and backed_off_ok else 'FAIL'}  SESSION-69 RELOC HOLD "
+          f"initial_wait_cut_short_then_backoff (initial wait ended {None if iw_end is None or grace_end is None else round(iw_end - grace_end, 2)}s "
+          f"after entry of {c69e.fallback_initial_wait_s:.0f}s, backed_off={backed_off_ok})")
+    print(f"[self-test] {'PASS' if legacy_grace_ok and legacy_iw_still_waiting_ok else 'FAIL'}  SESSION-69 RELOC HOLD "
+          f"no_attempts_keeps_legacy_timers (grace ended {grace_end_l}s, phase after 13 s = {c69l._fallback_phase})")
+    print(f"[self-test] {'PASS' if panel_ok else 'FAIL'}  SESSION-69 RELOC HOLD recovery_status_carries_hold_verdict")
+    print(f"[self-test] {'PASS' if junk_cut_ok else 'FAIL'}  SESSION-69 RELOC HOLD "
+          f"junk_candidates_cut_like_empties ({junk_end})")
+    print(f"[self-test] {'PASS' if trim_blocked_ok and trim_allowed_ok else 'FAIL'}  SESSION-69 TRIM GUARD "
+          f"no_trim_on_unconfirmed_relock (recovering={st_rec}, confirmed={st_conf})")
+    print(f"[self-test] {'PASS' if reloc_hold_ok else 'FAIL'}  SESSION-69 RELOC HOLD overall")
 
     print(f"\n[autopilot][self-test] {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return ok
