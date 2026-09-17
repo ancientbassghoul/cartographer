@@ -5,11 +5,50 @@ live watch list, standing-rules pointer). This file is the full session-by-sessi
 presentation record; read it when you need the "why" behind a past decision that `STATE.md`
 compressed away. Full per-session technical design/trace lives in `plans/*.md`, linked below.
 
-_Last updated **2026-09-07**, branch `all-bets-are-off`, session 67 (Chunks 1-5): `tracker.track()`
-is now instrumented end-to-end (CSV, console, visualizer) — **built and self-tested, not yet flown**.
-See `STATE.md` for what's next._
+_Last updated **2026-09-17**, branch `all-bets-are-off`, session 69: the thermal cliff is closed
+(fans), the remaining VRAM ramp is NAMED (allocator paging under WDDM), fix proposed and approved,
+not yet written. See `STATE.md` for what's next._
 
 ## Session Log (newest first)
+
+- **69 — THE THERMAL CLIFF IS CLOSED; THE REST OF THE RAMP IS THE ALLOCATOR PAGING, AND IT'S NAMED.**
+  The operator cleaned the intakes and put Fan Control on the fans, then flew two full autonomous
+  flights with `gpu_probe.py` and HWiNFO64 running. **Flight 1 (08:56):** peak 75 C instead of 96,
+  clock floor 780 MHz instead of 210, and `trk_pre_ms` FLAT at ~340 ms for seven minutes instead of
+  341 -> 3024. The 8x cliff is gone. But the probe showed a second thing the old flights were too
+  slow to reach: the python process's VRAM went 7 -> 15 GB in **one 87-second ramp** (clip 4:46 ->
+  6:13), the card filled, and 6 GB paged to system RAM, with `trk_pre_ms` rising 340 -> 540 in
+  lockstep. Keyframe rate, edge rate and voxel rate were all UNCHANGED through the ramp, so "more
+  room data" was ruled out. The ramp started 3 s after the autopilot finished a four-step 120-degree
+  turn and began advancing fast toward a far goal; the operator watched the clip — the drone was
+  banging against a **glass wall**, seeing geometry it could never reach. The probe only sees the
+  process total, so we added torch's own split of it to every perception row: `cuda_alloc_mb` (live
+  tensors), `cuda_reserved_mb` (what the caching allocator holds — the number the OS charges),
+  `cuda_peak_mb` (per-row transient peak) and `fg_edge_mb` (the FactorGraph's eight per-edge tensors);
+  `gpu_probe.py --report` joins them. Verified on real CUDA by a 30-frame replay (baseline 6.1 GB
+  alloc / 6.9 reserved = the preallocated keyframe buffers; one edge = 3.7 MB).
+  **Flight 2 (15:42) named it.** Over 100 keyframes / 256 edges: alloc 6.1 -> 7.0 GB (the 0.9 GB is
+  all `fg_edge`), peak never above 8.2 GB — but **reserved 6.9 -> 29.5 GB on a 16 GB card**, 15 GB of
+  it paged. Per-row: on EVERY keyframe, reserved jumps by one block of ~2.3 MB x edge-count (256 MB
+  at 100 edges, 576 MB at 256) — one gathered pointmap per edge, the global solve's working tensor.
+  Each pass needs a slightly bigger one than the last; the freed old block is too small, the
+  allocator asks the driver for a new one and caches the old one forever. Quadratic in keyframes;
+  sums to ~30 GB. **Why only on Windows:** on Linux `cudaMalloc` fails when VRAM is full and PyTorch
+  flushes its cache and retries; under WDDM `cudaMalloc` never fails — it pages — so the flush never
+  fires. PyTorch's cure (`expandable_segments`) is Linux-only (tested: "not supported on this
+  platform"). An offline reproduction of the `torch.cat` growth alone gave a 4x overhead, not 30x —
+  the per-pass solve block is the dominant term. **Fix, approved, next:** `torch.cuda.empty_cache()`
+  at the end of each `_run_backend()` pass; `cuda_reserved_mb` on the next flight is the test.
+  **The thermal picture, from HWiNFO (Lenovo ThinkPad P1 Gen 4, i9-11950H + RTX 3080 Laptop):** GPU
+  hot spot max 91 C vs edge 83 (8 C delta — paste is fine; "Memory Junction" does not exist on GDDR6
+  laptop parts), GPU `Performance Limit - Thermal` active **65 %** of the flight (the limiter acts on
+  the HOT SPOT vs the 87 C target, which is why nvidia-smi showed throttling at "73 C"), `Utilization`
+  limiter 31 % and GPU core load avg 58 % — the GPU waits on the CPU a third of the time — and the
+  **CPU at 100 C = TjMax, thermal-throttling 22 % of the flight**. Undervolting is locked on 11th-gen
+  ThinkPads; remaining levers are Lenovo Vantage's Performance thermal mode, a cooling pad, and
+  cutting our own CPU load (backlog J). Also noticed: the io_bridge recordings of 2026-09-06/07 have
+  no `moov` atom (writer killed before finalising) and will not open — backlog K. The operator used
+  flight 2 for the demo: "flew like a dream", visual-recovery fallback seen working.
 
 - **68 — THE ACCUMULATOR IS A THERMALLY THROTTLED GPU. Not an accumulator, and not in our code.**
   We flew session 67's instrumentation and read `tracker_trend`. The hypothesis it was built to test
@@ -772,9 +811,16 @@ assistant's recommendation, not a decision.
 | **H** | `main` branch HEIGHT issue, never diagnosed | Different branch |
 | **I** | Three parked choke cures (Stage A superseded, B live, C large) | Re-rank after thermals |
 
+| **J** | Cut our own CPU load (session 69: CPU at TjMax, throttling 22 %; GPU waits on it 31 %) — PLY sequence ~250 MB/flight, `timeline.jsonl` ~100 MB, visualizer mp4 encode, five processes | Cheap wins likely; measure with HWiNFO's CPU rows |
+| **K** | io_bridge recordings of 2026-09-06/07 have no `moov` atom — writer killed before finalising, files unopenable. Session 66's frame-exact replay depends on these | Check how io_bridge closes its writer on `fly.py` shutdown |
+
 **Suggested order if no other steer:** **E** now (free) → **B2+B3+C** as one log-reading pass (free,
 and it retires three stale watch lists) → **B8**, the only item the assessment task itself needs →
 everything else after the thermal experiment establishes the real performance baseline.
+**Session 69 update:** the thermal baseline is now established (fans fixed the cliff; the chassis
+still thermal-limits both chips — see the session-69 log and `Measured numbers`). With the paging
+fix in, **A1 (window ON)** rises: flight 2 measured the unbounded backend going 2 -> 13.7 s over 100
+keyframes on the new baseline, and that is now the largest remaining per-frame cost.
 
 
 ### Open items moved out of `STATE.md` (session 68 housekeeping)
@@ -1153,8 +1199,38 @@ log refers to but deliberately does not repeat. **Every number here was taken on
 later found running at ~10% of its clock** (see the session-68 log entry) — the relative comparisons
 were order-controlled and stand, but the absolute magnitudes are not what healthy hardware would show.
 
-**Session 68's clock/temperature table lives in `STATE.md`'s current status** while the thermal
-experiment is the live item. Move it here when it stops being current — do not copy it.
+**Session 68's throttled flight (2026-09-07, `OUTPUT/diag/20260907_122008_gpu.csv`, manual
+park/fly profile, BEFORE the cooling fix).** `SwThermalSlowdown` in 235 of 247 samples.
+
+| t | sm clock | temp | throttle reason |
+|---|---|---|---|
+| 17 s | 1725 MHz | 73 C | none |
+| 54 s | 780 MHz | 79 C | SwThermalSlowdown |
+| 123 s | 450 MHz | 89 C | SwThermalSlowdown |
+| 146 s -> end | **210 MHz** | 88-96 C | SwThermalSlowdown |
+
+Cycle-count test (time x clock, constant for fixed work): 257M at 600-1000 MHz, 263M at 300-600,
+482M below 300 — the clock explained ~3.7x of ~7x; session 69 found the rest was VRAM paging.
+
+**Session 69's two flights (2026-09-17, AFTER the cooling fix; autonomous).**
+`20260917_085604_gpu.csv` + `20260917_154226_gpu.csv`, joined to their perception CSVs.
+
+| | 09-07 (throttled) | 09-17 flight 1 | 09-17 flight 2 |
+|---|---|---|---|
+| peak GPU edge temp | 96 C | 75 C | 83 C (hot spot 91) |
+| clock under load | 210 MHz floor | 780 MHz, flat | 780 MHz, flat |
+| `trk_pre_ms` first 7 min | 341 -> 3024 | 334 -> 356 | 337 -> 346 |
+| python VRAM | 10.2 GB peak | 7 -> 15 GB in 87 s, then paging | 7 -> 15 GB, 15 GB paged |
+| `trk_pre_ms` once paging | — | 477-538 | 392-546 |
+
+Flight 2's torch split (`cuda_*` columns, per-minute medians): alloc 6103 -> 7037 MB; `fg_edge`
+0 -> 936 MB (3.7 MB/edge, 256 edges); peak 6435 -> 8198 MB; **reserved 6868 -> 29524 MB**. Per
+keyframe, reserved grows by ~2.3 MB x graph_edges and never shrinks. Backend (`backend_ms`, window
+OFF, solve touches every edge): 2.0 s at 100 edges -> 13.7 s at 256.
+
+HWiNFO Max column, flight 2: CPU Package 100 C, Core/Package thermal throttling Yes 22 %, power
+limit exceeded 8 %; GPU hot spot 91.3 C, thermal limiter 65 %, utilization limiter 31 %,
+reliability-voltage 4 %, power 0 %; GPU core load avg 57.8 %; GPU power max 70.9 W (limit 80/100).
 
 **The SLAM choke, attributed (session 62).** `OUTPUT/diag/20260905_113348_perception.csv`, 446 frames,
 35 min, voxels 3 220 → 386 558, keyframes 1 → 82. Phase closure residual median 0.1 ms, so the split

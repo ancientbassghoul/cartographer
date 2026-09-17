@@ -85,6 +85,10 @@ DIAG_PERF_FIELDS: tuple[str, ...] = (
     # every column before this keeps the exact position earlier flights' reports expect by name.
     "trk_pre_ms", "trk_solve_ms", "trk_gn_iters", "trk_gn_exit",
     "trk_valid_opt", "trk_match_frac", "trk_seeded",
+    # Session 69: torch's own view of GPU memory (slam_engine.SLAM_MEMORY_FIELDS), so a VRAM rise
+    # gpu_probe.py sees on the process total can be named: live tensors vs allocator cache vs the
+    # solve's transient peak vs the FactorGraph's per-edge tensors. Appended LAST, after trk_seeded.
+    "cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb", "fg_edge_mb",
 )
 
 # Session 57: fixed, index-ordered marker palette for the frozen goal-anchor points baked into every
@@ -488,7 +492,9 @@ class Pipeline:
             trk_pre_ms=round(res.trk_pre_ms, 1), trk_solve_ms=round(res.trk_solve_ms, 1),
             trk_gn_iters=res.trk_gn_iters, trk_gn_exit=res.trk_gn_exit,
             trk_valid_opt=res.trk_valid_opt, trk_match_frac=round(res.trk_match_frac, 4),
-            trk_seeded=res.trk_seeded)
+            trk_seeded=res.trk_seeded,
+            cuda_alloc_mb=round(res.cuda_alloc_mb, 1), cuda_reserved_mb=round(res.cuda_reserved_mb, 1),
+            cuda_peak_mb=round(res.cuda_peak_mb, 1), fg_edge_mb=round(res.fg_edge_mb, 1))
 
         # DA-V2 depth removed: no depth panel/payload. Callers get panel=None (only the map window shows).
         return res, None, None, map_updated
@@ -2169,8 +2175,9 @@ def _self_test_diag_tracker_fields():
     check("tracker_fields_present_exactly_once -- every SLAM_TRACKER_PHASE_FIELDS/STATE_FIELDS name "
           "is a DIAG_PERF_FIELDS column, exactly once",
           all(DIAG_PERF_FIELDS.count(f) == 1 for f in tracker_fields))
-    check("forty_columns_no_duplicates -- DIAG_PERF_FIELDS is 40 columns, all unique",
-          len(DIAG_PERF_FIELDS) == 40 and len(set(DIAG_PERF_FIELDS)) == 40)
+    # Session 69 appended the four SLAM_MEMORY_FIELDS after trk_seeded: 40 -> 44.
+    check("forty_four_columns_no_duplicates -- DIAG_PERF_FIELDS is 44 columns, all unique",
+          len(DIAG_PERF_FIELDS) == 44 and len(set(DIAG_PERF_FIELDS)) == 44)
 
     tmp_dir = tempfile.mkdtemp(prefix="tracker_fields_selftest_")
     try:
@@ -2300,6 +2307,18 @@ def _self_test_phase_timing(cfg):
           "is a DIAG_PERF_FIELDS column",
           all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_TRACKER_PHASE_FIELDS)
           and all(f in DIAG_PERF_FIELDS for f in slam_engine.SLAM_TRACKER_STATE_FIELDS))
+    # Session 69: the memory columns are the LAST four, in SLAM_MEMORY_FIELDS order, and every one
+    # of them is a SlamResult field defaulting to a float 0.0 ("not measured", distinguishable from
+    # a real reading only by never being exactly 0.0 on a CUDA process that has loaded a model).
+    check("memory_fields_last -- DIAG_PERF_FIELDS ends with SLAM_MEMORY_FIELDS, in order",
+          tuple(DIAG_PERF_FIELDS[-len(slam_engine.SLAM_MEMORY_FIELDS):])
+          == slam_engine.SLAM_MEMORY_FIELDS)
+    _r_mem = slam_engine.SlamResult(
+        tracking_mode="MASt3R", mode="TRACKING", n_keyframes=0, frame_idx=0,
+        camera_center=None, new_keyframe=False, reloc_event=False)
+    check("slam_result_memory_defaults -- all four are float 0.0",
+          all(getattr(_r_mem, f) == 0.0 and isinstance(getattr(_r_mem, f), float)
+              for f in slam_engine.SLAM_MEMORY_FIELDS))
 
     tmp_dir = tempfile.mkdtemp(prefix="phase_timing_selftest_")
     try:

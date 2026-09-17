@@ -114,6 +114,18 @@ class SlamResult:
     backend_graph_edges: int = 0          # total edges in the graph at that solve
     backend_anchors: int = 0              # out-of-window keyframes dragged in by loop edges
     backend_anchor_drift: float = 0.0     # max anchor pose displacement from that solve
+    # Session 69 -- GPU memory, read from torch's own allocator at the end of every process() call.
+    # gpu_probe.py sees only the process TOTAL (session 69's flight: 7 GB -> 15 GB in 87 s, then
+    # paging); these split that total so a rise can be NAMED. alloc = live tensors right now;
+    # reserved = what the caching allocator holds from the driver (alloc + cached-free blocks --
+    # this is the number Windows/nvidia-smi charge the process for); peak = highest alloc since the
+    # PREVIOUS row, so a solve's transient temporaries show up even though they are freed before
+    # the row is written; fg_edge = the FactorGraph's eight per-edge tensors (ii/jj/idx/valid/Q),
+    # the one structure that grows by torch.cat every add_factors. Defaults 0.0 = not measured.
+    cuda_alloc_mb: float = 0.0
+    cuda_reserved_mb: float = 0.0
+    cuda_peak_mb: float = 0.0
+    fg_edge_mb: float = 0.0
 
 
 # Session 62: the phase names in SlamResult, in pipeline order. Single source of truth shared by
@@ -139,6 +151,11 @@ SLAM_BACKEND_FIELDS: tuple[str, ...] = ("backend_mode", "backend_queue_depth",
 SLAM_WINDOW_FIELDS: tuple[str, ...] = ("backend_window_mode", "backend_window_kf", "backend_solve_kf",
                                        "backend_solve_edges", "backend_graph_edges", "backend_anchors",
                                        "backend_anchor_drift")
+
+# Session 69: GPU memory state carried on every SlamResult. STATE, not durations, and not part of any
+# closure invariant -- same standing as SLAM_BACKEND_FIELDS / SLAM_WINDOW_FIELDS.
+SLAM_MEMORY_FIELDS: tuple[str, ...] = ("cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb",
+                                       "fg_edge_mb")
 
 # Session 67: the split inside tracker_ms, and the GN solve's state. A THIRD closure invariant,
 # distinct from the four SLAM_PHASE_FIELDS close against slam_ms and the three SLAM_TRACK_PHASE_
@@ -660,6 +677,7 @@ class SlamEngine:
         # that mistake for a value that updates far more often (every backend pass, not once a solve).
         window_stats = (self.factor_graph.last_window_stats if self._initialized
                          else slam_window.WindowStats(mode=self.window_mode, window_kf=self.window_kf))
+        mem = self._memory_stats()
         return SlamResult(
             tracking_mode=self.tracking_mode, mode=cur_mode,
             n_keyframes=kf_count, frame_idx=i, camera_center=center,
@@ -678,4 +696,26 @@ class SlamEngine:
             backend_window_mode=window_stats.mode, backend_window_kf=window_stats.window_kf,
             backend_solve_kf=window_stats.solve_kf, backend_solve_edges=window_stats.solve_edges,
             backend_graph_edges=window_stats.graph_edges, backend_anchors=window_stats.anchors,
-            backend_anchor_drift=window_stats.anchor_drift)
+            backend_anchor_drift=window_stats.anchor_drift,
+            cuda_alloc_mb=mem[0], cuda_reserved_mb=mem[1], cuda_peak_mb=mem[2], fg_edge_mb=mem[3])
+
+    _FG_EDGE_TENSORS = ("ii", "jj", "idx_ii2jj", "idx_jj2ii", "valid_match_j", "valid_match_i",
+                        "Q_ii2jj", "Q_jj2ii")
+
+    def _memory_stats(self):
+        """Session 69: (alloc_mb, reserved_mb, peak_mb, fg_edge_mb) from torch's allocator -- see the
+        SlamResult field comment. Resets the peak counter so the next call reports the peak since
+        THIS one. Cheap (allocator bookkeeping, no sync). The FactorGraph tensors are read by
+        attribute; the backend thread rebinds them whole via torch.cat, never in place, so a read
+        from here sees either the old or the new tensor, both self-consistent."""
+        dev = self.device
+        alloc = torch.cuda.memory_allocated(dev) / 2**20
+        reserved = torch.cuda.memory_reserved(dev) / 2**20
+        peak = torch.cuda.max_memory_allocated(dev) / 2**20
+        torch.cuda.reset_peak_memory_stats(dev)
+        fg_bytes = 0
+        if self._initialized:
+            for name in self._FG_EDGE_TENSORS:
+                t = getattr(self.factor_graph, name)
+                fg_bytes += t.numel() * t.element_size()
+        return alloc, reserved, peak, fg_bytes / 2**20

@@ -25,7 +25,10 @@ limitation, not a driver bug), so per-process numbers come from Windows' own per
 
 Rows carry `wall_ts` from `time.time()`, the same clock `perception_worker` stamps its CSV with, so
 a probe run joins to a flight by time with no offset arithmetic. `--report` does that join and puts
-GPU state next to `trk_pre_ms`, session 67's fixed-work speedometer.
+GPU state next to `trk_pre_ms`, session 67's fixed-work speedometer, and (session 69) next to
+torch's own split of the process's VRAM -- t_alloc (live tensors), t_resv (allocator reserve, the
+number the OS charges the process), t_peak (bucket max of the per-row transient peak) and fg_edge
+(the FactorGraph's per-edge tensors) -- so a rise in `python_MB` can be named, not just seen.
 
 Usage:
     venv\\Scripts\\python.exe gpu_probe.py                 # log until Ctrl-C
@@ -287,6 +290,12 @@ def _med(rows, key):
     return statistics.median(vals) if vals else float("nan")
 
 
+# Session 69: perception-CSV memory columns joined into the report, and their table headers.
+MEM_COLS = ("cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb", "fg_edge_mb")
+MEM_HDR = {"cuda_alloc_mb": "t_alloc", "cuda_reserved_mb": "t_resv",
+           "cuda_peak_mb": "t_peak", "fg_edge_mb": "fg_edge"}
+
+
 def report(gpu_csv, perception_csv=None, buckets=12):
     """Bucket the probe by time and, when a flight CSV is given, join session 67's fixed-work
     speedometer (`trk_pre_ms`) alongside -- so GPU state and SLAM throughput are read together."""
@@ -300,13 +309,24 @@ def report(gpu_csv, perception_csv=None, buckets=12):
     track = [t for t in track if t != "other"]
 
     pre_by_bucket = {}
+    # Session 69: torch's own split of the process total (perception_worker's cuda_*/fg_edge_mb
+    # columns). Absent from flights before session 69 -> the columns are simply not printed.
+    mem_cols = []
+    mem_by_bucket = {}
     if perception_csv:
-        p = [r for r in csv.DictReader(open(perception_csv, encoding="utf-8"))
-             if r.get("trk_gn_exit", "") not in ("", "skipped", "error")]
+        allp = list(csv.DictReader(open(perception_csv, encoding="utf-8")))
+        mem_cols = [c for c in MEM_COLS if allp and c in allp[0]]
+        p = [r for r in allp if r.get("trk_gn_exit", "") not in ("", "skipped", "error")]
         for r in p:
             k = int((float(r["wall_ts"]) - t0) / max(span / buckets, 1e-9))
             if 0 <= k < buckets:
                 pre_by_bucket.setdefault(k, []).append(float(r["trk_pre_ms"]))
+        for r in allp:
+            k = int((float(r["wall_ts"]) - t0) / max(span / buckets, 1e-9))
+            if 0 <= k < buckets:
+                for c in mem_cols:
+                    if r[c] not in ("", "nan"):
+                        mem_by_bucket.setdefault((k, c), []).append(float(r[c]))
 
     print(f"\nGPU probe -- {os.path.basename(gpu_csv)} ({len(g)} samples, {span/60:.1f} min)")
     if perception_csv:
@@ -337,6 +357,7 @@ def report(gpu_csv, perception_csv=None, buckets=12):
         hdr += [f"{t}_MB", f"{t}_3d%", f"{t}_cu%"]
     if perception_csv:
         hdr += ["trk_pre_ms"]
+        hdr += [MEM_HDR[c] for c in mem_cols]
     print("| " + " | ".join(hdr) + " |")
     print("|" + "|".join("---" for _ in hdr) + "|")
     for k in range(buckets):
@@ -354,6 +375,12 @@ def report(gpu_csv, perception_csv=None, buckets=12):
         if perception_csv:
             v = pre_by_bucket.get(k, [])
             cells += [f"{statistics.median(v):.0f}" if v else "--"]
+            for c in mem_cols:
+                v = mem_by_bucket.get((k, c), [])
+                # peak is a per-row maximum by construction, so its bucket summary is the max too;
+                # the other three are levels, so the median is the honest bucket value.
+                cells += [(f"{max(v):.0f}" if c == "cuda_peak_mb" else f"{statistics.median(v):.0f}")
+                          if v else "--"]
         print("| " + " | ".join(cells) + " |")
 
 

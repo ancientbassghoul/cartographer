@@ -94,6 +94,12 @@ _TRACKER_PHASE_FIELDS: tuple[str, ...] = ("trk_pre_ms", "trk_solve_ms")
 _TRACKER_STATE_COLUMNS: tuple[str, ...] = ("trk_gn_iters", "trk_gn_exit", "trk_valid_opt",
                                            "trk_match_frac", "trk_seeded")
 
+# Session 69: mirror of slam_engine.SLAM_MEMORY_FIELDS -- megabytes, not milliseconds, so excluded
+# from PHASE_COLUMNS/render_table like the state columns above. They are read by
+# `gpu_probe.py --report`, which joins them to the GPU probe on wall_ts; this report ignores them.
+_MEMORY_COLUMNS: tuple[str, ...] = ("cuda_alloc_mb", "cuda_reserved_mb", "cuda_peak_mb",
+                                    "fg_edge_mb")
+
 
 @dataclass(frozen=True)
 class PhaseStats:
